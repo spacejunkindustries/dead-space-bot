@@ -55,7 +55,11 @@ class ConfigHolder:
 
 `AuraConfig` sections mirror GDD §16 one dataclass per section: `discord wake
 capture stt matching(.tiers/.priors) incidents discipline(.circuit_breaker)
-tts gazetteer ipc health database`. The token is **not** in config;
+tts gazetteer ipc health database`. `GazetteerConfig(file: str, home_system:
+str | None, include_all: bool = False)`: `home_system` accepts `null`/empty
+(→ `None`, home-bias prior off, nomadic corps); `include_all` mirrors the
+`gazetteer.yaml` flag and either being true activates the whole seeded map
+(GDD §8.1). The token is **not** in config;
 `discord.token_file` is a dev-only fallback path — `dsc/bot.py` reads
 `$CREDENTIALS_DIRECTORY/token` first (systemd `LoadCredential=`).
 
@@ -105,7 +109,13 @@ def clean_callsign(text: str) -> str | None
 #   sanitize_callsign, then title-cased (STT emits lowercase).
 
 # gazetteer.py — GDD §8.1. Loads scope rules from gazetteer.yaml, systems +
-# adjacency from the db (SDE-seeded). Rebuildable at runtime via /gazetteer.
+# adjacency from the db (SDE-seeded by `python -m aura.nlu.seed`). Rebuildable
+# at runtime via /gazetteer. Two modes: scoped (default, regions/
+# within_jumps_of/always_include narrow, exclude removes) and include_all
+# (nomadic — entire seeded map active; regions/within_jumps_of ignored, exclude
+# still removes, within_jumps_of/home may be omitted). load() raises
+# GazetteerError with an actionable "seed it with: …" message when the systems
+# table is empty.
 class Gazetteer:
     def __init__(self, conn: sqlite3.Connection, cfg: GazetteerConfig) -> None
     def load(self) -> None                        # blocking; call via to_thread
@@ -119,8 +129,14 @@ class Gazetteer:
     #   (one BFS parent map per source). Full graph — may cross pruned systems.
     def system_name(self, system_id: int) -> str | None     # FULL systems table, for path display
     def prompt_bias_text(self) -> str             # system names for Whisper initial_prompt
+    #   Bounded (PROMPT_BIAS_MAX_CHARS / PROMPT_BIAS_MAX_NAMES) and
+    #   preference-ordered so the prompt stays cheap even at a 5000-system
+    #   nomadic gazetteer: home → always_include hubs → alias targets → the
+    #   rest alphabetically. Built once per load() (cached), so per-incident
+    #   recency is handled by the §8.4 priors, not here; _build_prompt_bias
+    #   takes an optional recent_names hook for callers that can pass a list.
     @property
-    def home_system_id(self) -> int | None
+    def home_system_id(self) -> int | None        # None when home_system is null (nomadic)
 
 # phonetics.py — GDD §8.2–8.5. double_metaphone is implemented IN-REPO in pure
 # Python (the pypi `metaphone` package does not build here). Alias-table lookup
@@ -130,6 +146,26 @@ def resolve(text: str, gazetteer: Gazetteer, priors: PriorContext,
             cfg: MatchingConfig, conn: sqlite3.Connection | None = None) -> Resolution
 #   `conn` is used only for the aliases table lookup/learning read; pass None in
 #   pure-function tests. Pure scoring helpers must be importable and testable.
+
+# seed.py — operator CLI, GDD §8.1/§14. Seeds the systems + system_adjacency
+# tables from the EVE SDE. Stdlib + aura package only; standalone (does NOT
+# require the service running); reuses db.connect()/db.migrate() so pragmas and
+# schema match the service. Human-readable stdout, not JSON.
+#   python -m aura.nlu.seed --db PATH [--source fuzzwork]
+#       [--systems-csv F --jumps-csv F --regions-csv F]  # local files (all 3 together)
+#       [--include-wormholes]                            # keep regionID >= 11000000
+def main(argv: list[str] | None = None) -> int
+#   Default: download the three Fuzzwork CSVs (mapSolarSystems / mapSolarSystemJumps
+#   / mapRegions) over HTTPS (urllib, honours proxy env), bz2-decompress in
+#   memory IF compressed (the mirror currently serves plain .csv), parse with
+#   csv. systems: id=solarSystemID, name=solarSystemName, region=<name via
+#   regionID↔mapRegions>, constellation=NULL, metaphone=double_metaphone(name)[0],
+#   x/y/z from the CSV. adjacency: unordered deduped (min,max) pairs from the
+#   jumps CSV, only where BOTH endpoints were inserted. k-space only unless
+#   --include-wormholes (drops regionID >= 11000000); blank names dropped.
+#   Idempotent + atomic: one transaction (DELETE adjacency, DELETE systems,
+#   bulk executemany INSERT); prints regions/systems/jumps counts + a Jita/Amarr
+#   sanity line; nonzero exit with a clear message on download/parse failure.
 ```
 
 ## Core engine — `aura/core/`

@@ -69,7 +69,8 @@ tts:
 
 gazetteer:
   file: ./dev-data/gazetteer.yaml
-  home_system: Otanuomi
+  home_system: Otanuomi                # null/empty = no home bias (nomadic); see aura.yaml.example
+  include_all: false                   # true = entire seeded map active (nomadic mode, GDD §8.1)
 
 ipc:
   socket: ./dev-data/aura.sock

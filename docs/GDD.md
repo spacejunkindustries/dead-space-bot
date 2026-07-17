@@ -411,18 +411,63 @@ This subsystem decides whether AURA succeeds or fails. It is specified in the mo
 
 EVE system names are phonetically hostile — *Otanuomi*, *Kisogo*, *Alenia*, *Hulmate*, *Tannolen*. Generic English STT shreds them. And **naming the wrong system is worse than silence**: it sends the response fleet twelve jumps the wrong way while the reporter dies.
 
-### 8.1 Constrained gazetteer
+### 8.1 The gazetteer: seed wide, scope at runtime
 
-AURA does **not** load New Eden. It loads the corp's operational area:
+Two layers. The **seed** fills the `systems` + `system_adjacency` tables from
+the EVE static data export (Echoes uses New Eden names); the **scope rules** in
+`gazetteer.yaml` pick, at runtime, which of those systems are *active* — the
+set AURA will match a transcript against. The seed is wide on purpose so the
+scope can point anywhere without re-seeding; accuracy comes from the scope, not
+the seed.
 
-- home region(s)
-- adjacent regions
-- everything within *N* jumps of home
-- the trade hubs pilots name anyway (Jita, Amarr, Rens, Dodixie)
+**Seeding — `python -m aura.nlu.seed`.** An operator CLI (`aura/nlu/seed.py`)
+downloads the three Fuzzwork SDE CSVs (`mapSolarSystems`, `mapSolarSystemJumps`,
+`mapRegions`), joins each system to its region name, and loads **all of k-space
+New Eden** (~5000 systems) plus the jump graph. Wormhole/abyssal space
+(regionID ≥ 11000000) is dropped unless `--include-wormholes`. The reload is one
+atomic transaction and is idempotent, so re-running against a fresh SDE is safe.
+It runs standalone under the Brain venv — it does not require the service up.
 
-That is roughly **100–500 systems, not thousands**. Matching against a 300-entry gazetteer is a categorically different problem from matching against 8,000 — this single decision buys more accuracy than any model upgrade available at any price.
+**Scoping — two modes in `gazetteer.yaml`, editable by the FC without touching
+code, because corps move.**
 
-The gazetteer is seeded from the EVE Online static data export (Echoes uses New Eden names) and pruned by a region allowlist in `gazetteer.yaml`, editable by the FC without touching code, because corps move.
+- **Scoped mode (default, recommended for home-region corps).** The active set
+  is the corp's operational area: home region(s), adjacent regions, everything
+  within *N* jumps of home, and the trade hubs pilots name anyway (Jita, Amarr,
+  Rens, Dodixie). That is roughly **100–500 systems, not thousands**. Matching
+  against a 300-entry gazetteer is a categorically different problem from
+  matching against 5,000 — for a corp with a fixed footprint this single
+  decision buys more accuracy than any model upgrade at any price. This is the
+  core accuracy decision, and it stays the default.
+
+- **`include_all` mode (nomadic corps).** Set `include_all: true` and the
+  **entire seeded (k-space) map is active** — any system in New Eden resolves.
+  This is a first-class, supported mode: some corps have **no fixed home** and
+  relocate periodically, and for them a scoped gazetteer that must be re-cut on
+  every move is worse than a wide one. `regions`/`within_jumps_of` are ignored
+  in this mode; `exclude` still removes (e.g. a phonetic collision the corp
+  never visits), and `always_include` is a no-op.
+
+  **The tradeoff is real and stated honestly.** A 5,000-entry candidate set has
+  more near-homophones than a 300-entry one, so raw first-pass accuracy is
+  lower than a tight scoped gazetteer. AURA leans on the rest of §8 to close the
+  gap rather than on a narrow set:
+
+  - the **confidence tiers and confirm-flow** (§8.3) — AURA never silently
+    guesses; a MEDIUM match posts flagged with `[Wrong — fix]` and a spoken
+    "say again to confirm",
+  - the **context priors** (§8.4) — recency, proximity, and reporter-history
+    still cluster a fleet fight spatially and temporally even without a home
+    anchor,
+  - **alias learning** (§8.5) — within a month the corp's specific accents and
+    mics are baked in, which matters *more* at 5,000 systems, not less.
+
+  Home bias (§8.4) is inactive in the nomadic case: `gazetteer.home_system`
+  may be `null`, and the home-bias prior simply does not fire.
+
+Either way the jump graph (`Gazetteer.jumps`/`path`, §13) always runs over the
+full seeded adjacency — pruning decides what can be *named*, never how space is
+shaped.
 
 ### 8.2 Resolution pipeline
 
@@ -465,7 +510,7 @@ Candidates are reweighted by what is plausible *right now*. A fleet fight is spa
 | **Recency** | Systems with incidents in the last 10 minutes get a strong boost. If three pilots just pinged Kisogo, *"kissogo"* is Kisogo. |
 | **Proximity** | Systems within a few jumps of an active incident outrank systems forty jumps away. |
 | **Reporter history** | This pilot has reported from Otanuomi six times this week. That is a prior. |
-| **Home bias** | Home and adjacent systems carry a standing boost. |
+| **Home bias** | Home and adjacent systems carry a standing boost. Inactive when `gazetteer.home_system` is `null` (nomadic corps, §8.1) — the prior simply does not fire. |
 
 Applied as a cheap multiplicative reweighting over the top-8 base-score candidates — wider than the final top-3 on purpose, so a strong prior can promote a lower-ranked but spatially plausible candidate into the top-3. Weights live in `aura.yaml`.
 
@@ -681,6 +726,9 @@ SQLite. One corp, low write volume, no concurrency pressure — a managed databa
 
 ```sql
 -- ── gazetteer ────────────────────────────────────────────────
+-- Populated by `python -m aura.nlu.seed` from the EVE SDE (k-space New Eden,
+-- ~5000 systems + the jump graph; §8.1). gazetteer.yaml scopes the ACTIVE
+-- subset at runtime — the tables hold the wide seed, not the active set.
 CREATE TABLE systems (
     id              INTEGER PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
@@ -958,7 +1006,10 @@ tts:
 
 gazetteer:
   file: /etc/aura/gazetteer.yaml
-  home_system: Otanuomi
+  home_system: Otanuomi        # null/empty = no home system → home-bias prior
+                               # off (nomadic corps, §8.1/§8.4)
+  include_all: false           # nomadic override, mirrors gazetteer.yaml's flag;
+                               # either being true activates the whole seeded map
 
 ipc:
   socket: /run/aura/aura.sock
@@ -972,21 +1023,28 @@ health:
   voice_silence_alarm_s: 60
 ```
 
-`/etc/aura/gazetteer.yaml`:
+`/etc/aura/gazetteer.yaml` — scope rules over the SDE-seeded tables (§8.1). The
+tables themselves are filled by `python -m aura.nlu.seed` (k-space New Eden),
+which this file then scopes at runtime:
 
 ```yaml
-regions:
+# false (default) = scoped by the rules below (home-region corps).
+# true = nomadic mode: the entire seeded map is active, regions/within_jumps_of
+# are ignored, exclude still removes. Set home_system: null in aura.yaml too.
+include_all: false
+
+regions:                 # scoped mode: regions included wholesale
   - Kisogo-region
   - Lowsec-North
-within_jumps_of:
+within_jumps_of:         # scoped mode: everything within N jumps of the anchor
   system: Otanuomi
   jumps: 8
-always_include:
+always_include:          # the hubs pilots name anyway (both modes)
   - Jita
   - Amarr
   - Rens
   - Dodixie
-exclude: []
+exclude: []              # dropped even if a rule above matched (both modes)
 ```
 
 ---

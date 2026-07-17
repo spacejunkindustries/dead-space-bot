@@ -76,8 +76,12 @@ tts:
   # Ears (ears/src/playback.rs, GDD §12.2) — not tunables.
 
 gazetteer:
-  file: /etc/aura/gazetteer.yaml       # region allowlist + always-include list (GDD §8.1)
-  home_system: Otanuomi                # anchor for the home-bias prior and within_jumps_of
+  file: /etc/aura/gazetteer.yaml       # scope rules: regions/within_jumps_of/include_all (GDD §8.1)
+  home_system: Otanuomi                # anchor for the home-bias prior (§8.4) and within_jumps_of.
+                                       # null (or empty) = no home system → home-bias prior off;
+                                       # this is the nomadic-corp setting (GDD §8.1).
+  include_all: false                   # nomadic override, mirrors gazetteer.yaml include_all —
+                                       # either being true activates the entire seeded map.
 
 ipc:
   socket: /run/aura/aura.sock          # Brain binds; Ears connects (GDD §15)

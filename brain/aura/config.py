@@ -144,7 +144,8 @@ class TtsConfig:
 @dataclass(frozen=True, slots=True)
 class GazetteerConfig:
     file: str
-    home_system: str
+    home_system: str | None  # None/empty = no home-bias prior (nomadic corp)
+    include_all: bool = False  # nomadic mode: entire seeded map active (GDD §8.1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,9 +414,21 @@ def _build_tts(data: dict[str, Any]) -> TtsConfig:
 
 def _build_gazetteer(data: dict[str, Any]) -> GazetteerConfig:
     s = _section(data, "gazetteer")
+    # home_system is optional: an explicit null/empty (or missing) disables the
+    # home-bias prior — nomadic corps have no home system (GDD §8.1/§8.4).
+    raw_home = s.get("home_system", _MISSING)
+    if raw_home is _MISSING or raw_home is None or raw_home == "":
+        home_system: str | None = None
+    elif isinstance(raw_home, str):
+        home_system = raw_home
+    else:
+        raise ConfigError(
+            f"gazetteer.home_system: expected string or null, got {type(raw_home).__name__}"
+        )
     return GazetteerConfig(
         file=_get(s, "gazetteer.file", str),
-        home_system=_get(s, "gazetteer.home_system", str),
+        home_system=home_system,
+        include_all=_get(s, "gazetteer.include_all", bool, default=False),
     )
 
 
