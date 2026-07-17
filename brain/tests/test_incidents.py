@@ -1103,3 +1103,24 @@ async def test_build_prior_context(make_env: Callable[..., Env]) -> None:
     assert ctx.recency_min[1] == pytest.approx(2.0)
     other = env.engine.build_prior_context(GUILD, 99)
     assert other.reporter_counts == {}
+
+
+async def test_broadcast_relays_freeform_intel(make_env: Callable[..., Env]) -> None:
+    # GDD §8.6: anything not matching the grammar is relayed to the channel.
+    env = make_env()
+    out = await env.engine.broadcast(GUILD, 42, "blop fleet moving to Moe 8 gate")
+    assert out.outcome is Outcome.POSTED
+    assert len(env.poster.posts) == 1
+    _, channel, content, card = env.poster.posts[-1]
+    assert content == ""  # no @here without all-hands
+    assert card.embed["description"] == "blop fleet moving to Moe 8 gate"
+    row = db.query_one(env.conn, "SELECT parsed_intent, outcome FROM command_log")
+    assert row["parsed_intent"] == "BROADCAST" and row["outcome"] == "POSTED"
+
+
+async def test_broadcast_all_hands_pings_here(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    out = await env.engine.broadcast(GUILD, 42, "cyno up, all hands", here=True)
+    assert out.outcome is Outcome.POSTED
+    _, _, content, _ = env.poster.posts[-1]
+    assert "@here" in content

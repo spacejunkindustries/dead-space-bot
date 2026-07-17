@@ -441,3 +441,22 @@ def test_signoff_only_at_the_tail() -> None:
     assert parsed is not None
     assert parsed.intent is Intent.HOSTILE_SPOTTED
     assert "overheating" in (parsed.detail or "").lower()
+
+
+# ── freeform intel relay (GDD §8.6) ──────────────────────────────────────────
+
+
+def test_broadcast_text_strips_wake_and_signoff() -> None:
+    from aura.nlu.grammar import broadcast_text
+
+    assert broadcast_text("Hey Jarvis, blop fleet moving to Moe 8 gate, over") == (
+        "blop fleet moving to Moe 8 gate"
+    )
+    assert broadcast_text("jarvis stay docked in branch") == "stay docked in branch"
+
+
+def test_wants_all_hands() -> None:
+    from aura.nlu.grammar import wants_all_hands
+
+    assert wants_all_hands("cyno up in MOEE-8, all hands")
+    assert not wants_all_hands("blop fleet moving to Moe 8")

@@ -434,8 +434,20 @@ class App:
                     parsed = dataclasses.replace(pending[0], system_text=reply, raw=result.text)
                     log.info("retry_rebound", user_id=user_id, intent=str(parsed.intent))
             if parsed is None:
-                self.health.record_rejected()
-                log.info("utterance_no_intent", user_id=user_id, text=result.text)
+                # Nothing matched the fixed grammar → freeform intel relay
+                # (GDD §8.6): post whatever was said to the intel channel rather
+                # than drop it. A nullsec corp's comms are lively and
+                # unstructured — fleet movements, region callsigns, sitreps.
+                text = grammar.broadcast_text(result.text)
+                if len(text) < 3:
+                    self.health.record_rejected()
+                    log.info("utterance_no_intent", user_id=user_id, text=result.text)
+                    return
+                here = grammar.wants_all_hands(result.text) and self.discipline.may_mention(
+                    self._member_role_ids(user_id)
+                )
+                outcome = await self.engine.broadcast(guild_id, user_id, text, here=here)
+                self._count_outcome(outcome.outcome)
                 return
 
         # GDD §11.1 layer 4: only @Pilot may trigger mentions — reject the
