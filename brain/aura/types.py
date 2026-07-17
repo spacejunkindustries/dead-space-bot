@@ -52,10 +52,13 @@ class Intent(StrEnum):
     TIMER = "TIMER"
     FORMUP = "FORMUP"
     QUERY = "QUERY"
+    HELP = "HELP"
     CANCEL = "CANCEL"
     REGISTER = "REGISTER"
     UNREGISTER = "UNREGISTER"
     WHOAMI = "WHOAMI"
+    PING_ME = "PING_ME"
+    PING_ME_CLEAR = "PING_ME_CLEAR"
 
 
 class Severity(StrEnum):
@@ -78,10 +81,13 @@ INTENT_SEVERITY: Mapping[Intent, Severity] = MappingProxyType(
         Intent.TIMER: Severity.NONE,
         Intent.FORMUP: Severity.NONE,
         Intent.QUERY: Severity.NONE,
+        Intent.HELP: Severity.NONE,
         Intent.CANCEL: Severity.NONE,
         Intent.REGISTER: Severity.NONE,
         Intent.UNREGISTER: Severity.NONE,
         Intent.WHOAMI: Severity.NONE,
+        Intent.PING_ME: Severity.NONE,
+        Intent.PING_ME_CLEAR: Severity.NONE,
     }
 )
 
@@ -294,8 +300,11 @@ class RoutingDecision:
     ``role_ids`` is the deduplicated union of matching subscription roles,
     mentioned once. ``here`` is True only for escalating types (constraint 11).
     ``channel`` picks ``#intel-alerts`` (any mention) vs ``#intel-live``.
+    ``user_ids`` are matching personal ping subscribers (GDD §10.3) — user
+    mentions appended to the mention line; they never influence ``here``.
     """
 
     role_ids: tuple[int, ...]
     here: bool
     channel: AlertChannel
+    user_ids: tuple[int, ...] = ()

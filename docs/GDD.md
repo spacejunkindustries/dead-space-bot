@@ -200,15 +200,17 @@ Every module in the finished system.
 | `nlu/phonetics.py` | Double Metaphone + Levenshtein scoring, alias-table lookup, context priors, confidence tiers |
 | `core/incidents.py` | Incident lifecycle, dedupe folding, staleness sweep, message rendering |
 | `core/callsigns.py` | Pilot callsign registry: register/unregister/who-am-I, sync lookup mirror for renders |
-| `core/routing.py` | Subscription evaluation, role union, escalation, quiet hours |
+| `core/personal_pings.py` | Personal ping subscriptions (§10.3): capped per-user store, sync mirror for routing |
+| `core/routing.py` | Subscription evaluation, role union, escalation, quiet hours, personal-ping user mentions |
 | `core/discipline.py` | Per-user cooldowns, global circuit breaker, flood control |
 | `core/db.py` | SQLite access, migrations, backup hook |
 | `dsc/bot.py` | discord.py client, intents, persistent view registration |
 | `dsc/views.py` | Incident buttons, ambiguity resolver, subscription picker |
 | `dsc/cogs/intel.py` | `/hostiles`, `/under-attack`, `/help-me`, `/camp`, `/clear`, `/status`, `/cancel` |
-| `dsc/cogs/subs.py` | `/subscribe`, `/mysubs`, `/optout`, `/mute-voice`, `/register`, `/unregister`, `/whoami` |
+| `dsc/cogs/subs.py` | `/subscribe`, `/mysubs`, `/pingme`, `/mypings`, `/pingme-clear`, `/optout`, `/mute-voice`, `/register`, `/unregister`, `/whoami` |
 | `dsc/cogs/ops.py` | `/timer`, `/formup`, `/rollcall`, `/jumps` |
 | `dsc/cogs/admin.py` | `/routing`, `/gazetteer`, `/health`, `/fleetmode` |
+| `dsc/cogs/help.py` | `/help` — interactive help topics; the slash twin of voice "help" |
 | `tts.py` | Piper subprocess, raw→WAV wrapping, utterance queue, length cap |
 | `health.py` | Heartbeats, degradation detection, `#bot-health` reporting |
 | `voice_gateway.py` | Voice-state watch, auto-join/leave, Ears join/leave commands |
@@ -314,12 +316,17 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 | "timer \<system\> \<duration\>" | `TIMER` | none | schedules a future ping |
 | "form up \<system\> \<duration\>" | `FORMUP` | none | posts op with RSVP |
 | "status" | `QUERY` | none | spoken reply only |
+| "help" | `HELP` | none | spoken reply only — *"Check help in Discord."*; the manual is `/help` |
 | "cancel" | `CANCEL` | none | kills this user's last incident (30s window) |
 | "register \<callsign\>" / "call me \<callsign\>" | `REGISTER` | none | spoken reply only |
 | "unregister" / "unregister me" / "forget me" | `UNREGISTER` | none | spoken reply only |
 | "who am I" / "whoami" | `WHOAMI` | none | spoken reply only |
+| "ping me [for \<types\>] [in \<system\>]" | `PING_ME` | none | spoken reply only |
+| "stop pinging me" | `PING_ME_CLEAR` | none | spoken reply only |
 
-Higher-severity patterns are matched first, so *"tackled, need help in Kisogo"* resolves to `UNDER_ATTACK`, not a sighting.
+Higher-severity patterns are matched first, so *"tackled, need help in Kisogo"* resolves to `UNDER_ATTACK`, not a sighting. The personal-ping intents are the one exception: their utterances *contain* type words ("ping me for gate camps"), so `PING_ME`/`PING_ME_CLEAR` are matched before the type words can claim the utterance — a genuine distress call never contains "ping me".
+
+`PING_ME` (§10.3) reuses the type vocabulary above: *hostiles/reds/neuts* → `HOSTILE_SPOTTED`, *gate camp(s)* → `GATE_CAMP`, *under attack/attacks/tackled* → `UNDER_ATTACK`, *need help/need backup/assist request(s)* → `ASSIST_REQUEST`, and *"anything"/"everything"/"all"* (or no type word at all) → all four. The optional system window resolves through the same phonetic pipeline as reports (§8.2); anything below HIGH tier is treated as unresolved — a subscription silently scoped to the wrong system would never fire, so AURA answers *"Say again the system."* instead of guessing. No system means the subscription covers all systems. The recognised types travel to the engine encoded in `detail` (comma-separated `Intent` values), shared by the `/pingme` twin.
 
 The callsign commands are a **name registry keyed on the Discord user id** Ears already attaches to every utterance (the SSRC→user map, §15). There are no voice biometrics and nothing derived from the audio — identity comes from Discord, the callsign is just a display name (§19 posture unchanged). The spoken callsign is the cleaned post-intent remainder: filler stripped, title-cased, markdown/mention characters removed, capped at 32 characters. `/register` (the typed twin) stores the callsign exactly as typed, which is also how a pilot fixes an STT misspelling.
 
@@ -347,11 +354,13 @@ Anything after the system and group is captured verbatim into the incident body:
 "Aura Command, timer Kisogo four hours"
 "Aura Command, form up Otanuomi fifteen minutes"
 "Aura Command, status"
+"Aura Command, help"
 "Aura Command, cancel"
 "Aura Command, register Space Junkie"
+"Aura Command, ping me for gate camps in Otanuomi"
 ```
 
-Twelve commands. Short enough that pilots remember them under fire, which is the only time they matter.
+Fifteen commands. Short enough that pilots remember them under fire, which is the only time they matter.
 
 ---
 
@@ -367,6 +376,7 @@ Full parity. Every voice command routes to the same engine.
 | `/camp system detail` | Report a gate camp |
 | `/clear system` | Resolve an incident |
 | `/status` | Active incidents summary |
+| `/help [topic]` | Interactive help: main page + topic pages (reporting, responding, subscriptions, identity, ops, privacy, admin) via a select menu; twin of voice "help" |
 | `/cancel` | Retract your own last report (30s window) |
 | `/timer system duration note` | Schedule a structure timer ping |
 | `/formup system when note` | Post an op with RSVP |
@@ -379,7 +389,10 @@ Full parity. Every voice command routes to the same engine.
 | `/poll create question options…` | Quick vote with buttons, live counts edited in place |
 | `/poll close id` | Close a poll (author or admin) |
 | `/subscribe` | Self-service role picker |
-| `/mysubs` | Show my subscriptions |
+| `/mysubs` | Show my subscriptions (roles + personal pings) |
+| `/pingme type [system]` | Personal ping: mention me on matching incidents (§10.3) |
+| `/mypings` | List my personal pings, ephemeral |
+| `/pingme-clear [index]` | Remove my personal pings — all, or one by `/mypings` index |
 | `/optout` | Exclude my audio from AURA entirely |
 | `/mute-voice` | Stop AURA speaking to me |
 | `/register callsign` | Register my pilot callsign, exactly as typed (fixes STT misspellings) |
@@ -552,6 +565,15 @@ Routing = evaluate every rule against the incident → union the matching roles 
 
 `/subscribe` presents a role picker. `/mysubs` shows current subscriptions. Nobody needs an admin to opt into home defense.
 
+### 10.3 Personal pings
+
+*"Aura Command, ping me for gate camps in Otanuomi."* A personal ping is a **user mention, not a role** — the role model above is unchanged; personal pings are additive.
+
+- Stored in `personal_pings` (§14): incident types + an optional system (`NULL` = all systems). Capped per user by `discipline.personal_pings_max` (default 10); at the cap AURA answers *"Ping limit reached."*
+- Matching = incident type ∈ the subscription's types ∧ (no system, or the incident's system). Matching subscribers' mentions are **appended to the mention line** of the incident card in `#intel-alerts` — never a separate message.
+- **Same discipline, no exceptions.** Personal pings ride the exact mention path of §11: the reporter's per-user cooldown, the circuit breaker, and quiet-hour role logic all suppress them together with the roles; a dedupe fold (§9.2) never re-pings personal subscribers; the incident's own reporter is never personally pinged for their own report; and they can **never** cause `@here` (constraint 11 untouched).
+- Managed by voice (`PING_ME` / `PING_ME_CLEAR`, §6.1) and the slash twins `/pingme`, `/mypings`, `/pingme-clear` — all through the same engine entry point (constraint 10).
+
 ---
 
 ## 11. Notification discipline
@@ -613,11 +635,19 @@ Short. Always short. AURA is talking over a fight.
 | Timer set | *"Timer Kisogo, four hours."* |
 | Flood control | *"Flood control active."* |
 | Degraded | *"Voice offline, use slash commands."* |
+| Help | *"Check help in Discord."* |
 | Registered | *"Registered you as Space Junkie."* |
 | Unregistered | *"Unregistered."* |
 | Not registered | *"You are not registered."* |
 | Who am I | *"You are Space Junkie."* |
 | Unheard callsign | *"Say again the callsign."* |
+| Personal ping set | *"Pinging you for gate camps in Otanuomi."* |
+| Personal ping set, no system | *"Pinging you for everything everywhere."* |
+| Personal pings cleared | *"No longer pinging you."* |
+| No personal pings | *"You have no pings set."* |
+| Personal ping cap | *"Ping limit reached."* |
+
+Personal-ping type words pluralize naturally: *hostiles*, *attacks*, *assist requests*, *gate camps*, joined with "and"; all four collapse to *everything*.
 
 ### 12.2 Speaking rules
 
@@ -724,6 +754,21 @@ CREATE TABLE subscriptions (
     escalate_at   TEXT,
     quiet_hours_json TEXT
 );
+
+-- ── personal ping subscriptions (§10.3) ──────────────────────
+-- A user mention, not a role: matching incidents append <@user_id>
+-- to the mention line. types_json = JSON array of Intent values;
+-- system_id NULL = all systems. Capped by discipline.personal_pings_max;
+-- never causes @here (constraint 11).
+CREATE TABLE personal_pings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    types_json  TEXT NOT NULL,
+    system_id   INTEGER REFERENCES systems(id),
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX idx_personal_pings_guild ON personal_pings(guild_id);
 
 -- ── scheduled ────────────────────────────────────────────────
 CREATE TABLE timers (
@@ -901,6 +946,7 @@ discipline:
   circuit_breaker:
     max_mentions: 12
     window_min: 10
+  personal_pings_max: 10       # per-user cap on /pingme subscriptions (§10.3)
 
 tts:
   enabled: true

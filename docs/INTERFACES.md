@@ -12,8 +12,9 @@ matching the TEXT columns in `brain/schema.sql`.
 
 ```python
 class Intent(str, Enum):      # HOSTILE_SPOTTED UNDER_ATTACK ASSIST_REQUEST GATE_CAMP
-                              # RESOLVE TIMER FORMUP QUERY CANCEL
+                              # RESOLVE TIMER FORMUP QUERY HELP CANCEL
                               # REGISTER UNREGISTER WHOAMI      (callsigns, GDD §6.1)
+                              # PING_ME PING_ME_CLEAR           (personal pings, GDD §10.3)
 class Severity(str, Enum):    # NONE="none" MEDIUM="medium" HIGH="high"
 INTENT_SEVERITY: Mapping[Intent, Severity]        # GDD §6.1 defaults
 class Tier(str, Enum):        # HIGH MEDIUM LOW              (GDD §8.3)
@@ -34,7 +35,11 @@ CardRender(embed: dict, buttons: tuple[ButtonSpec, ...])   # embed = discord.Emb
 IncidentUpdate(user_id, text, at)
 Incident(...)                 # mirrors GDD §9 / incidents row + updates + responders
 IncidentOutcome(outcome: Outcome, utterance: str|None, card: CardRender|None, incident_id: int|None)
-RoutingDecision(role_ids: tuple[int, ...], here: bool, channel: AlertChannel)
+RoutingDecision(role_ids: tuple[int, ...], here: bool, channel: AlertChannel,
+                user_ids: tuple[int, ...] = ())
+#   user_ids = matching personal ping subscribers (GDD §10.3): user mentions
+#   appended to the mention line; they count as mentions for channel choice
+#   but never influence `here`.
 ```
 
 ## Config — `aura/config.py` (implemented)
@@ -77,10 +82,20 @@ Sync on purpose. Every caller on the event loop wraps calls in
 # grammar.py — fixed regex grammar, GDD §6. No LLM (constraint 6).
 def parse(transcript: str) -> ParsedCommand | None
 #   None = no intent recognised. Higher-severity patterns match first
-#   ("tackled, need help in Kisogo" → UNDER_ATTACK). group_alias is one of
+#   ("tackled, need help in Kisogo" → UNDER_ATTACK), except PING_ME /
+#   PING_ME_CLEAR which match before the type words (their utterances contain
+#   type words: "ping me for gate camps"). group_alias is one of
 #   "miners" | "defense" | "all_hands" | None. detail is verbatim, unparsed —
 #   except REGISTER, where detail carries the cleaned callsign (clean_callsign
-#   of the post-intent remainder; None when nothing usable was heard).
+#   of the post-intent remainder; None when nothing usable was heard), and
+#   PING_ME, where detail carries the recognised incident types encoded by
+#   encode_ping_types (comma-separated Intent values; no type word or
+#   "anything"/"everything"/"all" → all four). HELP ("help", systemless)
+#   matches below ASSIST_REQUEST so "need help" is always a distress call.
+PING_TYPE_ORDER: tuple[Intent, ...]   # canonical HOSTILE_SPOTTED UNDER_ATTACK
+                                      # ASSIST_REQUEST GATE_CAMP encode order
+def encode_ping_types(types: frozenset[Intent]) -> str
+#   Shared PING_ME detail encoding for both input paths (constraint 10).
 def sanitize_callsign(text: str) -> str | None
 #   Shared sanitiser: strips markdown/mention chars (@ # ` < > * _ ~ | \),
 #   collapses whitespace, caps at 32 chars, preserves case (slash path uses
@@ -136,10 +151,14 @@ class IncidentEngine:
                      resolution: Resolution | None) -> IncidentOutcome
     #   The single entry point for BOTH voice and slash paths (constraint 10).
     #   Handles tiers (§8.3), dedupe folding (§9.2), routing, discipline,
-    #   command_log write. resolution=None for QUERY/CANCEL and the callsign
+    #   command_log write. resolution=None for QUERY/HELP/CANCEL and the callsign
     #   intents REGISTER/UNREGISTER/WHOAMI, which dispatch to the CallsignRegistry
     #   below (no card, no mentions — spoken/ephemeral reply + command_log only).
+    #   PING_ME/PING_ME_CLEAR (GDD §10.3) dispatch to the PersonalPingRegistry
+    #   the same way; a PING_ME with a system window requires a HIGH-tier
+    #   resolution — anything less is rejected with "Say again the system."
     callsigns: CallsignRegistry            # property; both paths share it
+    personal_pings: PersonalPingRegistry   # property; both paths share it
     async def resolve_system(self, guild_id: int, user_id: int,
                              system_id: int) -> IncidentOutcome        # "clear X" / /clear
     async def cancel(self, guild_id: int, user_id: int) -> IncidentOutcome  # 30s window
@@ -185,28 +204,55 @@ class CallsignRegistry:
     #   (was_registered, utterance): "Unregistered." / "You are not registered."
     async def whoami(self, user_id: int) -> str    # "You are X." / "You are not registered."
 
+# personal_pings.py — GDD §10.3. Same pattern as callsigns.py: async methods,
+# sqlite via to_thread, writes behind one lock, sync in-memory mirror primed
+# by load() (__main__ does this at startup) so routing reads it per incident.
+@dataclass PingSub(id: int, guild_id: int, user_id: int, types: frozenset[Intent],
+                   system_id: int | None, created_at: str)   # one personal_pings row
+def types_from_detail(detail: str | None) -> frozenset[Intent]
+#   Decodes the PING_ME detail encoding (encode_ping_types); unusable input
+#   falls back to all four report types (defensive only).
+class PersonalPingRegistry:
+    def __init__(self, conn: sqlite3.Connection, holder: ConfigHolder) -> None
+    async def load(self) -> int                     # prime the mirror; row count
+    def rules_for(self, guild_id: int) -> tuple[PersonalPing, ...]  # sync, for evaluate()
+    def list_for(self, guild_id: int, user_id: int) -> tuple[PingSub, ...]  # /mypings order
+    async def add(self, guild_id, user_id, types, system_id) -> bool
+    #   False = discipline.personal_pings_max cap hit ("Ping limit reached.");
+    #   an exact duplicate succeeds without a new row.
+    async def clear(self, guild_id: int, user_id: int) -> int       # rows removed
+    async def remove(self, guild_id, user_id, index) -> PingSub | None  # 1-based /mypings index
+
 # routing.py — GDD §10/§11. Pure evaluation; rule loading is separate.
 @dataclass RoutingRule(role_id: int, types: frozenset[Intent], scope: RuleScope,
                        escalate_at: Intent | None, quiet_hours: QuietHours | None)
 @dataclass RuleScope(systems: tuple[int, ...], regions: tuple[str, ...],
                      within_jumps_of: tuple[int, int] | None)   # (system_id, jumps)
 @dataclass QuietHours(tz: str, start: str, end: str)            # "HH:MM"
+@dataclass PersonalPing(user_id: int, types: frozenset[Intent],
+                        system_id: int | None)                  # GDD §10.3; None = all systems
 def load_rules(path: str | Path, gazetteer: Gazetteer,
                resolve_role: Callable[[str], int | None]) -> list[RoutingRule]
 def evaluate(incident: Incident, rules: Sequence[RoutingRule], now: datetime,
-             *, gazetteer: Gazetteer) -> RoutingDecision
+             *, gazetteer: Gazetteer,
+             personal: Sequence[PersonalPing] = ()) -> RoutingDecision
 #   Pure given its inputs. here=True ONLY when a matched rule's escalate_at
 #   equals incident.type, and only for UNDER_ATTACK/ASSIST_REQUEST (constraint 11);
 #   group_alias "all_hands" is applied by the engine, not here.
+#   `personal` are the guild's personal ping subscriptions: matching
+#   subscribers union into user_ids (incident.reporter_id excluded, each
+#   mentioned once); they count as mentions for channel choice but never
+#   touch `here`.
 #   Channel semantics: any mention → ALERTS, else LIVE. A card lives in
 #   exactly ONE channel — never mirrored (constraint 9).
 
 ESCALATABLE_TYPES: frozenset[Intent]     # {UNDER_ATTACK, ASSIST_REQUEST}
 def apply_group_alias(decision, group_alias, rules, alias_roles) -> RoutingDecision
+#   Preserves decision.user_ids — group targeting narrows roles, not people.
 def suppress(decision) -> RoutingDecision
 #   Discipline suppression: RoutingDecision has no `suppressed` flag — a
-#   suppressed report becomes RoutingDecision((), False, LIVE): still posted,
-#   mention-free.
+#   suppressed report becomes RoutingDecision((), False, LIVE, ()): still
+#   posted, mention-free; personal pings are stripped with everything else.
 def load_group_aliases(path, resolve_role) -> dict[str, int]
 class RoutingConfigError(Exception)
 #   routing.yaml accepts the GDD §10.1 bare list of rules, OR a mapping form
@@ -335,7 +381,10 @@ class Speaker:
 #   ambiguous(type_word, system), say_again(), responders(n, system),
 #   resolved(system), timer_set(system, duration_words), flood_control(),
 #   degraded(), number_word(n), registered(callsign), unregistered(),
-#   not_registered(), whoami(callsign), say_again_callsign().
+#   not_registered(), whoami(callsign), say_again_callsign(),
+#   ping_types_phrase(types), pinging_you(types_phrase, system|None),
+#   ping_cleared(), no_pings(), ping_limit()  (personal pings, GDD §10.3),
+#   help_hint()  ("Check help in Discord." — the voice HELP intent, GDD §6.1).
 ```
 
 ## Discord layer — `aura/dsc/`
@@ -359,14 +408,31 @@ def read_token(cfg: DiscordConfig) -> str
   system name (autocompleted from `gazetteer.systems`). `subs.py` also carries
   the callsign twins `/register /unregister /whoami` — thin adapters building
   a systemless `ParsedCommand` (REGISTER's `detail` = `sanitize_callsign` of
-  the typed value) and dispatching through `engine.report`, ephemeral replies. `utility.py` carries
+  the typed value) and dispatching through `engine.report`, ephemeral replies.
+  `subs.py` also carries the personal-ping twins (GDD §10.3): `/pingme type
+  [system]` (type choices incl. "Anything"; system autocompleted, resolved
+  via `resolve_typed_system`, `detail` = `encode_ping_types`), `/mypings`,
+  and `/pingme-clear [index]` — the no-index form dispatches PING_ME_CLEAR
+  through `engine.report`; the index form calls `personal_pings.remove`
+  directly (slash-only convenience; the voice twin covers clear-all).
+  `/mysubs` lists personal pings under the role subscriptions. `utility.py` carries
   the slash-only quality-of-life commands (/evetime /route /history /remindme
   /poll) — no voice twins because they trigger no alerts; it also exports
   `ReminderService(conn, bot)` with `deliver_due(now) -> int` (DM, falling
   back to an #intel-live mention), driven by `__main__`'s reminder poll loop.
+- `cogs/help.py` carries `/help [topic]` — the slash twin of the voice `HELP`
+  intent (dispatched through `engine.report` for the command_log row; the
+  engine speaks `help_hint()` and posts nothing). Content lives in the
+  `HELP_TOPICS` table (topic → title/description/fields) so
+  `tests/test_help_cog.py` can assert every registered app command appears in
+  the help text. The topic select menu uses `custom_id = "aura:help:menu"`
+  under the `aura:help:{topic}` scheme, dispatched by the persistent
+  `HelpTopicSelect` DynamicItem; the admin topic is menu-hidden and
+  dispatch-gated by the admin cog's check.
 - Views: `custom_id = f"aura:inc:{incident_id}:{action}"` with `action` in
   `otw | watch | no | fix | pick:{system_id}`. Poll vote buttons use
-  `aura:poll:{poll_id}:{option_idx}` (handled in `cogs/utility.py`).
+  `aura:poll:{poll_id}:{option_idx}` (handled in `cogs/utility.py`); the help
+  topic select uses `aura:help:{topic}` (handled in `cogs/help.py`).
   Persistent (`timeout=None`), re-registered on startup so buttons survive
   restarts (GDD §9.3).
 

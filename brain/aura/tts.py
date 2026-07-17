@@ -34,6 +34,7 @@ import structlog
 
 from aura.config import ConfigHolder
 from aura.ipc import PRIORITY_NORMAL, IpcServer
+from aura.types import Intent
 
 __all__ = [
     "DEFAULT_SAMPLE_RATE",
@@ -43,9 +44,15 @@ __all__ = [
     "build_wav",
     "degraded",
     "flood_control",
+    "help_hint",
+    "no_pings",
     "not_registered",
     "number_word",
+    "ping_cleared",
+    "ping_limit",
     "ping_sent",
+    "ping_types_phrase",
+    "pinging_you",
     "read_voice_sample_rate",
     "registered",
     "resolved",
@@ -142,6 +149,11 @@ def degraded() -> str:
     return "Voice offline, use slash commands."
 
 
+def help_hint() -> str:
+    """*"Check help in Discord."* — the HELP intent; the real manual is /help."""
+    return "Check help in Discord."
+
+
 def registered(callsign: str) -> str:
     """*"Registered you as Space Junkie."*"""
     return f"Registered you as {callsign}."
@@ -165,6 +177,47 @@ def whoami(callsign: str) -> str:
 def say_again_callsign() -> str:
     """*"Say again the callsign."* — REGISTER heard with no usable name."""
     return "Say again the callsign."
+
+
+# Personal pings (GDD §10.3 / §12.1): spoken type words, pluralized naturally.
+# All four report types collapse to "everything".
+_PING_TYPE_WORDS: tuple[tuple[Intent, str], ...] = (
+    (Intent.HOSTILE_SPOTTED, "hostiles"),
+    (Intent.UNDER_ATTACK, "attacks"),
+    (Intent.ASSIST_REQUEST, "assist requests"),
+    (Intent.GATE_CAMP, "gate camps"),
+)
+
+
+def ping_types_phrase(types: frozenset[Intent]) -> str:
+    """Spoken phrase for a personal-ping type set: ``"gate camps"``,
+    ``"hostiles and attacks"``, all four → ``"everything"``."""
+    words = [word for intent, word in _PING_TYPE_WORDS if intent in types]
+    if len(words) == len(_PING_TYPE_WORDS):
+        return "everything"
+    return " and ".join(words)
+
+
+def pinging_you(types_phrase: str, system: str | None) -> str:
+    """*"Pinging you for gate camps in Otanuomi."* /
+    *"Pinging you for everything everywhere."*"""
+    where = f"in {system}" if system else "everywhere"
+    return f"Pinging you for {types_phrase} {where}."
+
+
+def ping_cleared() -> str:
+    """*"No longer pinging you."*"""
+    return "No longer pinging you."
+
+
+def no_pings() -> str:
+    """*"You have no pings set."*"""
+    return "You have no pings set."
+
+
+def ping_limit() -> str:
+    """*"Ping limit reached."* — the discipline.personal_pings_max cap."""
+    return "Ping limit reached."
 
 
 # ── WAV wrapping (in memory — constraint 5 adjacent: nothing touches disk) ───

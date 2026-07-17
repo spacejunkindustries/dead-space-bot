@@ -128,6 +128,7 @@ class CircuitBreakerConfig:
 class DisciplineConfig:
     user_cooldown_s: int
     circuit_breaker: CircuitBreakerConfig
+    personal_pings_max: int = 10  # per-user cap on /pingme subscriptions (GDD §10.3)
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +393,10 @@ def _build_discipline(data: dict[str, Any]) -> DisciplineConfig:
                 _get(cb, "discipline.circuit_breaker.window_min", int),
                 "discipline.circuit_breaker.window_min",
             ),
+        ),
+        personal_pings_max=_positive(
+            _get(s, "discipline.personal_pings_max", int, default=10),
+            "discipline.personal_pings_max",
         ),
     )
 

@@ -237,6 +237,110 @@ def test_whoami_synonyms(phrase: str) -> None:
     assert cmd.detail is None
 
 
+# ── personal pings (GDD §6.1 PING_ME / PING_ME_CLEAR) ────────────────────────
+
+ALL_TYPES = "HOSTILE_SPOTTED,UNDER_ATTACK,ASSIST_REQUEST,GATE_CAMP"
+
+
+def test_ping_me_gate_camps_with_system() -> None:
+    cmd = parse("Aura Command, ping me for gate camps in Otanuomi")
+    assert cmd is not None
+    assert cmd.intent is Intent.PING_ME
+    assert cmd.system_text == "Otanuomi"
+    assert cmd.detail == "GATE_CAMP"
+
+
+@pytest.mark.parametrize(
+    ("phrase", "detail"),
+    [
+        ("ping me for hostiles in Kisogo", "HOSTILE_SPOTTED"),
+        ("ping me for reds in Kisogo", "HOSTILE_SPOTTED"),
+        ("ping me for neuts in Kisogo", "HOSTILE_SPOTTED"),
+        ("ping me for gate camps in Kisogo", "GATE_CAMP"),
+        ("ping me for gate camp in Kisogo", "GATE_CAMP"),
+        ("ping me for under attack in Kisogo", "UNDER_ATTACK"),
+        ("ping me for attacks in Kisogo", "UNDER_ATTACK"),
+        ("ping me for tackled in Kisogo", "UNDER_ATTACK"),
+        ("ping me for need help in Kisogo", "ASSIST_REQUEST"),
+        ("ping me for need backup in Kisogo", "ASSIST_REQUEST"),
+        ("ping me for assist requests in Kisogo", "ASSIST_REQUEST"),
+    ],
+)
+def test_ping_me_type_word_matrix(phrase: str, detail: str) -> None:
+    """Each §6.1 type synonym maps to its incident type; PING_ME wins the
+    intent even though the utterance contains report type words."""
+    cmd = parse(phrase)
+    assert cmd is not None
+    assert cmd.intent is Intent.PING_ME
+    assert cmd.detail == detail
+    assert cmd.system_text == "Kisogo"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "ping me for anything",
+        "ping me for everything",
+        "ping me for all",
+        "ping me for everything everywhere",
+    ],
+)
+def test_ping_me_anything_covers_all_types_everywhere(phrase: str) -> None:
+    cmd = parse(phrase)
+    assert cmd is not None
+    assert cmd.intent is Intent.PING_ME
+    assert cmd.detail == ALL_TYPES
+    assert cmd.system_text is None  # "everywhere" is never a system window
+
+
+def test_ping_me_without_type_words_defaults_to_all_types() -> None:
+    cmd = parse("ping me in Otanuomi")
+    assert cmd is not None
+    assert cmd.intent is Intent.PING_ME
+    assert cmd.detail == ALL_TYPES
+    assert cmd.system_text == "Otanuomi"
+
+
+def test_ping_me_multiple_type_words() -> None:
+    cmd = parse("ping me for hostiles and gate camps in Otanuomi")
+    assert cmd is not None
+    assert cmd.detail == "HOSTILE_SPOTTED,GATE_CAMP"
+    assert cmd.system_text == "Otanuomi"
+
+
+def test_ping_me_without_system_covers_everywhere() -> None:
+    cmd = parse("Aura Command, ping me for gate camps")
+    assert cmd is not None
+    assert cmd.intent is Intent.PING_ME
+    assert cmd.detail == "GATE_CAMP"
+    assert cmd.system_text is None
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    ["stop pinging me", "Aura Command, stop pinging me", "stop pinging", "stop pings"],
+)
+def test_ping_me_clear_synonyms(phrase: str) -> None:
+    cmd = parse(phrase)
+    assert cmd is not None
+    assert cmd.intent is Intent.PING_ME_CLEAR
+    assert cmd.system_text is None
+    assert cmd.detail is None
+
+
+def test_stop_pinging_never_matches_ping_me() -> None:
+    cmd = parse("aura command stop pinging me")
+    assert cmd is not None
+    assert cmd.intent is Intent.PING_ME_CLEAR
+
+
+def test_tackled_without_ping_me_still_under_attack() -> None:
+    """The severity-first rule is untouched for genuine reports."""
+    cmd = parse("tackled in Kisogo")
+    assert cmd is not None
+    assert cmd.intent is Intent.UNDER_ATTACK
+
+
 # ── callsign sanitisation ────────────────────────────────────────────────────
 
 

@@ -120,6 +120,40 @@ def test_number_word() -> None:
     assert tts.number_word(-3) == "-3"
 
 
+def test_personal_ping_catalogue_strings() -> None:
+    assert tts.pinging_you("gate camps", "Otanuomi") == "Pinging you for gate camps in Otanuomi."
+    assert tts.pinging_you("everything", None) == "Pinging you for everything everywhere."
+    assert tts.ping_cleared() == "No longer pinging you."
+    assert tts.no_pings() == "You have no pings set."
+    assert tts.ping_limit() == "Ping limit reached."
+
+
+def test_ping_types_phrase_pluralizes_naturally() -> None:
+    from aura.types import Intent
+
+    assert tts.ping_types_phrase(frozenset({Intent.HOSTILE_SPOTTED})) == "hostiles"
+    assert tts.ping_types_phrase(frozenset({Intent.UNDER_ATTACK})) == "attacks"
+    assert tts.ping_types_phrase(frozenset({Intent.ASSIST_REQUEST})) == "assist requests"
+    assert tts.ping_types_phrase(frozenset({Intent.GATE_CAMP})) == "gate camps"
+    assert (
+        tts.ping_types_phrase(frozenset({Intent.HOSTILE_SPOTTED, Intent.GATE_CAMP}))
+        == "hostiles and gate camps"
+    )
+    assert (
+        tts.ping_types_phrase(
+            frozenset(
+                {
+                    Intent.HOSTILE_SPOTTED,
+                    Intent.UNDER_ATTACK,
+                    Intent.ASSIST_REQUEST,
+                    Intent.GATE_CAMP,
+                }
+            )
+        )
+        == "everything"
+    )
+
+
 # ── Speaker with a fake piper subprocess ──────────────────────────────────────
 
 

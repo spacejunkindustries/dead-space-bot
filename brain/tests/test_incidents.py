@@ -89,6 +89,7 @@ def make_config(
     dedupe_window_s: int = 90,
     stale_after_min: int = 20,
     cancel_window_s: int = 30,
+    personal_pings_max: int = 10,
 ) -> AuraConfig:
     return AuraConfig(
         discord=DiscordConfig(
@@ -132,6 +133,7 @@ def make_config(
         discipline=DisciplineConfig(
             user_cooldown_s=user_cooldown_s,
             circuit_breaker=CircuitBreakerConfig(max_mentions=max_mentions, window_min=window_min),
+            personal_pings_max=personal_pings_max,
         ),
         tts=TtsConfig(
             enabled=True,
@@ -902,6 +904,159 @@ async def test_card_falls_back_to_count_when_unregistered(
     env = make_env()
     out = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
     assert field_value(out.card, "Reported by") == "1"
+
+
+# ── personal pings through the shared report path (GDD §10.3) ────────────────
+
+
+def ping_cmd(detail: str, system_text: str | None = None) -> ParsedCommand:
+    return ParsedCommand(
+        intent=Intent.PING_ME,
+        system_text=system_text,
+        group_alias=None,
+        detail=detail,
+        raw="synthetic transcript",
+    )
+
+
+async def test_ping_me_through_report_path(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    out = await env.engine.report(GUILD, 99, ping_cmd("GATE_CAMP", "Otanuomi"), high(1, "Otanuomi"))
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "Pinging you for gate camps in Otanuomi."
+    assert out.card is None
+    assert out.incident_id is None
+    assert env.poster.posts == []  # no card, no mentions from the command itself
+    row = db.query_one(env.conn, "SELECT * FROM personal_pings")
+    assert row is not None
+    assert row["user_id"] == 99
+    assert row["system_id"] == 1
+    log_row = db.query_one(env.conn, "SELECT * FROM command_log")
+    assert log_row is not None
+    assert log_row["parsed_intent"] == "PING_ME"
+    assert log_row["outcome"] == "POSTED"
+
+
+async def test_ping_me_everywhere_utterance(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    out = await env.engine.report(
+        GUILD, 99, ping_cmd("HOSTILE_SPOTTED,UNDER_ATTACK,ASSIST_REQUEST,GATE_CAMP"), None
+    )
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "Pinging you for everything everywhere."
+
+
+async def test_ping_me_sub_high_resolution_rejected(make_env: Callable[..., Env]) -> None:
+    """A subscription silently scoped to the wrong system would never fire —
+    anything below HIGH tier asks again instead of storing."""
+    env = make_env()
+    for resolution in (medium(), None):
+        out = await env.engine.report(
+            GUILD, 99, ping_cmd("GATE_CAMP", "oh tan you oh me"), resolution
+        )
+        assert out.outcome is Outcome.REJECTED
+        assert out.utterance == "Say again the system."
+    assert db.query(env.conn, "SELECT * FROM personal_pings") == []
+
+
+async def test_ping_me_cap_rejected(make_env: Callable[..., Env]) -> None:
+    env = make_env(personal_pings_max=1)
+    first = await env.engine.report(GUILD, 99, ping_cmd("GATE_CAMP"), None)
+    assert first.outcome is Outcome.POSTED
+    out = await env.engine.report(GUILD, 99, ping_cmd("HOSTILE_SPOTTED"), None)
+    assert out.outcome is Outcome.REJECTED
+    assert out.utterance == "Ping limit reached."
+
+
+async def test_ping_me_clear_through_report_path(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    none_yet = await env.engine.report(GUILD, 99, cmd(Intent.PING_ME_CLEAR), None)
+    assert none_yet.outcome is Outcome.REJECTED
+    assert none_yet.utterance == "You have no pings set."
+    await env.engine.report(GUILD, 99, ping_cmd("GATE_CAMP"), None)
+    out = await env.engine.report(GUILD, 99, cmd(Intent.PING_ME_CLEAR), None)
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "No longer pinging you."
+    assert db.query(env.conn, "SELECT * FROM personal_pings") == []
+
+
+async def test_personal_subscriber_mentioned_on_matching_incident(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    await env.engine.report(GUILD, 99, ping_cmd("GATE_CAMP", "Otanuomi"), high(1, "Otanuomi"))
+    out = await env.engine.report(GUILD, 42, cmd(Intent.GATE_CAMP), high(1, "Otanuomi"))
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "Gate camp Otanuomi, pinged."
+    _, channel, content, _ = env.poster.posts[-1]
+    assert channel is AlertChannel.ALERTS
+    assert "<@99>" in content
+    assert "@here" not in content  # constraint 11: personal pings never @here
+
+
+async def test_personal_only_mention_still_goes_to_alerts(
+    make_env: Callable[..., Env],
+) -> None:
+    """No role rule matches Alenia — a personal subscriber alone carries the
+    card into #intel-alerts (a mention is a mention)."""
+    env = make_env()
+    await env.engine.report(GUILD, 99, ping_cmd("GATE_CAMP"), None)  # everywhere
+    out = await env.engine.report(GUILD, 42, cmd(Intent.GATE_CAMP), high(3, "Alenia"))
+    assert out.outcome is Outcome.POSTED
+    _, channel, content, _ = env.poster.posts[-1]
+    assert channel is AlertChannel.ALERTS
+    assert content == "<@99>"
+
+
+async def test_fold_never_repings_personal_subscribers(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    await env.engine.report(GUILD, 99, ping_cmd("GATE_CAMP", "Otanuomi"), high(1, "Otanuomi"))
+    await env.engine.report(GUILD, 42, cmd(Intent.GATE_CAMP), high(1, "Otanuomi"))
+    env.clock.advance(30)
+    folded = await env.engine.report(GUILD, 43, cmd(Intent.GATE_CAMP), high(1, "Otanuomi"))
+    assert folded.outcome is Outcome.FOLDED
+    assert len(env.poster.posts) == 1  # one incident, one message
+    _, _, edit_content, _ = env.poster.edits[-1]
+    assert edit_content == ""  # the fold edit carries no mentions at all
+
+
+async def test_reporter_not_personally_pinged_for_own_report(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    await env.engine.report(GUILD, 42, ping_cmd("GATE_CAMP"), None)
+    await env.engine.report(GUILD, 42, cmd(Intent.GATE_CAMP), high(1, "Otanuomi"))
+    _, _, content, _ = env.poster.posts[-1]
+    assert "<@42>" not in content
+
+
+async def test_personal_ping_rides_reporter_cooldown(make_env: Callable[..., Env]) -> None:
+    """Discipline suppression applies to personal pings exactly like roles."""
+    env = make_env()
+    await env.engine.report(GUILD, 99, ping_cmd("GATE_CAMP"), None)
+    await env.engine.report(GUILD, 42, cmd(Intent.GATE_CAMP), high(1, "Otanuomi"))
+    assert "<@99>" in env.poster.posts[-1][2]
+    env.clock.advance(10)  # inside reporter 42's 30s cooldown
+    out = await env.engine.report(GUILD, 42, cmd(Intent.GATE_CAMP), high(2, "Kisogo"))
+    assert out.outcome is Outcome.POSTED
+    _, channel, content, _ = env.poster.posts[-1]
+    assert content == ""  # suppressed — user mention included
+    assert channel is AlertChannel.LIVE
+    assert out.utterance == "Gate camp Kisogo, posted."
+
+
+async def test_ping_me_never_causes_here_even_for_escalatable_types(
+    make_env: Callable[..., Env],
+) -> None:
+    """UNDER_ATTACK escalates via the HD role rule; strip the roles and a
+    personal subscriber alone must never produce @here (constraint 11)."""
+    env = make_env()
+    env.engine._rules = []  # noqa: SLF001 — isolate the personal path
+    await env.engine.report(GUILD, 99, ping_cmd("UNDER_ATTACK"), None)
+    await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    _, _, content, _ = env.poster.posts[-1]
+    assert content == "<@99>"
+    assert "@here" not in content
 
 
 async def test_build_prior_context(make_env: Callable[..., Env]) -> None:

@@ -210,6 +210,9 @@ class App:
 
         # Prime the callsign mirror so cards and /rollcall can name reporters.
         await self.engine.callsigns.load()
+        # Prime the personal-ping mirror so routing sees subscriptions from
+        # the first incident after a restart (GDD §10.3).
+        await self.engine.personal_pings.load()
 
     # ── run / shutdown ───────────────────────────────────────────────────────
 
