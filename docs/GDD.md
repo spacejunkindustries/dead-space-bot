@@ -1036,7 +1036,8 @@ piper                  # /usr/local/bin/piper
 ```
 
 - **No ffmpeg.** Songbird ≥0.4 removed it entirely in favour of Symphonia.
-- Compile the Rust binary in CI or on a larger machine. A 4 GB droplet will thrash building Songbird with LTO. Ship the binary, not the toolchain.
+- Compile the Rust binary in CI or on a larger machine. A 4 GB droplet will thrash building Songbird with LTO. Ship the binary, not the toolchain. CI publishes each main-branch build to the `ears-bin` branch (binary + sha256), which `install.sh` fetches with the droplet's existing clone credentials — no GitHub API token on the host.
+- `openwakeword` is installed `--no-deps`: its Linux dependency pin `tflite-runtime` has no wheels for Python ≥3.12, and AURA uses only the ONNX inference path. Its true runtime dependencies are listed explicitly in `requirements.txt`.
 
 ### 17.4 Bot permissions and intents
 

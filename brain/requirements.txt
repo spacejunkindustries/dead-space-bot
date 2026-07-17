@@ -6,6 +6,14 @@ discord.py>=2.4          # dsc/ — gateway, slash commands, components, roles, 
 PyYAML>=6.0              # config.py, nlu/gazetteer.py — aura.yaml / gazetteer.yaml / routing.yaml
 structlog>=24.1          # everywhere — JSON structured logging
 webrtcvad-wheels>=2.0.14 # audio/vad.py — voice activity detection / utterance endpointing
-openwakeword>=0.6.0      # audio/wake.py — "Aura Command" wake-word inference (ONNX chain)
+# openwakeword is installed with --no-deps (see deploy/install.sh): its Linux
+# dependency pin tflite-runtime has no wheels for Python >=3.12, and AURA uses
+# only the ONNX inference path (audio/wake.py passes inference_framework="onnx").
+# The dependencies it actually needs at runtime are listed explicitly here.
+onnxruntime>=1.16        # audio/wake.py — openwakeword ONNX inference backend
+scipy>=1.11              # openwakeword.utils — feature pipeline
+scikit-learn>=1.3        # openwakeword.__init__ — imported at package load
+tqdm>=4.0                # openwakeword.utils — model download progress
+requests>=2.31           # openwakeword.utils — model downloads
 faster-whisper>=1.0      # audio/stt.py — default STT backend (CTranslate2, releases the GIL)
 numpy>=1.26              # audio/wake.py, audio/stt.py — PCM frame views and model input tensors
