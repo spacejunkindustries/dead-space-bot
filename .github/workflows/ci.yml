@@ -1,75 +1,18 @@
-# AURA CI — runs on every push and PR (CLAUDE.md Commands section).
-#
-# The rust job also builds and uploads the release binary: the production
-# droplet is 2 vCPU and will thrash compiling Songbird with LTO, so
-# deploy/install.sh installs this artifact instead of building locally.
-name: CI
+# AURA CI — Python (brain). Runs only when brain/ or this workflow changes,
+# so brain-only work does not pay for the Rust/Songbird compile (see rust.yml).
+name: brain (Python)
 
-on: [push, pull_request]
+on:
+  push:
+    paths:
+      - "brain/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "brain/**"
+      - ".github/workflows/ci.yml"
 
 jobs:
-  rust:
-    name: ears (Rust)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write   # push the built binary to the ears-bin branch
-    defaults:
-      run:
-        working-directory: ears
-    steps:
-      - uses: actions/checkout@v4
-
-      # Songbird needs libopus; its DAVE/MLS dependencies build C++ via cmake.
-      # NO ffmpeg — Songbird >=0.4 uses Symphonia in-process (constraint 3).
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libopus-dev cmake
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ears
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test
-
-      - name: Build release binary
-        run: cargo build --release
-
-      # The droplet downloads this instead of compiling (GDD §17.3).
-      - name: Upload aura-ears binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: aura-ears
-          path: ears/target/release/aura-ears
-          if-no-files-found: error
-
-      # Publish the binary to the ears-bin branch on every merge to main.
-      # The droplet fetches it with the same read credentials as its clone
-      # (deploy key), so install.sh needs no GitHub API token (GDD §17.3).
-      - name: Publish binary to ears-bin branch
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        working-directory: ${{ runner.temp }}
-        run: |
-          rm -rf ears-bin && mkdir ears-bin && cd ears-bin
-          cp "${GITHUB_WORKSPACE}/ears/target/release/aura-ears" .
-          sha256sum aura-ears > aura-ears.sha256
-          git init -q -b ears-bin
-          git -c user.name="aura-ci" -c user.email="ci@users.noreply.github.com" \
-            add -A
-          git -c user.name="aura-ci" -c user.email="ci@users.noreply.github.com" \
-            commit -qm "aura-ears built from ${GITHUB_SHA}"
-          git push -f \
-            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" \
-            ears-bin
-
   python:
     name: brain (Python)
     runs-on: ubuntu-latest
