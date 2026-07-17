@@ -58,8 +58,9 @@ The grammar is fixed regex + phonetic matching. This is deliberate. An LLM would
 **7. Match on phonemes, not characters.**
 STT errors are phonetic, not typographic. Whisper writes *"oh tan you oh me"* — that's character-distance-far from *Otanuomi* but phonetically adjacent. Levenshtein on raw text alone is the wrong tool. Metaphone first, weighted 0.6 phonetic / 0.4 text. GDD §8.2.
 
-**8. The gazetteer stays small on purpose.**
-~100–500 systems scoped to the corp's operational region — not all of New Eden. This is the core accuracy decision, not a shortcut. Do not "improve" it by loading the full SDE. GDD §8.1.
+**8. The gazetteer stays small by default — but nomadic mode is a sanctioned exception.**
+Scoped mode (~100–500 systems scoped to the corp's operational region, not all of New Eden) is the **default and the recommended path for home-region corps**. It is the core accuracy decision, not a shortcut: matching against 300 entries beats matching against 5,000. Do not silently widen a scoped gazetteer.
+There is one supported exception: **`include_all` mode** (`gazetteer.yaml`). Some corps are **nomadic** — no fixed home, they relocate and must report *any* k-space system — and for them scoping to a region that changes weekly is worse than a wide gazetteer. `include_all: true` activates the entire seeded (k-space) map as a first-class mode, with `gazetteer.home_system: null` disabling the home-bias prior. The accuracy tradeoff is real (more homophones in a 5,000-entry set) and is absorbed by the confirm-flow (§8.3), context priors (§8.4), and alias learning (§8.5) — not by pretending it isn't there. `python -m aura.nlu.seed` loads k-space wide precisely so both modes work off one seed. GDD §8.1.
 
 **9. Incident cards are edited in place.**
 One incident = one message, updated. Never post a second message for the same incident. Five pilots reporting one gate camp produce one card reading "reported by 5". GDD §9.1.

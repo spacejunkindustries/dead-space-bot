@@ -106,6 +106,87 @@ def test_unknown_home_system_is_none(conn: sqlite3.Connection, tmp_path: Path) -
     assert gaz.home_system_id is None
 
 
+# ── include_all (nomadic) mode ───────────────────────────────────────────────
+
+
+def test_include_all_active_set_is_all_seeded_minus_exclude(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    gaz = make_gazetteer(conn, tmp_path, "include_all: true\nexclude:\n  - Jita\n")
+    names = {e.name for e in gaz.systems}
+    # Every seeded system is active except the excluded one — regions/
+    # within_jumps_of no longer narrow it.
+    assert names == {"Otanuomi", "Kisogo", "Alenia", "Hulmate", "Tannolen"}
+    assert "Jita" not in names
+
+
+def test_include_all_ignores_regions_and_within_jumps(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    gaz = make_gazetteer(
+        conn,
+        tmp_path,
+        "include_all: true\nregions:\n  - Home-Region\n",
+    )
+    # The Home-Region-only allowlist would exclude Alenia/Hulmate/Jita in
+    # scoped mode; include_all activates the whole map regardless.
+    names = {e.name for e in gaz.systems}
+    assert names == {"Otanuomi", "Kisogo", "Alenia", "Hulmate", "Jita", "Tannolen"}
+
+
+def test_include_all_null_within_jumps_does_not_raise(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    # No within_jumps_of anchor at all: scoped mode would be fine, but the key
+    # point is include_all never needs one and never raises the missing-anchor
+    # error even when the corp has relocated away from any configured anchor.
+    gaz = make_gazetteer(conn, tmp_path, "include_all: true\n", home="Nowhere")
+    assert len(gaz.systems) == 6
+    assert gaz.home_system_id is None
+
+
+def test_include_all_config_flag_also_activates(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    # include_all can be switched on from aura.yaml (GazetteerConfig) too.
+    path = write_scope(tmp_path, "regions:\n  - Home-Region\n")
+    from aura.config import GazetteerConfig
+
+    gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system="Otanuomi", include_all=True))
+    gaz.load()
+    assert len(gaz.systems) == 6
+
+
+# ── nullable home (nomadic) ──────────────────────────────────────────────────
+
+
+def test_null_home_system_disables_bias(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    path = write_scope(tmp_path, "regions:\n  - Home-Region\n")
+    from aura.config import GazetteerConfig
+
+    gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system=None))
+    gaz.load()
+    assert gaz.home_system_id is None  # home-bias prior inactive, no crash
+    names = {e.name for e in gaz.systems}
+    assert names == {"Otanuomi", "Kisogo", "Tannolen"}
+
+
+# ── empty-table ergonomics ───────────────────────────────────────────────────
+
+
+def test_empty_systems_table_actionable_error(tmp_path: Path) -> None:
+    empty = db.connect(":memory:")
+    db.migrate(empty)  # schema present, but no systems rows seeded
+    path = write_scope(tmp_path, "regions:\n  - Home-Region\n")
+    from aura.config import GazetteerConfig
+
+    gaz = Gazetteer(empty, GazetteerConfig(file=str(path), home_system="Otanuomi"))
+    with pytest.raises(GazetteerError) as excinfo:
+        gaz.load()
+    assert str(excinfo.value) == (
+        "systems table is empty — seed it with: "
+        "/opt/aura/brain/venv/bin/python -m aura.nlu.seed --db /var/lib/aura/aura.db"
+    )
+
+
 # ── lookups ──────────────────────────────────────────────────────────────────
 
 

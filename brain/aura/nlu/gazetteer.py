@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -42,9 +43,16 @@ __all__ = ["Gazetteer", "GazetteerError"]
 log = structlog.get_logger(__name__)
 
 #: Character budget for the Whisper ``initial_prompt`` bias text. Whisper
-#: keeps roughly the last 224 tokens of the prompt, so the text is ordered
-#: home-first and truncated on a name boundary.
+#: keeps roughly the last 224 tokens of the prompt, so the text is ordered by
+#: salience and truncated on a name boundary.
 PROMPT_BIAS_MAX_CHARS = 900
+
+#: Hard cap on the number of names in the bias prompt. At a 5000-system
+#: nomadic gazetteer the whole active set cannot be listed, so the prompt is
+#: bounded and preference-ordered (home → hubs → alias targets → the rest);
+#: the character budget above is usually the binding limit, this is the
+#: backstop that keeps the prompt cheap regardless of gazetteer size.
+PROMPT_BIAS_MAX_NAMES = 200
 
 
 class GazetteerError(Exception):
@@ -72,11 +80,16 @@ def _load_scope(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise GazetteerError(f"{path}: top level must be a mapping")
 
+    include_all = data.get("include_all", False)
+    if not isinstance(include_all, bool):
+        raise GazetteerError("gazetteer.yaml: include_all must be a boolean")
+
     scope: dict[str, Any] = {
         "regions": _str_list(data, "regions"),
         "always_include": _str_list(data, "always_include"),
         "exclude": _str_list(data, "exclude"),
         "within_jumps_of": None,
+        "include_all": include_all,
     }
     wjo = data.get("within_jumps_of")
     if wjo is not None:
@@ -123,6 +136,12 @@ class Gazetteer:
         rows = db.query(
             self._conn, "SELECT id, name, region, constellation FROM systems ORDER BY name"
         )
+        if not rows:
+            # Fail fast with an actionable message: the tables are unseeded.
+            raise GazetteerError(
+                "systems table is empty — seed it with: "
+                "/opt/aura/brain/venv/bin/python -m aura.nlu.seed --db /var/lib/aura/aura.db"
+            )
         all_by_id: dict[int, SystemEntry] = {}
         all_by_name: dict[str, SystemEntry] = {}
         for row in rows:
@@ -142,21 +161,30 @@ class Gazetteer:
             adjacency.setdefault(row["b_id"], []).append(row["a_id"])
         adj: dict[int, tuple[int, ...]] = {k: tuple(v) for k, v in adjacency.items()}
 
+        include_all = scope["include_all"] or self._cfg.include_all
         active: set[int] = set()
 
-        regions = set(scope["regions"])
-        if regions:
-            active.update(e.id for e in all_by_id.values() if e.region in regions)
+        if include_all:
+            # Nomadic mode (GDD §8.1): the entire seeded (k-space) map is
+            # active. regions/within_jumps_of are ignored — anchoring is
+            # unnecessary, so within_jumps_of may be absent without error.
+            # always_include is a noop (everything is already present) and
+            # exclude still removes.
+            active.update(all_by_id.keys())
+        else:
+            regions = set(scope["regions"])
+            if regions:
+                active.update(e.id for e in all_by_id.values() if e.region in regions)
 
-        if scope["within_jumps_of"] is not None:
-            anchor_name, max_jumps = scope["within_jumps_of"]
-            anchor = all_by_name.get(anchor_name.lower())
-            if anchor is None:
-                raise GazetteerError(
-                    f"gazetteer.yaml: within_jumps_of.system {anchor_name!r} "
-                    "is not in the systems table"
-                )
-            active.update(_bfs_within(anchor.id, max_jumps, adj))
+            if scope["within_jumps_of"] is not None:
+                anchor_name, max_jumps = scope["within_jumps_of"]
+                anchor = all_by_name.get(anchor_name.lower())
+                if anchor is None:
+                    raise GazetteerError(
+                        f"gazetteer.yaml: within_jumps_of.system {anchor_name!r} "
+                        "is not in the systems table"
+                    )
+                active.update(_bfs_within(anchor.id, max_jumps, adj))
 
         for name in scope["always_include"]:
             entry = all_by_name.get(name.lower())
@@ -165,11 +193,17 @@ class Gazetteer:
             else:
                 active.add(entry.id)
 
-        home = all_by_name.get(self._cfg.home_system.lower())
-        if home is None:
-            log.warning("gazetteer_home_system_unknown", name=self._cfg.home_system)
+        home: SystemEntry | None = None
+        if self._cfg.home_system:
+            home = all_by_name.get(self._cfg.home_system.lower())
+            if home is None:
+                log.warning("gazetteer_home_system_unknown", name=self._cfg.home_system)
+            else:
+                active.add(home.id)
         else:
-            active.add(home.id)
+            # Nomadic corps run without a home system: the home-bias prior
+            # (GDD §8.4) is simply inactive — not a misconfiguration.
+            log.info("home_bias_disabled")
 
         for name in scope["exclude"]:
             entry = all_by_name.get(name.lower())
@@ -182,9 +216,11 @@ class Gazetteer:
         systems = tuple(sorted((all_by_id[i] for i in active), key=lambda e: e.name.lower()))
         if not systems:
             log.warning("gazetteer_empty_active_set", file=self._cfg.file)
-        if len(systems) > 500:
-            # Constraint 8: the gazetteer stays small ON PURPOSE. A huge set
-            # is an FC misconfiguration worth shouting about, not an upgrade.
+        if len(systems) > 500 and not include_all:
+            # Constraint 8: in scoped mode the gazetteer stays small ON PURPOSE.
+            # A huge scoped set is an FC misconfiguration worth shouting about,
+            # not an upgrade. include_all is the sanctioned exception (nomadic
+            # corps, GDD §8.1) — no warning there.
             log.warning("gazetteer_oversized", count=len(systems), recommended_max=500)
 
         self._persist_metaphones(systems)
@@ -199,12 +235,29 @@ class Gazetteer:
         self._all_names = {e.id: e.name for e in all_by_id.values()}
         self._home_system_id = home.id if home is not None else None
         self._systems = systems
-        self._prompt_bias = _build_prompt_bias(systems, self._home_system_id)
+        self._prompt_bias = _build_prompt_bias(
+            systems,
+            self._home_system_id,
+            hub_names=scope["always_include"],
+            alias_ids=self._alias_system_ids(),
+        )
         log.info(
             "gazetteer_loaded",
             active=len(systems),
-            regions=sorted(regions),
+            include_all=include_all,
+            regions=sorted(scope["regions"]),
             home=self._cfg.home_system,
+        )
+
+    def _alias_system_ids(self) -> frozenset[int]:
+        """system_ids referenced by the learned-alias table (GDD §8.5).
+
+        These are names the corp has actively corrected toward, so they earn a
+        place near the front of the bounded Whisper prompt even in a
+        5000-system nomadic gazetteer."""
+        return frozenset(
+            row["system_id"]
+            for row in db.query(self._conn, "SELECT DISTINCT system_id FROM aliases")
         )
 
     def _persist_metaphones(self, systems: tuple[SystemEntry, ...]) -> None:
@@ -330,20 +383,60 @@ def _bfs_distances(start: int, adj: dict[int, tuple[int, ...]]) -> dict[int, int
     return distances
 
 
-def _build_prompt_bias(systems: tuple[SystemEntry, ...], home_id: int | None) -> str:
-    """Home system first (Whisper truncates the head of long prompts, but we
-    cap well under its window so ordering is about salience), then the rest
-    alphabetically until the character budget runs out."""
-    names: list[str] = []
-    if home_id is not None:
-        for entry in systems:
-            if entry.id == home_id:
-                names.append(entry.name)
-                break
-    names.extend(e.name for e in systems if not (home_id is not None and e.id == home_id))
+def _build_prompt_bias(
+    systems: tuple[SystemEntry, ...],
+    home_id: int | None,
+    *,
+    hub_names: Sequence[str] = (),
+    alias_ids: frozenset[int] = frozenset(),
+    recent_names: Sequence[str] = (),
+) -> str:
+    """Bounded, preference-ordered Whisper ``initial_prompt`` bias (GDD §5.3).
+
+    A scoped gazetteer is small enough to list wholesale; a nomadic
+    ``include_all`` gazetteer (up to ~5000 systems) is not, so the prompt is
+    both length- and count-capped and the most useful names go first:
+
+    1. the home system (when set),
+    2. ``always_include`` hubs — the trade hubs pilots name anyway,
+    3. alias targets — systems the corp has actively corrected toward (§8.5),
+    4. ``recent_names`` — recently-active systems, when the caller supplies
+       them (the cached prompt is rebuilt on :meth:`Gazetteer.load` only, so
+       per-incident recency is handled by the resolution-time priors in §8.4
+       rather than here; this hook exists for callers that can pass a list),
+    5. the remaining active set, alphabetically,
+
+    truncated on a name boundary at whichever of the char / name cap hits
+    first. Only names inside the active set are emitted.
+    """
+    in_active = {e.name.lower() for e in systems}
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def _push(name: str) -> None:
+        key = name.lower()
+        if key in in_active and key not in seen:
+            seen.add(key)
+            ordered.append(name)
+
+    by_id = {e.id: e for e in systems}
+    if home_id is not None and home_id in by_id:
+        _push(by_id[home_id].name)
+    for name in hub_names:
+        _push(name)
+    for entry in systems:
+        if entry.id in alias_ids:
+            _push(entry.name)
+    for name in recent_names:
+        _push(name)
+    for entry in systems:  # already sorted by name in load()
+        _push(entry.name)
+
     out: list[str] = []
     used = len("Systems: ")
-    for name in names:
+    for name in ordered:
+        if len(out) >= PROMPT_BIAS_MAX_NAMES:
+            break
         extra = len(name) + (2 if out else 0)
         if used + extra > PROMPT_BIAS_MAX_CHARS:
             break

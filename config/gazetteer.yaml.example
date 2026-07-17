@@ -1,9 +1,23 @@
 # AURA gazetteer scope — GDD §8.1 / §16. Production copy: /etc/aura/gazetteer.yaml.
-# Deliberately small: ~100–500 systems scoped to the corp's operational area,
-# NOT all of New Eden (CLAUDE.md constraint 8). Seeded from the EVE SDE and
-# pruned by these rules; editable by the FC without touching code.
+# The systems + adjacency tables are seeded from the EVE SDE (k-space) by
+# `python -m aura.nlu.seed`; these rules pick the ACTIVE subset at runtime,
+# editable by the FC without touching code.
+#
+# Two modes:
+#  - scoped (default, recommended for home-region corps): ~100–500 systems
+#    scoped to the operational area via the rules below. The small set IS the
+#    accuracy decision (CLAUDE.md constraint 8), not a shortcut.
+#  - include_all (nomadic corps): the entire seeded (k-space) map is active so
+#    ANY system in New Eden resolves. Accuracy then leans on the confirm-flow
+#    (§8.3), context priors (§8.4), and alias learning (§8.5) rather than a
+#    narrow candidate set. Turn it on when the corp has no fixed home.
 
-# Regions whose systems are included wholesale.
+# Nomadic mode. false (default) = scoped by the rules below. true = entire
+# seeded map active; regions/within_jumps_of are then ignored, exclude still
+# removes, and within_jumps_of/home may be omitted without error.
+include_all: false
+
+# Regions whose systems are included wholesale. (scoped mode only)
 regions:
   - Kisogo-region
   - Lowsec-North
