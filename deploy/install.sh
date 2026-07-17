@@ -62,18 +62,28 @@ install -d -m 0750 -o root -g aura /etc/aura
 install -d -m 0750 -o aura -g aura /var/lib/aura
 
 # ---------------------------------------------------------------- ears binary
+# Stage to a temp file then atomically rename into place. rename(2) succeeds
+# even when the destination is a running executable ("Text file busy" on an
+# in-place write): the running process keeps the old inode and the next start
+# picks up the new binary. This makes re-running install.sh over a live
+# aura-ears.service safe — no need to stop it first.
+EARS_DEST=/opt/aura/bin/aura-ears
+EARS_TMP="${EARS_DEST}.new"
 if [[ -f "${EARS_BINARY}" ]]; then
     echo "==> Installing aura-ears binary from ${EARS_BINARY}"
-    install -m 0755 "${EARS_BINARY}" /opt/aura/bin/aura-ears
+    install -m 0755 "${EARS_BINARY}" "${EARS_TMP}"
+    mv -f "${EARS_TMP}" "${EARS_DEST}"
 elif git -C "${REPO_ROOT}" fetch --quiet --depth 1 origin ears-bin 2>/dev/null; then
     # CI publishes the release binary (built on every merge to main) to the
     # ears-bin branch, reachable with the same credentials as the clone.
     echo "==> Installing aura-ears binary from origin/ears-bin"
-    git -C "${REPO_ROOT}" show FETCH_HEAD:aura-ears > /opt/aura/bin/aura-ears
+    git -C "${REPO_ROOT}" show FETCH_HEAD:aura-ears > "${EARS_TMP}"
     git -C "${REPO_ROOT}" show FETCH_HEAD:aura-ears.sha256 \
+        | sed "s|aura-ears|${EARS_TMP##*/}|" \
         | (cd /opt/aura/bin && sha256sum --check --quiet -) \
-        || { echo "ERROR: aura-ears checksum mismatch"; rm -f /opt/aura/bin/aura-ears; exit 1; }
-    chmod 0755 /opt/aura/bin/aura-ears
+        || { echo "ERROR: aura-ears checksum mismatch"; rm -f "${EARS_TMP}"; exit 1; }
+    chmod 0755 "${EARS_TMP}"
+    mv -f "${EARS_TMP}" "${EARS_DEST}"
 else
     echo "==> aura-ears binary not found at ${EARS_BINARY} and no ears-bin branch — skipping"
     echo "    (download the 'aura-ears' CI artifact and re-run, or copy it"
