@@ -61,10 +61,15 @@ class _Engine:
     def __init__(self, outcome: IncidentOutcome) -> None:
         self.outcome = outcome
         self.reports: list[tuple[int, int, Any, Any]] = []
+        self.broadcasts: list[tuple[int, int, str, bool]] = []
         self.fired: list[datetime] = []
 
     async def report(self, guild_id: int, user_id: int, parsed: Any, resolution: Any) -> Any:
         self.reports.append((guild_id, user_id, parsed, resolution))
+        return self.outcome
+
+    async def broadcast(self, guild_id: int, user_id: int, text: str, *, here: bool = False) -> Any:
+        self.broadcasts.append((guild_id, user_id, text, here))
         return self.outcome
 
     def build_prior_context(self, guild_id: int, user_id: int) -> PriorContext:
@@ -243,22 +248,24 @@ async def test_low_tier_retry_rebinds_bare_system_name() -> None:
     assert USER not in app._pending_retry  # consumed
 
 
-async def test_bare_system_name_without_pending_retry_is_dropped() -> None:
-    app, engine, health, _, _ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]))
+async def test_bare_no_intent_utterance_is_relayed() -> None:
+    # No intent matched → freeform intel relay (GDD §8.6), not a drop.
+    app, engine, _, _, _ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]))
     await app._on_utterance(USER, GUILD, b"\x00\x00")
     assert engine.reports == []
-    assert health.rejected == 1
+    assert engine.broadcasts == [(GUILD, USER, "Kisogo", False)]
 
 
-async def test_expired_pending_retry_is_dropped() -> None:
-    app, engine, health, _, _ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]))
+async def test_expired_pending_retry_falls_through_to_relay() -> None:
+    # An expired retry no longer re-binds; the utterance is relayed instead.
+    app, engine, _, _, _ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]))
     stale = ParsedCommand(
         intent=Intent.HOSTILE_SPOTTED, system_text="x", group_alias=None, detail=None, raw="x"
     )
     app._pending_retry[USER] = (stale, asyncio.get_running_loop().time() - 1.0)
     await app._on_utterance(USER, GUILD, b"\x00\x00")
     assert engine.reports == []
-    assert health.rejected == 1
+    assert engine.broadcasts == [(GUILD, USER, "Kisogo", False)]
     assert USER not in app._pending_retry
 
 

@@ -313,6 +313,29 @@ def system_reply(transcript: str) -> str | None:
     return cleaned or None
 
 
+# Freeform relay (GDD §8.6): leading wake residue, tolerant of any wake phrase
+# ("hey jarvis", "aura command", "hey overseer"). Matches nothing when absent,
+# so a message that happens not to start with the wake word is left intact.
+_BROADCAST_WAKE_RE = re.compile(
+    r"^\W*(?:(?:hey|ok(?:ay)?|hi)\s+)?(?:jarvis|aura|overseer|alexa)(?:\s+command)?[\s,.:;!?-]*",
+    re.I,
+)
+_ALL_HANDS_RE = re.compile(r"\ball\s+hands\b|\bat\s+here\b|\bping\s+everyone\b", re.I)
+
+
+def broadcast_text(transcript: str) -> str:
+    """Clean a freeform relay message: strip a leading wake phrase and a
+    trailing radio sign-off, leaving the intel itself (GDD §8.6)."""
+    work = _BROADCAST_WAKE_RE.sub("", transcript, count=1)
+    work = _SIGNOFF_RE.sub("", work)
+    return work.strip(" ,.;:!?-")
+
+
+def wants_all_hands(transcript: str) -> bool:
+    """True when a freeform message asks to ping everyone (@here)."""
+    return bool(_ALL_HANDS_RE.search(transcript))
+
+
 def parse(transcript: str) -> ParsedCommand | None:
     """Parse one transcript into a :class:`ParsedCommand`, or ``None`` when no
     intent is recognised (the utterance is then dropped, GDD §6)."""

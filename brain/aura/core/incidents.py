@@ -98,6 +98,7 @@ _COLOR_BY_SEVERITY: dict[Severity, int] = {
 }
 _COLOR_RESOLVED = 0x95A5A6  # grey
 _COLOR_STALE = 0x607D8B  # dim slate
+_COLOR_BROADCAST = 0x3498DB  # blue — freeform intel relay (GDD §8.6)
 
 _GROUP_ALIAS_SPOKEN: dict[str, str] = {
     "miners": "miners",
@@ -657,6 +658,53 @@ class IncidentEngine:
         )
         await self._log_command(reporter_id, parsed, resolution, None, Outcome.REJECTED)
         return outcome
+
+    # ── freeform intel relay (GDD §8.6 catch-all) ────────────────────────────
+
+    async def broadcast(
+        self, guild_id: int, reporter_id: int, text: str, *, here: bool = False
+    ) -> IncidentOutcome:
+        """Post any spoken message to the intel channel verbatim.
+
+        The fallback when nothing matched the fixed grammar: fleet movements
+        ("blop fleet moving to Moe 8 gate"), region callsigns, freeform sitreps
+        — a nullsec corp's comms are lively and unstructured, and dropping a
+        call because it wasn't a recognised keyword is the wrong default. The
+        reporter's callsign labels the relay; ``here`` (an "all hands" phrase)
+        pings, gated by the same cooldown/circuit-breaker as any mention."""
+        text = text.strip()
+        if not text:
+            return IncidentOutcome(Outcome.REJECTED, None, None, None)
+        async with self._lock:
+            now = self._clock()
+            who = self._callsigns.lookup(reporter_id) or f"<@{reporter_id}>"
+            content = ""
+            if here and self._discipline.allow_mention(reporter_id, now):
+                self._discipline.record_mention(reporter_id, now)
+                if self._on_mention is not None:
+                    self._on_mention()
+                content = "@here"
+            card = CardRender(
+                embed={
+                    "title": "📡 Intel relay",
+                    "description": text,
+                    "color": _COLOR_BROADCAST,
+                    "timestamp": _iso(now),
+                    "fields": [{"name": "From", "value": who, "inline": True}],
+                    "footer": {"text": "AURA voice relay"},
+                }
+            )
+            await self._poster.post(guild_id, AlertChannel.ALERTS, content, card)
+        await asyncio.to_thread(
+            db.execute,
+            self._conn,
+            "INSERT INTO command_log (user_id, raw_transcript, parsed_intent,"
+            " matched_system_id, confidence, tier, outcome, at)"
+            " VALUES (?, ?, 'BROADCAST', NULL, NULL, NULL, 'POSTED', ?)",
+            (reporter_id, text, _iso(now)),
+        )
+        log.info("intel_broadcast", reporter_id=reporter_id, here=content == "@here")
+        return IncidentOutcome(Outcome.POSTED, None, card, None)
 
     # ── personal pings (GDD §10.3) ───────────────────────────────────────────
 
