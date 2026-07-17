@@ -212,17 +212,29 @@ class AuraBot(commands.Bot):
     # ── voice census → gateway (GDD §19 / voice_gateway) ─────────────────────
 
     @staticmethod
-    def _human_census(channel: discord.abc.Connectable) -> int:
-        """Unmuted, non-bot member count of a voice channel."""
+    def _human_census(channel: discord.abc.Connectable) -> tuple[int, int]:
+        """Census of a voice channel as ``(present, unmuted)``.
+
+        ``present`` counts every non-bot member physically in the channel,
+        regardless of mute state — this drives auto-join/leave, because a pilot
+        sitting muted until they need to shout a report is still present and
+        AURA must stay with them (GDD §1.2, the lonely ratter).
+
+        ``unmuted`` additionally excludes self/server-muted members — this
+        feeds the §20 "voice receive is dead" alarm, which must not fire when
+        the channel is simply quiet because everyone is muted.
+        """
         members = getattr(channel, "members", [])
-        count = 0
+        present = 0
+        unmuted = 0
         for member in members:
-            voice = member.voice
-            if member.bot or voice is None:
+            if member.bot:
                 continue
-            if not (voice.self_mute or voice.mute):
-                count += 1
-        return count
+            present += 1
+            voice = member.voice
+            if voice is not None and not (voice.self_mute or voice.mute):
+                unmuted += 1
+        return present, unmuted
 
     async def _seed_voice_census(self) -> None:
         if self.voice_gateway is None:
@@ -231,7 +243,8 @@ class AuraBot(commands.Bot):
             channel = self.get_channel(channel_id)
             if channel is None:
                 continue
-            await self.voice_gateway.on_voice_update(channel_id, self._human_census(channel))
+            present, unmuted = self._human_census(channel)
+            await self.voice_gateway.on_voice_update(channel_id, present, unmuted)
 
     async def on_voice_state_update(
         self,
@@ -253,7 +266,8 @@ class AuraBot(commands.Bot):
             if channel is not None and channel.id in watched:
                 touched[channel.id] = channel
         for channel_id, channel in touched.items():
-            await self.voice_gateway.on_voice_update(channel_id, self._human_census(channel))
+            present, unmuted = self._human_census(channel)
+            await self.voice_gateway.on_voice_update(channel_id, present, unmuted)
 
     # ── §19 consent announcement — every join, verbatim ──────────────────────
 
