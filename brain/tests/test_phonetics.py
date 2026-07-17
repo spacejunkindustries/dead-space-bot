@@ -50,11 +50,20 @@ NAMES = [
     "Otela",
 ]
 
+#: Nullsec designations — pilots say the prefix ("UMI", "Moe", "1DQ"). Kept in
+#: their own gazetteer so their phonetic neighbours don't perturb the highsec
+#: matching tests.
+NULLSEC_NAMES = ["UMI-KK", "MOEE-8", "1DQ1-A", "Otanuomi"]
+
 
 class FakeGazetteer:
     """Duck-typed stand-in: systems / by_id / by_name / jumps / home."""
 
-    def __init__(self, jumps_map: dict[tuple[int, int], int] | None = None) -> None:
+    def __init__(
+        self,
+        jumps_map: dict[tuple[int, int], int] | None = None,
+        names: list[str] | None = None,
+    ) -> None:
         self.entries = tuple(
             SystemEntry(
                 id=i + 1,
@@ -63,7 +72,7 @@ class FakeGazetteer:
                 constellation=None,
                 metaphone=double_metaphone(name)[0],
             )
-            for i, name in enumerate(NAMES)
+            for i, name in enumerate(names or NAMES)
         )
         self._jumps = jumps_map or {}
 
@@ -320,3 +329,33 @@ def test_no_conn_skips_alias_lookup() -> None:
     r = phonetics.resolve("ockthanoome", GAZ, NO_PRIORS, CFG, conn=None)
     # Without the alias table this is just a phonetic match attempt.
     assert isinstance(r.tier, Tier)
+
+
+# ── nullsec abbreviations (GDD §8.2): pilots say the pre-hyphen prefix ────────
+
+
+NULLSEC_GAZ = FakeGazetteer(names=NULLSEC_NAMES)
+
+
+@pytest.mark.parametrize(
+    ("spoken", "expect"),
+    [
+        ("UMI", "UMI-KK"),
+        ("hostiles UMI", "UMI-KK"),
+        ("Moe 8", "MOEE-8"),
+        ("1DQ", "1DQ1-A"),
+    ],
+)
+def test_nullsec_abbreviation_resolves_to_full_system(spoken: str, expect: str) -> None:
+    r = resolve(spoken, NULLSEC_GAZ, NO_PRIORS, CFG)
+    assert r.best is not None
+    assert r.best.name == expect
+    assert r.tier in (Tier.HIGH, Tier.MEDIUM)
+
+
+def test_eve_abbrev_only_hyphenated() -> None:
+    from aura.nlu.phonetics import eve_abbrev
+
+    assert eve_abbrev("UMI-KK") == "UMI"
+    assert eve_abbrev("1DQ1-A") == "1DQ1"
+    assert eve_abbrev("Jita") is None
