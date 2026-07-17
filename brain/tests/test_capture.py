@@ -459,3 +459,22 @@ def test_emit_works_without_a_running_event_loop() -> None:
     manager.feed(USER_A, GUILD, speech(1500))  # the command; endpoint needs speech first
     feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
     assert len(recorder.emitted) == 1
+
+
+async def test_force_endpoint_emits_open_capture() -> None:
+    # The wall-clock silence sweep ends a capture when Discord stops sending
+    # packets (no silence frames ever arrive to endpoint on).
+    manager, recorder, _ = make_manager()
+    manager.feed(USER_A, GUILD, MARKER)
+    cmd = speech(1500)
+    manager.feed(USER_A, GUILD, cmd)
+    assert manager.is_capturing(USER_A)
+    assert manager.capturing_users() == [USER_A]
+
+    assert manager.force_endpoint(USER_A) is True
+    await settle()
+    assert len(recorder.emitted) == 1
+    assert recorder.emitted[0][2] == b"".join([MARKER, cmd])
+    assert manager.phase_of(USER_A) is Phase.IDLE
+    # Idempotent: nothing to end now.
+    assert manager.force_endpoint(USER_A) is False

@@ -169,6 +169,25 @@ class CaptureManager:
     def is_capturing(self, user_id: int) -> bool:
         return self.phase_of(user_id) is Phase.CAPTURING
 
+    def capturing_users(self) -> list[int]:
+        """User ids with an open capture — for the wall-clock silence sweep."""
+        return [uid for uid, st in self._states.items() if st.phase is Phase.CAPTURING]
+
+    def force_endpoint(self, user_id: int, reason: str = "silence") -> bool:
+        """End an open capture now and emit it (GDD §5).
+
+        Discord sends no packets while a pilot is silent — it stops the stream
+        rather than sending silence frames — so the frame-counted endpoint can
+        never fire on a real pause. The composition root drives this from a
+        wall-clock timer instead: when a capturing user has sent no audio for
+        the endpoint window, their utterance is emitted here. No-op unless the
+        user is actually capturing."""
+        state = self._states.get(user_id)
+        if state is None or state.phase is not Phase.CAPTURING or state.capture is None:
+            return False
+        self._emit(user_id, state, self._holder.current, reason=reason)
+        return True
+
     @property
     def tracked_users(self) -> int:
         return len(self._states)

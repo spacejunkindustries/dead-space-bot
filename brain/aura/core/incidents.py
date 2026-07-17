@@ -125,6 +125,10 @@ _NUMBER_WORDS: dict[int, str] = {
 #: sets cannot silently diverge.
 _REPORT_INTENTS = MENTION_INTENTS
 
+#: Card label when a report gave no usable location at all — the alert still
+#: posts (GDD §8.6 catch-all) so a corpmate can ask "where?".
+_UNKNOWN_LOCATION = "location unclear"
+
 
 class Poster(Protocol):
     """Injected Discord side — implemented by ``aura.dsc.bot`` (INTERFACES.md)."""
@@ -606,7 +610,21 @@ class IncidentEngine:
             await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
             return outcome
 
-        # Every remaining intent names a system.
+        # Report intents are CATCH-ALL (GDD §8.6): a distress call always
+        # posts. When the spoken location does not confidently match the
+        # gazetteer, it goes on the card verbatim rather than being dropped —
+        # corps use region callsigns ("branch", "tribute") and raw system IDs
+        # ("NVLF6-2K") that STT mangles, and losing a real call is the worst
+        # possible failure. The gazetteer match, when it lands, still drives
+        # routing and proximity; when it doesn't, the report survives anyway.
+        if intent in _REPORT_INTENTS:
+            outcome = await self._report_incident(guild_id, reporter_id, parsed, resolution)
+            tier = resolution.tier if resolution is not None else None
+            await self._log_command(reporter_id, parsed, resolution, tier, outcome.outcome)
+            return outcome
+
+        # The remaining intents (clear / timer / form up) act on a *specific*
+        # real system, so they still require a confident match.
         if resolution is None or resolution.tier is Tier.LOW or resolution.best is None:
             outcome = IncidentOutcome(
                 outcome=Outcome.REJECTED,
@@ -630,11 +648,6 @@ class IncidentEngine:
 
         if intent is Intent.FORMUP:
             outcome = await self._create_formup(guild_id, reporter_id, parsed, best)
-            await self._log_command(reporter_id, parsed, resolution, None, outcome.outcome)
-            return outcome
-
-        if intent in _REPORT_INTENTS:
-            outcome = await self._report_incident(guild_id, reporter_id, parsed, resolution)
             await self._log_command(reporter_id, parsed, resolution, None, outcome.outcome)
             return outcome
 
@@ -688,22 +701,35 @@ class IncidentEngine:
         async with self._lock:
             now = self._clock()
             cfg = self._holder.current
-            best = resolution.best
-            assert best is not None  # guarded by report()
-            system_name = self._system_name(best.system_id, best.name)
-
+            best = resolution.best if resolution is not None else None
+            resolved = best is not None and resolution.tier is not Tier.LOW
             window = timedelta(seconds=cfg.incidents.dedupe_window_s)
-            existing_id = await asyncio.to_thread(
-                db.query_value,
-                self._conn,
-                "SELECT id FROM incidents WHERE guild_id = ? AND system_id = ? AND type = ?"
-                " AND status = 'ACTIVE' AND updated_at >= ? ORDER BY updated_at DESC LIMIT 1",
-                (guild_id, best.system_id, str(parsed.intent), _iso(now - window)),
-            )
+
+            if resolved:
+                system_name = self._system_name(best.system_id, best.name)
+                existing_id = await asyncio.to_thread(
+                    db.query_value,
+                    self._conn,
+                    "SELECT id FROM incidents WHERE guild_id = ? AND system_id = ? AND type = ?"
+                    " AND status = 'ACTIVE' AND updated_at >= ? ORDER BY updated_at DESC LIMIT 1",
+                    (guild_id, best.system_id, str(parsed.intent), _iso(now - window)),
+                )
+            else:
+                # Unmatched location: post it verbatim. Dedupe on the raw text
+                # so repeats of the same spoken location still fold to one card.
+                system_name = parsed.system_text or _UNKNOWN_LOCATION
+                existing_id = await asyncio.to_thread(
+                    db.query_value,
+                    self._conn,
+                    "SELECT id FROM incidents WHERE guild_id = ? AND system_id IS NULL"
+                    " AND raw_system_text IS ? AND type = ? AND status = 'ACTIVE'"
+                    " AND updated_at >= ? ORDER BY updated_at DESC LIMIT 1",
+                    (guild_id, parsed.system_text, str(parsed.intent), _iso(now - window)),
+                )
             if existing_id is not None:
                 return await self._fold(int(existing_id), reporter_id, parsed, now, system_name)
             return await self._open_incident(
-                guild_id, reporter_id, parsed, resolution, now, system_name
+                guild_id, reporter_id, parsed, resolution, now, system_name, resolved
             )
 
     async def _fold(
@@ -749,14 +775,18 @@ class IncidentEngine:
         guild_id: int,
         reporter_id: int,
         parsed: ParsedCommand,
-        resolution: Resolution,
+        resolution: Resolution | None,
         now: datetime,
         system_name: str,
+        resolved: bool,
     ) -> IncidentOutcome:
-        best = resolution.best
-        assert best is not None
+        best = resolution.best if resolution is not None else None
         severity = INTENT_SEVERITY[parsed.intent]
-        uncertain = resolution.tier is Tier.MEDIUM
+        # Only a resolved-but-borderline (MEDIUM) match offers the confirm
+        # buttons; an unmatched location has nothing to confirm against.
+        uncertain = resolved and resolution is not None and resolution.tier is Tier.MEDIUM
+        system_id = best.system_id if resolved and best is not None else None
+        confidence = best.score if resolved and best is not None else None
 
         incident_id = await asyncio.to_thread(
             db.execute,
@@ -766,8 +796,8 @@ class IncidentEngine:
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
             (
                 guild_id,
-                best.system_id,
-                best.score,
+                system_id,
+                confidence,
                 str(parsed.intent),
                 str(severity),
                 reporter_id,

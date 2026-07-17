@@ -75,6 +75,9 @@ _HEALTH_CHECK_INTERVAL_S = 5.0
 #: 4s frame-fed window.
 _RETRY_TTL_S = 10.0
 
+#: How often the wall-clock silence sweep checks for pilots who stopped talking.
+_SILENCE_SWEEP_MS = 100
+
 #: Spoken/posted when a non-@Pilot member voice-triggers a mention-bearing
 #: intent — mirrors the slash twin's rejection (GDD §11.1 layer 4).
 _PILOT_REQUIRED_UTTERANCE = "Reporting requires the Pilot role."
@@ -149,6 +152,8 @@ class App:
         # Fire-and-forget spoken cues (the "go ahead" ack); kept referenced so
         # they are not garbage-collected mid-flight.
         self._voice_tasks: set[asyncio.Task[None]] = set()
+        # Last time each user sent an audio frame — drives the silence sweep.
+        self._last_audio_at: dict[int, float] = {}
         # LOW-tier "say again" retry state (GDD §8.3): user_id → (the rejected
         # command, wall-clock deadline). The next utterance from that user may
         # be a bare system name that re-binds to the rejected intent.
@@ -250,6 +255,7 @@ class App:
         self._spawn("timer-poll", self._timer_loop())
         self._spawn("reminder-poll", self._reminder_loop())
         self._spawn("health-check", self._health_loop())
+        self._spawn("silence-sweep", self._silence_sweep())
 
         log.info("aura_started")
         await self._shutdown.wait()
@@ -305,8 +311,39 @@ class App:
         """IPC audio hot path — sync, never blocks (constraint: thin + RAM only)."""
         if self.health is not None:
             self.health.note_audio()
+        # Wall-clock marker for the silence sweep: Discord stops sending packets
+        # when a pilot goes quiet (no silence frames), so "no audio for a while"
+        # is how we detect end-of-speech.
+        self._last_audio_at[user_id] = self._loop_time()
         if self.capture is not None:
             self.capture.feed(user_id, guild_id, pcm)
+
+    @staticmethod
+    def _loop_time() -> float:
+        try:
+            return asyncio.get_running_loop().time()
+        except RuntimeError:  # pragma: no cover — only outside the loop (tests)
+            return 0.0
+
+    async def _silence_sweep(self) -> None:
+        """End captures once the pilot has stopped transmitting.
+
+        Runs every ``_SILENCE_SWEEP_MS``; a capturing user who has sent no audio
+        for ``endpoint_silence_ms`` (Discord's stream simply stopped) has their
+        utterance emitted. This is what makes a report end when you stop talking
+        instead of running to the hard cap."""
+        while not self._shutdown.is_set():
+            await asyncio.sleep(_SILENCE_SWEEP_MS / 1000)
+            if self.capture is None:
+                continue
+            now = self._loop_time()
+            # Floor at 700ms: Discord's DTX drops packets during brief pauses
+            # between words, so a too-eager gap would clip a pilot mid-sentence.
+            gap = max(self.holder.current.capture.endpoint_silence_ms / 1000, 0.7)
+            for user_id in self.capture.capturing_users():
+                last = self._last_audio_at.get(user_id)
+                if last is not None and now - last >= gap:
+                    self.capture.force_endpoint(user_id)
 
     def _on_capture_start(self, user_id: int, guild_id: int) -> None:
         """Wake fired — speak "go ahead" so the pilot knows AURA is listening.
