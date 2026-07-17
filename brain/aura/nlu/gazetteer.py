@@ -105,6 +105,8 @@ class Gazetteer:
         self._by_name: dict[str, SystemEntry] = {}
         self._adjacency: dict[int, tuple[int, ...]] = {}
         self._dist_memo: dict[int, dict[int, int]] = {}
+        self._parent_memo: dict[int, dict[int, int]] = {}
+        self._all_names: dict[int, str] = {}
         self._home_system_id: int | None = None
         self._prompt_bias: str = ""
 
@@ -193,6 +195,8 @@ class Gazetteer:
         self._by_name = {e.name.lower(): e for e in systems}
         self._adjacency = adj
         self._dist_memo = {}
+        self._parent_memo = {}
+        self._all_names = {e.id: e.name for e in all_by_id.values()}
         self._home_system_id = home.id if home is not None else None
         self._systems = systems
         self._prompt_bias = _build_prompt_bias(systems, self._home_system_id)
@@ -249,6 +253,39 @@ class Gazetteer:
         self._dist_memo[a_id] = distances
         return distances.get(b_id)
 
+    def path(self, a_id: int, b_id: int) -> tuple[int, ...] | None:
+        """Shortest jump path a→b, both endpoints included; None if disconnected.
+
+        Like :meth:`jumps`, this runs over the FULL adjacency graph, so the
+        path may pass through systems pruned from the active set (use
+        :meth:`system_name` to render them). Same memo style as ``jumps``:
+        one BFS parent map per source system, kept until the next
+        :meth:`load`.
+        """
+        if a_id == b_id:
+            return (a_id,)
+        parents = self._parent_memo.get(a_id)
+        if parents is None:
+            parents = _bfs_parents(a_id, self._adjacency)
+            self._parent_memo[a_id] = parents
+        if b_id not in parents:
+            return None
+        out = [b_id]
+        node = b_id
+        while node != a_id:
+            node = parents[node]
+            out.append(node)
+        out.reverse()
+        return tuple(out)
+
+    def system_name(self, system_id: int) -> str | None:
+        """Name lookup over the FULL systems table, not just the active set.
+
+        Route rendering needs names for pruned waypoint systems; everything
+        that must stay scoped to the active set uses :meth:`by_id` instead.
+        """
+        return self._all_names.get(system_id)
+
     def prompt_bias_text(self) -> str:
         """System names for the Whisper ``initial_prompt`` (GDD §5.3)."""
         return self._prompt_bias
@@ -266,6 +303,19 @@ def _bfs_within(start: int, max_jumps: int, adj: dict[int, tuple[int, ...]]) -> 
                 reached.add(neighbour)
                 frontier.append((neighbour, depth + 1))
     return reached
+
+
+def _bfs_parents(start: int, adj: dict[int, tuple[int, ...]]) -> dict[int, int]:
+    """BFS parent pointers from ``start``; the start maps to itself."""
+    parents: dict[int, int] = {start: start}
+    frontier = deque([start])
+    while frontier:
+        node = frontier.popleft()
+        for neighbour in adj.get(node, ()):
+            if neighbour not in parents:
+                parents[neighbour] = node
+                frontier.append(neighbour)
+    return parents
 
 
 def _bfs_distances(start: int, adj: dict[int, tuple[int, ...]]) -> dict[int, int]:

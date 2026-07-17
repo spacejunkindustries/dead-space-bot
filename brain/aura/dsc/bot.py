@@ -43,11 +43,12 @@ __all__ = ["AuraBot", "TokenError", "read_token", "resolve_typed_system"]
 
 log = structlog.get_logger(__name__)
 
-#: The four cogs of GDD §7, loaded in setup_hook.
+#: The cogs of GDD §7, loaded in setup_hook.
 _COG_MODULES = (
     "aura.dsc.cogs.intel",
     "aura.dsc.cogs.subs",
     "aura.dsc.cogs.ops",
+    "aura.dsc.cogs.utility",
     "aura.dsc.cogs.admin",
 )
 
@@ -140,10 +141,11 @@ class AuraBot(commands.Bot):
         from aura.dsc.cogs.intel import IntelCog
         from aura.dsc.cogs.ops import OpsCog
         from aura.dsc.cogs.subs import SubsCog
+        from aura.dsc.cogs.utility import PollVoteButton, UtilityCog
 
-        self.add_dynamic_items(views.IncidentButton, views.SubscriptionButton)
+        self.add_dynamic_items(views.IncidentButton, views.SubscriptionButton, PollVoteButton)
 
-        for cog in (IntelCog(self), SubsCog(self), OpsCog(self), AdminCog(self)):
+        for cog in (IntelCog(self), SubsCog(self), OpsCog(self), UtilityCog(self), AdminCog(self)):
             await self.add_cog(cog)
 
         guild = discord.Object(id=self.holder.current.discord.guild_id)

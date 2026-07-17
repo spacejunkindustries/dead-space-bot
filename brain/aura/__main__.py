@@ -45,6 +45,7 @@ from aura.core import db
 from aura.core.discipline import Discipline
 from aura.core.incidents import IncidentEngine, Poster, TimerPing
 from aura.dsc.bot import AuraBot, read_token
+from aura.dsc.cogs.utility import ReminderService
 from aura.health import HealthReporter
 from aura.ipc import PRIORITY_ALERT, PRIORITY_NORMAL, IpcServer
 from aura.nlu import grammar, phonetics
@@ -123,6 +124,7 @@ class App:
         self.bot: AuraBot | None = None
         self.health: HealthReporter | None = None
         self.gateway: VoiceGateway | None = None
+        self.reminders: ReminderService | None = None
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
 
@@ -159,6 +161,7 @@ class App:
             self.holder, self.engine, self.gazetteer, self.discipline, self.speaker, self.conn
         )
         late_poster.bind(self.bot)
+        self.reminders = ReminderService(self.conn, self.bot)
 
         self.health = HealthReporter(self.holder, self._post_health)
         self.gateway = VoiceGateway(self.holder, self.ipc, self.conn, self.bot.announce_join)
@@ -193,6 +196,7 @@ class App:
         self._spawn("discord-bot", self.bot.start(token))
         self._spawn("stale-sweep", self._sweep_loop())
         self._spawn("timer-poll", self._timer_loop())
+        self._spawn("reminder-poll", self._reminder_loop())
         self._spawn("health-check", self._health_loop())
 
         log.info("aura_started")
@@ -380,6 +384,12 @@ class App:
             pings = await self.engine.fire_due_timers(datetime.now(UTC))
             for ping in pings:
                 await self._announce_timer(ping)
+
+    async def _reminder_loop(self) -> None:
+        assert self.reminders
+        while True:
+            await asyncio.sleep(_TIMER_POLL_INTERVAL_S)
+            await self.reminders.deliver_due(datetime.now(UTC))
 
     async def _health_loop(self) -> None:
         assert self.health

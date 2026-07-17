@@ -89,6 +89,10 @@ class Gazetteer:
     def by_id(self, system_id: int) -> SystemEntry | None
     def by_name(self, name: str) -> SystemEntry | None      # case-insensitive exact
     def jumps(self, a_id: int, b_id: int) -> int | None     # BFS, memoised; None if disconnected
+    def path(self, a_id: int, b_id: int) -> tuple[int, ...] | None
+    #   Shortest jump path, endpoints included; same memo style as jumps()
+    #   (one BFS parent map per source). Full graph — may cross pruned systems.
+    def system_name(self, system_id: int) -> str | None     # FULL systems table, for path display
     def prompt_bias_text(self) -> str             # system names for Whisper initial_prompt
     @property
     def home_system_id(self) -> int | None
@@ -312,13 +316,19 @@ def read_token(cfg: DiscordConfig) -> str
 
 - `bot.py` also implements the `Poster` protocol (posts/edits cards, builds
   `discord.ui.View` from `CardRender.buttons`) and registers persistent views.
-- Cogs (`cogs/intel.py subs.py ops.py admin.py`, GDD §7) call the **same
-  `IncidentEngine`** methods as the voice path — constraint 10. A slash report
-  builds `ParsedCommand` + a HIGH-tier `Resolution` from the typed system name
-  (autocompleted from `gazetteer.systems`).
+- Cogs (`cogs/intel.py subs.py ops.py utility.py admin.py`, GDD §7) call the
+  **same `IncidentEngine`** methods as the voice path — constraint 10. A slash
+  report builds `ParsedCommand` + a HIGH-tier `Resolution` from the typed
+  system name (autocompleted from `gazetteer.systems`). `utility.py` carries
+  the slash-only quality-of-life commands (/evetime /route /history /remindme
+  /poll) — no voice twins because they trigger no alerts; it also exports
+  `ReminderService(conn, bot)` with `deliver_due(now) -> int` (DM, falling
+  back to an #intel-live mention), driven by `__main__`'s reminder poll loop.
 - Views: `custom_id = f"aura:inc:{incident_id}:{action}"` with `action` in
-  `otw | watch | no | fix | pick:{system_id}`. Persistent (`timeout=None`),
-  re-registered on startup so buttons survive restarts (GDD §9.3).
+  `otw | watch | no | fix | pick:{system_id}`. Poll vote buttons use
+  `aura:poll:{poll_id}:{option_idx}` (handled in `cogs/utility.py`).
+  Persistent (`timeout=None`), re-registered on startup so buttons survive
+  restarts (GDD §9.3).
 
 ## Wiring — `aura/__main__.py`
 
@@ -326,8 +336,8 @@ Ownership: `__main__` builds, in order: `ConfigHolder` → `db.connect`+`migrate
 (via to_thread) → `Gazetteer.load` → `Discipline` → `IpcServer` → `Speaker` →
 `make_transcriber` → `CaptureManager` → `IncidentEngine` (Poster = AuraBot) →
 `AuraBot`. One asyncio event loop, owned by `__main__` (`asyncio.run`);
-`bot.start()`, `ipc.start()`, the stale sweep, timers, and health reporter run
-as supervised tasks. SIGHUP → `holder.reload()`; SIGTERM → graceful shutdown
+`bot.start()`, `ipc.start()`, the stale sweep, timers, reminders, and health
+reporter run as supervised tasks. SIGHUP → `holder.reload()`; SIGTERM → graceful shutdown
 (stop IPC, close bot, close db). `voice_gateway.py` watches voice states and
 sends `join`/`leave`/`optouts` control messages.
 
