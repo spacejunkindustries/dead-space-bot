@@ -42,7 +42,7 @@ apt-get install -y -qq \
     build-essential autoconf automake libtool m4 cmake pkg-config \
     libopus-dev \
     python3.12 python3.12-venv \
-    sqlite3
+    sqlite3 rsync
 
 # ---------------------------------------------------------------- aura user
 if ! id -u aura >/dev/null 2>&1; then
@@ -71,14 +71,31 @@ else
     echo "     to /opt/aura/bin/aura-ears yourself)"
 fi
 
+# ---------------------------------------------------------------- brain tree
+# GDD §17.2: /opt/aura/brain/ holds venv + package. The package is deployed
+# as a source tree (editable install) because migrations/ and schema.sql are
+# resolved relative to the aura package at runtime (aura/core/db.py).
+echo "==> Deploying Brain source tree to /opt/aura/brain"
+rsync -a --delete "${REPO_ROOT}/brain/aura/" /opt/aura/brain/aura/ \
+    --exclude '__pycache__'
+rsync -a --delete "${REPO_ROOT}/brain/migrations/" /opt/aura/brain/migrations/
+install -m 0644 "${REPO_ROOT}/brain/schema.sql" /opt/aura/brain/schema.sql
+install -m 0644 "${REPO_ROOT}/brain/pyproject.toml" /opt/aura/brain/pyproject.toml
+install -m 0644 "${REPO_ROOT}/brain/requirements.txt" /opt/aura/brain/requirements.txt
+install -d -m 0755 /opt/aura/brain/docs
+install -m 0644 "${REPO_ROOT}/docs/GDD.md" /opt/aura/brain/docs/GDD.md
+
 # ---------------------------------------------------------------- brain venv
 echo "==> Building Brain venv at /opt/aura/brain/venv"
 if [[ ! -x /opt/aura/brain/venv/bin/python ]]; then
     python3.12 -m venv /opt/aura/brain/venv
 fi
 /opt/aura/brain/venv/bin/pip install --quiet --upgrade pip
-/opt/aura/brain/venv/bin/pip install --quiet -r "${REPO_ROOT}/brain/requirements.txt"
-/opt/aura/brain/venv/bin/pip install --quiet "${REPO_ROOT}/brain"
+/opt/aura/brain/venv/bin/pip install --quiet -r /opt/aura/brain/requirements.txt
+/opt/aura/brain/venv/bin/pip install --quiet -e /opt/aura/brain
+# ProtectSystem=strict makes /opt read-only for the service: precompile
+# bytecode now so the runtime never tries to write __pycache__.
+/opt/aura/brain/venv/bin/python -m compileall -q /opt/aura/brain/aura
 
 # ---------------------------------------------------------------- config
 # Copy examples only if absent — never clobber a live, tuned config.
