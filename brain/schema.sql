@@ -104,6 +104,15 @@ CREATE TABLE voice_mutes (
     at       TEXT NOT NULL
 );
 
+-- ── pilot callsign registry ──────────────────────────────────
+-- Keyed on the Discord user id Ears attaches to every utterance
+-- (SSRC→user map): a name registry, no voice biometrics (GDD §19).
+CREATE TABLE callsigns (
+    user_id        INTEGER PRIMARY KEY,
+    callsign       TEXT NOT NULL,
+    registered_at  TEXT NOT NULL
+);
+
 -- ── personal reminders (/remindme) ───────────────────────────
 CREATE TABLE reminders (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

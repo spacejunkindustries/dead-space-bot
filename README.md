@@ -107,5 +107,8 @@ feature list.
 ## Documentation
 
 - [`docs/GDD.md`](docs/GDD.md) — the full specification (the spec is the truth)
+- [`training/wake/`](training/wake/) — offline wake-word training pipeline
+  (GPU box or Colab, never the droplet); produces the ONNX chain for
+  `/opt/aura/models/wake/`
 - [`docs/INTERFACES.md`](docs/INTERFACES.md) — Brain module interface contract
 - [`CLAUDE.md`](CLAUDE.md) — hard constraints and conventions for contributors

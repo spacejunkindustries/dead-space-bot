@@ -1,0 +1,4 @@
+# Offline training workspace — clones, datasets, clips, features, models.
+# Tens of GB; never committed. Audio here is synthetic TTS output only.
+work/
+.venv/

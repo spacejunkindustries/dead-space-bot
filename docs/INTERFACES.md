@@ -13,6 +13,7 @@ matching the TEXT columns in `brain/schema.sql`.
 ```python
 class Intent(str, Enum):      # HOSTILE_SPOTTED UNDER_ATTACK ASSIST_REQUEST GATE_CAMP
                               # RESOLVE TIMER FORMUP QUERY CANCEL
+                              # REGISTER UNREGISTER WHOAMI      (callsigns, GDD §6.1)
 class Severity(str, Enum):    # NONE="none" MEDIUM="medium" HIGH="high"
 INTENT_SEVERITY: Mapping[Intent, Severity]        # GDD §6.1 defaults
 class Tier(str, Enum):        # HIGH MEDIUM LOW              (GDD §8.3)
@@ -77,7 +78,16 @@ Sync on purpose. Every caller on the event loop wraps calls in
 def parse(transcript: str) -> ParsedCommand | None
 #   None = no intent recognised. Higher-severity patterns match first
 #   ("tackled, need help in Kisogo" → UNDER_ATTACK). group_alias is one of
-#   "miners" | "defense" | "all_hands" | None. detail is verbatim, unparsed.
+#   "miners" | "defense" | "all_hands" | None. detail is verbatim, unparsed —
+#   except REGISTER, where detail carries the cleaned callsign (clean_callsign
+#   of the post-intent remainder; None when nothing usable was heard).
+def sanitize_callsign(text: str) -> str | None
+#   Shared sanitiser: strips markdown/mention chars (@ # ` < > * _ ~ | \),
+#   collapses whitespace, caps at 32 chars, preserves case (slash path uses
+#   this directly — typed input is exact). None when nothing survives.
+def clean_callsign(text: str) -> str | None
+#   Voice path: leading filler ("me as", "my name is") stripped, then
+#   sanitize_callsign, then title-cased (STT emits lowercase).
 
 # gazetteer.py — GDD §8.1. Loads scope rules from gazetteer.yaml, systems +
 # adjacency from the db (SDE-seeded). Rebuildable at runtime via /gazetteer.
@@ -126,7 +136,10 @@ class IncidentEngine:
                      resolution: Resolution | None) -> IncidentOutcome
     #   The single entry point for BOTH voice and slash paths (constraint 10).
     #   Handles tiers (§8.3), dedupe folding (§9.2), routing, discipline,
-    #   command_log write. resolution=None for QUERY/CANCEL.
+    #   command_log write. resolution=None for QUERY/CANCEL and the callsign
+    #   intents REGISTER/UNREGISTER/WHOAMI, which dispatch to the CallsignRegistry
+    #   below (no card, no mentions — spoken/ephemeral reply + command_log only).
+    callsigns: CallsignRegistry            # property; both paths share it
     async def resolve_system(self, guild_id: int, user_id: int,
                              system_id: int) -> IncidentOutcome        # "clear X" / /clear
     async def cancel(self, guild_id: int, user_id: int) -> IncidentOutcome  # 30s window
@@ -154,6 +167,23 @@ class IncidentEngine:
 
 def parse_duration(text: str) -> timedelta | None    # public: engine + /timer//formup share it
 def render_card(...) -> CardRender                   # public for tests/views smoke checks
+#   Accepts reporter_callsign: str | None — names a sole registered reporter
+#   on the "Reported by" field; multi-reporter cards keep the distinct count
+#   ("reported by 5", GDD §9.1).
+
+# callsigns.py — GDD §6.1. A name registry keyed on the Discord user id Ears
+# attaches to every utterance (SSRC→user map): NO voice biometrics, no audio
+# (GDD §19). Same serialization pattern as the engine: async methods, sqlite
+# via to_thread, writes behind one lock. Methods return the exact §12.1
+# utterance strings so voice and slash speak/print identically.
+class CallsignRegistry:
+    def __init__(self, conn: sqlite3.Connection) -> None
+    async def load(self) -> int              # prime the in-memory mirror; row count
+    def lookup(self, user_id: int) -> str | None   # sync mirror read (cards, /rollcall)
+    async def register(self, user_id: int, callsign: str) -> str   # upsert; "Registered you as X."
+    async def unregister(self, user_id: int) -> tuple[bool, str]
+    #   (was_registered, utterance): "Unregistered." / "You are not registered."
+    async def whoami(self, user_id: int) -> str    # "You are X." / "You are not registered."
 
 # routing.py — GDD §10/§11. Pure evaluation; rule loading is separate.
 @dataclass RoutingRule(role_id: int, types: frozenset[Intent], scope: RuleScope,
@@ -304,7 +334,8 @@ class Speaker:
 #   exact GDD strings: ping_sent(system, group=None, *, type_word="Hostiles"),
 #   ambiguous(type_word, system), say_again(), responders(n, system),
 #   resolved(system), timer_set(system, duration_words), flood_control(),
-#   degraded(), number_word(n).
+#   degraded(), number_word(n), registered(callsign), unregistered(),
+#   not_registered(), whoami(callsign), say_again_callsign().
 ```
 
 ## Discord layer — `aura/dsc/`
@@ -325,7 +356,10 @@ def read_token(cfg: DiscordConfig) -> str
 - Cogs (`cogs/intel.py subs.py ops.py utility.py admin.py`, GDD §7) call the
   **same `IncidentEngine`** methods as the voice path — constraint 10. A slash
   report builds `ParsedCommand` + a HIGH-tier `Resolution` from the typed
-  system name (autocompleted from `gazetteer.systems`). `utility.py` carries
+  system name (autocompleted from `gazetteer.systems`). `subs.py` also carries
+  the callsign twins `/register /unregister /whoami` — thin adapters building
+  a systemless `ParsedCommand` (REGISTER's `detail` = `sanitize_callsign` of
+  the typed value) and dispatching through `engine.report`, ephemeral replies. `utility.py` carries
   the slash-only quality-of-life commands (/evetime /route /history /remindme
   /poll) — no voice twins because they trigger no alerts; it also exports
   `ReminderService(conn, bot)` with `deliver_due(now) -> int` (DM, falling

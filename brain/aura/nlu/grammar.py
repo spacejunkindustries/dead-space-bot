@@ -4,7 +4,7 @@
 
 The grammar is regex over the transcript, nothing more (constraint 6: no LLM
 in the command path — it would be slower, cost money per fight, hallucinate
-system names, and be undebuggable at 02:00). Nine intents, matched in
+system names, and be undebuggable at 02:00). Twelve intents, matched in
 severity order so *"tackled, need help in Kisogo"* resolves to
 ``UNDER_ATTACK`` rather than a sighting.
 
@@ -12,7 +12,10 @@ severity order so *"tackled, need help in Kisogo"* resolves to
 resolved here; ``aura.nlu.phonetics.resolve`` owns that. ``detail`` is
 captured verbatim and never parsed (GDD §6.3). For ``TIMER``/``FORMUP`` the
 duration text is left inside ``detail`` — the incident engine re-parses it
-with ``aura.core.incidents.parse_duration``.
+with ``aura.core.incidents.parse_duration``. For ``REGISTER`` the callsign is
+the cleaned post-intent remainder, carried in ``detail`` (GDD §6.1) — it is a
+name for the registry keyed on the Discord user id Ears already attaches to
+every utterance, never anything derived from the audio itself (GDD §19).
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import re
 
 from aura.types import Intent, ParsedCommand
 
-__all__ = ["parse", "system_reply"]
+__all__ = ["clean_callsign", "parse", "sanitize_callsign", "system_reply"]
 
 # Leading wake-phrase residue. The wake detector gates on audio, but the
 # capture window starts 300ms of pre-roll before the trigger, so the phrase
@@ -44,6 +47,11 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
     (Intent.FORMUP, re.compile(r"\bform(?:\s|-)?up\b", re.I)),
     (Intent.QUERY, re.compile(r"\bstatus\b", re.I)),
     (Intent.CANCEL, re.compile(r"\bcancel\b", re.I)),
+    # Callsign registry (GDD §6.1). UNREGISTER before REGISTER so the longer
+    # word can never be claimed by the shorter pattern.
+    (Intent.UNREGISTER, re.compile(r"\bunregister(?:\s+me)?\b|\bforget\s+me\b", re.I)),
+    (Intent.WHOAMI, re.compile(r"\bwho\s+am\s+i\b|\bwhoami\b", re.I)),
+    (Intent.REGISTER, re.compile(r"\bregister\b|\bcall\s+me\b", re.I)),
 )
 
 # Group targeting (GDD §6.2). Deliberately few — every alias is another token
@@ -73,7 +81,43 @@ _DURATION_START_RE = re.compile(
     re.IGNORECASE,
 )
 
-_SYSTEMLESS_INTENTS = frozenset((Intent.QUERY, Intent.CANCEL))
+_SYSTEMLESS_INTENTS = frozenset((Intent.QUERY, Intent.CANCEL, Intent.UNREGISTER, Intent.WHOAMI))
+
+# ── callsign cleaning (GDD §6.1 REGISTER) ────────────────────────────────────
+
+#: Hard cap on a stored callsign. Cards and utterances stay short (§12.1).
+_CALLSIGN_MAX_LEN = 32
+
+# Markdown/mention machinery is stripped so a callsign can never smuggle a
+# ping or formatting into a card: @mentions, #channels, backticks, <...> tags.
+_CALLSIGN_STRIP_RE = re.compile(r"[@#`<>*_~|\\]")
+
+# Connective filler between the intent word and the name itself:
+# "register *me as* Space Junkie", "call me Space Junkie".
+_CALLSIGN_FILLER = frozenset(("as", "me", "my", "is", "name", "callsign"))
+
+
+def sanitize_callsign(text: str) -> str | None:
+    """Shared callsign sanitiser for both input paths (constraint 10).
+
+    Strips markdown/mention characters, collapses whitespace, and caps the
+    result at 32 characters. Case is preserved — the slash twin's typed value
+    is exact. Returns ``None`` when nothing usable survives.
+    """
+    cleaned = _CALLSIGN_STRIP_RE.sub("", text)
+    cleaned = " ".join(cleaned.split())
+    cleaned = cleaned[:_CALLSIGN_MAX_LEN].strip()
+    return cleaned or None
+
+
+def clean_callsign(text: str) -> str | None:
+    """Voice-path callsign cleaning: filler stripped, then sanitised and
+    title-cased (STT emits lowercase; a callsign is a proper name)."""
+    tokens = [t for t in re.split(r"[\s,.;:!?]+", text) if t]
+    while tokens and tokens[0].lower() in (_CALLSIGN_FILLER | _FILLER):
+        tokens.pop(0)
+    cleaned = sanitize_callsign(" ".join(tokens))
+    return cleaned.title() if cleaned else None
 
 
 def _strip_filler(text: str) -> str:
@@ -170,6 +214,17 @@ def parse(transcript: str) -> ParsedCommand | None:
     if intent in _SYSTEMLESS_INTENTS:
         return ParsedCommand(
             intent=intent, system_text=None, group_alias=group_alias, detail=None, raw=transcript
+        )
+
+    if intent is Intent.REGISTER:
+        # The whole remainder is the callsign — cleaned, never resolved
+        # against the gazetteer. Carried in ``detail`` (GDD §6.1).
+        return ParsedCommand(
+            intent=intent,
+            system_text=None,
+            group_alias=group_alias,
+            detail=clean_callsign(remainder),
+            raw=transcript,
         )
 
     if intent in (Intent.TIMER, Intent.FORMUP):

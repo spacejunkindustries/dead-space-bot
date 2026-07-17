@@ -208,6 +208,9 @@ class App:
         rows = await asyncio.to_thread(db.query, self.conn, "SELECT user_id FROM voice_mutes", ())
         self.speaker.set_voice_mutes({row["user_id"] for row in rows})
 
+        # Prime the callsign mirror so cards and /rollcall can name reporters.
+        await self.engine.callsigns.load()
+
     # ── run / shutdown ───────────────────────────────────────────────────────
 
     def run(self) -> None:

@@ -39,6 +39,7 @@ import structlog
 from aura import tts
 from aura.config import ConfigHolder
 from aura.core import db
+from aura.core.callsigns import CallsignRegistry
 from aura.core.discipline import Discipline
 from aura.core.routing import RoutingRule, apply_group_alias, evaluate, load_group_aliases
 from aura.core.routing import load_rules as load_routing_rules_file
@@ -310,12 +311,15 @@ def render_card(
     candidates: tuple[MatchCandidate, ...] = (),
     cancelled: bool = False,
     formup_at: str | None = None,
+    reporter_callsign: str | None = None,
 ) -> CardRender:
     """Render an incident as a plain embed dict + button specs.
 
     The view layer (``aura.dsc``) turns this into a ``discord.Embed`` and a
     persistent ``View``; nothing Discord-specific leaks in here so the render
-    is directly assertable in tests.
+    is directly assertable in tests. ``reporter_callsign`` names a sole
+    registered reporter on the card; folded multi-reporter cards keep the
+    distinct count ("reported by 5", GDD §9.1).
     """
     status = incident.status
     if status is IncidentStatus.RESOLVED:
@@ -356,13 +360,19 @@ def render_card(
     else:
         footer = "Active"
 
+    reporter_value = (
+        reporter_callsign
+        if reporter_callsign is not None and incident.reporter_count == 1
+        else str(incident.reporter_count)
+    )
+
     embed: dict[str, object] = {
         "title": title,
         "color": color,
         "timestamp": incident.opened_at,
         "fields": [
             {"name": "System", "value": system_value, "inline": True},
-            {"name": "Reported by", "value": str(incident.reporter_count), "inline": True},
+            {"name": "Reported by", "value": reporter_value, "inline": True},
             {
                 "name": "Responders",
                 "value": f"🚀 {otw} · 👀 {watching} · ❌ {declined}",
@@ -486,6 +496,9 @@ class IncidentEngine:
         self._rules: list[RoutingRule] = []
         self._alias_roles: dict[str, int] = {}
         self._lock = asyncio.Lock()
+        # Callsign registry (GDD §6.1): same conn, own write lock. Exposed via
+        # the ``callsigns`` property so /rollcall and the cogs share it.
+        self._callsigns = CallsignRegistry(conn)
         # In-memory only: candidate lists for uncertain (MEDIUM-tier) cards so
         # re-renders keep their pick buttons until confirmed/corrected. After a
         # restart an uncertain card keeps its already-posted buttons (persistent
@@ -495,6 +508,11 @@ class IncidentEngine:
         self._clock: Callable[[], datetime] = _utcnow
 
     # ── setup ────────────────────────────────────────────────────────────────
+
+    @property
+    def callsigns(self) -> CallsignRegistry:
+        """The pilot callsign registry both paths dispatch through."""
+        return self._callsigns
 
     def load_routing_rules(self, resolve_role: Callable[[str], int | None]) -> int:
         """(Re)load ``routing.yaml``. Blocking file I/O — call via ``to_thread``.
@@ -525,6 +543,31 @@ class IncidentEngine:
 
         if intent is Intent.QUERY:
             outcome = await self._query_status(guild_id)
+            await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
+            return outcome
+
+        # Callsign registry (GDD §6.1): systemless, no card, no mentions —
+        # a spoken/ephemeral reply plus the command_log row, nothing else.
+        if intent is Intent.REGISTER:
+            callsign = (parsed.detail or "").strip()
+            if not callsign:
+                outcome = IncidentOutcome(Outcome.REJECTED, tts.say_again_callsign(), None, None)
+            else:
+                utterance = await self._callsigns.register(reporter_id, callsign)
+                outcome = IncidentOutcome(Outcome.POSTED, utterance, None, None)
+            await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
+            return outcome
+
+        if intent is Intent.UNREGISTER:
+            removed, utterance = await self._callsigns.unregister(reporter_id)
+            kind = Outcome.POSTED if removed else Outcome.REJECTED
+            outcome = IncidentOutcome(kind, utterance, None, None)
+            await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
+            return outcome
+
+        if intent is Intent.WHOAMI:
+            utterance = await self._callsigns.whoami(reporter_id)
+            outcome = IncidentOutcome(Outcome.POSTED, utterance, None, None)
             await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
             return outcome
 
@@ -1174,6 +1217,7 @@ class IncidentEngine:
             candidates=candidates,
             cancelled=cancelled,
             formup_at=formup_at,
+            reporter_callsign=self._callsigns.lookup(incident.reporter_id),
         )
 
     async def _log_command(

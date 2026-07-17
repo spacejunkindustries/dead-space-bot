@@ -827,6 +827,83 @@ async def test_on_mention_callback_fires_only_when_mentions_send(
     assert len(calls) == 1
 
 
+# ── callsign registry through the shared report path (GDD §6.1) ──────────────
+
+
+async def test_register_through_report_path(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    out = await env.engine.report(GUILD, 42, cmd(Intent.REGISTER, detail="Space Junkie"), None)
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "Registered you as Space Junkie."
+    assert out.card is None
+    assert out.incident_id is None
+    assert env.poster.posts == []  # no card, no mentions — ever
+    assert env.engine.callsigns.lookup(42) == "Space Junkie"
+    log_row = db.query_one(env.conn, "SELECT * FROM command_log")
+    assert log_row is not None
+    assert log_row["parsed_intent"] == "REGISTER"
+    assert log_row["outcome"] == "POSTED"
+
+
+async def test_register_without_callsign_rejected(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    out = await env.engine.report(GUILD, 42, cmd(Intent.REGISTER), None)
+    assert out.outcome is Outcome.REJECTED
+    assert out.utterance == "Say again the callsign."
+    assert db.query(env.conn, "SELECT * FROM callsigns") == []
+
+
+async def test_unregister_through_report_path(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    missing = await env.engine.report(GUILD, 42, cmd(Intent.UNREGISTER), None)
+    assert missing.outcome is Outcome.REJECTED
+    assert missing.utterance == "You are not registered."
+    await env.engine.report(GUILD, 42, cmd(Intent.REGISTER, detail="Space Junkie"), None)
+    out = await env.engine.report(GUILD, 42, cmd(Intent.UNREGISTER), None)
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "Unregistered."
+    assert env.engine.callsigns.lookup(42) is None
+    rows = db.query(env.conn, "SELECT parsed_intent, outcome FROM command_log ORDER BY id")
+    assert [(r["parsed_intent"], r["outcome"]) for r in rows] == [
+        ("UNREGISTER", "REJECTED"),
+        ("REGISTER", "POSTED"),
+        ("UNREGISTER", "POSTED"),
+    ]
+
+
+async def test_whoami_through_report_path(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    out = await env.engine.report(GUILD, 42, cmd(Intent.WHOAMI), None)
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "You are not registered."
+    await env.engine.report(GUILD, 42, cmd(Intent.REGISTER, detail="Space Junkie"), None)
+    out = await env.engine.report(GUILD, 42, cmd(Intent.WHOAMI), None)
+    assert out.utterance == "You are Space Junkie."
+
+
+async def test_card_shows_reporter_callsign_when_registered(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    await env.engine.report(GUILD, 42, cmd(Intent.REGISTER, detail="Space Junkie"), None)
+    out = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    assert out.card is not None
+    assert field_value(out.card, "Reported by") == "Space Junkie"
+    # A fold goes back to the distinct-reporter count ("reported by 2", §9.1).
+    env.clock.advance(10)
+    folded = await env.engine.report(GUILD, 43, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    assert folded.outcome is Outcome.FOLDED
+    assert field_value(folded.card, "Reported by") == "2"
+
+
+async def test_card_falls_back_to_count_when_unregistered(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    out = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    assert field_value(out.card, "Reported by") == "1"
+
+
 async def test_build_prior_context(make_env: Callable[..., Env]) -> None:
     env = make_env()
     await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))

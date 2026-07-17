@@ -1,4 +1,4 @@
-"""Self-service subscription & consent commands (GDD §7 / §10.2 / §19).
+"""Self-service subscription, consent & identity commands (GDD §7 / §10.2 / §19).
 
 /subscribe   role picker built from the loaded routing rules
 /mysubs      the member's roles ∩ routing roles, ephemeral
@@ -6,6 +6,14 @@
              is pushed to Ears immediately, where the drop is enforced BEFORE
              frames cross the IPC boundary (CLAUDE.md: opt-out lives in Ears)
 /mute-voice  stop AURA speaking to this member (GDD §12.2)
+/register    register a pilot callsign — the slash twin of the voice command
+/unregister  delete the callsign row
+/whoami      speak back the registered callsign
+
+The callsign commands are thin adapters over ``IncidentEngine.report``
+(constraint 10) — voice and slash hit the identical registry path. Identity is
+the member's Discord user id; this is a name registry, never voice biometrics
+(GDD §19).
 """
 
 from __future__ import annotations
@@ -21,7 +29,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from aura.core import db
+from aura.dsc.cogs.intel import outcome_text
 from aura.dsc.views import SubscriptionView
+from aura.nlu.grammar import sanitize_callsign
+from aura.types import Intent, ParsedCommand
 
 if TYPE_CHECKING:  # pragma: no cover
     from aura.dsc.bot import AuraBot
@@ -138,3 +149,43 @@ class SubsCog(commands.Cog):
             else "🔔 AURA will speak replies to your commands again."
         )
         await interaction.followup.send(text, ephemeral=True)
+
+    # ── callsign registry: /register /unregister /whoami (GDD §6.1) ──────────
+
+    async def _callsign_command(
+        self, interaction: discord.Interaction, intent: Intent, detail: str | None, raw: str
+    ) -> None:
+        """Shared engine dispatch — the slash half of constraint 10."""
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        parsed = ParsedCommand(
+            intent=intent, system_text=None, group_alias=None, detail=detail, raw=raw
+        )
+        outcome = await self.bot.engine.report(
+            interaction.guild_id, interaction.user.id, parsed, None
+        )
+        await interaction.followup.send(
+            outcome_text(outcome.outcome, outcome.utterance), ephemeral=True
+        )
+
+    @app_commands.command(
+        name="register",
+        description="Register your pilot callsign (a name, tied to your Discord id)",
+    )
+    @app_commands.describe(callsign="Your callsign, e.g. 'Space Junkie' (max 32 characters)")
+    async def register(self, interaction: discord.Interaction, callsign: str) -> None:
+        # Typed input is exact — the sanitiser only strips markdown/mention
+        # characters and caps length; case is preserved. This is also how a
+        # pilot fixes an STT misspelling from the voice path.
+        cleaned = sanitize_callsign(callsign)
+        await self._callsign_command(interaction, Intent.REGISTER, cleaned, f"/register {callsign}")
+
+    @app_commands.command(name="unregister", description="Delete your registered callsign")
+    async def unregister(self, interaction: discord.Interaction) -> None:
+        await self._callsign_command(interaction, Intent.UNREGISTER, None, "/unregister")
+
+    @app_commands.command(name="whoami", description="Show your registered callsign")
+    async def whoami(self, interaction: discord.Interaction) -> None:
+        await self._callsign_command(interaction, Intent.WHOAMI, None, "/whoami")

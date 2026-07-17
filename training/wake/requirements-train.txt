@@ -1,0 +1,47 @@
+# AURA wake-word TRAINING dependencies — OFFLINE pipeline only.
+#
+# Install into a dedicated venv on a GPU box or Colab. These packages must
+# NEVER be added to brain/requirements.txt and never installed on the droplet;
+# the droplet only ever receives the finished .onnx files.
+#
+# The pin set mirrors openWakeWord's notebooks/automatic_model_training.ipynb
+# (https://github.com/dscripka/openWakeWord). Upstream targets Python 3.10
+# (Colab); a 3.10 venv is the safest choice. generate_samples.py additionally
+# clones piper-sample-generator and the openWakeWord repo itself (the training
+# entry point runs from the clone).
+
+# Core
+torch>=2.0                    # GPU build strongly recommended for TTS + training
+openwakeword>=0.6.0           # inference library (validation sweep, base-model download)
+numpy
+scipy
+soundfile
+PyYAML
+onnx
+onnxruntime
+
+# piper-sample-generator (TTS synthesis of positive/adversarial clips)
+piper-phonemize
+webrtcvad
+
+# Upstream training-notebook pins
+mutagen==1.47.0
+torchinfo==1.8.0
+torchmetrics==1.2.0
+speechbrain==0.5.14
+audiomentations==0.33.0
+torch-audiomentations==0.11.0
+acoustics==0.2.6
+pronouncing==0.2.0
+datasets==2.14.6
+deep-phonemizer==0.0.19
+
+# Dataset downloads (features, RIRs, AudioSet, FMA)
+huggingface_hub
+
+# Optional — ONLY for `train.py --tflite`. AURA deploys ONNX, so these stay
+# commented out unless you specifically need a .tflite export. They are the
+# reason upstream pins Python 3.10.
+# tensorflow-cpu==2.8.1
+# tensorflow_probability==0.16.0
+# onnx_tf==1.10.0
