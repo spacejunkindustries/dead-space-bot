@@ -143,6 +143,19 @@ impl Receiver {
         }
     }
 
+    /// SSRCs are assigned per voice-server session; on (re)connect all
+    /// pre-existing mappings are invalid. Drop them so audio we can no
+    /// longer attribute is dropped (opt-out hard constraint) instead of
+    /// being credited to a stale user id.
+    fn reset_ssrc_state(&self) {
+        if let Ok(mut map) = self.inner.ssrc_users.write() {
+            map.clear();
+        }
+        if let Ok(mut decs) = self.inner.decimators.lock() {
+            decs.clear();
+        }
+    }
+
     fn on_client_disconnect(&self, evt: &ClientDisconnect) {
         let user_id = evt.user_id.0;
         if let Ok(mut map) = self.inner.ssrc_users.write() {
@@ -175,6 +188,7 @@ impl EventHandler for Receiver {
             EventContext::ClientDisconnect(evt) => self.on_client_disconnect(evt),
             EventContext::DriverConnect(ConnectData { .. }) => {
                 info!(guild_id = self.inner.guild_id, "voice driver connected");
+                self.reset_ssrc_state();
                 self.inner
                     .shared
                     .stats
@@ -183,6 +197,7 @@ impl EventHandler for Receiver {
             },
             EventContext::DriverReconnect(ConnectData { .. }) => {
                 info!(guild_id = self.inner.guild_id, "voice driver reconnected");
+                self.reset_ssrc_state();
                 self.inner
                     .shared
                     .stats

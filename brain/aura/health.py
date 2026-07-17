@@ -218,7 +218,7 @@ class HealthReporter:
                 humans_present=self._humans_present,
             )
             await self._post(
-                "⚠️ **Voice offline — use `/hostiles` and `/help-me`.** "
+                "⚠️ **Voice offline — use `/under-attack`, `/help-me` and `/hostiles`.** "
                 "No audio received for "
                 f"{alarm_s}s with pilots in channel; retrying. "
                 "Every slash command and the incident engine keep working.",

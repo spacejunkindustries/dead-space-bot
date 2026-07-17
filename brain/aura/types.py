@@ -21,6 +21,7 @@ __all__ = [
     "ButtonSpec",
     "CardRender",
     "INTENT_SEVERITY",
+    "MENTION_INTENTS",
     "Incident",
     "IncidentOutcome",
     "IncidentStatus",
@@ -76,6 +77,14 @@ INTENT_SEVERITY: Mapping[Intent, Severity] = MappingProxyType(
         Intent.QUERY: Severity.NONE,
         Intent.CANCEL: Severity.NONE,
     }
+)
+
+
+#: Intents whose reports trigger role mentions/@here and therefore require the
+#: @Pilot role (GDD §11.1 layer 4). One shared set so the slash cog's gate and
+#: the voice pipeline's gate can never silently diverge (constraint 10).
+MENTION_INTENTS: frozenset[Intent] = frozenset(
+    {Intent.HOSTILE_SPOTTED, Intent.UNDER_ATTACK, Intent.ASSIST_REQUEST, Intent.GATE_CAMP}
 )
 
 

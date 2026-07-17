@@ -1,4 +1,4 @@
-"""Intel slash commands: /hostiles /help-me /camp /clear /status (GDD §7).
+"""Intel slash commands: /hostiles /under-attack /help-me /camp /clear /status /cancel (GDD §7).
 
 Every command here is the slash twin of a voice command and calls the SAME
 ``IncidentEngine.report`` entry point (CLAUDE.md constraint 10) — the cog only
@@ -19,7 +19,7 @@ from discord.ext import commands
 
 from aura.core import db
 from aura.dsc.bot import resolve_typed_system
-from aura.types import Intent, Outcome, ParsedCommand
+from aura.types import MENTION_INTENTS, Intent, Outcome, ParsedCommand
 
 if TYPE_CHECKING:  # pragma: no cover
     from aura.dsc.bot import AuraBot
@@ -29,10 +29,9 @@ __all__ = ["IntelCog", "outcome_text", "system_autocomplete"]
 log = structlog.get_logger(__name__)
 
 #: Slash intents that trigger mentions and therefore require @Pilot (GDD §11.1
-#: layer 4). RESOLVE/QUERY never mention, so they stay open to everyone.
-_MENTION_INTENTS = frozenset(
-    {Intent.HOSTILE_SPOTTED, Intent.UNDER_ATTACK, Intent.ASSIST_REQUEST, Intent.GATE_CAMP}
-)
+#: layer 4). RESOLVE/QUERY/CANCEL never mention, so they stay open to everyone.
+#: The set itself lives in aura.types so the voice-path gate shares it.
+_MENTION_INTENTS = MENTION_INTENTS
 
 _TYPE_BADGES: dict[str, str] = {
     str(Intent.HOSTILE_SPOTTED): "🟠 Hostiles",
@@ -137,6 +136,16 @@ class IntelCog(commands.Cog):
     ) -> None:
         await self._report(interaction, Intent.ASSIST_REQUEST, system, detail, "help-me")
 
+    @app_commands.command(
+        name="under-attack", description="You are under attack — tackled or taking damage"
+    )
+    @app_commands.describe(system="System name", detail="Free-text note, e.g. 'pointed on gate'")
+    @app_commands.autocomplete(system=system_autocomplete)
+    async def under_attack(
+        self, interaction: discord.Interaction, system: str, detail: str | None = None
+    ) -> None:
+        await self._report(interaction, Intent.UNDER_ATTACK, system, detail, "under-attack")
+
     @app_commands.command(name="camp", description="Report a gate camp")
     @app_commands.describe(system="System name", detail="Free-text note, e.g. 'camping the gate'")
     @app_commands.autocomplete(system=system_autocomplete)
@@ -170,6 +179,24 @@ class IntelCog(commands.Cog):
             await interaction.followup.send(
                 outcome.utterance or "All clear.", embed=embed, ephemeral=True
             )
+
+    @app_commands.command(name="cancel", description="Retract your last report (30s window)")
+    async def cancel(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        parsed = ParsedCommand(
+            intent=Intent.CANCEL, system_text=None, group_alias=None, detail=None, raw="/cancel"
+        )
+        # Shared entry point (constraint 10): report() enforces the
+        # incidents.cancel_window_s window and writes the command_log row.
+        outcome = await self.bot.engine.report(
+            interaction.guild_id, interaction.user.id, parsed, None
+        )
+        await interaction.followup.send(
+            outcome_text(outcome.outcome, outcome.utterance), ephemeral=True
+        )
 
     async def _status_embed(self, guild_id: int) -> discord.Embed | None:
         """Read-only view of the active incident list — rendering, not judgement."""

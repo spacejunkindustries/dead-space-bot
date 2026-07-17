@@ -161,8 +161,6 @@ def _holder(tmp_path, *, enabled: bool = True, max_utterance_s: float = 3.0) -> 
             voice=str(voice),
             binary="/nonexistent/piper",
             max_utterance_s=max_utterance_s,
-            duck_to=0.6,
-            suppress_while_speech=True,
         )
     )
     return SimpleNamespace(current=cfg)
@@ -293,6 +291,28 @@ async def test_per_guild_ordering(tmp_path, monkeypatch) -> None:
     assert results == [True, True, True]
     assert order == ["first", "second", "third"]
     assert [len(s) for s in ipc.sent] == [3, 3, 3]
+    await speaker.close()
+
+
+async def test_voice_swap_on_reload_refreshes_sample_rate(tmp_path, monkeypatch) -> None:
+    """A SIGHUP that swaps tts.voice must rebuild WAV headers (and the
+    duration check) with the NEW voice's native rate, not the boot-time one."""
+    holder = _holder(tmp_path)  # voice A: 22050 Hz
+    voice_b = tmp_path / "voice_b.onnx"
+    (tmp_path / "voice_b.onnx.json").write_text(
+        json.dumps({"audio": {"sample_rate": 16000}}), encoding="utf-8"
+    )
+    pcm = b"\x01\x00" * 16000  # 1s at 16 kHz
+    _patch_piper(monkeypatch, pcm)
+    ipc = _FakeIpc()
+    speaker = Speaker(holder, ipc)  # type: ignore[arg-type]
+    assert speaker.sample_rate == 22050
+
+    holder.current.tts.voice = str(voice_b)  # simulate the config reload
+    assert await speaker.say(1, "after reload") is True
+    assert speaker.sample_rate == 16000
+    with wave.open(io.BytesIO(ipc.sent[0][2])) as w:
+        assert w.getframerate() == 16000  # header built with the new rate
     await speaker.close()
 
 

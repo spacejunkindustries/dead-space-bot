@@ -63,7 +63,6 @@ class DiscordConfig:
 
 @dataclass(frozen=True, slots=True)
 class WakeConfig:
-    phrase: str
     model: str
     threshold: float
     refractory_ms: int
@@ -137,8 +136,8 @@ class TtsConfig:
     voice: str
     binary: str
     max_utterance_s: float
-    duck_to: float
-    suppress_while_speech: bool
+    # Ducking level and talk-over suppression are fixed playback mechanics in
+    # Ears (ears/src/playback.rs) — deliberately not tunables here.
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +149,8 @@ class GazetteerConfig:
 @dataclass(frozen=True, slots=True)
 class IpcConfig:
     socket: str
-    buffer_seconds: int
+    # Ears' outbound ring size lives in /etc/aura/ears.yaml (buffer_seconds):
+    # the ring must survive Brain restarts, so Brain cannot own that knob.
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +266,6 @@ def _build_discord(data: dict[str, Any]) -> DiscordConfig:
 def _build_wake(data: dict[str, Any]) -> WakeConfig:
     s = _section(data, "wake")
     return WakeConfig(
-        phrase=_get(s, "wake.phrase", str),
         model=_get(s, "wake.model", str),
         threshold=_in_range(_get(s, "wake.threshold", float), "wake.threshold", 0.0, 1.0),
         refractory_ms=_positive(_get(s, "wake.refractory_ms", int), "wake.refractory_ms"),
@@ -404,8 +403,6 @@ def _build_tts(data: dict[str, Any]) -> TtsConfig:
         voice=_get(s, "tts.voice", str),
         binary=_get(s, "tts.binary", str),
         max_utterance_s=_positive(_get(s, "tts.max_utterance_s", float), "tts.max_utterance_s"),
-        duck_to=_in_range(_get(s, "tts.duck_to", float), "tts.duck_to", 0.0, 1.0),
-        suppress_while_speech=_get(s, "tts.suppress_while_speech", bool, default=True),
     )
 
 
@@ -421,7 +418,6 @@ def _build_ipc(data: dict[str, Any]) -> IpcConfig:
     s = _section(data, "ipc")
     return IpcConfig(
         socket=_get(s, "ipc.socket", str),
-        buffer_seconds=_positive(_get(s, "ipc.buffer_seconds", int), "ipc.buffer_seconds"),
     )
 
 

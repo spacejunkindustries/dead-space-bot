@@ -54,6 +54,13 @@ JOIN_DEBOUNCE_S = 5.0
 AnnounceFn = Callable[[int], Awaitable[None]]
 
 
+def _log_task_failure(task: asyncio.Task[None]) -> None:
+    """Done-callback for the fire-and-forget debounce task: a swallowed
+    exception here would silently skip a join, so it is always logged."""
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        log.error("voice_join_task_failed", task=task.get_name(), exc_info=exc)
+
+
 class VoiceGateway:
     """Auto-join/leave state machine over injected voice-census updates.
 
@@ -166,6 +173,7 @@ class VoiceGateway:
         self._pending_join = asyncio.create_task(
             self._debounced_join(channel_id), name=f"voice-join-{channel_id}"
         )
+        self._pending_join.add_done_callback(_log_task_failure)
         log.debug("join_debounce_started", channel_id=channel_id, delay_s=self._join_debounce_s)
 
     def _cancel_pending_join(self) -> None:
@@ -196,7 +204,11 @@ class VoiceGateway:
         if self._on_census is not None:
             self._on_census(self._counts.get(channel_id, 0))
         log.info("voice_join_sent", channel_id=channel_id)
-        await self.push_optouts()
+        try:
+            await self.push_optouts()
+        except Exception:
+            # Never let a DB hiccup swallow the §19 consent announcement.
+            log.exception("optouts_push_failed", channel_id=channel_id)
         if announce:
             # §19: the consent announcement goes out every single time.
             try:

@@ -21,7 +21,7 @@ import re
 
 from aura.types import Intent, ParsedCommand
 
-__all__ = ["parse"]
+__all__ = ["parse", "system_reply"]
 
 # Leading wake-phrase residue. The wake detector gates on audio, but the
 # capture window starts 300ms of pre-roll before the trigger, so the phrase
@@ -122,6 +122,21 @@ def _split_timer(remainder: str) -> tuple[str | None, str | None]:
     system_text = _strip_filler(_remove_intent_phrases(flat[: m.start()]))
     detail = flat[m.start() :].strip()
     return system_text or None, detail or None
+
+
+def system_reply(transcript: str) -> str | None:
+    """Clean a bare system-name reply spoken into a reopened window (GDD §8.3).
+
+    After a LOW-tier "Say again the system." the pilot answers with just the
+    name ("Kisogo", "in Kisogo"). This applies the module's own normalisation
+    — wake-residue strip plus filler strip — so the reply is handled exactly
+    like the normal system window. Returns ``None`` when nothing survives.
+    """
+    if not transcript or not transcript.strip():
+        return None
+    work = _WAKE_RE.sub("", transcript, count=1)
+    cleaned = _strip_filler(work.strip(" ,.;:!?-"))
+    return cleaned or None
 
 
 def parse(transcript: str) -> ParsedCommand | None:

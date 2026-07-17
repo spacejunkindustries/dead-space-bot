@@ -259,7 +259,14 @@ class CaptureManager:
             return
         task = loop.create_task(_await(coro))
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: asyncio.Task[None]) -> None:
+        """Reap a finished utterance task; a swallowed exception here would
+        silently drop the pilot's command, so it is always logged."""
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.error("utterance_task_failed", exc_info=task.exception())
 
 
 async def _await(coro: Awaitable[None]) -> None:

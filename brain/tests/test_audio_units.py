@@ -55,13 +55,23 @@ def frame_of(value: int) -> bytes:
 FRAME = frame_of(1000)
 
 
+class _StubHolder:
+    """Duck-typed ConfigHolder exposing just ``.current.wake``."""
+
+    def __init__(self, wake: WakeConfig) -> None:
+        self.current = types.SimpleNamespace(wake=wake)
+
+
 def make_wake_config(threshold: float = 0.5, refractory_ms: int = 200) -> WakeConfig:
     return WakeConfig(
-        phrase="aura command",
         model="/opt/aura/models/wake/aura_command.onnx",
         threshold=threshold,
         refractory_ms=refractory_ms,
     )
+
+
+def make_wake_holder(threshold: float = 0.5, refractory_ms: int = 200) -> _StubHolder:
+    return _StubHolder(make_wake_config(threshold, refractory_ms))
 
 
 def make_stt_config(backend: str = "faster-whisper", bias_with_gazetteer: bool = True) -> SttConfig:
@@ -188,7 +198,7 @@ class _ScriptedPredict:
 def make_detector(
     scores: list[float], threshold: float = 0.5, refractory_ms: int = 200
 ) -> tuple[OpenWakeWordDetector, _ScriptedPredict]:
-    detector = OpenWakeWordDetector(make_wake_config(threshold, refractory_ms))
+    detector = OpenWakeWordDetector(make_wake_holder(threshold, refractory_ms))  # type: ignore[arg-type]
     predict = _ScriptedPredict(scores)
     detector._predict_chunk = predict  # type: ignore[method-assign]
     return detector, predict
@@ -205,18 +215,30 @@ def test_frames_accumulate_to_one_oww_chunk() -> None:
     assert len(predict.chunks[0]) == OWW_CHUNK_BYTES
 
 
-def test_hit_starts_refractory_and_suppresses_retrigger() -> None:
-    # refractory 200ms = 10 frames
-    detector, predict = make_detector([0.9, 0.9, 0.9], refractory_ms=200)
-    scores = [detector.score(USER, FRAME) for _ in range(4)]
-    assert scores[-1] == pytest.approx(0.9)  # the hit itself reports its score
+def test_hit_clears_streaming_state_but_not_scoring() -> None:
+    # Refractory suppression is the CaptureManager's job (single owner);
+    # a hit only clears pending bytes + held score + model buffers so the
+    # same utterance's tail cannot retrigger from a held score.
+    class _ResettableModel:
+        def __init__(self) -> None:
+            self.resets = 0
 
-    # The next 10 frames are dead: score 0.0 and no inference at all.
-    for _ in range(10):
-        assert detector.score(USER, FRAME) == 0.0
-    assert len(predict.chunks) == 1
+        def reset(self) -> None:
+            self.resets += 1
 
-    # Re-armed: four more frames form a chunk and can hit again.
+    detector, predict = make_detector([0.9, 0.9])
+    for _ in range(3):
+        detector.score(USER, FRAME)  # accumulate a partial chunk
+    state = detector._states[USER]
+    model = _ResettableModel()
+    state.model = model
+
+    assert detector.score(USER, FRAME) == pytest.approx(0.9)  # chunk complete: hit
+    assert state.last_score == 0.0  # held score cleared: the tail cannot retrigger
+    assert state.pending == bytearray()  # partial-chunk residue discarded
+    assert model.resets == 1  # model prediction buffer cleared
+
+    # Scoring stays live immediately: the next full chunk can hit again.
     rearmed = [detector.score(USER, FRAME) for _ in range(4)]
     assert rearmed[-1] == pytest.approx(0.9)
     assert len(predict.chunks) == 2
@@ -241,7 +263,7 @@ def test_wake_state_is_per_user_and_reset_purges_it() -> None:
         detector.score(other_user, FRAME)
     assert detector.score(USER, FRAME) == pytest.approx(0.9)  # USER hits...
     assert detector.score(other_user, FRAME) == pytest.approx(0.1)  # ...B unaffected
-    assert detector.score(USER, FRAME) == 0.0  # USER refractory
+    assert detector.score(USER, FRAME) == 0.0  # USER's held score was cleared by the hit
 
     detector.reset(USER)  # purge (leave/opt-out)
     for _ in range(3):

@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import signal
 import sqlite3
@@ -37,7 +38,7 @@ import structlog
 
 from aura import tts as tts_mod
 from aura.audio.capture import CaptureManager
-from aura.audio.stt import Transcriber, make_transcriber
+from aura.audio.stt import SttError, SttTimeoutError, Transcriber, make_transcriber
 from aura.audio.vad import VadGate
 from aura.audio.wake import OpenWakeWordDetector
 from aura.config import ConfigError, ConfigHolder
@@ -51,7 +52,15 @@ from aura.ipc import PRIORITY_ALERT, PRIORITY_NORMAL, IpcServer
 from aura.nlu import grammar, phonetics
 from aura.nlu.gazetteer import Gazetteer
 from aura.tts import Speaker
-from aura.types import INTENT_SEVERITY, CardRender, Outcome, Severity, Tier
+from aura.types import (
+    INTENT_SEVERITY,
+    MENTION_INTENTS,
+    CardRender,
+    Outcome,
+    ParsedCommand,
+    Severity,
+    Tier,
+)
 from aura.voice_gateway import VoiceGateway
 
 log = structlog.get_logger(__name__)
@@ -59,6 +68,16 @@ log = structlog.get_logger(__name__)
 _SWEEP_INTERVAL_S = 60.0
 _TIMER_POLL_INTERVAL_S = 15.0
 _HEALTH_CHECK_INTERVAL_S = 5.0
+
+#: Wall-clock TTL for a pending LOW-tier retry (GDD §8.3). The reopened
+#: capture window is measured in fed frames and cannot expire while the user
+#: is not transmitting, so this TTL is deliberately generous relative to the
+#: 4s frame-fed window.
+_RETRY_TTL_S = 10.0
+
+#: Spoken/posted when a non-@Pilot member voice-triggers a mention-bearing
+#: intent — mirrors the slash twin's rejection (GDD §11.1 layer 4).
+_PILOT_REQUIRED_UTTERANCE = "Reporting requires the Pilot role."
 
 
 def configure_logging(level: int = logging.INFO) -> None:
@@ -127,6 +146,10 @@ class App:
         self.reminders: ReminderService | None = None
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
+        # LOW-tier "say again" retry state (GDD §8.3): user_id → (the rejected
+        # command, wall-clock deadline). The next utterance from that user may
+        # be a bare system name that re-binds to the rejected intent.
+        self._pending_retry: dict[int, tuple[ParsedCommand, float]] = {}
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -149,13 +172,24 @@ class App:
 
         self.transcriber = await asyncio.to_thread(make_transcriber, cfg.stt)
         vad = VadGate(cfg.capture.vad_aggressiveness)
-        wake = await asyncio.to_thread(OpenWakeWordDetector, cfg.wake)
+        # The detector reads holder.current at the point of use (config.py
+        # contract) so SIGHUP retunes apply to it and CaptureManager alike.
+        wake = await asyncio.to_thread(OpenWakeWordDetector, self.holder)
         self.capture = CaptureManager(self.holder, vad, wake, self._on_utterance)
+
+        # Health before the engine: the engine reports mentions into it.
+        self.health = HealthReporter(self.holder, self._post_health)
 
         late_poster = _LatePoster()
         rules_path = self.holder.path.parent / "routing.yaml"
         self.engine = IncidentEngine(
-            self.conn, self.holder, self.gazetteer, self.discipline, late_poster, rules_path
+            self.conn,
+            self.holder,
+            self.gazetteer,
+            self.discipline,
+            late_poster,
+            rules_path,
+            on_mention=self.health.record_mention,
         )
         self.bot = AuraBot(
             self.holder, self.engine, self.gazetteer, self.discipline, self.speaker, self.conn
@@ -163,7 +197,6 @@ class App:
         late_poster.bind(self.bot)
         self.reminders = ReminderService(self.conn, self.bot)
 
-        self.health = HealthReporter(self.holder, self._post_health)
         self.gateway = VoiceGateway(self.holder, self.ipc, self.conn, self.bot.announce_join)
         self.gateway.set_census_listener(self.health.set_humans_present)
         # The bot forwards its voice census (on_voice_state_update + on_ready
@@ -280,7 +313,9 @@ class App:
         The pcm buffer is dropped the moment ``transcribe`` returns; only the
         transcript is retained (constraint 5, GDD §19).
         """
-        assert self.gazetteer and self.transcriber and self.engine and self.health
+        assert (
+            self.gazetteer and self.transcriber and self.engine and self.health and self.discipline
+        )
         cfg = self.holder.current
         if self.health is not None:
             self.health.record_wake_hit()
@@ -290,7 +325,21 @@ class App:
             return
 
         bias = self.gazetteer.prompt_bias_text() if cfg.stt.bias_with_gazetteer else ""
-        result = await asyncio.to_thread(self.transcriber.transcribe, pcm, bias)
+        try:
+            result = await asyncio.to_thread(self.transcriber.transcribe, pcm, bias)
+        except SttError as exc:
+            del pcm  # constraint 5: audio dropped even on failure
+            self.health.record_rejected()
+            log.warning(
+                "stt_failed",
+                user_id=user_id,
+                timed_out=isinstance(exc, SttTimeoutError),
+                error=str(exc),
+            )
+            if self.capture is not None:
+                self.capture.reopen(user_id, guild_id)  # wake-free retry, GDD §8.3
+            await self._speak_or_post(guild_id, user_id, tts_mod.say_again())
+            return
         del pcm  # transcript only from here on
         log.info(
             "utterance_transcribed",
@@ -299,10 +348,33 @@ class App:
             avg_logprob=round(result.avg_logprob, 3),
         )
 
+        # The pending-retry context applies only to this user's very next
+        # utterance — pop unconditionally (a full command discards it).
+        loop = asyncio.get_running_loop()
+        pending = self._pending_retry.pop(user_id, None)
+
         parsed = grammar.parse(result.text)
         if parsed is None:
+            # §8.3 retry: a bare system name in the reopened window re-binds
+            # to the LOW-rejected command's intent.
+            if pending is not None and loop.time() <= pending[1]:
+                reply = grammar.system_reply(result.text)
+                if reply is not None:
+                    parsed = dataclasses.replace(pending[0], system_text=reply, raw=result.text)
+                    log.info("retry_rebound", user_id=user_id, intent=str(parsed.intent))
+            if parsed is None:
+                self.health.record_rejected()
+                log.info("utterance_no_intent", user_id=user_id, text=result.text)
+                return
+
+        # GDD §11.1 layer 4: only @Pilot may trigger mentions — reject the
+        # command outright, exactly like the slash twin (constraint 10).
+        if parsed.intent in MENTION_INTENTS and not self.discipline.may_mention(
+            self._member_role_ids(user_id)
+        ):
             self.health.record_rejected()
-            log.info("utterance_no_intent", user_id=user_id, text=result.text)
+            log.info("voice_pilot_denied", user_id=user_id)
+            await self._speak_or_post(guild_id, user_id, _PILOT_REQUIRED_UTTERANCE)
             return
 
         resolution = None
@@ -323,7 +395,9 @@ class App:
         outcome = await self.engine.report(guild_id, user_id, parsed, resolution)
         self._count_outcome(outcome.outcome)
 
-        # LOW tier: "say again" — reopen capture so the retry needs no wake word.
+        # LOW tier: "say again" — reopen capture so the retry needs no wake
+        # word, and remember the rejected command so a bare system-name reply
+        # re-binds to its intent (GDD §8.3).
         if (
             outcome.outcome is Outcome.REJECTED
             and (resolution is None or resolution.tier is Tier.LOW)
@@ -331,6 +405,7 @@ class App:
             and parsed.system_text
         ):
             self.capture.reopen(user_id, guild_id)
+            self._pending_retry[user_id] = (parsed, loop.time() + _RETRY_TTL_S)
 
         await self._reply(guild_id, user_id, parsed_intent_severity(parsed.intent), outcome)
 
@@ -359,13 +434,26 @@ class App:
                 self.holder.current.discord.channels.intel_live, f"🔊 {utterance}"
             )
 
-    def _may_voice_trigger(self, user_id: int) -> bool:
-        """Fleetmode gate (GDD §11.1): voice triggers may be FC-only."""
-        assert self.bot and self.discipline
+    async def _speak_or_post(self, guild_id: int, user_id: int, utterance: str) -> None:
+        """Speak a short rejection/reply; fall back to channel text when muted."""
+        assert self.speaker
+        spoken = await self.speaker.say(guild_id, utterance, PRIORITY_NORMAL, user_id=user_id)
+        if not spoken:
+            await self._send_channel(
+                self.holder.current.discord.channels.intel_live, f"🔊 {utterance}"
+            )
+
+    def _member_role_ids(self, user_id: int) -> list[int]:
+        """This member's role ids from the guild cache (empty when unknown)."""
+        assert self.bot
         guild = self.bot.get_guild(self.holder.current.discord.guild_id)
         member = guild.get_member(user_id) if guild is not None else None
-        role_ids = [role.id for role in member.roles] if member is not None else []
-        return self.discipline.may_voice_trigger(role_ids)
+        return [role.id for role in member.roles] if member is not None else []
+
+    def _may_voice_trigger(self, user_id: int) -> bool:
+        """Fleetmode gate (GDD §11.1): voice triggers may be FC-only."""
+        assert self.discipline
+        return self.discipline.may_voice_trigger(self._member_role_ids(user_id))
 
     # ── periodic tasks ───────────────────────────────────────────────────────
 
@@ -378,17 +466,25 @@ class App:
                 log.info("incidents_marked_stale", ids=stale)
 
     async def _timer_loop(self) -> None:
-        assert self.engine
+        assert self.engine and self.bot
         while True:
             await asyncio.sleep(_TIMER_POLL_INTERVAL_S)
+            # fire_due_timers commits fired=1 before delivery, so never
+            # consume due rows while Discord is unusable (pre-login,
+            # fetch_channel raises AttributeError and the ping is lost).
+            # is_ready() is MISSING-safe pre-login; wait_until_ready() is not.
+            if not self.bot.is_ready():
+                continue
             pings = await self.engine.fire_due_timers(datetime.now(UTC))
             for ping in pings:
                 await self._announce_timer(ping)
 
     async def _reminder_loop(self) -> None:
-        assert self.reminders
+        assert self.reminders and self.bot
         while True:
             await asyncio.sleep(_TIMER_POLL_INTERVAL_S)
+            if not self.bot.is_ready():
+                continue  # don't consume due reminders before Discord is usable
             await self.reminders.deliver_due(datetime.now(UTC))
 
     async def _health_loop(self) -> None:

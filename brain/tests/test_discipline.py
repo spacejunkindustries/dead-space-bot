@@ -47,9 +47,7 @@ def make_config(
             watch_voice_channels=(9,),
             auto_join=True,
         ),
-        wake=WakeConfig(
-            phrase="aura command", model="wake.onnx", threshold=0.55, refractory_ms=2000
-        ),
+        wake=WakeConfig(model="wake.onnx", threshold=0.55, refractory_ms=2000),
         capture=CaptureConfig(
             preroll_ms=300, endpoint_silence_ms=400, max_utterance_ms=6000, vad_aggressiveness=2
         ),
@@ -84,11 +82,9 @@ def make_config(
             voice="voice.onnx",
             binary="/usr/local/bin/piper",
             max_utterance_s=3.0,
-            duck_to=0.6,
-            suppress_while_speech=True,
         ),
         gazetteer=GazetteerConfig(file="gazetteer.yaml", home_system="Otanuomi"),
-        ipc=IpcConfig(socket="/run/aura/aura.sock", buffer_seconds=60),
+        ipc=IpcConfig(socket="/run/aura/aura.sock"),
         health=HealthConfig(report_interval_min=60, voice_silence_alarm_s=60),
         database=DatabaseConfig(path=":memory:"),
     )

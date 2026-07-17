@@ -16,7 +16,6 @@ discord:
   auto_join: true
 
 wake:
-  phrase: "aura command"
   model:  ./dev-data/models/wake/aura_command.onnx
   threshold: 0.55
   refractory_ms: 2000
@@ -66,8 +65,6 @@ tts:
   voice: ./dev-data/models/piper/en_US-amy-medium.onnx
   binary: /usr/local/bin/piper
   max_utterance_s: 3
-  duck_to: 0.6
-  suppress_while_speech: true
 
 gazetteer:
   file: ./dev-data/gazetteer.yaml
@@ -75,7 +72,6 @@ gazetteer:
 
 ipc:
   socket: ./dev-data/aura.sock
-  buffer_seconds: 60
 
 health:
   report_interval_min: 60

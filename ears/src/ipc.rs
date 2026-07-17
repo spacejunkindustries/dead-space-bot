@@ -247,6 +247,26 @@ impl AudioRing {
         }
     }
 
+    /// Re-insert a frame at the front (oldest position). Used only to
+    /// restore a just-popped frame after a failed flush write so temporal
+    /// order is preserved across reconnects. Evicts from the back if over
+    /// capacity (evicting from the front would discard the frame being
+    /// restored); in practice the caller re-inserts a frame popped a moment
+    /// earlier, so eviction cannot fire.
+    pub fn push_front(&mut self, frame: Vec<u8>) {
+        self.bytes += frame.len();
+        self.frames.push_front(frame);
+        while self.bytes > self.capacity_bytes {
+            match self.frames.pop_back() {
+                Some(evicted) => self.bytes -= evicted.len(),
+                None => {
+                    self.bytes = 0;
+                    break;
+                },
+            }
+        }
+    }
+
     pub fn pop(&mut self) -> Option<Vec<u8>> {
         let frame = self.frames.pop_front()?;
         self.bytes -= frame.len();
@@ -371,7 +391,7 @@ async fn pump(
     }
     while let Some(frame) = ring.pop() {
         if let Err(e) = writer.write_all(&frame).await {
-            ring.push(frame); // keep what we couldn't send
+            ring.push_front(frame); // keep what we couldn't send, in order
             return Disconnect::Lost(format!("ring flush write: {e}"));
         }
     }
@@ -625,6 +645,21 @@ mod tests {
     fn ring_seconds_capacity() {
         let ring = AudioRing::with_seconds(60);
         assert_eq!(ring.capacity_bytes, 60 * 32_000);
+    }
+
+    #[test]
+    fn ring_push_front_preserves_order_after_failed_flush() {
+        let mut ring = AudioRing::with_capacity_bytes(1024);
+        for i in 0..3u8 {
+            ring.push(vec![i; 8]);
+        }
+        let popped = ring.pop().unwrap(); // simulate failed write of oldest
+        ring.push_front(popped);
+        for i in 0..3u8 {
+            assert_eq!(ring.pop(), Some(vec![i; 8]));
+        }
+        assert!(ring.is_empty());
+        assert_eq!(ring.bytes(), 0);
     }
 
     #[test]

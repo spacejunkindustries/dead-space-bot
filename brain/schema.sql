@@ -49,7 +49,9 @@ CREATE TABLE incidents (
     updated_at         TEXT NOT NULL,
     status             TEXT NOT NULL DEFAULT 'ACTIVE',
     message_id         INTEGER,
-    channel_id         INTEGER
+    channel_id         INTEGER,
+    raw_system_text    TEXT               -- transcript window that named the
+                                          -- system; alias key for [Wrong — fix]
 );
 CREATE INDEX idx_inc_active ON incidents(guild_id, status, system_id, type, opened_at);
 

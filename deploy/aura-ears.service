@@ -19,7 +19,9 @@ Wants=network-online.target aura-brain.service
 Type=simple
 User=aura
 Group=aura
-ExecStart=/opt/aura/bin/aura-ears --config /etc/aura/ears.yaml
+# The config path is positional argv[1], not a --config flag — see
+# ears/src/config.rs (DEFAULT_CONFIG_PATH / load).
+ExecStart=/opt/aura/bin/aura-ears /etc/aura/ears.yaml
 Restart=always
 RestartSec=5
 

@@ -227,7 +227,10 @@ class Speaker:
     def __init__(self, holder: ConfigHolder, ipc: IpcServer) -> None:
         self._holder = holder
         self._ipc = ipc
-        self._sample_rate = read_voice_sample_rate(holder.current.tts.voice)
+        # Cache the voice path with its rate so a SIGHUP voice swap refreshes
+        # the rate before the next WAV header is built (see _speak).
+        self._voice_path = holder.current.tts.voice
+        self._sample_rate = read_voice_sample_rate(self._voice_path)
         self._synth_lock = asyncio.Lock()
         self._queues: dict[int, asyncio.Queue[_SayJob]] = {}
         self._workers: dict[int, asyncio.Task[None]] = {}
@@ -236,7 +239,7 @@ class Speaker:
 
     @property
     def sample_rate(self) -> int:
-        """The voice's native output rate (from the ``.onnx.json`` config)."""
+        """The native output rate of the last-used voice (from ``.onnx.json``)."""
         return self._sample_rate
 
     # ── /mute-voice (GDD §12.2) ──────────────────────────────────────────────
@@ -367,6 +370,13 @@ class Speaker:
 
     async def _speak(self, guild_id: int, job: _SayJob) -> bool:
         cfg = self._holder.current.tts
+        if cfg.voice != self._voice_path:
+            # SIGHUP swapped the voice model: refresh the cached rate so the
+            # WAV header and duration check match the new voice. Safe to
+            # mutate here — _speak runs only inside per-guild workers and
+            # synthesis is serialised by _synth_lock.
+            self._sample_rate = await asyncio.to_thread(read_voice_sample_rate, cfg.voice)
+            self._voice_path = cfg.voice
         try:
             pcm = await self.synthesize(job.text)
         except SynthesisError as exc:

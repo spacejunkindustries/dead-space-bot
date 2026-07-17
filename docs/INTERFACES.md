@@ -136,7 +136,10 @@ class IncidentEngine:
     #   only on OTW transitions.
     async def correct_system(self, incident_id: int, user_id: int, system_id: int,
                              raw_text: str) -> IncidentOutcome
-    #   [Wrong — fix] path: updates card AND learns alias (§8.5).
+    #   [Wrong — fix] path: updates card AND learns alias (§8.5). An explicit
+    #   caller-supplied raw_text wins; when it is empty (button presses carry
+    #   no transcript) the alias key falls back to the incident row's stored
+    #   raw_system_text, so button corrections learn across restarts too.
     async def sweep_stale(self) -> list[int]     # ids marked STALE; called by a periodic task
     def build_prior_context(self, guild_id: int, reporter_id: int) -> PriorContext  # blocking
     def load_routing_rules(self, resolve_role: Callable[[str], int | None]) -> int  # blocking
@@ -210,7 +213,10 @@ class VadGate:
 class WakeDetector(Protocol):
     def score(self, user_id: int, frame: bytes) -> float     # 0..1, per-user state
     def reset(self, user_id: int) -> None
-class OpenWakeWordDetector(WakeDetector): ...                # openwakeword-backed
+class OpenWakeWordDetector(WakeDetector):
+    def __init__(self, holder: ConfigHolder) -> None         # reads holder.current.wake live
+#   Refractory suppression is owned by CaptureManager; a hit only clears the
+#   detector's per-user streaming state (pending bytes, held score, model).
 
 # capture.py — per-user state machine: preroll ring → wake hit → capture →
 # endpoint (silence) → emit. Ring buffers overwritten every ~1.5s; capture

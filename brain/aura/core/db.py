@@ -5,8 +5,13 @@ write volume, no concurrency pressure (GDD §14). Callers on the event loop
 MUST wrap every call in ``asyncio.to_thread`` (or a dedicated executor);
 nothing in this module is safe to run on the loop directly. Connections are
 created with ``check_same_thread=False`` so the ``to_thread`` worker pool can
-use them, but access must still be serialized by the caller — the incident
-engine funnels all writes through one path, which is the intended pattern.
+use them; the statement helpers below (:func:`execute`, :func:`executemany`,
+:func:`query`, :func:`query_one`, :func:`query_value`) serialize access to
+the shared connection internally with a module-level lock, so concurrent
+``to_thread`` workers from different components (engine, cogs, reminders,
+voice gateway) can never commit or roll back each other's in-flight statement.
+:func:`connect`/:func:`migrate`/:func:`backup` run in single-threaded contexts
+(startup, nightly job) and are not locked.
 
 Schema revisions are tracked with ``PRAGMA user_version``: each file in
 ``brain/migrations/`` is named ``NNNN_description.sql`` and, once applied,
@@ -18,6 +23,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -25,6 +31,10 @@ from typing import Any
 import structlog
 
 log = structlog.get_logger(__name__)
+
+#: Serializes every statement helper below across ``asyncio.to_thread``
+#: workers sharing the one ``check_same_thread=False`` connection.
+_CONN_LOCK = threading.Lock()
 
 #: Default migrations directory: brain/migrations/ relative to this file.
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
@@ -155,31 +165,34 @@ def _split_statements(sql: str) -> list[str]:
 
 def execute(conn: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> int:
     """Run a single INSERT/UPDATE/DELETE and commit. Returns ``lastrowid``."""
-    with conn:
+    with _CONN_LOCK, conn:
         cur = conn.execute(sql, params)
-    return int(cur.lastrowid or 0)
+        return int(cur.lastrowid or 0)
 
 
 def executemany(conn: sqlite3.Connection, sql: str, seq_of_params: Sequence[Sequence[Any]]) -> int:
     """Run a batched write and commit. Returns the affected row count."""
-    with conn:
+    with _CONN_LOCK, conn:
         cur = conn.executemany(sql, seq_of_params)
-    return int(cur.rowcount)
+        return int(cur.rowcount)
 
 
 def query(conn: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
     """Run a SELECT and return all rows (as :class:`sqlite3.Row`)."""
-    return conn.execute(sql, params).fetchall()
+    with _CONN_LOCK:
+        return conn.execute(sql, params).fetchall()
 
 
 def query_one(conn: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
     """Run a SELECT and return the first row, or None."""
-    return conn.execute(sql, params).fetchone()
+    with _CONN_LOCK:
+        return conn.execute(sql, params).fetchone()
 
 
 def query_value(conn: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> Any:
     """Run a SELECT returning a single scalar (first column of first row), or None."""
-    row = conn.execute(sql, params).fetchone()
+    with _CONN_LOCK:
+        row = conn.execute(sql, params).fetchone()
     return None if row is None else row[0]
 
 

@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
+from aura import tts
 from aura.config import ConfigHolder
 from aura.core import db
 from aura.core.discipline import Discipline
@@ -44,6 +45,7 @@ from aura.core.routing import load_rules as load_routing_rules_file
 from aura.core.routing import suppress as suppress_decision
 from aura.types import (
     INTENT_SEVERITY,
+    MENTION_INTENTS,
     AlertChannel,
     ButtonSpec,
     CardRender,
@@ -116,10 +118,10 @@ _NUMBER_WORDS: dict[int, str] = {
     12: "Twelve",
 }
 
-#: Intents that open (or fold into) an incident card.
-_REPORT_INTENTS = frozenset(
-    {Intent.HOSTILE_SPOTTED, Intent.UNDER_ATTACK, Intent.ASSIST_REQUEST, Intent.GATE_CAMP}
-)
+#: Intents that open (or fold into) an incident card — exactly the
+#: mention-bearing set (aura.types.MENTION_INTENTS), shared so the report/gate
+#: sets cannot silently diverge.
+_REPORT_INTENTS = MENTION_INTENTS
 
 
 class Poster(Protocol):
@@ -236,14 +238,56 @@ def parse_duration(text: str) -> timedelta | None:
     return timedelta(seconds=total)
 
 
+_DURATION_ONES: tuple[str, ...] = (
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+)
+
+_DURATION_TENS: dict[int, str] = {20: "twenty", 30: "thirty", 40: "forty", 50: "fifty"}
+
+
+def _duration_word(n: int) -> str:
+    """Lowercase number words for spoken durations (§12.1): 0–20 plus tens
+    compounds up to fifty nine — the vocabulary ``parse_duration`` accepts.
+    Anything larger falls back to digits."""
+    if 0 <= n <= 20:
+        return _DURATION_ONES[n]
+    if 20 < n < 60:
+        tens, ones = divmod(n, 10)
+        word = _DURATION_TENS[tens * 10]
+        return f"{word} {_DURATION_ONES[ones]}" if ones else word
+    return str(n)
+
+
 def _format_duration(delta: timedelta) -> str:
+    """Spoken duration, worded per the §12.1 catalogue: "four hours",
+    "one hour thirty minutes", "fifteen minutes"."""
     minutes = int(delta.total_seconds() // 60)
     hours, mins = divmod(minutes, 60)
     parts: list[str] = []
     if hours:
-        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+        parts.append(f"{_duration_word(hours)} hour{'s' if hours != 1 else ''}")
     if mins or not parts:
-        parts.append(f"{mins} minute{'s' if mins != 1 else ''}")
+        parts.append(f"{_duration_word(mins)} minute{'s' if mins != 1 else ''}")
     return " ".join(parts)
 
 
@@ -427,12 +471,17 @@ class IncidentEngine:
         discipline: Discipline,
         poster: Poster,
         rules_path: str | Path,
+        *,
+        on_mention: Callable[[], None] | None = None,
     ) -> None:
         self._conn = conn
         self._holder = holder
         self._gazetteer = gazetteer
         self._discipline = discipline
         self._poster = poster
+        # Fired once per mention actually sent (health counter); optional so
+        # the engine stays decoupled from HealthReporter.
+        self._on_mention = on_mention
         self._rules_path = Path(rules_path)
         self._rules: list[RoutingRule] = []
         self._alias_roles: dict[str, int] = {}
@@ -604,8 +653,8 @@ class IncidentEngine:
             db.execute,
             self._conn,
             "INSERT INTO incidents (guild_id, system_id, system_confidence, type, severity,"
-            " reporter_id, detail, opened_at, updated_at, status)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')",
+            " reporter_id, detail, opened_at, updated_at, status, raw_system_text)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
             (
                 guild_id,
                 best.system_id,
@@ -616,6 +665,9 @@ class IncidentEngine:
                 parsed.detail,
                 _iso(now),
                 _iso(now),
+                # The transcript window that named the system (§8.5): survives
+                # restarts so a later [Wrong — fix] press can learn the alias.
+                parsed.system_text,
             ),
         )
         incident = await asyncio.to_thread(_load_incident, self._conn, incident_id)
@@ -629,6 +681,8 @@ class IncidentEngine:
         if mentions_wanted:
             if self._discipline.allow_mention(reporter_id, now):
                 self._discipline.record_mention(reporter_id, now)
+                if self._on_mention is not None:
+                    self._on_mention()
             else:
                 decision = suppress_decision(decision)
                 flood_announced = self._discipline.should_announce_flood(now)
@@ -811,14 +865,28 @@ class IncidentEngine:
     async def correct_system(
         self, incident_id: int, user_id: int, system_id: int, raw_text: str
     ) -> IncidentOutcome:
-        """Apply a human correction: update the card AND learn the alias."""
+        """Apply a human correction: update the card AND learn the alias.
+
+        An explicit ``raw_text`` (a caller-supplied transcript) wins; when it
+        is empty — the pick/fix buttons carry no transcript — the alias key
+        falls back to the ``raw_system_text`` stored with the incident when it
+        opened, so button corrections still learn (§8.5), even after a
+        restart (the buttons are restart-proof, GDD §9.3).
+        """
         async with self._lock:
             now = self._clock()
-            alias_key = raw_text.strip().lower()
 
-            def _correct() -> Incident | None:
+            def _correct() -> tuple[Incident | None, str] | None:
                 if _load_incident(self._conn, incident_id) is None:
                     return None
+                alias_key = raw_text.strip().lower()
+                if not alias_key:
+                    stored = db.query_value(
+                        self._conn,
+                        "SELECT raw_system_text FROM incidents WHERE id = ?",
+                        (incident_id,),
+                    )
+                    alias_key = (stored or "").strip().lower()
                 db.execute(
                     self._conn,
                     "UPDATE incidents SET system_id = ?, system_confidence = 1.0,"
@@ -835,9 +903,9 @@ class IncidentEngine:
                         " corrected_by = excluded.corrected_by",
                         (alias_key, system_id, _iso(now), user_id),
                     )
-                return _load_incident(self._conn, incident_id)
+                return _load_incident(self._conn, incident_id), alias_key
 
-            incident = await asyncio.to_thread(_correct)
+            incident, learned_alias = await asyncio.to_thread(_correct) or (None, "")
             if incident is None:
                 return IncidentOutcome(Outcome.REJECTED, None, None, None)
             self._pending_candidates.pop(incident_id, None)
@@ -849,7 +917,7 @@ class IncidentEngine:
                 "system_corrected",
                 incident_id=incident_id,
                 system=system_name,
-                alias=alias_key,
+                alias=learned_alias,
                 user_id=user_id,
             )
             return IncidentOutcome(
@@ -917,7 +985,7 @@ class IncidentEngine:
                 system=system_name,
                 fires_at=_iso(fires_at),
             )
-            utterance = f"Timer {system_name}, {_format_duration(duration)}."
+            utterance = tts.timer_set(system_name, _format_duration(duration))
             return IncidentOutcome(Outcome.POSTED, utterance, None, None)
 
     async def _create_formup(

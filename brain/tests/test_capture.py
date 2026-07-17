@@ -113,9 +113,7 @@ def make_config() -> AuraConfig:
             watch_voice_channels=(9,),
             auto_join=True,
         ),
-        wake=WakeConfig(
-            phrase="aura command", model="wake.onnx", threshold=0.55, refractory_ms=2000
-        ),
+        wake=WakeConfig(model="wake.onnx", threshold=0.55, refractory_ms=2000),
         capture=CaptureConfig(
             preroll_ms=300, endpoint_silence_ms=400, max_utterance_ms=6000, vad_aggressiveness=2
         ),
@@ -150,11 +148,9 @@ def make_config() -> AuraConfig:
             voice="voice.onnx",
             binary="/usr/local/bin/piper",
             max_utterance_s=3.0,
-            duck_to=0.6,
-            suppress_while_speech=True,
         ),
         gazetteer=GazetteerConfig(file="gazetteer.yaml", home_system="Otanuomi"),
-        ipc=IpcConfig(socket="/run/aura/aura.sock", buffer_seconds=60),
+        ipc=IpcConfig(socket="/run/aura/aura.sock"),
         health=HealthConfig(report_interval_min=60, voice_silence_alarm_s=60),
         database=DatabaseConfig(path=":memory:"),
     )
@@ -413,6 +409,38 @@ async def test_malformed_frame_is_dropped() -> None:
     await settle()
     assert len(recorder.emitted) == 1
     assert recorder.emitted[0][2] == b"".join([MARKER] + [SILENCE] * ENDPOINT_FRAMES)
+
+
+async def test_single_refractory_window_with_real_detector() -> None:
+    """Composed regression (single refractory owner): with the real
+    OpenWakeWordDetector plugged in, a wake attempt succeeds on the first
+    speech frames after ``burn_refractory`` — the detector must not stack a
+    second refractory window on top of the capture layer's."""
+    from aura.audio.wake import OpenWakeWordDetector
+
+    recorder = Recorder()
+    holder = StubHolder(make_config())
+    detector = OpenWakeWordDetector(holder)  # type: ignore[arg-type]
+    detector._predict_chunk = lambda state, chunk: 0.9  # type: ignore[method-assign]
+    manager = CaptureManager(
+        holder,  # type: ignore[arg-type]
+        FakeVad(),  # type: ignore[arg-type]
+        detector,
+        recorder,
+    )
+
+    # First utterance: four speech frames form a chunk, hit, capture, endpoint.
+    feed_all(manager, USER_A, [speech(1500)] * 4)
+    assert manager.is_capturing(USER_A)
+    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    await settle()
+    assert len(recorder.emitted) == 1
+
+    # Exactly one refractory window (capture.py's): the first speech frames
+    # after it must be scored and hit again immediately.
+    burn_refractory(manager, USER_A)
+    feed_all(manager, USER_A, [speech(1500)] * 4)
+    assert manager.is_capturing(USER_A)
 
 
 def test_emit_works_without_a_running_event_loop() -> None:

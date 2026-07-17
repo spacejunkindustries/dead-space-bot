@@ -33,6 +33,7 @@ from aura.config import (
 from aura.core import db
 from aura.core.discipline import Discipline
 from aura.core.incidents import IncidentEngine, parse_duration
+from aura.nlu import phonetics
 from aura.types import (
     AlertChannel,
     CardRender,
@@ -40,6 +41,7 @@ from aura.types import (
     MatchCandidate,
     Outcome,
     ParsedCommand,
+    PriorContext,
     Resolution,
     ResponderState,
     SystemEntry,
@@ -97,9 +99,7 @@ def make_config(
             watch_voice_channels=(9,),
             auto_join=True,
         ),
-        wake=WakeConfig(
-            phrase="aura command", model="wake.onnx", threshold=0.55, refractory_ms=2000
-        ),
+        wake=WakeConfig(model="wake.onnx", threshold=0.55, refractory_ms=2000),
         capture=CaptureConfig(
             preroll_ms=300, endpoint_silence_ms=400, max_utterance_ms=6000, vad_aggressiveness=2
         ),
@@ -138,11 +138,9 @@ def make_config(
             voice="voice.onnx",
             binary="/usr/local/bin/piper",
             max_utterance_s=3.0,
-            duck_to=0.6,
-            suppress_while_speech=True,
         ),
         gazetteer=GazetteerConfig(file="gazetteer.yaml", home_system="Otanuomi"),
-        ipc=IpcConfig(socket="/run/aura/aura.sock", buffer_seconds=60),
+        ipc=IpcConfig(socket="/run/aura/aura.sock"),
         health=HealthConfig(report_interval_min=60, voice_silence_alarm_s=60),
         database=DatabaseConfig(path=":memory:"),
     )
@@ -225,7 +223,7 @@ class Env:
 
 @pytest.fixture()
 def make_env(tmp_path: Path) -> Callable[..., Env]:
-    def _make(**cfg_overrides: int) -> Env:
+    def _make(on_mention: Callable[[], None] | None = None, **cfg_overrides: int) -> Env:
         conn = db.connect(":memory:")
         db.migrate(conn)
         db.executemany(
@@ -253,6 +251,7 @@ def make_env(tmp_path: Path) -> Callable[..., Env]:
             discipline,
             poster,
             rules_path,
+            on_mention=on_mention,
         )
         engine.load_routing_rules(ROLE_IDS.get)
         clock = Clock(T0)
@@ -634,7 +633,7 @@ async def test_timer_created_and_fires_when_due(make_env: Callable[..., Env]) ->
         GUILD, 42, cmd(Intent.TIMER, detail="four hours"), high(2, "Kisogo")
     )
     assert out.outcome is Outcome.POSTED
-    assert out.utterance == "Timer Kisogo, 4 hours."
+    assert out.utterance == "Timer Kisogo, four hours."  # §12.1 catalogue string
     assert env.poster.posts == []  # timers schedule a ping, no card
     row = db.query_one(env.conn, "SELECT * FROM timers")
     assert row is not None
@@ -649,6 +648,14 @@ async def test_timer_created_and_fires_when_due(make_env: Callable[..., Env]) ->
     assert pings[0].guild_id == GUILD
     assert pings[0].created_by == 42
     assert await env.engine.fire_due_timers(T0 + timedelta(hours=5)) == []  # fired once
+
+
+async def test_timer_mixed_duration_spoken_in_words(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    out = await env.engine.report(
+        GUILD, 42, cmd(Intent.TIMER, detail="90 minutes"), high(2, "Kisogo")
+    )
+    assert out.utterance == "Timer Kisogo, one hour thirty minutes."
 
 
 async def test_timer_without_duration_rejected(make_env: Callable[..., Env]) -> None:
@@ -667,7 +674,7 @@ async def test_formup_posts_op_card_with_rsvp(make_env: Callable[..., Env]) -> N
         GUILD, 42, cmd(Intent.FORMUP, detail="fifteen minutes"), high(1, "Otanuomi")
     )
     assert out.outcome is Outcome.POSTED
-    assert out.utterance == "Form up Otanuomi, 15 minutes."
+    assert out.utterance == "Form up Otanuomi, fifteen minutes."
     assert out.incident_id is not None
     _, channel, content, card = env.poster.posts[0]
     assert channel is AlertChannel.LIVE
@@ -721,6 +728,103 @@ async def test_correct_system_updates_card_and_learns_alias(
     _, _, _, card = env.poster.edits[-1]
     assert field_value(card, "System") == "Kisogo"
     assert all(":pick:" not in cid for cid in custom_ids(card))  # confirmed now
+
+
+async def test_button_correction_learns_alias_from_stored_transcript(
+    make_env: Callable[..., Env],
+) -> None:
+    """§8.5 via the pick/fix buttons: raw_text="" falls back to the incident's
+    stored raw_system_text, and the learned alias resolves at HIGH next time."""
+    env = make_env()
+    parsed = ParsedCommand(
+        intent=Intent.HOSTILE_SPOTTED,
+        system_text="oh tan you oh me",
+        group_alias=None,
+        detail=None,
+        raw="hostiles oh tan you oh me",
+    )
+    posted = await env.engine.report(GUILD, 42, parsed, medium())
+    assert posted.outcome is Outcome.ASKED
+    row = db.query_one(
+        env.conn, "SELECT raw_system_text FROM incidents WHERE id = ?", (posted.incident_id,)
+    )
+    assert row["raw_system_text"] == "oh tan you oh me"
+
+    out = await env.engine.correct_system(posted.incident_id, 55, 2, raw_text="")
+    assert out.outcome is Outcome.POSTED
+    alias = db.query_one(
+        env.conn, "SELECT * FROM aliases WHERE raw_text = ?", ("oh tan you oh me",)
+    )
+    assert alias is not None
+    assert alias["system_id"] == 2
+    assert alias["corrected_by"] == 55
+
+    # The live resolve path now alias-hits at full confidence (HIGH tier).
+    resolution = phonetics.resolve(
+        "oh tan you oh me",
+        env.engine._gazetteer,  # noqa: SLF001 — same fake the engine renders with
+        PriorContext(),
+        make_config().matching,
+        env.conn,
+    )
+    assert resolution.tier is Tier.HIGH
+    assert resolution.best is not None
+    assert resolution.best.system_id == 2
+
+
+async def test_button_correction_without_stored_transcript_writes_no_alias(
+    make_env: Callable[..., Env],
+) -> None:
+    """A pre-migration incident (raw_system_text NULL) still gets its card
+    corrected; no alias row is invented."""
+    env = make_env()
+    posted = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), medium())
+    db.execute(
+        env.conn,
+        "UPDATE incidents SET raw_system_text = NULL WHERE id = ?",
+        (posted.incident_id,),
+    )
+    out = await env.engine.correct_system(posted.incident_id, 55, 2, raw_text="")
+    assert out.outcome is Outcome.POSTED
+    row = db.query_one(
+        env.conn, "SELECT system_id FROM incidents WHERE id = ?", (posted.incident_id,)
+    )
+    assert row["system_id"] == 2
+    assert db.query(env.conn, "SELECT * FROM aliases") == []
+
+
+async def test_explicit_raw_text_beats_stored_transcript(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    parsed = ParsedCommand(
+        intent=Intent.HOSTILE_SPOTTED,
+        system_text="stored window",
+        group_alias=None,
+        detail=None,
+        raw="hostiles stored window",
+    )
+    posted = await env.engine.report(GUILD, 42, parsed, medium())
+    await env.engine.correct_system(posted.incident_id, 55, 2, raw_text="caller supplied")
+    assert db.query_one(env.conn, "SELECT * FROM aliases WHERE raw_text = 'caller supplied'")
+    assert db.query_one(env.conn, "SELECT * FROM aliases WHERE raw_text = 'stored window'") is None
+
+
+async def test_on_mention_callback_fires_only_when_mentions_send(
+    make_env: Callable[..., Env],
+) -> None:
+    """The injected mention counter fires once per mention actually sent and
+    stays silent when discipline suppresses (health 'Mentions' field wiring)."""
+    calls: list[None] = []
+    env = make_env(on_mention=lambda: calls.append(None))
+    await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    assert len(calls) == 1
+    env.clock.advance(5)  # inside the 30s per-user cooldown → suppressed
+    await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(2, "Kisogo"))
+    assert len(calls) == 1
+    # Non-mention intents never fire it.
+    await env.engine.report(GUILD, 42, cmd(Intent.TIMER, detail="1h"), high(2, "Kisogo"))
+    assert len(calls) == 1
 
 
 async def test_build_prior_context(make_env: Callable[..., Env]) -> None:

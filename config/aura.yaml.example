@@ -20,7 +20,8 @@ discord:
   auto_join: true                      # join when a pilot enters, leave when empty
 
 wake:
-  phrase: "aura command"               # >=6 phonemes, never said naturally on comms (GDD §5.2)
+  # The phrase itself ("aura command", GDD §5.2) is baked into the trained
+  # model below — changing it means training a new model, not editing config.
   model:  /opt/aura/models/wake/aura_command.onnx  # trained openWakeWord ONNX chain
   threshold: 0.55                      # wake score needed to open a capture window
   refractory_ms: 2000                  # per-user dead time after a wake hit
@@ -70,8 +71,8 @@ tts:
   voice: /opt/aura/models/piper/en_US-amy-medium.onnx  # Piper voice model
   binary: /usr/local/bin/piper         # Piper invoked as a subprocess (GDD §12 license note)
   max_utterance_s: 3                   # hard cap; longer text goes to the channel instead
-  duck_to: 0.6                         # playback volume relative to speakers
-  suppress_while_speech: true          # never talk over active speech; queue instead
+  # Ducking (60%) and talk-over suppression are fixed playback mechanics in
+  # Ears (ears/src/playback.rs, GDD §12.2) — not tunables.
 
 gazetteer:
   file: /etc/aura/gazetteer.yaml       # region allowlist + always-include list (GDD §8.1)
@@ -79,7 +80,8 @@ gazetteer:
 
 ipc:
   socket: /run/aura/aura.sock          # Brain binds; Ears connects (GDD §15)
-  buffer_seconds: 60                   # Ears' outbound ring buffer across Brain restarts
+  # Ears' outbound ring size (buffer_seconds) lives in /etc/aura/ears.yaml —
+  # the ring must survive Brain restarts, so Brain cannot own that knob.
 
 health:
   report_interval_min: 60              # cadence of #bot-health self-reports

@@ -263,8 +263,9 @@ async def dispatch_incident_action(
         return
 
     # pick:{system_id} — confirm a MEDIUM-tier candidate. The engine updates
-    # the card in place; alias learning needs the misheard raw text, which a
-    # button press does not carry, so raw_text is empty here (no alias row).
+    # the card in place; the button press carries no transcript, so raw_text
+    # is empty and the engine falls back to the incident's stored
+    # raw_system_text as the alias key (§8.5 — learning works across restarts).
     assert action.system_id is not None
     outcome = await bot.engine.correct_system(
         action.incident_id, interaction.user.id, action.system_id, raw_text=""
@@ -300,13 +301,16 @@ async def dispatch_subscription_toggle(
         return
 
     subscribed = role in member.roles
+    # Acknowledge BEFORE the role mutation: add/remove_roles can sleep on a
+    # rate-limit bucket past the 3-second initial-response window.
+    await interaction.response.defer()
     try:
         if subscribed:
             await member.remove_roles(role, reason="AURA /subscribe toggle")
         else:
             await member.add_roles(role, reason="AURA /subscribe toggle")
     except discord.Forbidden:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"I can't manage **{role.name}** — my role must sit above it and I need "
             "the Manage Roles permission (GDD §17.4). Ask an admin to reorder the roles.",
             ephemeral=True,
@@ -316,7 +320,9 @@ async def dispatch_subscription_toggle(
     new_role_ids = {r.id for r in member.roles} ^ {role.id}
     view = SubscriptionView(bot.subscription_role_pairs(guild), new_role_ids)
     verb = "Unsubscribed from" if subscribed else "Subscribed to"
-    await interaction.response.edit_message(
+    # defer() on a component interaction is a deferred message update, so this
+    # edits the same picker message the button lives on.
+    await interaction.edit_original_response(
         content=f"{verb} **{role.name}**. Toggle your subscriptions:", view=view
     )
     log.info(

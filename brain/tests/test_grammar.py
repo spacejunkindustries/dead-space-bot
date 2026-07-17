@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from aura.nlu.grammar import parse
+from aura.nlu.grammar import parse, system_reply
 from aura.types import Intent
 
 # ── the nine GDD §6.4 examples ───────────────────────────────────────────────
@@ -178,3 +178,22 @@ def test_hostiles_without_system() -> None:
     assert cmd is not None
     assert cmd.intent is Intent.HOSTILE_SPOTTED
     assert cmd.system_text is None
+
+
+# ── system_reply (GDD §8.3 "say again" retry window) ─────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("transcript", "expected"),
+    [
+        ("Kisogo", "Kisogo"),
+        ("in Kisogo", "Kisogo"),
+        ("Aura Command, Kisogo", "Kisogo"),
+        ("uh, Otanuomi", "Otanuomi"),
+        ("", None),
+        ("   ", None),
+        ("um uh", None),
+    ],
+)
+def test_system_reply_normalises_bare_names(transcript: str, expected: str | None) -> None:
+    assert system_reply(transcript) == expected
