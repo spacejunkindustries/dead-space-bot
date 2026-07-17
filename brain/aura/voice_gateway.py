@@ -10,9 +10,11 @@ via IPC control messages (GDD §15, ids as strings):
     {"t": "optouts", "user_ids": ["…", …]}
 
 No discord import here — the dsc layer feeds :meth:`on_voice_update` with
-``(channel_id, human_count)`` whenever a watched channel's unmuted human
-census changes, and supplies an async ``announce_fn(channel_id)`` used for
-the §19 consent announcement, posted **every single time** AURA joins.
+``(channel_id, present_count, unmuted_count)`` whenever a watched channel's
+census changes: presence (mute-agnostic) drives join/leave so AURA stays with
+a muted-but-present pilot, and the unmuted count feeds the §20 silence alarm.
+The dsc layer also supplies an async ``announce_fn(channel_id)`` used for the
+§19 consent announcement, posted **every single time** AURA joins.
 
 Joins are debounced (5 s): a pilot popping into an empty channel and
 straight back out must not drag the bot in and out behind them. Leaves are
@@ -85,7 +87,8 @@ class VoiceGateway:
         self._joined_channel_id: int | None = None
         self._pending_join: asyncio.Task[None] | None = None
         self._pending_channel_id: int | None = None
-        self._counts: dict[int, int] = {}
+        self._counts: dict[int, int] = {}  # present (mute-agnostic) → join/leave
+        self._unmuted: dict[int, int] = {}  # unmuted → §20 silence alarm
         self._lock = asyncio.Lock()
         self._on_census: Callable[[int], None] | None = None
 
@@ -103,24 +106,34 @@ class VoiceGateway:
 
     # ── inbound events ───────────────────────────────────────────────────────
 
-    async def on_voice_update(self, channel_id: int, human_count: int) -> None:
-        """The unmuted human census of ``channel_id`` changed.
+    async def on_voice_update(
+        self, channel_id: int, present_count: int, unmuted_count: int | None = None
+    ) -> None:
+        """A watched channel's census changed.
+
+        ``present_count`` is every non-bot human in the channel (mute-agnostic)
+        and drives auto-join/leave: AURA stays with a pilot who sits muted until
+        they need to talk. ``unmuted_count`` (defaults to ``present_count`` when
+        omitted) feeds the §20 voice-silence alarm via the census listener.
 
         The dsc layer calls this for watched channels only, on every relevant
         voice-state event; calls are idempotent and cheap.
         """
+        if unmuted_count is None:
+            unmuted_count = present_count
         cfg = self._holder.current.discord
         if channel_id not in cfg.watch_voice_channels:
             return
         async with self._lock:
-            self._counts[channel_id] = human_count
+            self._counts[channel_id] = present_count
+            self._unmuted[channel_id] = unmuted_count
             if channel_id == self._joined_channel_id and self._on_census is not None:
-                self._on_census(human_count)
+                self._on_census(unmuted_count)
 
             if not cfg.auto_join:
                 return
 
-            if human_count > 0:
+            if present_count > 0:
                 if self._joined_channel_id == channel_id:
                     return  # already there
                 if self._pending_channel_id == channel_id:
@@ -202,7 +215,7 @@ class VoiceGateway:
         )
         self._joined_channel_id = channel_id
         if self._on_census is not None:
-            self._on_census(self._counts.get(channel_id, 0))
+            self._on_census(self._unmuted.get(channel_id, 0))
         log.info("voice_join_sent", channel_id=channel_id)
         try:
             await self.push_optouts()
