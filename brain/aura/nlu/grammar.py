@@ -47,6 +47,42 @@ _WAKE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# STT mishearings of the jargon trigger words, normalized to the canonical
+# spelling *before* intent matching. STT errors on EVE/military vocabulary are
+# phonetic and routine (GDD §8.6) — "hostiles" comes back as "hustiles",
+# "hostels", "ostiles" — and a fixed grammar that only accepts the exact word
+# throws the command away. This is fixed-grammar normalization, not an LLM
+# (constraint 6): a small, auditable table of the words STT actually produces.
+# Extend it from the command_log when a real mishearing slips through.
+_JARGON_NORMALIZE: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"\b(?:hustiles?|hostels?|hostals?|hostals?|ostiles?|hostiels?|hostials?|"
+            r"hastiles?|haustiles?|hostilds?|hostvilles?)\b",
+            re.I,
+        ),
+        "hostiles",
+    ),
+    (re.compile(r"\b(?:newts?|nutes?|noots?|neutes?|knutes?)\b", re.I), "neuts"),
+    (re.compile(r"\b(?:tickled|tackle)\b", re.I), "tackled"),
+    (re.compile(r"\b(?:gatecamp|gate\s*champ|gate\s*camps?)\b", re.I), "gate camp"),
+)
+
+# Radio sign-off at the tail of an utterance ("...three battleships, over").
+# "over"/"out" are the pilot's cue that they are done talking; they are not
+# part of the report, so they are stripped before parsing (the trailing
+# silence after them is what actually ends the capture).
+_SIGNOFF_RE = re.compile(
+    r"[\s,.;:!?-]*\b(?:over\s+and\s+out|over|out|copy|roger)\b[\s,.;:!?-]*$", re.I
+)
+
+
+def _normalize_jargon(text: str) -> str:
+    for pattern, canonical in _JARGON_NORMALIZE:
+        text = pattern.sub(canonical, text)
+    return text
+
+
 # Intent patterns in match-priority order (GDD §6.1): the higher-severity
 # pattern wins regardless of position in the utterance. The personal-ping
 # intents sit above the type words because their utterances *contain* type
@@ -272,6 +308,7 @@ def system_reply(transcript: str) -> str | None:
     if not transcript or not transcript.strip():
         return None
     work = _WAKE_RE.sub("", transcript, count=1)
+    work = _SIGNOFF_RE.sub("", work)
     cleaned = _strip_filler(work.strip(" ,.;:!?-"))
     return cleaned or None
 
@@ -282,6 +319,8 @@ def parse(transcript: str) -> ParsedCommand | None:
     if not transcript or not transcript.strip():
         return None
     work = _WAKE_RE.sub("", transcript, count=1)
+    work = _SIGNOFF_RE.sub("", work)
+    work = _normalize_jargon(work)
 
     intent: Intent | None = None
     match: re.Match[str] | None = None

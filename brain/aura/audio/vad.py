@@ -65,9 +65,15 @@ class EndpointTracker:
     """Tracks consecutive silence duration for utterance endpointing (GDD §5).
 
     Feed one VAD verdict per 20 ms frame via :meth:`update`; it returns True
-    once ``silence_ms`` of *uninterrupted* silence has accumulated. Any speech
-    frame resets the run. Time is derived purely from frame count — 20 ms per
-    update — so the tracker is fully deterministic.
+    once ``silence_ms`` of *uninterrupted* silence has accumulated **after at
+    least one speech frame has been seen**. Any speech frame resets the run.
+    Time is derived purely from frame count — 20 ms per update — so the tracker
+    is fully deterministic.
+
+    The "speech seen first" rule is what makes the spoken "go ahead" cue safe:
+    a pilot who waits for the acknowledgement before talking opens the capture
+    with a stretch of leading silence, and without this guard that silence
+    would endpoint the utterance before a word was said (GDD §5).
     """
 
     def __init__(self, silence_ms: int, frame_ms: int = FRAME_MS) -> None:
@@ -78,6 +84,7 @@ class EndpointTracker:
         self._limit_frames = max(1, silence_ms // frame_ms)
         self._frame_ms = frame_ms
         self._silent_frames = 0
+        self._speech_seen = False
 
     @property
     def silence_ms(self) -> int:
@@ -85,12 +92,18 @@ class EndpointTracker:
         return self._silent_frames * self._frame_ms
 
     def update(self, is_speech: bool) -> bool:
-        """Record one frame's verdict; True when the silence endpoint is reached."""
+        """Record one frame's verdict; True when the silence endpoint is reached.
+
+        Leading silence (before the pilot starts speaking) never endpoints —
+        only ``silence_ms`` of quiet *following* speech does.
+        """
         if is_speech:
+            self._speech_seen = True
             self._silent_frames = 0
         else:
             self._silent_frames += 1
-        return self._silent_frames >= self._limit_frames
+        return self._speech_seen and self._silent_frames >= self._limit_frames
 
     def reset(self) -> None:
         self._silent_frames = 0
+        self._speech_seen = False

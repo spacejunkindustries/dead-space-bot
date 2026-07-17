@@ -146,6 +146,9 @@ class App:
         self.reminders: ReminderService | None = None
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
+        # Fire-and-forget spoken cues (the "go ahead" ack); kept referenced so
+        # they are not garbage-collected mid-flight.
+        self._voice_tasks: set[asyncio.Task[None]] = set()
         # LOW-tier "say again" retry state (GDD §8.3): user_id → (the rejected
         # command, wall-clock deadline). The next utterance from that user may
         # be a bare system name that re-binds to the rejected intent.
@@ -171,11 +174,20 @@ class App:
         self.speaker = Speaker(self.holder, self.ipc)
 
         self.transcriber = await asyncio.to_thread(make_transcriber, cfg.stt)
+        # Load the Whisper weights now, off the request path: the first real
+        # utterance must not pay the model load inside the STT watchdog (that
+        # loop never produced a transcript on a 2-vCPU box).
+        warm = getattr(self.transcriber, "warm", None)
+        if callable(warm):
+            await asyncio.to_thread(warm)
+            log.info("stt_model_warmed", model=cfg.stt.model)
         vad = VadGate(cfg.capture.vad_aggressiveness)
         # The detector reads holder.current at the point of use (config.py
         # contract) so SIGHUP retunes apply to it and CaptureManager alike.
         wake = await asyncio.to_thread(OpenWakeWordDetector, self.holder)
-        self.capture = CaptureManager(self.holder, vad, wake, self._on_utterance)
+        self.capture = CaptureManager(
+            self.holder, vad, wake, self._on_utterance, self._on_capture_start
+        )
 
         # Health before the engine: the engine reports mentions into it.
         self.health = HealthReporter(self.holder, self._post_health)
@@ -294,6 +306,21 @@ class App:
             self.health.note_audio()
         if self.capture is not None:
             self.capture.feed(user_id, guild_id, pcm)
+
+    def _on_capture_start(self, user_id: int, guild_id: int) -> None:
+        """Wake fired — speak "go ahead" so the pilot knows AURA is listening.
+
+        Sync hot-path callback: it only schedules the spoken cue as a task, so
+        the audio thread never blocks. ALERT priority jumps the queue ahead of
+        any pending confirmations. AURA never captures its own playback, so the
+        cue cannot bleed into the utterance being recorded."""
+        if self.speaker is None:
+            return
+        task = asyncio.create_task(
+            self.speaker.say(guild_id, tts_mod.go_ahead(), PRIORITY_ALERT, user_id=user_id)
+        )
+        self._voice_tasks.add(task)
+        task.add_done_callback(self._voice_tasks.discard)
 
     async def _on_control(self, msg: dict[str, Any]) -> None:
         t = msg.get("t")

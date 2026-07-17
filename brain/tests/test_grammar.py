@@ -392,3 +392,52 @@ def test_sanitize_callsign_preserves_typed_case() -> None:
 )
 def test_system_reply_normalises_bare_names(transcript: str, expected: str | None) -> None:
     assert system_reply(transcript) == expected
+
+
+# ── STT mishearing tolerance + radio sign-off (voice UX fixes) ────────────────
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "hustiles Jita",
+        "Hustiles, Jita",
+        "hostels jita",
+        "ostiles jita",
+    ],
+)
+def test_hostiles_mishearings_normalize(transcript: str) -> None:
+    parsed = parse(transcript)
+    assert parsed is not None
+    assert parsed.intent is Intent.HOSTILE_SPOTTED
+    assert parsed.system_text is not None
+
+
+def test_neuts_mishearing_normalizes() -> None:
+    parsed = parse("newts in Amarr")
+    assert parsed is not None
+    assert parsed.intent is Intent.HOSTILE_SPOTTED
+
+
+def test_gate_camp_mishearing_normalizes() -> None:
+    parsed = parse("gate champ Otanuomi")
+    assert parsed is not None
+    assert parsed.intent is Intent.GATE_CAMP
+
+
+@pytest.mark.parametrize("signoff", ["over", "out", "over and out", "copy", "roger"])
+def test_radio_signoff_stripped(signoff: str) -> None:
+    parsed = parse(f"under attack Kisogo {signoff}")
+    assert parsed is not None
+    assert parsed.intent is Intent.UNDER_ATTACK
+    assert parsed.system_text == "Kisogo"
+    # the sign-off word never survives into the report
+    assert signoff.split()[0] not in (parsed.detail or "").lower()
+
+
+def test_signoff_only_at_the_tail() -> None:
+    # "over" mid-utterance (part of a real word/name) is not a sign-off.
+    parsed = parse("hostiles Jita, overheating, over")
+    assert parsed is not None
+    assert parsed.intent is Intent.HOSTILE_SPOTTED
+    assert "overheating" in (parsed.detail or "").lower()

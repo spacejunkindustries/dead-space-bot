@@ -52,8 +52,13 @@ __all__ = [
     "pcm_to_wav_bytes",
 ]
 
-#: STT watchdog deadline — GDD §20: "STT worker hang → 5s watchdog".
-DEFAULT_WATCHDOG_S = 5.0
+#: STT watchdog deadline — GDD §20 "STT worker hang". This is a *hang*
+#: backstop, not a latency target: the model is preloaded at startup (see
+#: ``warm``), so a real transcription of a few-second clip finishes in well
+#: under this even on a 2-vCPU box. Set generously so slow-but-progressing
+#: decoding is never mistaken for a hang and killed mid-flight (which, before
+#: preloading, spun a reload→timeout→reload loop that never produced a word).
+DEFAULT_WATCHDOG_S = 15.0
 
 #: int16 full-scale divisor for the float32 conversion Whisper expects.
 _INT16_FULL_SCALE = 32768.0
@@ -143,6 +148,13 @@ class FasterWhisperTranscriber:
                     cpu_threads=self._cfg.cpu_threads,
                 )
             return self._model
+
+    def warm(self) -> None:
+        """Load the model now, off the request path.
+
+        Called once at startup (via a thread) so the first real utterance does
+        not pay the multi-second model-load *inside* the watchdog window."""
+        self._get_model()
 
     def close(self) -> None:
         """Drop the loaded model so a respawned instance starts clean."""
@@ -241,6 +253,12 @@ class TimeoutTranscriber:
         """The currently live backend (rebuilt after each watchdog fire)."""
         with self._lock:
             return self._inner
+
+    def warm(self) -> None:
+        """Preload the backend model, outside the per-call watchdog window."""
+        inner_warm = getattr(self.inner, "warm", None)
+        if callable(inner_warm):
+            inner_warm()
 
     def transcribe(self, pcm16k: bytes, bias: str) -> TranscriptResult:
         with self._lock:

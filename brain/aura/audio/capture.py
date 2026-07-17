@@ -84,11 +84,16 @@ class CaptureManager:
         vad: VadGate,
         wake: WakeDetector,
         on_utterance: OnUtterance,
+        on_capture_start: Callable[[int, int], None] | None = None,
     ) -> None:
         self._holder = holder
         self._vad = vad
         self._wake = wake
         self._on_utterance = on_utterance
+        # Fired (sync, on the hot path) the instant a capture opens — the
+        # composition root uses it to speak the "go ahead" cue so the pilot
+        # knows AURA is listening (GDD §5). Must not block; it schedules.
+        self._on_capture_start = on_capture_start
         self._states: dict[int, _UserState] = {}
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -225,6 +230,8 @@ class CaptureManager:
         state.phase = Phase.CAPTURING
         state.reopen_frames_left = 0
         log.info("capture_started", user_id=user_id, preroll_frames=len(preroll))
+        if self._on_capture_start is not None:
+            self._on_capture_start(user_id, state.guild_id)
 
     def _emit(self, user_id: int, state: _UserState, cfg: AuraConfig, reason: str) -> None:
         """Hand the utterance off and free the capture buffer immediately (GDD §19)."""
