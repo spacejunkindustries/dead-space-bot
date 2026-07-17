@@ -81,13 +81,9 @@ class AdminCog(commands.Cog):
                 return roles_by_name.get(name.lstrip("@"))
 
             try:
-                count = await asyncio.to_thread(
-                    self.bot.engine.load_routing_rules, resolve_role
-                )
+                count = await asyncio.to_thread(self.bot.engine.load_routing_rules, resolve_role)
             except RoutingConfigError as exc:
-                await interaction.followup.send(
-                    f"❌ routing.yaml rejected: {exc}", ephemeral=True
-                )
+                await interaction.followup.send(f"❌ routing.yaml rejected: {exc}", ephemeral=True)
                 return
             log.info("routing_reloaded_via_slash", count=count, user_id=interaction.user.id)
             await interaction.followup.send(
@@ -98,9 +94,7 @@ class AdminCog(commands.Cog):
 
     def _rules_embed(self, guild: discord.Guild) -> discord.Embed:
         rules = getattr(self.bot.engine, "_rules", [])
-        embed = discord.Embed(
-            title="Routing rules", color=0x3498DB, timestamp=datetime.now(UTC)
-        )
+        embed = discord.Embed(title="Routing rules", color=0x3498DB, timestamp=datetime.now(UTC))
         if not rules:
             embed.description = "No rules loaded. `/routing reload` after editing routing.yaml."
             return embed
@@ -175,16 +169,12 @@ class AdminCog(commands.Cog):
         regions = Counter(s.region for s in systems)
         home = gaz.by_id(gaz.home_system_id) if gaz.home_system_id is not None else None
         region_lines = [f"**{name}**: {count}" for name, count in regions.most_common(10)]
-        embed = discord.Embed(
-            title="Gazetteer", color=0x3498DB, timestamp=datetime.now(UTC)
-        )
+        embed = discord.Embed(title="Gazetteer", color=0x3498DB, timestamp=datetime.now(UTC))
         embed.add_field(name="Active systems", value=str(len(systems)), inline=True)
         embed.add_field(
             name="Home system", value=home.name if home is not None else "unset", inline=True
         )
-        embed.add_field(
-            name="Regions", value="\n".join(region_lines) or "none", inline=False
-        )
+        embed.add_field(name="Regions", value="\n".join(region_lines) or "none", inline=False)
         return embed
 
     # ── /fleetmode ───────────────────────────────────────────────────────────
@@ -236,22 +226,17 @@ class AdminCog(commands.Cog):
             )
             tier_rows = db.query(
                 self.bot.conn,
-                "SELECT tier, outcome, confidence FROM command_log"
-                " ORDER BY id DESC LIMIT 100",
+                "SELECT tier, outcome, confidence FROM command_log ORDER BY id DESC LIMIT 100",
             )
             return status_rows, tier_rows
 
         status_rows, tier_rows = await asyncio.to_thread(_collect)
-        status_line = (
-            " · ".join(f"{row['status']}: {row['n']}" for row in status_rows) or "none"
-        )
+        status_line = " · ".join(f"{row['status']}: {row['n']}" for row in status_rows) or "none"
         tiers = Counter(row["tier"] or "n/a" for row in tier_rows)
         outcomes = Counter(row["outcome"] or "n/a" for row in tier_rows)
         confidences = [row["confidence"] for row in tier_rows if row["confidence"] is not None]
         avg_conf = f"{sum(confidences) / len(confidences):.2f}" if confidences else "n/a"
-        tier_line = (
-            " · ".join(f"{t}: {n}" for t, n in sorted(tiers.items())) or "no commands yet"
-        )
+        tier_line = " · ".join(f"{t}: {n}" for t, n in sorted(tiers.items())) or "no commands yet"
         outcome_line = (
             " · ".join(f"{o}: {n}" for o, n in sorted(outcomes.items())) or "no commands yet"
         )

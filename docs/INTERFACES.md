@@ -135,6 +135,18 @@ class IncidentEngine:
     #   [Wrong — fix] path: updates card AND learns alias (§8.5).
     async def sweep_stale(self) -> list[int]     # ids marked STALE; called by a periodic task
     def build_prior_context(self, guild_id: int, reporter_id: int) -> PriorContext  # blocking
+    def load_routing_rules(self, resolve_role: Callable[[str], int | None]) -> int  # blocking
+    #   (Re)loads routing.yaml + group aliases through the engine. Needs the
+    #   guild role cache: AuraBot runs it (via to_thread) in on_ready, and
+    #   /routing reload re-runs it. Until it succeeds the engine holds zero
+    #   rules — cards still post, nobody is mentioned.
+    async def fire_due_timers(self, now: datetime) -> list[TimerPing]
+    #   TimerPing(timer_id, guild_id, system_id, system_name, note, fires_at,
+    #   created_by) — exported from incidents.py; rows are marked fired, the
+    #   caller (__main__'s timer loop) announces and speaks.
+
+def parse_duration(text: str) -> timedelta | None    # public: engine + /timer//formup share it
+def render_card(...) -> CardRender                   # public for tests/views smoke checks
 
 # routing.py — GDD §10/§11. Pure evaluation; rule loading is separate.
 @dataclass RoutingRule(role_id: int, types: frozenset[Intent], scope: RuleScope,
@@ -149,6 +161,19 @@ def evaluate(incident: Incident, rules: Sequence[RoutingRule], now: datetime,
 #   Pure given its inputs. here=True ONLY when a matched rule's escalate_at
 #   equals incident.type, and only for UNDER_ATTACK/ASSIST_REQUEST (constraint 11);
 #   group_alias "all_hands" is applied by the engine, not here.
+#   Channel semantics: any mention → ALERTS, else LIVE. A card lives in
+#   exactly ONE channel — never mirrored (constraint 9).
+
+ESCALATABLE_TYPES: frozenset[Intent]     # {UNDER_ATTACK, ASSIST_REQUEST}
+def apply_group_alias(decision, group_alias, rules, alias_roles) -> RoutingDecision
+def suppress(decision) -> RoutingDecision
+#   Discipline suppression: RoutingDecision has no `suppressed` flag — a
+#   suppressed report becomes RoutingDecision((), False, LIVE): still posted,
+#   mention-free.
+def load_group_aliases(path, resolve_role) -> dict[str, int]
+class RoutingConfigError(Exception)
+#   routing.yaml accepts the GDD §10.1 bare list of rules, OR a mapping form
+#   {rules: [...], group_aliases: {miners: "@Miners", defense: "@Home-Defense"}}.
 
 # discipline.py — GDD §11.1. Pure state machine over injected `now` datetimes.
 class Discipline:
@@ -161,6 +186,9 @@ class Discipline:
     def may_voice_trigger(self, member_role_ids: Iterable[int]) -> bool
     #   fleetmode → requires fc role; always requires pilot role for mentions.
     def may_mention(self, member_role_ids: Iterable[int]) -> bool      # pilot-role gate
+    def should_announce_flood(self, now: datetime) -> bool   # True once per breaker episode
+    def check(self, member_role_ids: Iterable[int], source: str) -> bool  # "voice" | "slash"
+    fleetmode: bool                                          # read-only property
 ```
 
 ## Audio — `aura/audio/`  (RAM only — constraint 5)

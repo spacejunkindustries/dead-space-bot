@@ -58,9 +58,7 @@ class SubsCog(commands.Cog):
 
     # ── /subscribe ───────────────────────────────────────────────────────────
 
-    @app_commands.command(
-        name="subscribe", description="Pick which alert roles you subscribe to"
-    )
+    @app_commands.command(name="subscribe", description="Pick which alert roles you subscribe to")
     async def subscribe(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member):

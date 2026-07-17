@@ -161,9 +161,12 @@ class App:
         late_poster.bind(self.bot)
 
         self.health = HealthReporter(self.holder, self._post_health)
-        self.gateway = VoiceGateway(self.holder, self.ipc, self.conn, self._announce_join)
+        self.gateway = VoiceGateway(self.holder, self.ipc, self.conn, self.bot.announce_join)
         self.gateway.set_census_listener(self.health.set_humans_present)
-        self.bot.add_listener(self._on_voice_state_update, "on_voice_state_update")
+        # The bot forwards its voice census (on_voice_state_update + on_ready
+        # seed) to the gateway, and the cogs reach both through the bot.
+        self.bot.voice_gateway = self.gateway
+        self.bot.health_reporter = self.health
 
         # Load the muted-voice set so /mute-voice survives restarts.
         rows = await asyncio.to_thread(db.query, self.conn, "SELECT user_id FROM voice_mutes", ())
@@ -419,25 +422,6 @@ class App:
 
     async def _post_health(self, content: str, embed: dict[str, Any] | None) -> None:
         await self._send_channel(self.holder.current.discord.channels.health, content, embed)
-
-    async def _announce_join(self, channel_id: int) -> None:
-        """§19 consent announcement, into the voice channel's text chat."""
-        from aura.voice_gateway import ANNOUNCEMENT
-
-        await self._send_channel(channel_id, ANNOUNCEMENT)
-
-    async def _on_voice_state_update(self, member: Any, before: Any, after: Any) -> None:
-        """discord.py listener → watched-channel census → voice gateway."""
-        assert self.gateway
-        if member.bot:
-            return
-        watched = set(self.holder.current.discord.watch_voice_channels)
-        for state in (before, after):
-            channel = state.channel
-            if channel is None or channel.id not in watched:
-                continue
-            humans = sum(1 for m in channel.members if not m.bot)
-            await self.gateway.on_voice_update(channel.id, humans)
 
 
 def parsed_intent_severity(intent: Any) -> Severity:

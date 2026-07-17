@@ -112,18 +112,14 @@ class OpsCog(commands.Cog):
 
     # ── /rollcall ────────────────────────────────────────────────────────────
 
-    @app_commands.command(
-        name="rollcall", description="Who's in voice, subscribed, and responding"
-    )
+    @app_commands.command(name="rollcall", description="Who's in voice, subscribed, and responding")
     async def rollcall(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message("Guild only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        embed = discord.Embed(
-            title="Roll call", color=0x3498DB, timestamp=datetime.now(UTC)
-        )
+        embed = discord.Embed(title="Roll call", color=0x3498DB, timestamp=datetime.now(UTC))
         embed.add_field(name="In voice", value=self._voice_field(guild), inline=False)
         embed.add_field(name="Subscriptions", value=self._subs_field(guild), inline=False)
         embed.add_field(
@@ -169,9 +165,7 @@ class OpsCog(commands.Cog):
         lines: list[str] = []
         for row in rows:
             entry = (
-                self.bot.gazetteer.by_id(row["system_id"])
-                if row["system_id"] is not None
-                else None
+                self.bot.gazetteer.by_id(row["system_id"]) if row["system_id"] is not None else None
             )
             system = entry.name if entry is not None else "unknown"
             lines.append(f"**{system}**: 🚀 {row['otw']} · 👀 {row['watching']}")
@@ -190,9 +184,7 @@ class OpsCog(commands.Cog):
         origin = gaz.by_name(from_system.strip())
         dest = gaz.by_name(to_system.strip())
         missing = [
-            name
-            for name, entry in ((from_system, origin), (to_system, dest))
-            if entry is None
+            name for name, entry in ((from_system, origin), (to_system, dest)) if entry is None
         ]
         if origin is None or dest is None:
             await interaction.response.send_message(

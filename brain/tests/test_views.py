@@ -79,10 +79,13 @@ def test_subscription_round_trip() -> None:
 
 def test_round_trip_matches_engine_rendered_ids() -> None:
     """The engine renders these exact shapes in render_card — keep in lockstep."""
+    otw = ComponentAction(kind="respond", incident_id=12, state=ResponderState.OTW)
+    pick = ComponentAction(kind="pick", incident_id=12, system_id=30002187)
+    fix = ComponentAction(kind="fix", incident_id=12)
     for custom_id, expected in [
-        ("aura:inc:12:otw", ComponentAction(kind="respond", incident_id=12, state=ResponderState.OTW)),
-        ("aura:inc:12:pick:30002187", ComponentAction(kind="pick", incident_id=12, system_id=30002187)),
-        ("aura:inc:12:fix", ComponentAction(kind="fix", incident_id=12)),
+        ("aura:inc:12:otw", otw),
+        ("aura:inc:12:pick:30002187", pick),
+        ("aura:inc:12:fix", fix),
     ]:
         assert parse_custom_id(custom_id) == expected
 

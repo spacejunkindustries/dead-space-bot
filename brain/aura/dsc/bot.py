@@ -118,9 +118,7 @@ class AuraBot(commands.Bot):
         intents.voice_states = True  # census + auto-join (GDD §17.4)
         # No message_content: AURA never reads chat, and the prefix path is
         # inert — every command is a slash command on the app-command tree.
-        super().__init__(
-            command_prefix=commands.when_mentioned, intents=intents, help_command=None
-        )
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
         self.holder = holder
         self.engine = engine
         self.gazetteer = gazetteer
@@ -165,9 +163,38 @@ class AuraBot(commands.Bot):
             guilds=len(self.guilds),
             fleetmode=self.discipline.fleetmode,
         )
+        # Routing rules name roles ("@Home-Defense"); resolving them needs the
+        # guild role cache, which only exists now. Until this succeeds the
+        # engine runs with zero rules — cards post, nobody gets mentioned.
+        await self._load_routing_rules()
         # Pilots may already be in voice when Brain (re)starts — no voice
         # event will fire for them, so seed the census once.
         await self._seed_voice_census()
+
+    async def _load_routing_rules(self) -> None:
+        """Load routing.yaml through the engine (same path as /routing reload)."""
+        import asyncio
+
+        from aura.core.routing import RoutingConfigError
+
+        guild = self.get_guild(self.holder.current.discord.guild_id)
+        if guild is None:
+            log.error(
+                "routing_rules_not_loaded_guild_missing",
+                guild_id=self.holder.current.discord.guild_id,
+            )
+            return
+        roles_by_name = {r.name: r.id for r in guild.roles}
+
+        def resolve_role(name: str) -> int | None:
+            return roles_by_name.get(name.lstrip("@"))
+
+        try:
+            count = await asyncio.to_thread(self.engine.load_routing_rules, resolve_role)
+        except RoutingConfigError as exc:
+            log.error("routing_rules_rejected", error=str(exc))
+            return
+        log.info("routing_rules_loaded", count=count)
 
     # ── voice census → gateway (GDD §19 / voice_gateway) ─────────────────────
 
@@ -269,9 +296,7 @@ class AuraBot(commands.Bot):
         )
         return target.id, message.id
 
-    async def edit(
-        self, channel_id: int, message_id: int, content: str, card: CardRender
-    ) -> None:
+    async def edit(self, channel_id: int, message_id: int, content: str, card: CardRender) -> None:
         """Edit the card in place — the only mutation an incident ever gets."""
         from aura.dsc.views import view_from_card
 

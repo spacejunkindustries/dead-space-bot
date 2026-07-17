@@ -13,9 +13,9 @@ can never produce ``here=True`` through this module, full stop.
 
 Channel semantics: a decision with any mention carries ``AlertChannel.ALERTS``;
 ``#intel-alerts`` receives only mentioning incidents while ``#intel-live`` is
-the mention-free firehose (GDD §11.2), so ``channel == ALERTS`` always implies
-the incident is also visible via the live log — the ``Poster`` implementation
-mirrors alerted cards there.
+the mention-free feed (GDD §11.2). Each incident card lives in exactly ONE
+channel — one incident, one message, edited in place forever (constraint 9);
+nothing is mirrored.
 """
 
 from __future__ import annotations

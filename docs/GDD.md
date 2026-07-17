@@ -553,10 +553,12 @@ If AURA is annoying for one week, the corp mutes `#intel-alerts` and the project
 
 | Channel | Contents |
 |---|---|
-| `#intel-live` | Every incident, no mentions. The firehose, for people who want it. |
+| `#intel-live` | Every incident that mentions nobody. The quiet feed, for people who want it. |
 | `#intel-alerts` | Only incidents that mention a role. |
 
-Let people choose their own volume.
+Let people choose their own volume. An incident card lives in exactly one of
+the two channels — one incident is one message, edited in place (§9.1), never
+mirrored or reposted.
 
 ### 11.3 Health channel
 

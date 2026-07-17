@@ -112,9 +112,7 @@ class IntelCog(commands.Cog):
         parsed = ParsedCommand(
             intent=intent, system_text=system, group_alias=None, detail=detail, raw=raw
         )
-        outcome = await self.bot.engine.report(
-            interaction.guild_id, member.id, parsed, resolution
-        )
+        outcome = await self.bot.engine.report(interaction.guild_id, member.id, parsed, resolution)
         await interaction.followup.send(
             outcome_text(outcome.outcome, outcome.utterance), ephemeral=True
         )
@@ -187,9 +185,7 @@ class IntelCog(commands.Cog):
         lines: list[str] = []
         for row in rows:
             entry = (
-                self.bot.gazetteer.by_id(row["system_id"])
-                if row["system_id"] is not None
-                else None
+                self.bot.gazetteer.by_id(row["system_id"]) if row["system_id"] is not None else None
             )
             system = entry.name if entry is not None else "unknown"
             badge = _TYPE_BADGES.get(row["type"], row["type"])

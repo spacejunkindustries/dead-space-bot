@@ -202,7 +202,7 @@ class IncidentView(discord.ui.View):
     def __init__(self, specs: Sequence[ButtonSpec]) -> None:
         super().__init__(timeout=None)
         rows = incident_button_rows(specs)
-        for spec, row in zip(specs, rows):
+        for spec, row in zip(specs, rows, strict=True):
             self.add_item(_button(spec, row))
 
 
@@ -213,9 +213,7 @@ class AmbiguityView(IncidentView):
 class SubscriptionView(discord.ui.View):
     """Role-toggle picker for ``/subscribe`` (GDD §10.2)."""
 
-    def __init__(
-        self, roles: Sequence[tuple[int, str]], member_role_ids: Collection[int]
-    ) -> None:
+    def __init__(self, roles: Sequence[tuple[int, str]], member_role_ids: Collection[int]) -> None:
         super().__init__(timeout=None)
         for i, spec in enumerate(subscription_buttons(roles, member_role_ids)):
             self.add_item(_button(spec, row=i // _ROW_WIDTH))
@@ -256,9 +254,7 @@ async def dispatch_incident_action(
         assert action.state is not None
         outcome = await bot.engine.respond(action.incident_id, interaction.user.id, action.state)
         if outcome.outcome is Outcome.REJECTED:
-            await interaction.followup.send(
-                "That incident is already resolved.", ephemeral=True
-            )
+            await interaction.followup.send("That incident is already resolved.", ephemeral=True)
             return
         # GDD §9.3: the first "On my way" answers audibly into voice.
         if outcome.utterance is not None and interaction.guild_id is not None:
@@ -276,9 +272,7 @@ async def dispatch_incident_action(
     if outcome.outcome is Outcome.REJECTED:
         await interaction.followup.send("That incident no longer exists.", ephemeral=True)
         return
-    await interaction.followup.send(
-        outcome.utterance or "System confirmed.", ephemeral=True
-    )
+    await interaction.followup.send(outcome.utterance or "System confirmed.", ephemeral=True)
 
 
 async def dispatch_subscription_toggle(
@@ -413,9 +407,7 @@ class SystemFixModal(discord.ui.Modal, title="Correct the system"):
         entry = self._bot.gazetteer.by_name(text)
         if entry is None:
             lowered = text.lower()
-            matches = [
-                s for s in self._bot.gazetteer.systems if s.name.lower().startswith(lowered)
-            ]
+            matches = [s for s in self._bot.gazetteer.systems if s.name.lower().startswith(lowered)]
             if len(matches) == 1:
                 entry = matches[0]
             elif matches:
