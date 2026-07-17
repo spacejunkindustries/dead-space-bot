@@ -437,18 +437,50 @@ async def test_medium_tier_posts_flagged_uncertain_with_candidates(
     assert log_row["tier"] == "MEDIUM"
 
 
-async def test_low_tier_rejected_without_posting(make_env: Callable[..., Env]) -> None:
+async def test_report_posts_catch_all_when_location_unmatched(
+    make_env: Callable[..., Env],
+) -> None:
+    # GDD §8.6 catch-all: a report whose location does not match the gazetteer
+    # still posts, with the spoken location on the card verbatim — never dropped.
     env = make_env()
+    spoken = ParsedCommand(
+        intent=Intent.HOSTILE_SPOTTED,
+        system_text="UMI",
+        group_alias=None,
+        detail="three battleships",
+        raw="hostiles UMI three battleships",
+    )
     low = Resolution(tier=Tier.LOW, candidates=(MatchCandidate(1, "Otanuomi", 0.3),))
-    for resolution in (low, None):
-        out = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), resolution)
-        assert out.outcome is Outcome.REJECTED
-        assert out.utterance == "Say again the system."
-        assert out.incident_id is None
+    out = await env.engine.report(GUILD, 42, spoken, low)
+    assert out.outcome is Outcome.POSTED
+    assert out.incident_id is not None
+    assert len(env.poster.posts) == 1
+    _, _, _, card = env.poster.posts[-1]
+    assert "UMI" in card.embed["title"]  # the raw spoken location, shown as-is
+    row = db.query_one(
+        env.conn,
+        "SELECT system_id, raw_system_text FROM incidents WHERE id = ?",
+        (out.incident_id,),
+    )
+    assert row["system_id"] is None  # unmatched — no gazetteer id
+    assert row["raw_system_text"] == "UMI"
+
+
+async def test_report_posts_even_with_no_location(make_env: Callable[..., Env]) -> None:
+    # No usable location at all → still an alert (generic), never a rejection.
+    env = make_env()
+    out = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), None)
+    assert out.outcome is Outcome.POSTED
+    assert len(env.poster.posts) == 1
+
+
+async def test_non_report_intent_still_rejects_on_low(make_env: Callable[..., Env]) -> None:
+    # clear/timer/form up act on a specific system, so they still need a match.
+    env = make_env()
+    out = await env.engine.report(GUILD, 42, cmd(Intent.RESOLVE), None)
+    assert out.outcome is Outcome.REJECTED
+    assert out.utterance == "Say again the system."
     assert env.poster.posts == []
-    rows = db.query(env.conn, "SELECT outcome, tier FROM command_log")
-    assert all(r["outcome"] == "REJECTED" and r["tier"] == "LOW" for r in rows)
-    assert len(rows) == 2
 
 
 # ── resolve / cancel ─────────────────────────────────────────────────────────
