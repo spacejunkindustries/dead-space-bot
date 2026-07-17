@@ -172,6 +172,7 @@ class App:
         self.discipline = Discipline(self.holder)
         self.ipc = IpcServer(self.holder, self._on_audio, self._on_control)
         self.speaker = Speaker(self.holder, self.ipc)
+        await self.speaker.warm()  # prime Piper's model into cache off the hot path
 
         self.transcriber = await asyncio.to_thread(make_transcriber, cfg.stt)
         # Load the Whisper weights now, off the request path: the first real
@@ -316,9 +317,9 @@ class App:
         cue cannot bleed into the utterance being recorded."""
         if self.speaker is None:
             return
-        task = asyncio.create_task(
-            self.speaker.say(guild_id, tts_mod.go_ahead(), PRIORITY_ALERT, user_id=user_id)
-        )
+        # Instant tone, not a spoken line: acknowledging the wake word must not
+        # wait on a neural-voice synthesis (that was most of the 30s latency).
+        task = asyncio.create_task(self.speaker.chirp(guild_id, user_id=user_id))
         self._voice_tasks.add(task)
         task.add_done_callback(self._voice_tasks.discard)
 
