@@ -43,13 +43,18 @@ __all__ = [
     "build_wav",
     "degraded",
     "flood_control",
+    "not_registered",
     "number_word",
     "ping_sent",
     "read_voice_sample_rate",
+    "registered",
     "resolved",
     "responders",
     "say_again",
+    "say_again_callsign",
     "timer_set",
+    "unregistered",
+    "whoami",
 ]
 
 log = structlog.get_logger(__name__)
@@ -135,6 +140,31 @@ def flood_control() -> str:
 def degraded() -> str:
     """*"Voice offline, use slash commands."*"""
     return "Voice offline, use slash commands."
+
+
+def registered(callsign: str) -> str:
+    """*"Registered you as Space Junkie."*"""
+    return f"Registered you as {callsign}."
+
+
+def unregistered() -> str:
+    """*"Unregistered."*"""
+    return "Unregistered."
+
+
+def not_registered() -> str:
+    """*"You are not registered."*"""
+    return "You are not registered."
+
+
+def whoami(callsign: str) -> str:
+    """*"You are Space Junkie."*"""
+    return f"You are {callsign}."
+
+
+def say_again_callsign() -> str:
+    """*"Say again the callsign."* — REGISTER heard with no usable name."""
+    return "Say again the callsign."
 
 
 # ── WAV wrapping (in memory — constraint 5 adjacent: nothing touches disk) ───

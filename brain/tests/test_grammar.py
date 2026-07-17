@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from aura.nlu.grammar import parse, system_reply
+from aura.nlu.grammar import clean_callsign, parse, sanitize_callsign, system_reply
 from aura.types import Intent
 
-# ── the nine GDD §6.4 examples ───────────────────────────────────────────────
+# ── the GDD §6.4 examples ────────────────────────────────────────────────────
 
 
 def test_hostiles_with_detail() -> None:
@@ -178,6 +178,97 @@ def test_hostiles_without_system() -> None:
     assert cmd is not None
     assert cmd.intent is Intent.HOSTILE_SPOTTED
     assert cmd.system_text is None
+
+
+# ── callsign registry intents (GDD §6.1) ─────────────────────────────────────
+
+
+def test_register_captures_title_cased_callsign() -> None:
+    cmd = parse("Aura Command, register space junkie")
+    assert cmd is not None
+    assert cmd.intent is Intent.REGISTER
+    assert cmd.system_text is None
+    assert cmd.detail == "Space Junkie"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "call me space junkie",
+        "register me as space junkie",
+        "Aura Command, register Space Junkie",
+    ],
+)
+def test_register_synonyms_and_filler(phrase: str) -> None:
+    cmd = parse(phrase)
+    assert cmd is not None
+    assert cmd.intent is Intent.REGISTER
+    assert cmd.detail == "Space Junkie"
+
+
+def test_register_without_callsign_yields_no_detail() -> None:
+    cmd = parse("Aura Command, register")
+    assert cmd is not None
+    assert cmd.intent is Intent.REGISTER
+    assert cmd.detail is None
+
+
+@pytest.mark.parametrize("phrase", ["unregister", "Aura Command, unregister me", "forget me"])
+def test_unregister_synonyms(phrase: str) -> None:
+    cmd = parse(phrase)
+    assert cmd is not None
+    assert cmd.intent is Intent.UNREGISTER
+    assert cmd.system_text is None
+    assert cmd.detail is None
+
+
+def test_unregister_never_matches_register() -> None:
+    cmd = parse("aura command unregister")
+    assert cmd is not None
+    assert cmd.intent is Intent.UNREGISTER
+
+
+@pytest.mark.parametrize("phrase", ["who am I", "Aura Command, who am i", "whoami"])
+def test_whoami_synonyms(phrase: str) -> None:
+    cmd = parse(phrase)
+    assert cmd is not None
+    assert cmd.intent is Intent.WHOAMI
+    assert cmd.system_text is None
+    assert cmd.detail is None
+
+
+# ── callsign sanitisation ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("space junkie", "Space Junkie"),
+        ("me as space junkie", "Space Junkie"),
+        ("@space #junkie", "Space Junkie"),
+        ("`space` <junkie>", "Space Junkie"),
+        ("**space** __junkie__", "Space Junkie"),
+        ("  space   junkie  ", "Space Junkie"),
+        ("", None),
+        ("@#`<>", None),
+        ("as me my", None),
+    ],
+)
+def test_clean_callsign(raw: str, expected: str | None) -> None:
+    assert clean_callsign(raw) == expected
+
+
+def test_clean_callsign_caps_at_32_chars() -> None:
+    cleaned = clean_callsign("a" * 60)
+    assert cleaned is not None
+    assert len(cleaned) <= 32
+
+
+def test_sanitize_callsign_preserves_typed_case() -> None:
+    """Slash input is exact: no title-casing, only markdown/mention strip."""
+    assert sanitize_callsign("xX SpaceJunkie Xx") == "xX SpaceJunkie Xx"
+    assert sanitize_callsign("<@12345> `boom`") == "12345 boom"
+    assert sanitize_callsign("   ") is None
 
 
 # ── system_reply (GDD §8.3 "say again" retry window) ─────────────────────────

@@ -53,6 +53,9 @@ class Intent(StrEnum):
     FORMUP = "FORMUP"
     QUERY = "QUERY"
     CANCEL = "CANCEL"
+    REGISTER = "REGISTER"
+    UNREGISTER = "UNREGISTER"
+    WHOAMI = "WHOAMI"
 
 
 class Severity(StrEnum):
@@ -76,6 +79,9 @@ INTENT_SEVERITY: Mapping[Intent, Severity] = MappingProxyType(
         Intent.FORMUP: Severity.NONE,
         Intent.QUERY: Severity.NONE,
         Intent.CANCEL: Severity.NONE,
+        Intent.REGISTER: Severity.NONE,
+        Intent.UNREGISTER: Severity.NONE,
+        Intent.WHOAMI: Severity.NONE,
     }
 )
 

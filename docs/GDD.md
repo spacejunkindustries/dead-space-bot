@@ -199,13 +199,14 @@ Every module in the finished system.
 | `nlu/gazetteer.py` | System load, region pruning, adjacency graph, jump-distance BFS with memo |
 | `nlu/phonetics.py` | Double Metaphone + Levenshtein scoring, alias-table lookup, context priors, confidence tiers |
 | `core/incidents.py` | Incident lifecycle, dedupe folding, staleness sweep, message rendering |
+| `core/callsigns.py` | Pilot callsign registry: register/unregister/who-am-I, sync lookup mirror for renders |
 | `core/routing.py` | Subscription evaluation, role union, escalation, quiet hours |
 | `core/discipline.py` | Per-user cooldowns, global circuit breaker, flood control |
 | `core/db.py` | SQLite access, migrations, backup hook |
 | `dsc/bot.py` | discord.py client, intents, persistent view registration |
 | `dsc/views.py` | Incident buttons, ambiguity resolver, subscription picker |
 | `dsc/cogs/intel.py` | `/hostiles`, `/under-attack`, `/help-me`, `/camp`, `/clear`, `/status`, `/cancel` |
-| `dsc/cogs/subs.py` | `/subscribe`, `/mysubs`, `/optout`, `/mute-voice` |
+| `dsc/cogs/subs.py` | `/subscribe`, `/mysubs`, `/optout`, `/mute-voice`, `/register`, `/unregister`, `/whoami` |
 | `dsc/cogs/ops.py` | `/timer`, `/formup`, `/rollcall`, `/jumps` |
 | `dsc/cogs/admin.py` | `/routing`, `/gazetteer`, `/health`, `/fleetmode` |
 | `tts.py` | Piper subprocess, raw→WAV wrapping, utterance queue, length cap |
@@ -314,8 +315,13 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 | "form up \<system\> \<duration\>" | `FORMUP` | none | posts op with RSVP |
 | "status" | `QUERY` | none | spoken reply only |
 | "cancel" | `CANCEL` | none | kills this user's last incident (30s window) |
+| "register \<callsign\>" / "call me \<callsign\>" | `REGISTER` | none | spoken reply only |
+| "unregister" / "unregister me" / "forget me" | `UNREGISTER` | none | spoken reply only |
+| "who am I" / "whoami" | `WHOAMI` | none | spoken reply only |
 
 Higher-severity patterns are matched first, so *"tackled, need help in Kisogo"* resolves to `UNDER_ATTACK`, not a sighting.
+
+The callsign commands are a **name registry keyed on the Discord user id** Ears already attaches to every utterance (the SSRC→user map, §15). There are no voice biometrics and nothing derived from the audio — identity comes from Discord, the callsign is just a display name (§19 posture unchanged). The spoken callsign is the cleaned post-intent remainder: filler stripped, title-cased, markdown/mention characters removed, capped at 32 characters. `/register` (the typed twin) stores the callsign exactly as typed, which is also how a pilot fixes an STT misspelling.
 
 ### 6.2 Group targeting
 
@@ -342,9 +348,10 @@ Anything after the system and group is captured verbatim into the incident body:
 "Aura Command, form up Otanuomi fifteen minutes"
 "Aura Command, status"
 "Aura Command, cancel"
+"Aura Command, register Space Junkie"
 ```
 
-Nine commands. Short enough that pilots remember them under fire, which is the only time they matter.
+Twelve commands. Short enough that pilots remember them under fire, which is the only time they matter.
 
 ---
 
@@ -375,6 +382,9 @@ Full parity. Every voice command routes to the same engine.
 | `/mysubs` | Show my subscriptions |
 | `/optout` | Exclude my audio from AURA entirely |
 | `/mute-voice` | Stop AURA speaking to me |
+| `/register callsign` | Register my pilot callsign, exactly as typed (fixes STT misspellings) |
+| `/unregister` | Delete my registered callsign |
+| `/whoami` | Show my registered callsign |
 | `/routing` | *(admin)* Manage subscription rules |
 | `/gazetteer` | *(admin)* Reload / inspect / prune systems |
 | `/fleetmode` | *(admin)* Restrict voice triggering to FC role |
@@ -603,6 +613,11 @@ Short. Always short. AURA is talking over a fight.
 | Timer set | *"Timer Kisogo, four hours."* |
 | Flood control | *"Flood control active."* |
 | Degraded | *"Voice offline, use slash commands."* |
+| Registered | *"Registered you as Space Junkie."* |
+| Unregistered | *"Unregistered."* |
+| Not registered | *"You are not registered."* |
+| Who am I | *"You are Space Junkie."* |
+| Unheard callsign | *"Say again the callsign."* |
 
 ### 12.2 Speaking rules
 
@@ -763,6 +778,15 @@ CREATE TABLE optouts (
 CREATE TABLE voice_mutes (
     user_id  INTEGER PRIMARY KEY,
     at       TEXT NOT NULL
+);
+
+-- ── pilot callsign registry ──────────────────────────────────
+-- Keyed on the Discord user id Ears attaches to every utterance
+-- (SSRC→user map): a name registry, no voice biometrics (§19).
+CREATE TABLE callsigns (
+    user_id        INTEGER PRIMARY KEY,
+    callsign       TEXT NOT NULL,
+    registered_at  TEXT NOT NULL
 );
 
 -- ── observability: transcripts only, never audio ─────────────
@@ -1016,6 +1040,7 @@ Additionally:
 - **Announcement on join.** AURA posts: *"🎙️ AURA is listening for commands. Audio is not recorded. `/optout` to exclude yourself."* — every single time it joins.
 - **`/optout`** drops that user's stream **inside Ears, before any processing and before it crosses the IPC boundary**. An actual drop, not a downstream filter.
 - AURA reads Discord's `allow_voice_recording` voice flag as an additional consent signal.
+- Callsign registration (§6.1) is keyed on the Discord user id attached to each utterance — it stores a chosen display name, never a voiceprint or anything derived from audio.
 - A plain-language privacy note is pinned in the channel. Discord's Developer Policy expects a privacy policy regardless, and an honest one here is four sentences.
 
 **Introduce AURA to the corp with this section, not with the feature list.** If half the corp is uncomfortable, that conversation is cheaper before the droplet is provisioned than after.

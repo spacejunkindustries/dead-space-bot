@@ -128,12 +128,14 @@ class OpsCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     def _voice_field(self, guild: discord.Guild) -> str:
+        # Registered callsigns first (GDD §6.1), display name as the fallback.
+        registry = self.bot.engine.callsigns
         lines: list[str] = []
         for channel_id in self.bot.holder.current.discord.watch_voice_channels:
             channel = guild.get_channel(channel_id)
             if not isinstance(channel, discord.VoiceChannel):
                 continue
-            pilots = [m.display_name for m in channel.members if not m.bot]
+            pilots = [registry.lookup(m.id) or m.display_name for m in channel.members if not m.bot]
             if pilots:
                 lines.append(f"**{channel.name}** ({len(pilots)}): {', '.join(sorted(pilots))}")
             else:
