@@ -50,6 +50,7 @@ _COG_MODULES = (
     "aura.dsc.cogs.ops",
     "aura.dsc.cogs.utility",
     "aura.dsc.cogs.admin",
+    "aura.dsc.cogs.help",
 )
 
 
@@ -138,14 +139,24 @@ class AuraBot(commands.Bot):
         # Imported here, not at module top: the cogs import this module.
         from aura.dsc import views
         from aura.dsc.cogs.admin import AdminCog
+        from aura.dsc.cogs.help import HelpCog, HelpTopicSelect
         from aura.dsc.cogs.intel import IntelCog
         from aura.dsc.cogs.ops import OpsCog
         from aura.dsc.cogs.subs import SubsCog
         from aura.dsc.cogs.utility import PollVoteButton, UtilityCog
 
-        self.add_dynamic_items(views.IncidentButton, views.SubscriptionButton, PollVoteButton)
+        self.add_dynamic_items(
+            views.IncidentButton, views.SubscriptionButton, PollVoteButton, HelpTopicSelect
+        )
 
-        for cog in (IntelCog(self), SubsCog(self), OpsCog(self), UtilityCog(self), AdminCog(self)):
+        for cog in (
+            IntelCog(self),
+            SubsCog(self),
+            OpsCog(self),
+            UtilityCog(self),
+            AdminCog(self),
+            HelpCog(self),
+        ):
             await self.add_cog(cog)
 
         guild = discord.Object(id=self.holder.current.discord.guild_id)

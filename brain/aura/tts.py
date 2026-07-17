@@ -44,6 +44,7 @@ __all__ = [
     "build_wav",
     "degraded",
     "flood_control",
+    "help_hint",
     "no_pings",
     "not_registered",
     "number_word",
@@ -146,6 +147,11 @@ def flood_control() -> str:
 def degraded() -> str:
     """*"Voice offline, use slash commands."*"""
     return "Voice offline, use slash commands."
+
+
+def help_hint() -> str:
+    """*"Check help in Discord."* — the HELP intent; the real manual is /help."""
+    return "Check help in Discord."
 
 
 def registered(callsign: str) -> str:

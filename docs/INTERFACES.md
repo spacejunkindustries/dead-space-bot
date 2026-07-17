@@ -12,7 +12,7 @@ matching the TEXT columns in `brain/schema.sql`.
 
 ```python
 class Intent(str, Enum):      # HOSTILE_SPOTTED UNDER_ATTACK ASSIST_REQUEST GATE_CAMP
-                              # RESOLVE TIMER FORMUP QUERY CANCEL
+                              # RESOLVE TIMER FORMUP QUERY HELP CANCEL
                               # REGISTER UNREGISTER WHOAMI      (callsigns, GDD §6.1)
                               # PING_ME PING_ME_CLEAR           (personal pings, GDD §10.3)
 class Severity(str, Enum):    # NONE="none" MEDIUM="medium" HIGH="high"
@@ -90,7 +90,8 @@ def parse(transcript: str) -> ParsedCommand | None
 #   of the post-intent remainder; None when nothing usable was heard), and
 #   PING_ME, where detail carries the recognised incident types encoded by
 #   encode_ping_types (comma-separated Intent values; no type word or
-#   "anything"/"everything"/"all" → all four).
+#   "anything"/"everything"/"all" → all four). HELP ("help", systemless)
+#   matches below ASSIST_REQUEST so "need help" is always a distress call.
 PING_TYPE_ORDER: tuple[Intent, ...]   # canonical HOSTILE_SPOTTED UNDER_ATTACK
                                       # ASSIST_REQUEST GATE_CAMP encode order
 def encode_ping_types(types: frozenset[Intent]) -> str
@@ -150,7 +151,7 @@ class IncidentEngine:
                      resolution: Resolution | None) -> IncidentOutcome
     #   The single entry point for BOTH voice and slash paths (constraint 10).
     #   Handles tiers (§8.3), dedupe folding (§9.2), routing, discipline,
-    #   command_log write. resolution=None for QUERY/CANCEL and the callsign
+    #   command_log write. resolution=None for QUERY/HELP/CANCEL and the callsign
     #   intents REGISTER/UNREGISTER/WHOAMI, which dispatch to the CallsignRegistry
     #   below (no card, no mentions — spoken/ephemeral reply + command_log only).
     #   PING_ME/PING_ME_CLEAR (GDD §10.3) dispatch to the PersonalPingRegistry
@@ -382,7 +383,8 @@ class Speaker:
 #   degraded(), number_word(n), registered(callsign), unregistered(),
 #   not_registered(), whoami(callsign), say_again_callsign(),
 #   ping_types_phrase(types), pinging_you(types_phrase, system|None),
-#   ping_cleared(), no_pings(), ping_limit()  (personal pings, GDD §10.3).
+#   ping_cleared(), no_pings(), ping_limit()  (personal pings, GDD §10.3),
+#   help_hint()  ("Check help in Discord." — the voice HELP intent, GDD §6.1).
 ```
 
 ## Discord layer — `aura/dsc/`
@@ -418,9 +420,19 @@ def read_token(cfg: DiscordConfig) -> str
   /poll) — no voice twins because they trigger no alerts; it also exports
   `ReminderService(conn, bot)` with `deliver_due(now) -> int` (DM, falling
   back to an #intel-live mention), driven by `__main__`'s reminder poll loop.
+- `cogs/help.py` carries `/help [topic]` — the slash twin of the voice `HELP`
+  intent (dispatched through `engine.report` for the command_log row; the
+  engine speaks `help_hint()` and posts nothing). Content lives in the
+  `HELP_TOPICS` table (topic → title/description/fields) so
+  `tests/test_help_cog.py` can assert every registered app command appears in
+  the help text. The topic select menu uses `custom_id = "aura:help:menu"`
+  under the `aura:help:{topic}` scheme, dispatched by the persistent
+  `HelpTopicSelect` DynamicItem; the admin topic is menu-hidden and
+  dispatch-gated by the admin cog's check.
 - Views: `custom_id = f"aura:inc:{incident_id}:{action}"` with `action` in
   `otw | watch | no | fix | pick:{system_id}`. Poll vote buttons use
-  `aura:poll:{poll_id}:{option_idx}` (handled in `cogs/utility.py`).
+  `aura:poll:{poll_id}:{option_idx}` (handled in `cogs/utility.py`); the help
+  topic select uses `aura:help:{topic}` (handled in `cogs/help.py`).
   Persistent (`timeout=None`), re-registered on startup so buttons survive
   restarts (GDD §9.3).
 

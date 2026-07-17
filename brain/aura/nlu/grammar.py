@@ -4,7 +4,7 @@
 
 The grammar is regex over the transcript, nothing more (constraint 6: no LLM
 in the command path — it would be slower, cost money per fight, hallucinate
-system names, and be undebuggable at 02:00). Fourteen intents, matched in
+system names, and be undebuggable at 02:00). Fifteen intents, matched in
 severity order so *"tackled, need help in Kisogo"* resolves to
 ``UNDER_ATTACK`` rather than a sighting. The two personal-ping intents are the
 one exception to severity-first: "ping me for hostiles" *names* incident types
@@ -63,6 +63,9 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
     (Intent.TIMER, re.compile(r"\btimer\b", re.I)),
     (Intent.FORMUP, re.compile(r"\bform(?:\s|-)?up\b", re.I)),
     (Intent.QUERY, re.compile(r"\bstatus\b", re.I)),
+    # HELP sits below ASSIST_REQUEST so "need help" is always a distress call;
+    # a bare "help" (nothing else claimed it) is a request for the manual.
+    (Intent.HELP, re.compile(r"\bhelp\b", re.I)),
     (Intent.CANCEL, re.compile(r"\bcancel\b", re.I)),
     # Callsign registry (GDD §6.1). UNREGISTER before REGISTER so the longer
     # word can never be claimed by the shorter pattern.
@@ -99,7 +102,14 @@ _DURATION_START_RE = re.compile(
 )
 
 _SYSTEMLESS_INTENTS = frozenset(
-    (Intent.QUERY, Intent.CANCEL, Intent.UNREGISTER, Intent.WHOAMI, Intent.PING_ME_CLEAR)
+    (
+        Intent.QUERY,
+        Intent.HELP,
+        Intent.CANCEL,
+        Intent.UNREGISTER,
+        Intent.WHOAMI,
+        Intent.PING_ME_CLEAR,
+    )
 )
 
 # ── personal pings (GDD §6.1 PING_ME) ────────────────────────────────────────

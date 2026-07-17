@@ -558,6 +558,13 @@ class IncidentEngine:
             await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
             return outcome
 
+        if intent is Intent.HELP:
+            # Voice "help" (GDD §6.1): no card, no mentions — the spoken hint
+            # points at /help, the real manual, plus the command_log row.
+            outcome = IncidentOutcome(Outcome.POSTED, tts.help_hint(), None, None)
+            await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
+            return outcome
+
         # Callsign registry (GDD §6.1): systemless, no card, no mentions —
         # a spoken/ephemeral reply plus the command_log row, nothing else.
         if intent is Intent.REGISTER:

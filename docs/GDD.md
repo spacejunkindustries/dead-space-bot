@@ -210,6 +210,7 @@ Every module in the finished system.
 | `dsc/cogs/subs.py` | `/subscribe`, `/mysubs`, `/pingme`, `/mypings`, `/pingme-clear`, `/optout`, `/mute-voice`, `/register`, `/unregister`, `/whoami` |
 | `dsc/cogs/ops.py` | `/timer`, `/formup`, `/rollcall`, `/jumps` |
 | `dsc/cogs/admin.py` | `/routing`, `/gazetteer`, `/health`, `/fleetmode` |
+| `dsc/cogs/help.py` | `/help` — interactive help topics; the slash twin of voice "help" |
 | `tts.py` | Piper subprocess, raw→WAV wrapping, utterance queue, length cap |
 | `health.py` | Heartbeats, degradation detection, `#bot-health` reporting |
 | `voice_gateway.py` | Voice-state watch, auto-join/leave, Ears join/leave commands |
@@ -315,6 +316,7 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 | "timer \<system\> \<duration\>" | `TIMER` | none | schedules a future ping |
 | "form up \<system\> \<duration\>" | `FORMUP` | none | posts op with RSVP |
 | "status" | `QUERY` | none | spoken reply only |
+| "help" | `HELP` | none | spoken reply only — *"Check help in Discord."*; the manual is `/help` |
 | "cancel" | `CANCEL` | none | kills this user's last incident (30s window) |
 | "register \<callsign\>" / "call me \<callsign\>" | `REGISTER` | none | spoken reply only |
 | "unregister" / "unregister me" / "forget me" | `UNREGISTER` | none | spoken reply only |
@@ -352,12 +354,13 @@ Anything after the system and group is captured verbatim into the incident body:
 "Aura Command, timer Kisogo four hours"
 "Aura Command, form up Otanuomi fifteen minutes"
 "Aura Command, status"
+"Aura Command, help"
 "Aura Command, cancel"
 "Aura Command, register Space Junkie"
 "Aura Command, ping me for gate camps in Otanuomi"
 ```
 
-Fourteen commands. Short enough that pilots remember them under fire, which is the only time they matter.
+Fifteen commands. Short enough that pilots remember them under fire, which is the only time they matter.
 
 ---
 
@@ -373,6 +376,7 @@ Full parity. Every voice command routes to the same engine.
 | `/camp system detail` | Report a gate camp |
 | `/clear system` | Resolve an incident |
 | `/status` | Active incidents summary |
+| `/help [topic]` | Interactive help: main page + topic pages (reporting, responding, subscriptions, identity, ops, privacy, admin) via a select menu; twin of voice "help" |
 | `/cancel` | Retract your own last report (30s window) |
 | `/timer system duration note` | Schedule a structure timer ping |
 | `/formup system when note` | Post an op with RSVP |
@@ -631,6 +635,7 @@ Short. Always short. AURA is talking over a fight.
 | Timer set | *"Timer Kisogo, four hours."* |
 | Flood control | *"Flood control active."* |
 | Degraded | *"Voice offline, use slash commands."* |
+| Help | *"Check help in Discord."* |
 | Registered | *"Registered you as Space Junkie."* |
 | Unregistered | *"Unregistered."* |
 | Not registered | *"You are not registered."* |

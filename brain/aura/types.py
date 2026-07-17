@@ -52,6 +52,7 @@ class Intent(StrEnum):
     TIMER = "TIMER"
     FORMUP = "FORMUP"
     QUERY = "QUERY"
+    HELP = "HELP"
     CANCEL = "CANCEL"
     REGISTER = "REGISTER"
     UNREGISTER = "UNREGISTER"
@@ -80,6 +81,7 @@ INTENT_SEVERITY: Mapping[Intent, Severity] = MappingProxyType(
         Intent.TIMER: Severity.NONE,
         Intent.FORMUP: Severity.NONE,
         Intent.QUERY: Severity.NONE,
+        Intent.HELP: Severity.NONE,
         Intent.CANCEL: Severity.NONE,
         Intent.REGISTER: Severity.NONE,
         Intent.UNREGISTER: Severity.NONE,
