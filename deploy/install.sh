@@ -65,8 +65,17 @@ install -d -m 0750 -o aura -g aura /var/lib/aura
 if [[ -f "${EARS_BINARY}" ]]; then
     echo "==> Installing aura-ears binary from ${EARS_BINARY}"
     install -m 0755 "${EARS_BINARY}" /opt/aura/bin/aura-ears
+elif git -C "${REPO_ROOT}" fetch --quiet --depth 1 origin ears-bin 2>/dev/null; then
+    # CI publishes the release binary (built on every merge to main) to the
+    # ears-bin branch, reachable with the same credentials as the clone.
+    echo "==> Installing aura-ears binary from origin/ears-bin"
+    git -C "${REPO_ROOT}" show FETCH_HEAD:aura-ears > /opt/aura/bin/aura-ears
+    git -C "${REPO_ROOT}" show FETCH_HEAD:aura-ears.sha256 \
+        | (cd /opt/aura/bin && sha256sum --check --quiet -) \
+        || { echo "ERROR: aura-ears checksum mismatch"; rm -f /opt/aura/bin/aura-ears; exit 1; }
+    chmod 0755 /opt/aura/bin/aura-ears
 else
-    echo "==> aura-ears binary not found at ${EARS_BINARY} — skipping"
+    echo "==> aura-ears binary not found at ${EARS_BINARY} and no ears-bin branch — skipping"
     echo "    (download the 'aura-ears' CI artifact and re-run, or copy it"
     echo "     to /opt/aura/bin/aura-ears yourself)"
 fi
@@ -92,6 +101,10 @@ if [[ ! -x /opt/aura/brain/venv/bin/python ]]; then
 fi
 /opt/aura/brain/venv/bin/pip install --quiet --upgrade pip
 /opt/aura/brain/venv/bin/pip install --quiet -r /opt/aura/brain/requirements.txt
+# openwakeword pins tflite-runtime on Linux, which has no wheels for
+# Python >=3.12. AURA only uses its ONNX path (inference_framework="onnx"),
+# so install it without deps; its real runtime deps are in requirements.txt.
+/opt/aura/brain/venv/bin/pip install --quiet --no-deps "openwakeword>=0.6.0"
 /opt/aura/brain/venv/bin/pip install --quiet -e /opt/aura/brain
 # ProtectSystem=strict makes /opt read-only for the service: precompile
 # bytecode now so the runtime never tries to write __pycache__.
