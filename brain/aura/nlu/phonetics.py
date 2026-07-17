@@ -308,18 +308,53 @@ def _phonetic_similarity(a: str, b: str) -> float:
     return max(similarity(pa, pb), similarity(pa, ab), similarity(aa, pb), similarity(aa, ab))
 
 
+#: Minimum abbreviation-match score to promote a nullsec short-form match —
+#: high enough that only a clearly-spoken prefix ("UMI"→UMI-KK) counts.
+_ABBREV_PROMOTE_MIN = 0.78
+
+
+def eve_abbrev(name: str) -> str | None:
+    """The spoken short form of a nullsec system name — the part before the
+    first hyphen. EVE nullsec systems are ``PREFIX-SUFFIX`` ("UMI-KK",
+    "MOEE-8", "1DQ1-A", "NVLF6-2K") and pilots call them by the prefix alone;
+    the full designation is almost never said. Returns ``None`` when there is
+    no distinct hyphenated short form (high/low-sec names like "Jita")."""
+    head = name.split("-", 1)[0].strip()
+    if head and head != name and len(head) >= 2:
+        return head
+    return None
+
+
 def base_score(window: str, name: str, cfg: MatchingConfig) -> float:
     """``phonetic_weight·phonetic_sim + text_weight·text_sim`` — GDD §8.2.
 
     ``window`` is a joined token window from the transcript, ``name`` a
     gazetteer system name. Spaces/hyphens are collapsed on both sides so
-    *"oh tan you oh me"* lines up with *Otanuomi* character-wise too.
+    *"oh tan you oh me"* lines up with *Otanuomi* character-wise too. For a
+    hyphenated nullsec name the window is also scored against the spoken
+    short form (:func:`eve_abbrev`), so *"UMI"* matches *UMI-KK* and *"Moe 8"*
+    matches *MOEE-8* — the full tail no longer drags the confidence down.
     """
     a = re.sub(r"[^a-z0-9]", "", window.lower())
     b = re.sub(r"[^a-z0-9]", "", name.lower())
-    phonetic = _phonetic_similarity(a, b)
-    text = similarity(a, b)
-    return cfg.phonetic_weight * phonetic + cfg.text_weight * text
+    score = cfg.phonetic_weight * _phonetic_similarity(a, b) + cfg.text_weight * similarity(a, b)
+
+    abbrev = eve_abbrev(name)
+    if abbrev is not None:
+        c = re.sub(r"[^a-z0-9]", "", abbrev.lower())
+        # Score the window against the short form, but only *promote* the match
+        # when it is strong (>= _ABBREV_PROMOTE_MIN) and the window is nearly
+        # as long as the prefix. A clearly-spoken abbreviation ("UMI", "Moe")
+        # clears this bar; a coincidental phonetic overlap between a noise
+        # window ("oh me") and a prefix ("MOEE") does not — which keeps
+        # abbreviations from inventing spurious competitors.
+        if len(a) >= max(3, len(c) - 1):
+            abbrev_score = cfg.phonetic_weight * _phonetic_similarity(a, c) + cfg.text_weight * (
+                similarity(a, c)
+            )
+            if abbrev_score >= _ABBREV_PROMOTE_MIN:
+                score = max(score, abbrev_score)
+    return score
 
 
 def _windows(tokens: list[str]) -> list[str]:
