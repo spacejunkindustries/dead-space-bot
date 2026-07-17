@@ -4,9 +4,14 @@
 
 The grammar is regex over the transcript, nothing more (constraint 6: no LLM
 in the command path — it would be slower, cost money per fight, hallucinate
-system names, and be undebuggable at 02:00). Twelve intents, matched in
+system names, and be undebuggable at 02:00). Fourteen intents, matched in
 severity order so *"tackled, need help in Kisogo"* resolves to
-``UNDER_ATTACK`` rather than a sighting.
+``UNDER_ATTACK`` rather than a sighting. The two personal-ping intents are the
+one exception to severity-first: "ping me for hostiles" *names* incident types
+without reporting one, so ``PING_ME``/``PING_ME_CLEAR`` are matched before the
+type words can claim the utterance (a genuine distress call never contains
+"ping me"). For ``PING_ME`` the recognised type words are carried in
+``detail`` as a comma-separated list of ``Intent`` values (GDD §6.1).
 
 ``system_text`` is the raw token window believed to name a system — it is NOT
 resolved here; ``aura.nlu.phonetics.resolve`` owns that. ``detail`` is
@@ -24,7 +29,14 @@ import re
 
 from aura.types import Intent, ParsedCommand
 
-__all__ = ["clean_callsign", "parse", "sanitize_callsign", "system_reply"]
+__all__ = [
+    "PING_TYPE_ORDER",
+    "clean_callsign",
+    "encode_ping_types",
+    "parse",
+    "sanitize_callsign",
+    "system_reply",
+]
 
 # Leading wake-phrase residue. The wake detector gates on audio, but the
 # capture window starts 300ms of pre-roll before the trigger, so the phrase
@@ -36,8 +48,13 @@ _WAKE_RE = re.compile(
 )
 
 # Intent patterns in match-priority order (GDD §6.1): the higher-severity
-# pattern wins regardless of position in the utterance.
+# pattern wins regardless of position in the utterance. The personal-ping
+# intents sit above the type words because their utterances *contain* type
+# words ("ping me for gate camps"); PING_ME_CLEAR before PING_ME so "stop
+# pinging me" can never be claimed as a new subscription.
 _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
+    (Intent.PING_ME_CLEAR, re.compile(r"\bstop\s+ping(?:ing|s)?(?:\s+me)?\b", re.I)),
+    (Intent.PING_ME, re.compile(r"\bping\s+me\b", re.I)),
     (Intent.UNDER_ATTACK, re.compile(r"\bunder\s+attack\b|\btackled\b|\bpoint\s+on\s+me\b", re.I)),
     (Intent.ASSIST_REQUEST, re.compile(r"\bneed\s+(?:help|backup|back\s*up)\b", re.I)),
     (Intent.HOSTILE_SPOTTED, re.compile(r"\bhostiles?\b|\breds?\b|\bneuts?\b", re.I)),
@@ -81,7 +98,73 @@ _DURATION_START_RE = re.compile(
     re.IGNORECASE,
 )
 
-_SYSTEMLESS_INTENTS = frozenset((Intent.QUERY, Intent.CANCEL, Intent.UNREGISTER, Intent.WHOAMI))
+_SYSTEMLESS_INTENTS = frozenset(
+    (Intent.QUERY, Intent.CANCEL, Intent.UNREGISTER, Intent.WHOAMI, Intent.PING_ME_CLEAR)
+)
+
+# ── personal pings (GDD §6.1 PING_ME) ────────────────────────────────────────
+
+#: Canonical order for the encoded type list — matches the §12.1 spoken order.
+PING_TYPE_ORDER: tuple[Intent, ...] = (
+    Intent.HOSTILE_SPOTTED,
+    Intent.UNDER_ATTACK,
+    Intent.ASSIST_REQUEST,
+    Intent.GATE_CAMP,
+)
+
+# The §6.1 synonym vocabulary, re-scoped to the PING_ME remainder ("ping me
+# for gate camps in Otanuomi"). Scanned — not matched in priority order —
+# because "ping me for hostiles and gate camps" names several types at once.
+_PING_TYPE_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
+    (Intent.HOSTILE_SPOTTED, re.compile(r"\bhostiles?\b|\breds?\b|\bneuts?\b", re.I)),
+    (Intent.UNDER_ATTACK, re.compile(r"\b(?:under\s+)?attacks?\b|\btackled\b", re.I)),
+    (
+        Intent.ASSIST_REQUEST,
+        re.compile(
+            r"\bassist\s+requests?\b|\bassists?\b|\bneed\s+(?:help|backup|back\s*up)\b", re.I
+        ),
+    ),
+    (Intent.GATE_CAMP, re.compile(r"\bgate\s*camps?\b", re.I)),
+)
+
+# "anything" / "everything" / "all" → all four report types.
+_PING_ALL_RE = re.compile(r"\banything\b|\beverything\b|\ball\b", re.I)
+
+# Connective filler specific to the PING_ME phrasing ("ping me *for* gate
+# camps *and* hostiles"). "everywhere"/"anywhere" name the no-system default
+# out loud — they must never be mistaken for a system window.
+_PING_FILLER = frozenset(("for", "and", "please", "when", "me", "everywhere", "anywhere"))
+
+
+def encode_ping_types(types: frozenset[Intent]) -> str:
+    """Encode a PING_ME type set into the ``detail`` slot: comma-separated
+    ``Intent`` values in canonical order — readable in ``command_log``, shared
+    by voice and slash (constraint 10)."""
+    return ",".join(str(t) for t in PING_TYPE_ORDER if t in types)
+
+
+def _parse_ping_me(remainder: str) -> tuple[str | None, str]:
+    """Split a PING_ME remainder into ``(system_text, encoded_types)``.
+
+    Type words are scanned with the §6.1 synonym vocabulary and stripped;
+    whatever survives filler removal is the system window. No type word (or an
+    explicit "anything"/"everything"/"all") means all four report types —
+    "ping me in Otanuomi" is a subscription to everything there.
+    """
+    types: set[Intent] = set()
+    work = remainder
+    for intent, pattern in _PING_TYPE_PATTERNS:
+        if pattern.search(work):
+            types.add(intent)
+            work = pattern.sub(" ", work)
+    if _PING_ALL_RE.search(work) or not types:
+        types = set(PING_TYPE_ORDER)
+        work = _PING_ALL_RE.sub(" ", work)
+    tokens = [t for t in re.split(r"[\s,.;:!?]+", work) if t]
+    kept = [t for t in tokens if t.lower() not in (_FILLER | _PING_FILLER)]
+    system_text = " ".join(kept) or None
+    return system_text, encode_ping_types(frozenset(types))
+
 
 # ── callsign cleaning (GDD §6.1 REGISTER) ────────────────────────────────────
 
@@ -214,6 +297,19 @@ def parse(transcript: str) -> ParsedCommand | None:
     if intent in _SYSTEMLESS_INTENTS:
         return ParsedCommand(
             intent=intent, system_text=None, group_alias=group_alias, detail=None, raw=transcript
+        )
+
+    if intent is Intent.PING_ME:
+        # The remainder names incident types (carried encoded in ``detail``)
+        # and optionally a system window — resolved later by phonetics, same
+        # pipeline as reports (GDD §8.2).
+        system_text, encoded = _parse_ping_me(remainder)
+        return ParsedCommand(
+            intent=intent,
+            system_text=system_text,
+            group_alias=group_alias,
+            detail=encoded,
+            raw=transcript,
         )
 
     if intent is Intent.REGISTER:

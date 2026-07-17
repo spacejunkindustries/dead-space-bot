@@ -41,6 +41,7 @@ from aura.config import ConfigHolder
 from aura.core import db
 from aura.core.callsigns import CallsignRegistry
 from aura.core.discipline import Discipline
+from aura.core.personal_pings import PersonalPingRegistry, types_from_detail
 from aura.core.routing import RoutingRule, apply_group_alias, evaluate, load_group_aliases
 from aura.core.routing import load_rules as load_routing_rules_file
 from aura.core.routing import suppress as suppress_decision
@@ -297,6 +298,9 @@ def _mention_content(decision: RoutingDecision) -> str:
     if decision.here:
         parts.append("@here")
     parts.extend(f"<@&{role_id}>" for role_id in decision.role_ids)
+    # Personal ping subscribers (GDD §10.3): user mentions appended after the
+    # roles — never @here, never a separate message.
+    parts.extend(f"<@{user_id}>" for user_id in decision.user_ids)
     return " ".join(parts)
 
 
@@ -499,6 +503,9 @@ class IncidentEngine:
         # Callsign registry (GDD §6.1): same conn, own write lock. Exposed via
         # the ``callsigns`` property so /rollcall and the cogs share it.
         self._callsigns = CallsignRegistry(conn)
+        # Personal ping subscriptions (GDD §10.3): same pattern; the routing
+        # evaluator reads its mirror on every incident open.
+        self._personal_pings = PersonalPingRegistry(conn, holder)
         # In-memory only: candidate lists for uncertain (MEDIUM-tier) cards so
         # re-renders keep their pick buttons until confirmed/corrected. After a
         # restart an uncertain card keeps its already-posted buttons (persistent
@@ -513,6 +520,11 @@ class IncidentEngine:
     def callsigns(self) -> CallsignRegistry:
         """The pilot callsign registry both paths dispatch through."""
         return self._callsigns
+
+    @property
+    def personal_pings(self) -> PersonalPingRegistry:
+        """The personal ping registry both paths dispatch through (GDD §10.3)."""
+        return self._personal_pings
 
     def load_routing_rules(self, resolve_role: Callable[[str], int | None]) -> int:
         """(Re)load ``routing.yaml``. Blocking file I/O — call via ``to_thread``.
@@ -571,6 +583,22 @@ class IncidentEngine:
             await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
             return outcome
 
+        # Personal pings (GDD §10.3): no card, no mentions from the command
+        # itself — a spoken/ephemeral reply plus the command_log row.
+        if intent is Intent.PING_ME:
+            outcome = await self._ping_me(guild_id, reporter_id, parsed, resolution)
+            await self._log_command(reporter_id, parsed, resolution, None, outcome.outcome)
+            return outcome
+
+        if intent is Intent.PING_ME_CLEAR:
+            removed = await self._personal_pings.clear(guild_id, reporter_id)
+            if removed:
+                outcome = IncidentOutcome(Outcome.POSTED, tts.ping_cleared(), None, None)
+            else:
+                outcome = IncidentOutcome(Outcome.REJECTED, tts.no_pings(), None, None)
+            await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
+            return outcome
+
         # Every remaining intent names a system.
         if resolution is None or resolution.tier is Tier.LOW or resolution.best is None:
             outcome = IncidentOutcome(
@@ -609,6 +637,37 @@ class IncidentEngine:
         )
         await self._log_command(reporter_id, parsed, resolution, None, Outcome.REJECTED)
         return outcome
+
+    # ── personal pings (GDD §10.3) ───────────────────────────────────────────
+
+    async def _ping_me(
+        self,
+        guild_id: int,
+        reporter_id: int,
+        parsed: ParsedCommand,
+        resolution: Resolution | None,
+    ) -> IncidentOutcome:
+        """Store one personal ping subscription and speak the confirmation.
+
+        The system window resolves through the same phonetic pipeline as
+        reports; anything below HIGH tier is treated as unresolved — a stored
+        subscription silently scoped to the wrong system would never fire, so
+        AURA asks again instead of guessing (GDD §8.3 posture).
+        """
+        types = types_from_detail(parsed.detail)
+        system_id: int | None = None
+        system_name: str | None = None
+        if parsed.system_text:
+            if resolution is None or resolution.tier is not Tier.HIGH or resolution.best is None:
+                return IncidentOutcome(Outcome.REJECTED, tts.say_again(), None, None)
+            best = resolution.best
+            system_id = best.system_id
+            system_name = self._system_name(best.system_id, best.name)
+        added = await self._personal_pings.add(guild_id, reporter_id, types, system_id)
+        if not added:
+            return IncidentOutcome(Outcome.REJECTED, tts.ping_limit(), None, None)
+        utterance = tts.pinging_you(tts.ping_types_phrase(types), system_name)
+        return IncidentOutcome(Outcome.POSTED, utterance, None, None)
 
     # ── incident reports: dedupe fold or create (GDD §9.2) ───────────────────
 
@@ -716,11 +775,19 @@ class IncidentEngine:
         incident = await asyncio.to_thread(_load_incident, self._conn, incident_id)
         assert incident is not None
 
-        # Routing → group alias → discipline.
-        decision = evaluate(incident, self._rules, now, gazetteer=self._gazetteer)
+        # Routing → group alias → discipline. Personal subscribers (GDD §10.3)
+        # ride the same decision, so cooldown/breaker suppression and the
+        # dedupe fold's no-re-mention rule apply to them identically.
+        decision = evaluate(
+            incident,
+            self._rules,
+            now,
+            gazetteer=self._gazetteer,
+            personal=self._personal_pings.rules_for(guild_id),
+        )
         decision = apply_group_alias(decision, parsed.group_alias, self._rules, self._alias_roles)
         flood_announced = False
-        mentions_wanted = bool(decision.role_ids or decision.here)
+        mentions_wanted = bool(decision.role_ids or decision.here or decision.user_ids)
         if mentions_wanted:
             if self._discipline.allow_mention(reporter_id, now):
                 self._discipline.record_mention(reporter_id, now)
@@ -752,7 +819,7 @@ class IncidentEngine:
             utterance = "Flood control active."
         elif uncertain:
             utterance = f"{label} {system_name} — say again to confirm."
-        elif decision.role_ids or decision.here:
+        elif decision.role_ids or decision.here or decision.user_ids:
             scoped = _GROUP_ALIAS_SPOKEN.get(parsed.group_alias or "")
             utterance = (
                 f"{label} {system_name}, pinged {scoped}."
@@ -770,6 +837,7 @@ class IncidentEngine:
             severity=str(severity),
             uncertain=uncertain,
             mentions=len(decision.role_ids),
+            personal_pings=len(decision.user_ids),
             here=decision.here,
         )
         outcome = Outcome.ASKED if uncertain else Outcome.POSTED

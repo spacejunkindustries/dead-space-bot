@@ -59,6 +59,7 @@ discipline:
   circuit_breaker:
     max_mentions: 12
     window_min: 10
+  personal_pings_max: 10               # max personal /pingme subscriptions per pilot
 
 tts:
   enabled: true

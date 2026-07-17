@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from aura.core.routing import (
+    PersonalPing,
     QuietHours,
     RoutingConfigError,
     RoutingRule,
@@ -307,6 +308,108 @@ def test_suppress_strips_all_mentions() -> None:
     assert stripped.role_ids == ()
     assert stripped.here is False
     assert stripped.channel is AlertChannel.LIVE
+
+
+# ── personal pings (GDD §10.3) ───────────────────────────────────────────────
+
+
+def ping(user_id: int, *types: Intent, system_id: int | None = None) -> PersonalPing:
+    return PersonalPing(user_id=user_id, types=frozenset(types), system_id=system_id)
+
+
+def test_personal_ping_matches_type_and_system(gazetteer: FakeGazetteer) -> None:
+    personal = [
+        ping(100, Intent.GATE_CAMP, system_id=1),
+        ping(101, Intent.GATE_CAMP),  # all systems
+        ping(102, Intent.HOSTILE_SPOTTED, system_id=1),  # wrong type
+        ping(103, Intent.GATE_CAMP, system_id=2),  # wrong system
+    ]
+    decision = evaluate(
+        make_incident(Intent.GATE_CAMP, 1), [], NOW, gazetteer=gazetteer, personal=personal
+    )
+    assert decision.user_ids == (100, 101)
+    assert decision.role_ids == ()
+    assert decision.here is False
+    assert decision.channel is AlertChannel.ALERTS  # a mention is a mention
+
+
+def test_personal_ping_never_pings_the_reporter(gazetteer: FakeGazetteer) -> None:
+    # make_incident's reporter_id is 42.
+    personal = [ping(42, Intent.GATE_CAMP), ping(100, Intent.GATE_CAMP)]
+    decision = evaluate(
+        make_incident(Intent.GATE_CAMP, 1), [], NOW, gazetteer=gazetteer, personal=personal
+    )
+    assert decision.user_ids == (100,)
+
+
+def test_personal_ping_deduplicates_user(gazetteer: FakeGazetteer) -> None:
+    personal = [ping(100, Intent.GATE_CAMP, system_id=1), ping(100, Intent.GATE_CAMP)]
+    decision = evaluate(
+        make_incident(Intent.GATE_CAMP, 1), [], NOW, gazetteer=gazetteer, personal=personal
+    )
+    assert decision.user_ids == (100,)
+
+
+def test_personal_ping_never_causes_here(gazetteer: FakeGazetteer) -> None:
+    """Constraint 11: user subscriptions cannot escalate — even on escalatable
+    types, and no roles means no escalation source at all."""
+    for intent in (Intent.UNDER_ATTACK, Intent.ASSIST_REQUEST, Intent.GATE_CAMP):
+        decision = evaluate(
+            make_incident(intent, 1),
+            [],
+            NOW,
+            gazetteer=gazetteer,
+            personal=[ping(100, intent)],
+        )
+        assert decision.here is False
+        assert decision.user_ids == (100,)
+
+
+def test_personal_ping_appended_alongside_roles(gazetteer: FakeGazetteer) -> None:
+    decision = evaluate(
+        make_incident(Intent.HOSTILE_SPOTTED, 1),
+        [MINERS_RULE],
+        NOW,
+        gazetteer=gazetteer,
+        personal=[ping(100, Intent.HOSTILE_SPOTTED)],
+    )
+    assert decision.role_ids == (MINERS_ROLE,)
+    assert decision.user_ids == (100,)
+    assert decision.channel is AlertChannel.ALERTS
+
+
+def test_no_matching_personal_ping_stays_live(gazetteer: FakeGazetteer) -> None:
+    decision = evaluate(
+        make_incident(Intent.GATE_CAMP, 5),
+        [],
+        NOW,
+        gazetteer=gazetteer,
+        personal=[ping(100, Intent.GATE_CAMP, system_id=1)],
+    )
+    assert decision.user_ids == ()
+    assert decision.channel is AlertChannel.LIVE
+
+
+def test_suppress_strips_personal_pings_too() -> None:
+    decision = RoutingDecision(
+        role_ids=(HD_ROLE,), here=True, channel=AlertChannel.ALERTS, user_ids=(100, 101)
+    )
+    assert suppress(decision).user_ids == ()
+
+
+def test_group_alias_preserves_personal_pings(gazetteer: FakeGazetteer) -> None:
+    rules = [hd_rule(), MINERS_RULE]
+    base = evaluate(
+        make_incident(Intent.HOSTILE_SPOTTED, 1),
+        rules,
+        NOW,
+        gazetteer=gazetteer,
+        personal=[ping(100, Intent.HOSTILE_SPOTTED)],
+    )
+    restricted = apply_group_alias(base, "miners", rules, {"miners": MINERS_ROLE})
+    assert restricted.user_ids == (100,)
+    all_hands = apply_group_alias(base, "all_hands", rules, {})
+    assert all_hands.user_ids == (100,)
 
 
 # ── rule loading ─────────────────────────────────────────────────────────────

@@ -82,6 +82,21 @@ CREATE TABLE subscriptions (
     quiet_hours_json TEXT
 );
 
+-- ── personal ping subscriptions (GDD §10.3) ──────────────────
+-- A user mention, not a role: matching incidents append <@user_id>
+-- to the mention line. types_json = JSON array of Intent values;
+-- system_id NULL = all systems. Capped by discipline.personal_pings_max;
+-- never causes @here (constraint 11).
+CREATE TABLE personal_pings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    types_json  TEXT NOT NULL,
+    system_id   INTEGER REFERENCES systems(id),
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX idx_personal_pings_guild ON personal_pings(guild_id);
+
 -- ── scheduled ────────────────────────────────────────────────
 CREATE TABLE timers (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -65,6 +65,7 @@ discipline:
   circuit_breaker:
     max_mentions: 12                   # more than this many mentions ...
     window_min: 10                     # ... in this many minutes → flood control (GDD §11.1)
+  personal_pings_max: 10               # max personal /pingme subscriptions per pilot (GDD §10.3)
 
 tts:
   enabled: true                        # spoken back-channel on/off

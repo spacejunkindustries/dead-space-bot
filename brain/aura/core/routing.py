@@ -38,6 +38,7 @@ if TYPE_CHECKING:  # pragma: no cover — real class lands with aura.nlu.gazette
 
 __all__ = [
     "ESCALATABLE_TYPES",
+    "PersonalPing",
     "QuietHours",
     "RoutingConfigError",
     "RoutingRule",
@@ -117,6 +118,20 @@ class RoutingRule:
     quiet_hours: QuietHours | None
 
 
+@dataclass(frozen=True, slots=True)
+class PersonalPing:
+    """One personal ping subscription (GDD §10.3) — a **user** mention.
+
+    ``system_id is None`` covers all systems. Personal pings match on type ∧
+    system only; they carry no escalation and no quiet hours, and can never
+    contribute to ``here`` (constraint 11).
+    """
+
+    user_id: int
+    types: frozenset[Intent]
+    system_id: int | None
+
+
 def _parse_hhmm(value: str, dotted: str) -> int:
     m = _HHMM.match(value)
     if m is None:
@@ -152,6 +167,7 @@ def evaluate(
     now: datetime,
     *,
     gazetteer: Gazetteer,
+    personal: Sequence[PersonalPing] = (),
 ) -> RoutingDecision:
     """Evaluate every rule against the incident — GDD §10.1.
 
@@ -159,6 +175,11 @@ def evaluate(
     escalation under constraint 11, and pick the channel: any mention goes to
     ``#intel-alerts``, otherwise ``#intel-live``. A rule inside its quiet
     hours contributes neither its role nor its escalation.
+
+    ``personal`` are the guild's personal ping subscriptions (GDD §10.3):
+    matching subscribers are unioned into ``user_ids`` (each mentioned once),
+    the incident's own reporter excluded. Personal pings count as mentions for
+    channel choice but never touch ``here`` (constraint 11).
     """
     role_ids: list[int] = []
     here = False
@@ -182,8 +203,20 @@ def evaluate(
     assert not here or incident.type in ESCALATABLE_TYPES, (
         f"@here escalation computed for non-escalatable type {incident.type} — constraint 11"
     )
-    channel = AlertChannel.ALERTS if (role_ids or here) else AlertChannel.LIVE
-    return RoutingDecision(role_ids=tuple(role_ids), here=here, channel=channel)
+    user_ids: list[int] = []
+    for ping in personal:
+        if ping.user_id == incident.reporter_id:
+            continue  # never pinged for your own report
+        if incident.type not in ping.types:
+            continue
+        if ping.system_id is not None and ping.system_id != incident.system_id:
+            continue
+        if ping.user_id not in user_ids:
+            user_ids.append(ping.user_id)
+    channel = AlertChannel.ALERTS if (role_ids or here or user_ids) else AlertChannel.LIVE
+    return RoutingDecision(
+        role_ids=tuple(role_ids), here=here, channel=channel, user_ids=tuple(user_ids)
+    )
 
 
 def apply_group_alias(
@@ -207,12 +240,22 @@ def apply_group_alias(
         for rule in rules:
             if rule.role_id not in all_roles:
                 all_roles.append(rule.role_id)
-        return RoutingDecision(role_ids=tuple(all_roles), here=True, channel=AlertChannel.ALERTS)
+        return RoutingDecision(
+            role_ids=tuple(all_roles),
+            here=True,
+            channel=AlertChannel.ALERTS,
+            user_ids=decision.user_ids,
+        )
     role_id = alias_roles.get(group_alias)
     if role_id is None:
         log.warning("group_alias_unmapped", alias=group_alias)
         return decision
-    return RoutingDecision(role_ids=(role_id,), here=decision.here, channel=AlertChannel.ALERTS)
+    return RoutingDecision(
+        role_ids=(role_id,),
+        here=decision.here,
+        channel=AlertChannel.ALERTS,
+        user_ids=decision.user_ids,
+    )
 
 
 def suppress(decision: RoutingDecision) -> RoutingDecision:
@@ -220,8 +263,10 @@ def suppress(decision: RoutingDecision) -> RoutingDecision:
 
     The incident still gets posted, to ``#intel-live`` only — the engine keeps
     logging while the circuit breaker is open or a cooldown is running.
+    Personal pings are stripped with everything else — they ride the same
+    discipline (GDD §10.3).
     """
-    return RoutingDecision(role_ids=(), here=False, channel=AlertChannel.LIVE)
+    return RoutingDecision(role_ids=(), here=False, channel=AlertChannel.LIVE, user_ids=())
 
 
 # ── rule loading ─────────────────────────────────────────────────────────────
