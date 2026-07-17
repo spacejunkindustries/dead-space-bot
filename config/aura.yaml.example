@@ -1,0 +1,91 @@
+# AURA main configuration — GDD §16.
+# Production copy lives at /etc/aura/aura.yaml and is hot-reloaded on SIGHUP.
+# Every tunable in the system lives here; code contains no magic numbers.
+# The numeric defaults below are starting values tuned from real fleet audio —
+# expect them to move (see CLAUDE.md conventions).
+
+discord:
+  token_file: /etc/aura/token          # dev fallback ONLY (0600, root:aura). Production
+                                       # reads $CREDENTIALS_DIRECTORY/token via systemd
+                                       # LoadCredential= — the token is never in this file.
+  guild_id: 000000000000000000         # the corp's guild (snowflake)
+  channels:
+    intel_alerts: 000000000000000000   # only incidents that mention a role (GDD §11.2)
+    intel_live:   000000000000000000   # every incident, no mentions — the firehose
+    health:       000000000000000000   # hourly self-reports and degradation alerts
+  roles:
+    pilot: 000000000000000000          # gate: only members with this role may trigger mentions
+    fc:    000000000000000000          # gate: only this role may voice-trigger under fleetmode
+  watch_voice_channels: [000000000000000000]  # voice channels AURA watches / auto-joins
+  auto_join: true                      # join when a pilot enters, leave when empty
+
+wake:
+  # The phrase itself ("aura command", GDD §5.2) is baked into the trained
+  # model below — changing it means training a new model, not editing config.
+  model:  /opt/aura/models/wake/aura_command.onnx  # trained openWakeWord ONNX chain
+  threshold: 0.55                      # wake score needed to open a capture window
+  refractory_ms: 2000                  # per-user dead time after a wake hit
+
+capture:
+  preroll_ms: 300                      # RAM ring-buffer audio prepended to each capture
+  endpoint_silence_ms: 400             # trailing silence that ends an utterance
+  max_utterance_ms: 6000               # hard cap on a single capture window
+  vad_aggressiveness: 2                # webrtcvad mode, 0 (permissive) – 3 (aggressive)
+
+stt:
+  backend: faster-whisper              # or: whisper-cpp (same Transcriber protocol)
+  model: small                         # Whisper model size
+  compute_type: int8                   # CTranslate2 quantization
+  cpu_threads: 2                       # inference threads (droplet has 2 dedicated vCPUs)
+  bias_with_gazetteer: true            # pass system names as Whisper initial_prompt
+  whisper_cpp_url: http://127.0.0.1:8080/inference  # used only when backend: whisper-cpp
+
+matching:
+  phonetic_weight: 0.6                 # weight of metaphone similarity (constraint 7)
+  text_weight: 0.4                     # weight of raw-text Levenshtein similarity
+  tiers:                               # confidence tiers — GDD §8.3
+    high_min: 0.80                     # top1 >= this ...
+    high_margin: 0.12                  # ... and top1 - top2 >= this → post immediately
+    medium_min: 0.55                   # top1 >= this → post flagged uncertain, with buttons
+  priors:                              # context reweighting — GDD §8.4
+    recency_weight: 0.35               # boost for systems with recent incidents
+    recency_window_min: 10             # how recent counts as recent
+    proximity_weight: 0.25             # boost for systems near an active incident
+    proximity_max_jumps: 5             # beyond this many jumps, no proximity boost
+    reporter_history_weight: 0.15      # boost for systems this pilot reports from often
+    home_weight: 0.10                  # standing boost for home and adjacent systems
+
+incidents:
+  dedupe_window_s: 90                  # same system + type within this window → fold (GDD §9.2)
+  stale_after_min: 20                  # no updates for this long → auto-STALE, silently
+  cancel_window_s: 30                  # "aura command, cancel" kills the user's last incident
+
+discipline:
+  user_cooldown_s: 30                  # min seconds between mentions from the same pilot
+  circuit_breaker:
+    max_mentions: 12                   # more than this many mentions ...
+    window_min: 10                     # ... in this many minutes → flood control (GDD §11.1)
+
+tts:
+  enabled: true                        # spoken back-channel on/off
+  voice: /opt/aura/models/piper/en_US-amy-medium.onnx  # Piper voice model
+  binary: /usr/local/bin/piper         # Piper invoked as a subprocess (GDD §12 license note)
+  max_utterance_s: 3                   # hard cap; longer text goes to the channel instead
+  # Ducking (60%) and talk-over suppression are fixed playback mechanics in
+  # Ears (ears/src/playback.rs, GDD §12.2) — not tunables.
+
+gazetteer:
+  file: /etc/aura/gazetteer.yaml       # region allowlist + always-include list (GDD §8.1)
+  home_system: Otanuomi                # anchor for the home-bias prior and within_jumps_of
+
+ipc:
+  socket: /run/aura/aura.sock          # Brain binds; Ears connects (GDD §15)
+  # Ears' outbound ring size (buffer_seconds) lives in /etc/aura/ears.yaml —
+  # the ring must survive Brain restarts, so Brain cannot own that knob.
+
+health:
+  report_interval_min: 60              # cadence of #bot-health self-reports
+  voice_silence_alarm_s: 60            # no VoiceTick this long with >=2 humans → degraded
+
+database:
+  path: /var/lib/aura/aura.db          # SQLite (WAL); backed up nightly (GDD §18)

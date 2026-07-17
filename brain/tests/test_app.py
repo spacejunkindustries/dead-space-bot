@@ -1,0 +1,295 @@
+"""Voice-pipeline wiring tests for ``aura.__main__.App`` — GDD §5, §8.3, §11.1.
+
+The App is assembled from stubs around the real ``_on_utterance`` flow: real
+grammar parse, real phonetic resolve (against a fake gazetteer), real
+Discipline, stubbed STT/engine/speaker/capture. Covers the @Pilot voice gate
+(constraint 10 parity with the slash path), the LOW-tier "say again" retry
+re-bind, the STT-failure reply, and the timer/reminder poll readiness guards.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from dataclasses import dataclass, field
+from datetime import datetime
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+import aura.__main__ as app_main
+from aura.__main__ import App
+from aura.audio.stt import SttTimeoutError
+from aura.core.discipline import Discipline
+from aura.types import (
+    IncidentOutcome,
+    Intent,
+    Outcome,
+    ParsedCommand,
+    PriorContext,
+    SystemEntry,
+    TranscriptResult,
+)
+from tests.test_incidents import PILOT_ROLE, FakeGazetteer, StubHolder, make_config
+from tests.test_incidents import SYSTEMS as GAZ_SYSTEMS
+
+GUILD = 1
+USER = 42
+
+
+# ── stubs ────────────────────────────────────────────────────────────────────
+
+
+class _Gazetteer(FakeGazetteer):
+    def prompt_bias_text(self) -> str:
+        return ""
+
+
+class _Transcriber:
+    def __init__(self, texts: list[str] | None = None, error: Exception | None = None) -> None:
+        self.texts = list(texts or [])
+        self.error = error
+
+    def transcribe(self, pcm: bytes, bias: str) -> TranscriptResult:
+        if self.error is not None:
+            raise self.error
+        return TranscriptResult(text=self.texts.pop(0), avg_logprob=-0.1)
+
+
+class _Engine:
+    def __init__(self, outcome: IncidentOutcome) -> None:
+        self.outcome = outcome
+        self.reports: list[tuple[int, int, Any, Any]] = []
+        self.fired: list[datetime] = []
+
+    async def report(self, guild_id: int, user_id: int, parsed: Any, resolution: Any) -> Any:
+        self.reports.append((guild_id, user_id, parsed, resolution))
+        return self.outcome
+
+    def build_prior_context(self, guild_id: int, user_id: int) -> PriorContext:
+        return PriorContext()
+
+    async def fire_due_timers(self, now: datetime) -> list[Any]:
+        self.fired.append(now)
+        return []
+
+
+class _Health:
+    def __init__(self) -> None:
+        self.wake_hits = 0
+        self.rejected = 0
+        self.stt: list[tuple[float, Any]] = []
+        self.degraded = False
+
+    def record_wake_hit(self) -> None:
+        self.wake_hits += 1
+
+    def record_rejected(self) -> None:
+        self.rejected += 1
+
+    def record_stt(self, confidence: float, tier: Any) -> None:
+        self.stt.append((confidence, tier))
+
+    def record_incident_posted(self) -> None:
+        pass
+
+    def record_incident_folded(self) -> None:
+        pass
+
+
+class _Speaker:
+    def __init__(self) -> None:
+        self.said: list[tuple[int, str]] = []
+
+    async def say(self, guild_id: int, text: str, priority: int = 1, *, user_id=None) -> bool:
+        self.said.append((guild_id, text))
+        return True
+
+
+@dataclass
+class _Capture:
+    reopened: list[tuple[int, int]] = field(default_factory=list)
+
+    def reopen(self, user_id: int, guild_id: int) -> None:
+        self.reopened.append((user_id, guild_id))
+
+
+class _Bot:
+    def __init__(self, role_ids: list[int]) -> None:
+        member = SimpleNamespace(roles=[SimpleNamespace(id=r) for r in role_ids])
+        self._guild = SimpleNamespace(get_member=lambda uid: member)
+        self.ready = False
+
+    def get_guild(self, guild_id: int) -> Any:
+        return self._guild
+
+    def is_ready(self) -> bool:
+        return self.ready
+
+
+class _Reminders:
+    def __init__(self) -> None:
+        self.delivered: list[datetime] = []
+
+    async def deliver_due(self, now: datetime) -> int:
+        self.delivered.append(now)
+        return 0
+
+
+# ── assembly ─────────────────────────────────────────────────────────────────
+
+
+def make_app(
+    *,
+    roles: list[int],
+    transcriber: _Transcriber,
+    outcome: IncidentOutcome | None = None,
+) -> tuple[App, _Engine, _Health, _Speaker, _Capture]:
+    holder = StubHolder(make_config())
+    app = App(holder)  # type: ignore[arg-type]
+    app.gazetteer = _Gazetteer(  # type: ignore[assignment]
+        entries={
+            sid: SystemEntry(
+                id=sid, name=name, region=region, constellation=None, metaphone=name.upper()
+            )
+            for sid, name, region in GAZ_SYSTEMS
+        }
+    )
+    app.transcriber = transcriber  # type: ignore[assignment]
+    engine = _Engine(outcome or IncidentOutcome(Outcome.POSTED, None, None, 1))
+    app.engine = engine  # type: ignore[assignment]
+    health = _Health()
+    app.health = health  # type: ignore[assignment]
+    app.discipline = Discipline(holder)  # type: ignore[arg-type]
+    speaker = _Speaker()
+    app.speaker = speaker  # type: ignore[assignment]
+    capture = _Capture()
+    app.capture = capture  # type: ignore[assignment]
+    app.bot = _Bot(roles)  # type: ignore[assignment]
+    app.conn = None
+    return app, engine, health, speaker, capture
+
+
+# ── @Pilot voice gate (GDD §11.1 layer 4, constraint 10 parity) ──────────────
+
+
+async def test_non_pilot_voice_report_is_rejected_before_the_engine() -> None:
+    app, engine, health, speaker, _ = make_app(
+        roles=[999], transcriber=_Transcriber(["aura command hostiles Otanuomi"])
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert engine.reports == []  # never reaches the shared engine
+    assert health.rejected == 1
+    assert speaker.said == [(GUILD, "Reporting requires the Pilot role.")]
+
+
+async def test_pilot_voice_report_reaches_the_engine() -> None:
+    app, engine, _, _, _ = make_app(
+        roles=[PILOT_ROLE], transcriber=_Transcriber(["aura command hostiles Otanuomi"])
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert len(engine.reports) == 1
+    assert engine.reports[0][2].intent is Intent.HOSTILE_SPOTTED
+
+
+async def test_non_mention_intents_stay_open_to_non_pilots() -> None:
+    app, engine, health, _, _ = make_app(
+        roles=[], transcriber=_Transcriber(["aura command status"])
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert len(engine.reports) == 1
+    assert engine.reports[0][2].intent is Intent.QUERY
+    assert health.rejected == 0
+
+
+# ── STT failure path (GDD §20 watchdog → "say again") ────────────────────────
+
+
+async def test_stt_timeout_reopens_capture_and_says_again() -> None:
+    app, engine, health, speaker, capture = make_app(
+        roles=[PILOT_ROLE], transcriber=_Transcriber(error=SttTimeoutError("watchdog"))
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert engine.reports == []
+    assert health.rejected == 1
+    assert capture.reopened == [(USER, GUILD)]
+    assert speaker.said == [(GUILD, "Say again the system.")]
+
+
+# ── LOW-tier retry re-bind (GDD §8.3) ────────────────────────────────────────
+
+
+async def test_low_tier_retry_rebinds_bare_system_name() -> None:
+    rejected = IncidentOutcome(Outcome.REJECTED, None, None, None)
+    app, engine, _, _, capture = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["aura command hostiles zzzz qqqq", "Kisogo"]),
+        outcome=rejected,
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert len(engine.reports) == 1
+    assert engine.reports[0][3].tier.value == "LOW"
+    assert capture.reopened == [(USER, GUILD)]  # window reopened
+    assert USER in app._pending_retry
+
+    # The bare name in the reopened window re-binds to the rejected intent.
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert len(engine.reports) == 2
+    retried = engine.reports[1][2]
+    assert retried.intent is Intent.HOSTILE_SPOTTED
+    assert retried.system_text == "Kisogo"
+    assert retried.raw == "Kisogo"
+    assert USER not in app._pending_retry  # consumed
+
+
+async def test_bare_system_name_without_pending_retry_is_dropped() -> None:
+    app, engine, health, _, _ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]))
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert engine.reports == []
+    assert health.rejected == 1
+
+
+async def test_expired_pending_retry_is_dropped() -> None:
+    app, engine, health, _, _ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]))
+    stale = ParsedCommand(
+        intent=Intent.HOSTILE_SPOTTED, system_text="x", group_alias=None, detail=None, raw="x"
+    )
+    app._pending_retry[USER] = (stale, asyncio.get_running_loop().time() - 1.0)
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert engine.reports == []
+    assert health.rejected == 1
+    assert USER not in app._pending_retry
+
+
+# ── timer/reminder polls gated on Discord readiness ──────────────────────────
+
+
+async def test_timer_and_reminder_polls_wait_for_bot_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A due timer/reminder is never consumed (fired=1) before login: the poll
+    body is skipped entirely while bot.is_ready() is False."""
+    monkeypatch.setattr(app_main, "_TIMER_POLL_INTERVAL_S", 0.01)
+    app, engine, _, _, _ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+    reminders = _Reminders()
+    app.reminders = reminders  # type: ignore[assignment]
+
+    timer_task = asyncio.create_task(app._timer_loop())
+    reminder_task = asyncio.create_task(app._reminder_loop())
+    try:
+        await asyncio.sleep(0.08)
+        assert engine.fired == []  # nothing consumed pre-ready
+        assert reminders.delivered == []
+
+        app.bot.ready = True  # type: ignore[union-attr]
+        await asyncio.sleep(0.08)
+        assert engine.fired  # polls resume once Discord is usable
+        assert reminders.delivered
+    finally:
+        timer_task.cancel()
+        reminder_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await timer_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await reminder_task

@@ -192,8 +192,8 @@ Every module in the finished system.
 | `config.py` | YAML load, schema validation, hot-reload on SIGHUP |
 | `ipc.py` | UDS server, frame codec, per-user stream demux, Ears liveness |
 | `audio/vad.py` | webrtcvad wrapper; utterance endpointing |
-| `audio/wake.py` | openWakeWord instances, per-user state, score thresholds, refractory period |
-| `audio/capture.py` | Per-user capture state machine: pre-roll ring buffer → wake hit → capture → endpoint → emit |
+| `audio/wake.py` | openWakeWord instances, per-user state, score thresholds |
+| `audio/capture.py` | Per-user capture state machine: pre-roll ring buffer → wake hit → capture → endpoint → emit; owns the wake refractory period |
 | `audio/stt.py` | `Transcriber` protocol; faster-whisper (default) and whisper.cpp HTTP backends; gazetteer prompt biasing |
 | `nlu/grammar.py` | Intent extraction, group-alias extraction, detail capture |
 | `nlu/gazetteer.py` | System load, region pruning, adjacency graph, jump-distance BFS with memo |
@@ -204,7 +204,7 @@ Every module in the finished system.
 | `core/db.py` | SQLite access, migrations, backup hook |
 | `dsc/bot.py` | discord.py client, intents, persistent view registration |
 | `dsc/views.py` | Incident buttons, ambiguity resolver, subscription picker |
-| `dsc/cogs/intel.py` | `/hostiles`, `/help-me`, `/camp`, `/clear`, `/status` |
+| `dsc/cogs/intel.py` | `/hostiles`, `/under-attack`, `/help-me`, `/camp`, `/clear`, `/status`, `/cancel` |
 | `dsc/cogs/subs.py` | `/subscribe`, `/mysubs`, `/optout`, `/mute-voice` |
 | `dsc/cogs/ops.py` | `/timer`, `/formup`, `/rollcall`, `/jumps` |
 | `dsc/cogs/admin.py` | `/routing`, `/gazetteer`, `/health`, `/fleetmode` |
@@ -355,14 +355,22 @@ Full parity. Every voice command routes to the same engine.
 | Command | Purpose |
 |---|---|
 | `/hostiles system detail` | Report a sighting |
+| `/under-attack system detail` | You are under attack — tackled or taking damage |
 | `/help-me system detail` | High-severity assist request |
 | `/camp system detail` | Report a gate camp |
 | `/clear system` | Resolve an incident |
 | `/status` | Active incidents summary |
+| `/cancel` | Retract your own last report (30s window) |
 | `/timer system duration note` | Schedule a structure timer ping |
 | `/formup system when note` | Post an op with RSVP |
 | `/rollcall` | Who's in voice, subscribed, responding |
 | `/jumps from to` | Jump distance between systems |
+| `/evetime` | Current EVE time (UTC) with a local-time hint |
+| `/route from to` | Full shortest jump path between two systems |
+| `/history system hours` | Recent incidents in a system (default 24h, max 72h) |
+| `/remindme duration message` | Personal reminder, DMed when due (max 10 pending, 7 days out) |
+| `/poll create question options…` | Quick vote with buttons, live counts edited in place |
+| `/poll close id` | Close a poll (author or admin) |
 | `/subscribe` | Self-service role picker |
 | `/mysubs` | Show my subscriptions |
 | `/optout` | Exclude my audio from AURA entirely |
@@ -409,7 +417,7 @@ raw transcript
    │       text_sim      = 1 − levenshtein(a, b) / len
    │       base          = 0.6 · phonetic_sim + 0.4 · text_sim
    │
-   ├─► context prior (§8.4):
+   ├─► top-8 by base score → context prior (§8.4):
    │       score = base × prior
    │
    └─► top-3 candidates → confidence tier (§8.3)
@@ -423,7 +431,7 @@ Levenshtein on raw text alone is the wrong tool: STT errors are **phonetic, not 
 |---|---|---|
 | **High** | `top1 ≥ 0.80` and `top1 − top2 ≥ 0.12` | Post immediately. Speak *"Hostiles Otanuomi, pinged."* |
 | **Medium** | `top1 ≥ 0.55` | **Post anyway**, flagged uncertain, with buttons `[Otanuomi] [Kisogo] [Wrong — fix]`. Speak *"Hostiles Otanuomi — say again to confirm."* Speed beats certainty when a pilot is in structure; get the ping out and let humans correct it. |
-| **Low** | below | Do not post. Speak *"Say again the system."* Reopen the capture window for 4s. |
+| **Low** | below | Do not post. Speak *"Say again the system."* Reopen the capture window for 4s. A bare system name spoken into the reopened window is re-bound to the rejected command's intent and resolved as its system. |
 
 ### 8.4 Context priors
 
@@ -436,7 +444,7 @@ Candidates are reweighted by what is plausible *right now*. A fleet fight is spa
 | **Reporter history** | This pilot has reported from Otanuomi six times this week. That is a prior. |
 | **Home bias** | Home and adjacent systems carry a standing boost. |
 
-Applied as a cheap multiplicative reweighting over the top-3. Weights live in `aura.yaml`.
+Applied as a cheap multiplicative reweighting over the top-8 base-score candidates — wider than the final top-3 on purpose, so a strong prior can promote a lower-ranked but spatially plausible candidate into the top-3. Weights live in `aura.yaml`.
 
 ### 8.5 Alias learning
 
@@ -553,10 +561,12 @@ If AURA is annoying for one week, the corp mutes `#intel-alerts` and the project
 
 | Channel | Contents |
 |---|---|
-| `#intel-live` | Every incident, no mentions. The firehose, for people who want it. |
+| `#intel-live` | Every incident that mentions nobody. The quiet feed, for people who want it. |
 | `#intel-alerts` | Only incidents that mention a role. |
 
-Let people choose their own volume.
+Let people choose their own volume. An incident card lives in exactly one of
+the two channels — one incident is one message, edited in place (§9.1), never
+mirrored or reposted.
 
 ### 11.3 Health channel
 
@@ -597,7 +607,7 @@ Short. Always short. AURA is talking over a fight.
 ### 12.2 Speaking rules
 
 - **Never speak over a high-severity report in progress.** If VAD reports active speech, queue.
-- Duck to 60% volume. AURA is not the FC.
+- Duck to 60% volume. AURA is not the FC. The duck level and talk-over suppression are fixed playback mechanics in Ears (`ears/src/playback.rs`), not config knobs.
 - Hard cap **3 seconds** per utterance. If it does not fit, it goes to the channel instead.
 - `/mute-voice` per user. Some pilots will hate this. They can silence it without leaving.
 
@@ -667,7 +677,9 @@ CREATE TABLE incidents (
     updated_at         TEXT NOT NULL,
     status             TEXT NOT NULL DEFAULT 'ACTIVE',
     message_id         INTEGER,
-    channel_id         INTEGER
+    channel_id         INTEGER,
+    raw_system_text    TEXT               -- transcript window that named the
+                                          -- system; alias key for [Wrong — fix]
 );
 CREATE INDEX idx_inc_active ON incidents(guild_id, status, system_id, type, opened_at);
 
@@ -709,6 +721,39 @@ CREATE TABLE timers (
     fired       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_timers_pending ON timers(fired, fires_at);
+
+-- ── personal reminders (/remindme) ───────────────────────────
+CREATE TABLE reminders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    fires_at    TEXT NOT NULL,
+    message     TEXT NOT NULL,
+    fired       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_reminders_pending ON reminders(fired, fires_at);
+CREATE INDEX idx_reminders_user ON reminders(user_id, fired);
+
+-- ── quick votes (/poll) ──────────────────────────────────────
+CREATE TABLE polls (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    channel_id   INTEGER,
+    message_id   INTEGER,
+    author_id    INTEGER NOT NULL,
+    question     TEXT NOT NULL,
+    options_json TEXT NOT NULL,        -- JSON array of option labels
+    opened_at    TEXT NOT NULL,
+    closed_at    TEXT                  -- NULL while the poll is open
+);
+
+CREATE TABLE poll_votes (
+    poll_id     INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+    user_id     INTEGER NOT NULL,
+    option_idx  INTEGER NOT NULL,
+    at          TEXT NOT NULL,
+    PRIMARY KEY (poll_id, user_id)     -- one vote per pilot; switchable
+);
 
 -- ── consent ──────────────────────────────────────────────────
 CREATE TABLE optouts (
@@ -789,8 +834,7 @@ discord:
   auto_join: true                       # join when a pilot enters, leave when empty
 
 wake:
-  phrase: "aura command"
-  model:  /opt/aura/models/wake/aura_command.onnx
+  model:  /opt/aura/models/wake/aura_command.onnx   # the phrase is baked into the model
   threshold: 0.55
   refractory_ms: 2000
 
@@ -839,8 +883,8 @@ tts:
   voice: /opt/aura/models/piper/en_US-amy-medium.onnx
   binary: /usr/local/bin/piper
   max_utterance_s: 3
-  duck_to: 0.6
-  suppress_while_speech: true
+  # Ducking (60%) and talk-over suppression are fixed playback mechanics in
+  # Ears (§12.2) — deliberately not tunables here.
 
 gazetteer:
   file: /etc/aura/gazetteer.yaml
@@ -848,7 +892,10 @@ gazetteer:
 
 ipc:
   socket: /run/aura/aura.sock
-  buffer_seconds: 60
+  # Ears' outbound ring size (buffer_seconds) lives in Ears' own config,
+  # /etc/aura/ears.yaml (token_file, socket_path, buffer_seconds — see
+  # ears/ears.yaml.example): the ring must survive Brain restarts, so Brain
+  # cannot own that knob.
 
 health:
   report_interval_min: 60
@@ -981,7 +1028,7 @@ Because voice receive is undocumented and can break without warning (§2.2), AUR
 
 | Failure | Detection | Response |
 |---|---|---|
-| Discord breaks voice receive | No `VoiceTick` from anyone for 60s while ≥2 unmuted humans are in channel | Post **⚠️ Voice offline — use `/hostiles` and `/help-me`**; keep retrying. **Every slash command and the entire incident engine keep working.** |
+| Discord breaks voice receive | No `VoiceTick` from anyone for 60s while ≥2 unmuted humans are in channel | Post **⚠️ Voice offline — use `/under-attack`, `/help-me` and `/hostiles`**; keep retrying. **Every slash command and the entire incident engine keep working.** |
 | Voice gateway 4017 | Close code on connect | Loud alert to `#bot-health` — the Songbird version needs updating |
 | DAVE session crash | Session exception | Rebuild, exponential backoff, cap retries, then degrade |
 | STT worker hang | 5s watchdog | Kill, respawn, speak *"say again"* |

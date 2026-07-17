@@ -1,0 +1,9 @@
+target/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+reference/songbird/
+*.egg-info/
+dev-data/
