@@ -124,6 +124,12 @@ def say_again() -> str:
     return "Say again the system."
 
 
+def go_ahead() -> str:
+    """*"Go ahead."* — spoken the instant the wake word fires, so the pilot
+    knows AURA is listening before they start their report (§5 capture)."""
+    return "Go ahead."
+
+
 def responders(n: int, system: str) -> str:
     """*"Two responding to Otanuomi."*"""
     return f"{number_word(n).capitalize()} responding to {system}."

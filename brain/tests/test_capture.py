@@ -260,6 +260,7 @@ async def test_hard_cap_at_6s_of_continuous_speech() -> None:
 async def test_refractory_blocks_immediate_retrigger() -> None:
     manager, recorder, _ = make_manager()
     manager.feed(USER_A, GUILD, MARKER)
+    manager.feed(USER_A, GUILD, speech(1500))  # the command; endpoint needs speech first
     feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
     await settle()
     assert len(recorder.emitted) == 1
@@ -296,6 +297,7 @@ async def test_reopen_captures_without_wake_word() -> None:
 async def test_reopen_clears_refractory_for_say_again() -> None:
     manager, recorder, _ = make_manager()
     manager.feed(USER_A, GUILD, MARKER)
+    manager.feed(USER_A, GUILD, speech(1500))  # the command; endpoint needs speech first
     feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
     await settle()
     assert len(recorder.emitted) == 1
@@ -346,6 +348,7 @@ async def test_capture_buffer_freed_and_ring_keeps_rolling() -> None:
     first = [speech(1000 + i) for i in range(20)]
     feed_all(manager, USER_A, first)
     manager.feed(USER_A, GUILD, MARKER)
+    manager.feed(USER_A, GUILD, speech(1500))  # the command; endpoint needs speech first
     feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
     await settle()
     assert len(recorder.emitted) == 1
@@ -355,6 +358,8 @@ async def test_capture_buffer_freed_and_ring_keeps_rolling() -> None:
     second = [speech(3000 + i) for i in range(PREROLL_FRAMES)]
     feed_all(manager, USER_A, second)  # the ring kept rolling through all of it
     manager.feed(USER_A, GUILD, MARKER)
+    cmd2 = speech(3500)
+    manager.feed(USER_A, GUILD, cmd2)
     feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
     await settle()
 
@@ -362,7 +367,7 @@ async def test_capture_buffer_freed_and_ring_keeps_rolling() -> None:
     pcm = recorder.emitted[1][2]
     # Pre-roll is exactly the fresh frames; nothing from the first utterance
     # (or the silence between) leaks in.
-    assert pcm == b"".join(second + [MARKER] + [SILENCE] * ENDPOINT_FRAMES)
+    assert pcm == b"".join(second + [MARKER, cmd2] + [SILENCE] * ENDPOINT_FRAMES)
     for frame in first:
         assert frame not in pcm
 
@@ -405,10 +410,12 @@ async def test_malformed_frame_is_dropped() -> None:
     manager.feed(USER_A, GUILD, b"\x00" * 10)  # wrong size: dropped, no crash
     manager.feed(USER_A, GUILD, MARKER)
     assert manager.is_capturing(USER_A)
+    cmd = speech(1500)  # the command; endpoint needs speech first
+    manager.feed(USER_A, GUILD, cmd)
     feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
     await settle()
     assert len(recorder.emitted) == 1
-    assert recorder.emitted[0][2] == b"".join([MARKER] + [SILENCE] * ENDPOINT_FRAMES)
+    assert recorder.emitted[0][2] == b"".join([MARKER, cmd] + [SILENCE] * ENDPOINT_FRAMES)
 
 
 async def test_single_refractory_window_with_real_detector() -> None:
@@ -429,8 +436,9 @@ async def test_single_refractory_window_with_real_detector() -> None:
         recorder,
     )
 
-    # First utterance: four speech frames form a chunk, hit, capture, endpoint.
-    feed_all(manager, USER_A, [speech(1500)] * 4)
+    # First utterance: four speech frames form a chunk and hit; the two after
+    # the hit are the captured command (endpoint needs speech before silence).
+    feed_all(manager, USER_A, [speech(1500)] * 6)
     assert manager.is_capturing(USER_A)
     feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
     await settle()
@@ -448,5 +456,6 @@ def test_emit_works_without_a_running_event_loop() -> None:
     # delivers the utterance (documented in CaptureManager._dispatch).
     manager, recorder, _ = make_manager()
     manager.feed(USER_A, GUILD, MARKER)
+    manager.feed(USER_A, GUILD, speech(1500))  # the command; endpoint needs speech first
     feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
     assert len(recorder.emitted) == 1

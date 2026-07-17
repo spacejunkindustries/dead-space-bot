@@ -100,9 +100,22 @@ def test_frame_constants_match_the_wire_format() -> None:
 
 def test_endpoint_reached_after_consecutive_silence() -> None:
     tracker = EndpointTracker(silence_ms=400)
+    tracker.update(True)  # speech must be seen before silence can endpoint
     for _ in range(19):
         assert not tracker.update(False)
     assert tracker.update(False)  # 20th silent frame = 400ms
+
+
+def test_leading_silence_never_endpoints() -> None:
+    # A pilot waiting for the "go ahead" cue opens the capture with silence;
+    # that must not endpoint before a word is spoken.
+    tracker = EndpointTracker(silence_ms=400)
+    for _ in range(200):  # 4s of pure leading silence
+        assert not tracker.update(False)
+    tracker.update(True)  # now they speak
+    for _ in range(19):
+        assert not tracker.update(False)
+    assert tracker.update(False)  # only now, after speech, does silence end it
 
 
 def test_speech_resets_the_silence_run() -> None:
