@@ -356,3 +356,16 @@ async def test_close_flushes_pending_jobs_false(tmp_path, monkeypatch) -> None:
     assert await speaker.say(1, "warm up") is True  # spin up the worker
     await speaker.close()
     assert await speaker.say(1, "after close") is False
+
+
+def test_build_chirp_is_valid_wav() -> None:
+    import io
+    import wave
+
+    from aura.tts import build_chirp
+
+    data = build_chirp(22050)
+    with wave.open(io.BytesIO(data)) as r:
+        assert r.getnchannels() == 1
+        assert r.getframerate() == 22050
+        assert r.getnframes() > 0  # non-empty tone

@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +34,7 @@ from pathlib import Path
 import structlog
 
 from aura.config import ConfigHolder
-from aura.ipc import PRIORITY_NORMAL, IpcServer
+from aura.ipc import PRIORITY_ALERT, PRIORITY_NORMAL, IpcServer
 from aura.types import Intent
 
 __all__ = [
@@ -258,6 +259,28 @@ def build_wav(pcm_s16le: bytes, sample_rate: int) -> bytes:
     return header + pcm_s16le
 
 
+def build_chirp(sample_rate: int, freq_hz: int = 880, ms: int = 130) -> bytes:
+    """A short sine-tone WAV (the wake-ack "listening" chirp), built in memory.
+
+    Two quick rising blips with a cosine fade in/out so there is no click.
+    Generated once and reused, so acknowledging the wake word costs no neural
+    synthesis — the whole point is that it is instant on a small CPU."""
+    n = max(1, sample_rate * ms // 1000)
+    fade = max(1, n // 8)
+    samples = bytearray()
+    for i in range(n):
+        # Two-tone blip: second half a fifth higher, for a recognisable rise.
+        f = freq_hz if i < n // 2 else int(freq_hz * 1.5)
+        env = 1.0
+        if i < fade:
+            env = 0.5 - 0.5 * math.cos(math.pi * i / fade)
+        elif i > n - fade:
+            env = 0.5 - 0.5 * math.cos(math.pi * (n - i) / fade)
+        value = int(0.35 * env * 32767 * math.sin(2 * math.pi * f * i / sample_rate))
+        samples += struct.pack("<h", max(-32768, min(32767, value)))
+    return build_wav(bytes(samples), sample_rate)
+
+
 def read_voice_sample_rate(voice_path: str | Path) -> int:
     """Read the native sample rate from the Piper voice config JSON.
 
@@ -325,6 +348,23 @@ class Speaker:
         self._workers: dict[int, asyncio.Task[None]] = {}
         self._closed = False
         self._voice_mutes: set[int] = set()
+        # Pre-built "listening" chirp — a short tone, generated once in memory.
+        # The wake acknowledgement uses this instead of Piper so it is instant
+        # (no neural-voice model load) and gives the pilot immediate feedback.
+        self._chirp_wav = build_chirp(self._sample_rate)
+
+    async def chirp(self, guild_id: int, *, user_id: int | None = None) -> bool:
+        """Play the instant "listening" tone into ``guild_id`` (wake ack).
+
+        Bypasses Piper entirely — the WAV is pre-generated — so there is no
+        synthesis latency before the pilot starts talking. Respects TTS-enabled
+        and per-user /mute-voice."""
+        if self._closed or not self._holder.current.tts.enabled:
+            return False
+        if user_id is not None and user_id in self._voice_mutes:
+            return False
+        await self._ipc.send_tts(guild_id, PRIORITY_ALERT, self._chirp_wav)
+        return True
 
     @property
     def sample_rate(self) -> int:
@@ -412,6 +452,21 @@ class Speaker:
         if len(stdout) % _BYTES_PER_SAMPLE != 0:
             stdout = stdout[: len(stdout) - (len(stdout) % _BYTES_PER_SAMPLE)]
         return stdout
+
+    async def warm(self) -> None:
+        """Prime Piper once at startup (best-effort).
+
+        Piper reloads the voice model on every subprocess spawn; running a
+        throwaway synthesis now pulls the model file into the OS page cache so
+        the first *real* reply loads from RAM, not disk. Failures are ignored —
+        warming must never block or crash startup."""
+        if not self._holder.current.tts.enabled:
+            return
+        try:
+            await self.synthesize("ready")
+            log.info("tts_warmed")
+        except Exception as exc:  # noqa: BLE001 — warming is best-effort
+            log.warning("tts_warm_failed", error=str(exc))
 
     async def close(self) -> None:
         """Stop accepting work, drain nothing, cancel all guild workers."""
