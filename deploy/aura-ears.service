@@ -1,0 +1,37 @@
+# AURA Ears — Rust: Songbird ≥0.6 voice socket (DAVE + receive), TTS playback.
+# Deliberately thin; everything requiring judgement lives in Brain.
+#
+# Ordered after aura-brain.service because Brain BINDS the IPC socket and Ears
+# connects — this way Ears buffers through a Brain restart, not the reverse.
+# It is Wants=, not Requires=: Ears reconnects with backoff forever, so it must
+# survive (and buffer across) Brain being down (GDD §15/§20).
+#
+# Token comes ONLY via LoadCredential= (GDD §18/§22, CLAUDE.md constraint 12);
+# the process reads $CREDENTIALS_DIRECTORY/token.
+
+[Unit]
+Description=AURA Ears (Discord voice socket)
+Documentation=file:/opt/aura/brain/docs/GDD.md
+After=network-online.target aura-brain.service
+Wants=network-online.target aura-brain.service
+
+[Service]
+Type=simple
+User=aura
+Group=aura
+ExecStart=/opt/aura/bin/aura-ears --config /etc/aura/ears.yaml
+Restart=always
+RestartSec=5
+
+# Secrets: token file 0600, surfaced read-only at $CREDENTIALS_DIRECTORY/token.
+LoadCredential=token:/etc/aura/token
+
+# Hardening (GDD §22)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/aura /run/aura
+
+[Install]
+WantedBy=multi-user.target

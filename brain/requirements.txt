@@ -1,0 +1,11 @@
+# AURA Brain runtime dependencies.
+# Hard constraint 2 (CLAUDE.md): NO PyNaCl, NO discord.py[voice] — their absence
+# is what makes it impossible to accidentally wire up Python voice.
+
+discord.py>=2.4          # dsc/ — gateway, slash commands, components, roles, REST
+PyYAML>=6.0              # config.py, nlu/gazetteer.py — aura.yaml / gazetteer.yaml / routing.yaml
+structlog>=24.1          # everywhere — JSON structured logging
+webrtcvad-wheels>=2.0.14 # audio/vad.py — voice activity detection / utterance endpointing
+openwakeword>=0.6.0      # audio/wake.py — "Aura Command" wake-word inference (ONNX chain)
+faster-whisper>=1.0      # audio/stt.py — default STT backend (CTranslate2, releases the GIL)
+numpy>=1.26              # audio/wake.py, audio/stt.py — PCM frame views and model input tensors

@@ -1,0 +1,33 @@
+[package]
+name = "aura-ears"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.83"
+description = "AURA voice socket: DAVE-capable Discord audio pump (Songbird 0.6)"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+serenity = { version = "0.12", default-features = false, features = [
+    "client",
+    "gateway",
+    "model",
+    "voice",
+    "rustls_backend",
+] }
+songbird = { version = "0.6.0", features = ["receive"] }
+# Feature unification: enables WAV/PCM demuxing inside Songbird's Symphonia
+# probe so Brain's in-memory WAV TTS bytes are playable (GDD §12.3, §15 0x03).
+symphonia = { version = "0.5.2", default-features = false, features = ["wav", "pcm"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

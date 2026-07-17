@@ -1,0 +1,86 @@
+# AURA CI — runs on every push and PR (CLAUDE.md Commands section).
+#
+# The rust job also builds and uploads the release binary: the production
+# droplet is 2 vCPU and will thrash compiling Songbird with LTO, so
+# deploy/install.sh installs this artifact instead of building locally.
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  rust:
+    name: ears (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ears
+    steps:
+      - uses: actions/checkout@v4
+
+      # Songbird needs libopus; its DAVE/MLS dependencies build C++ via cmake.
+      # NO ffmpeg — Songbird >=0.4 uses Symphonia in-process (constraint 3).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ears
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # The droplet downloads this instead of compiling (GDD §17.3).
+      - name: Upload aura-ears binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: aura-ears
+          path: ears/target/release/aura-ears
+          if-no-files-found: error
+
+  python:
+    name: brain (Python)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: brain
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            brain/requirements-dev.txt
+            brain/pyproject.toml
+
+      # Install only what the tests need. The heavy audio/STT stack
+      # (webrtcvad, openwakeword, faster-whisper, numpy) is lazily imported
+      # inside aura.audio.*, so the suite passes without it; tests exercise
+      # the audio path with synthetic in-memory PCM only (constraint 5).
+      # NO PyNaCl / discord.py[voice] — ever (constraint 2).
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          pip install "discord.py>=2.4" "PyYAML>=6.0" "structlog>=24.1"
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format
+        run: ruff format --check .
+
+      - name: Pytest
+        run: pytest

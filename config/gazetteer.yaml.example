@@ -1,0 +1,25 @@
+# AURA gazetteer scope — GDD §8.1 / §16. Production copy: /etc/aura/gazetteer.yaml.
+# Deliberately small: ~100–500 systems scoped to the corp's operational area,
+# NOT all of New Eden (CLAUDE.md constraint 8). Seeded from the EVE SDE and
+# pruned by these rules; editable by the FC without touching code.
+
+# Regions whose systems are included wholesale.
+regions:
+  - Kisogo-region
+  - Lowsec-North
+
+# Additionally include everything within N jumps of a system (usually home).
+within_jumps_of:
+  system: Otanuomi
+  jumps: 8
+
+# Systems always included regardless of region — the hubs pilots name anyway.
+always_include:
+  - Jita
+  - Amarr
+  - Rens
+  - Dodixie
+
+# Systems to drop even if a rule above matched them (e.g. phonetic collisions
+# with a system the corp never visits).
+exclude: []

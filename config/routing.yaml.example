@@ -1,0 +1,32 @@
+# AURA subscription routing rules — GDD §10.1. Production copy: /etc/aura/routing.yaml.
+# Routing = evaluate every rule against the incident → union the matching
+# roles → mention once. `escalate_at` may only name UNDER_ATTACK or
+# ASSIST_REQUEST — sightings never fire @here (CLAUDE.md constraint 11).
+#
+# Rule fields:
+#   role:         the Discord role to mention (resolved by name at load)
+#   types:        incident types this role subscribes to
+#   scope:        systems | regions | within_jumps_of — any match counts
+#   escalate_at:  incident type that additionally fires @here, or `never`
+#   quiet_hours:  suppress mentions for this role in a daily window, or null
+
+- role: "@Home-Defense"
+  types: [UNDER_ATTACK, ASSIST_REQUEST, HOSTILE_SPOTTED]
+  scope:
+    regions: [Kisogo-region]
+    within_jumps_of: { system: Otanuomi, jumps: 5 }
+  escalate_at: UNDER_ATTACK        # this type also fires @here
+  quiet_hours: null
+
+- role: "@Miners"
+  types: [HOSTILE_SPOTTED, GATE_CAMP]
+  scope:
+    systems: [Otanuomi, Kisogo]
+  escalate_at: never
+
+- role: "@Roam-Crew"
+  types: [HOSTILE_SPOTTED]
+  scope:
+    regions: [Lowsec-North]
+  escalate_at: never
+  quiet_hours: { tz: UTC, from: "02:00", to: "14:00" }
