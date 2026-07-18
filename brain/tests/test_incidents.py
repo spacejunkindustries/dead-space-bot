@@ -90,6 +90,7 @@ def make_config(
     stale_after_min: int = 20,
     cancel_window_s: int = 30,
     personal_pings_max: int = 10,
+    mentions_enabled: bool = True,
 ) -> AuraConfig:
     return AuraConfig(
         discord=DiscordConfig(
@@ -99,6 +100,7 @@ def make_config(
             roles=RolesConfig(pilot=PILOT_ROLE, fc=FC_ROLE),
             watch_voice_channels=(9,),
             auto_join=True,
+            mentions_enabled=mentions_enabled,
         ),
         wake=WakeConfig(model="wake.onnx", threshold=0.55, refractory_ms=2000),
         capture=CaptureConfig(
@@ -1124,3 +1126,15 @@ async def test_broadcast_all_hands_pings_here(make_env: Callable[..., Env]) -> N
     assert out.outcome is Outcome.POSTED
     _, _, content, _ = env.poster.posts[-1]
     assert "@here" in content
+
+
+async def test_silent_mode_posts_without_pinging(make_env: Callable[..., Env]) -> None:
+    # mentions_enabled=False: incidents still post, but AURA mentions nobody.
+    env = make_env(mentions_enabled=False)
+    out = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    assert out.outcome is Outcome.POSTED
+    _, _, content, _ = env.poster.posts[-1]
+    assert content == ""  # no @here, no role mention
+    b = await env.engine.broadcast(GUILD, 42, "cyno up, all hands", here=True)
+    assert b.outcome is Outcome.POSTED
+    assert env.poster.posts[-1][2] == ""  # silent even with all-hands

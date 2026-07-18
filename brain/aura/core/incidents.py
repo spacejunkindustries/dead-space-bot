@@ -679,6 +679,7 @@ class IncidentEngine:
             now = self._clock()
             who = self._callsigns.lookup(reporter_id) or f"<@{reporter_id}>"
             content = ""
+            here = here and self._holder.current.discord.mentions_enabled
             if here and self._discipline.allow_mention(reporter_id, now):
                 self._discipline.record_mention(reporter_id, now)
                 if self._on_mention is not None:
@@ -871,6 +872,8 @@ class IncidentEngine:
             personal=self._personal_pings.rules_for(guild_id),
         )
         decision = apply_group_alias(decision, parsed.group_alias, self._rules, self._alias_roles)
+        if not self._holder.current.discord.mentions_enabled:
+            decision = suppress_decision(decision)  # silent mode: post, ping nobody
         flood_announced = False
         mentions_wanted = bool(decision.role_ids or decision.here or decision.user_ids)
         if mentions_wanted:

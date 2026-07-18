@@ -451,9 +451,13 @@ class App:
                 return
 
         # GDD §11.1 layer 4: only @Pilot may trigger mentions — reject the
-        # command outright, exactly like the slash twin (constraint 10).
-        if parsed.intent in MENTION_INTENTS and not self.discipline.may_mention(
-            self._member_role_ids(user_id)
+        # command outright, exactly like the slash twin (constraint 10). Lifted
+        # in silent mode: with pings off there is no mention to protect, so
+        # anyone may post (and no roles need wiring up first).
+        if (
+            cfg.discord.mentions_enabled
+            and parsed.intent in MENTION_INTENTS
+            and not self.discipline.may_mention(self._member_role_ids(user_id))
         ):
             self.health.record_rejected()
             log.info("voice_pilot_denied", user_id=user_id)
