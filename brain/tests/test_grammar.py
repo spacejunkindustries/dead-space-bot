@@ -9,6 +9,7 @@ from cortana.nlu.grammar import (
     broadcast_severity,
     broadcast_text,
     clean_callsign,
+    confirm_reply,
     parse,
     sanitize_callsign,
     system_reply,
@@ -878,3 +879,65 @@ def test_spelled_article_a_survives_the_window() -> None:
     cmd2 = parse("under attack in the Kisogo")
     assert cmd2 is not None
     assert cmd2.system_text == "Kisogo"
+
+
+# ── confirm-window replies (GDD §8.3 AWAIT_CONFIRM) ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "yes",
+        "Yes.",
+        "yeah",
+        "yep",
+        "aye",
+        "affirmative",
+        "confirm",
+        "confirmed",
+        "correct",
+        "do it",
+        "yeah do it",
+        "yes please",
+        "confirm it, over",  # radio tail rides along
+        "roger",  # radio ack — would vanish under the sign-off strip
+        "copy that",
+        "hey cortana yes",  # wake residue survives into the window transcript
+    ],
+)
+def test_confirm_reply_affirmatives(heard: str) -> None:
+    assert confirm_reply(heard) == "yes"
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "no",
+        "No.",
+        "nope",
+        "negative",
+        "cancel",
+        "wrong",
+        "no that's wrong",
+        "belay that",
+        "yes— no, cancel",  # any negative vetoes: destructive confirms fail closed
+    ],
+)
+def test_confirm_reply_negatives(heard: str) -> None:
+    assert confirm_reply(heard) == "no"
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "",
+        "   ",
+        "yes hostiles Kisogo",  # a command, not a reply — the grammar claims it
+        "clear Otanuomi",
+        "mumble static",
+        "Otanuomi",
+        "thank you",
+    ],
+)
+def test_confirm_reply_other_content_is_neither(heard: str) -> None:
+    assert confirm_reply(heard) is None

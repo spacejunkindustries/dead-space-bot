@@ -22,6 +22,7 @@ from cortana.dialog.types import (
     Action,
     ArmWindow,
     Classified,
+    ConfirmPending,
     DialogEvent,
     DialogSession,
     DialogState,
@@ -29,6 +30,7 @@ from cortana.dialog.types import (
     Ev,
     Line,
     NoteRejected,
+    PendingConfirm,
     PendingKind,
     Relay,
     Report,
@@ -46,6 +48,7 @@ _AWAIT_FOR: dict[PendingKind, DialogState] = {
     PendingKind.SEVERITY: DialogState.AWAIT_SEVERITY_REPORT,
     PendingKind.OVERRIDE: DialogState.AWAIT_OVERRIDE_QUESTION,
     PendingKind.REPEAT: DialogState.AWAIT_REPEAT,
+    PendingKind.CONFIRM: DialogState.AWAIT_CONFIRM,
     PendingKind.NONE: DialogState.AWAIT_REPEAT,
 }
 
@@ -112,6 +115,17 @@ def transition(s: DialogSession, ev: DialogEvent, max_retries: int) -> Transitio
             return _fail(retry, None, keep_ctx=True)
         return TransitionResult(s)
 
+    if ev.kind is Ev.ENGINE_ASKED:
+        # The engine answered "say again to confirm" for a MEDIUM-tier match
+        # (GDD §8.3): arm one wake-free window carrying the pending command +
+        # candidate, so an affirmative or an exact repeat can complete the
+        # confirm by voice instead of dead-ending. Same budgeted door as
+        # every other window; no prompt — the outcome utterance was it.
+        if s.state is DialogState.IDLE and ev.confirm is not None:
+            pend = dataclasses.replace(s, pending=PendingKind.CONFIRM, ctx_confirm=ev.confirm)
+            return _fail(pend, None, keep_ctx=True)
+        return TransitionResult(s)
+
     if ev.kind is Ev.CLASSIFIED:
         if s.state is DialogState.THINKING and ev.gen == s.gen and ev.classified is not None:
             return _classified(s, ev.classified)
@@ -124,6 +138,12 @@ def transition(s: DialogSession, ev: DialogEvent, max_retries: int) -> Transitio
 
 
 def _classified(s: DialogSession, c: Classified) -> TransitionResult:
+    # 0. Confirm continuation (GDD §8.3): the window carries a pending
+    #    command + candidate — complete it, decline it, or close. It never
+    #    re-asks, so the ask-loop the old flow dead-ended in cannot form.
+    if s.pending is PendingKind.CONFIRM and s.ctx_confirm is not None:
+        return _confirm_continuation(s, s.ctx_confirm, c)
+
     # 1. Override continuation: the whole utterance IS the question.
     if s.pending is PendingKind.OVERRIDE:
         query = c.override_query or c.relay_text or c.text
@@ -184,6 +204,37 @@ def _classified(s: DialogSession, c: Classified) -> TransitionResult:
     return TransitionResult(s.idle(), (Relay(c.relay_text, severity=inherited, framed=c.framed),))
 
 
+def _confirm_continuation(s: DialogSession, ctx: PendingConfirm, c: Classified) -> TransitionResult:
+    """One utterance into an AWAIT_CONFIRM window (GDD §8.3).
+
+    Completes on a confident standalone affirmative, on a repeat that parses
+    to the same intent + system, or on a confident bare reply naming the
+    candidate. A negative — or anything else — closes silently with
+    standing-down semantics: the dialog ends, the budget stays spent, and a
+    fresh wake is the way back in. A destructive confirm fails closed; it is
+    never guessed from an unmatched utterance.
+    """
+    if c.confirm_reply == "no":
+        return TransitionResult(s.idle(), (NoteRejected("confirm_declined"),))
+    if c.confirm_reply == "yes" and c.confident:
+        # Short affirmatives are exactly what Whisper hallucinates from
+        # noise, so "yes" is confidence-gated like the override path.
+        return TransitionResult(s.idle(), (ConfirmPending(ctx),))
+    heard = {(ctx.parsed.system_text or "").casefold(), ctx.candidate.name.casefold()} - {""}
+    if (
+        c.parsed is not None
+        and c.parsed.intent is ctx.parsed.intent
+        and (c.parsed.system_text or "").casefold() in heard
+    ):
+        # "Say again to confirm" taken literally: the repeated command names
+        # the same system — that IS the confirmation.
+        return TransitionResult(s.idle(), (ConfirmPending(ctx),))
+    if c.confident and c.system_reply is not None and c.system_reply.casefold() in heard:
+        # A bare repeat of just the system name confirms too.
+        return TransitionResult(s.idle(), (ConfirmPending(ctx),))
+    return TransitionResult(s.idle(), (NoteRejected("confirm_unmatched"),))
+
+
 def _rejected_fail(
     s: DialogSession, reason: str, line: Line, *, keep_ctx: bool
 ) -> TransitionResult:
@@ -213,6 +264,7 @@ def _fail(s: DialogSession, line: Line | None, *, keep_ctx: bool) -> TransitionR
         pending=pending,
         ctx_severity=s.ctx_severity if keep_ctx else None,
         ctx_retry=s.ctx_retry if keep_ctx else None,
+        ctx_confirm=s.ctx_confirm if keep_ctx else None,
     )
     actions: list[Action] = []
     if line is not None:

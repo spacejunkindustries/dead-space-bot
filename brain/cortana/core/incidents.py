@@ -1698,6 +1698,26 @@ class IncidentEngine:
         await self._deliver(work)
         return IncidentOutcome(Outcome.POSTED, f"Corrected to {system_name}.", card, incident_id)
 
+    async def confirm_system(
+        self, incident_id: int, user_id: int, system_id: int
+    ) -> IncidentOutcome:
+        """Confirm an uncertain card's heard candidate — the voice twin of
+        tapping that candidate's pick button (GDD §8.3, constraint 10).
+
+        Same path as :meth:`correct_system` — confidence pinned, candidates
+        cleared, and the alias still learns from the stored transcript
+        (§8.5: a confirmed hearing is as much signal as a corrected one) —
+        only the spoken wording differs, because confirming the heard name
+        is not a correction.
+        """
+        outcome = await self.correct_system(incident_id, user_id, system_id, raw_text="")
+        if outcome.outcome is not Outcome.POSTED:
+            return outcome
+        system_name = self._system_name(system_id, str(system_id))
+        return IncidentOutcome(
+            outcome.outcome, f"Confirmed {system_name}.", outcome.card, outcome.incident_id
+        )
+
     # ── staleness sweep (GDD §9.1) ───────────────────────────────────────────
 
     async def sweep_stale(self) -> list[int]:

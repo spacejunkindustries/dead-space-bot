@@ -822,6 +822,50 @@ async def test_correct_system_updates_card_and_learns_alias(
     assert all(":pick:" not in cid for cid in custom_ids(card))  # confirmed now
 
 
+async def test_confirm_system_pins_heard_candidate_and_learns_alias(
+    make_env: Callable[..., Env],
+) -> None:
+    """§8.3 voice confirm: same path as the pick button — confidence pinned,
+    pick buttons gone, alias learned from the stored transcript — but worded
+    as a confirmation, not a correction."""
+    env = make_env()
+    parsed = ParsedCommand(
+        intent=Intent.HOSTILE_SPOTTED,
+        system_text="oh tan you oh me",
+        group_alias=None,
+        detail=None,
+        raw="hostiles oh tan you oh me",
+    )
+    posted = await env.engine.report(GUILD, 42, parsed, medium())
+    assert posted.outcome is Outcome.ASKED
+    out = await env.engine.confirm_system(posted.incident_id, 42, 1)
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "Confirmed Otanuomi."
+    assert out.incident_id == posted.incident_id
+    row = db.query_one(
+        env.conn,
+        "SELECT system_id, system_confidence FROM incidents WHERE id = ?",
+        (posted.incident_id,),
+    )
+    assert row["system_id"] == 1
+    assert row["system_confidence"] == 1.0
+    alias = db.query_one(
+        env.conn, "SELECT * FROM aliases WHERE raw_text = ?", ("oh tan you oh me",)
+    )
+    assert alias is not None
+    assert alias["system_id"] == 1
+    _, _, _, card = env.poster.edits[-1]
+    assert all(":pick:" not in cid for cid in custom_ids(card))  # confirmed now
+
+
+async def test_confirm_system_on_a_dead_incident_rejects(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    out = await env.engine.confirm_system(999, 42, 1)
+    assert out.outcome is Outcome.REJECTED
+
+
 async def test_button_correction_learns_alias_from_stored_transcript(
     make_env: Callable[..., Env],
 ) -> None:
