@@ -822,6 +822,52 @@ async def test_hello_control_resets_every_dialog() -> None:
     assert rig.dialog.session_state(USER) is DialogState.IDLE
 
 
+class _StateRecordingGateway:
+    def __init__(self) -> None:
+        self.states: list[tuple[bool, int | None]] = []
+
+    async def on_ears_state(self, connected: bool, channel_id: int | None) -> None:
+        self.states.append((connected, channel_id))
+
+
+async def test_snapshot_control_feeds_connect_state_to_the_gateway() -> None:
+    """The snapshot's per-guild connected/channel fields must reach the
+    voice gateway (which owns the rejoin/adopt/leave judgement) — after an
+    unclean Brain death this is the only way a fresh Brain learns Ears is
+    still parked in a voice channel."""
+    app, _rig = make_app(roles=[PILOT_ROLE])
+    gateway = _StateRecordingGateway()
+    app.gateway = gateway  # type: ignore[assignment]
+
+    await app._on_control(
+        {
+            "t": "snapshot",
+            "guilds": [
+                {"guild_id": "999", "channel_id": "5", "connected": True, "users": []},
+                {"guild_id": str(GUILD), "channel_id": "9", "connected": True, "users": []},
+            ],
+        }
+    )
+
+    assert gateway.states == [(True, 9)]  # the CONFIGURED guild's state
+
+
+async def test_snapshot_without_the_guild_reports_disconnected() -> None:
+    app, _rig = make_app(roles=[PILOT_ROLE])
+    gateway = _StateRecordingGateway()
+    app.gateway = gateway  # type: ignore[assignment]
+
+    await app._on_control({"t": "snapshot", "guilds": []})
+    await app._on_control(
+        {
+            "t": "snapshot",
+            "guilds": [{"guild_id": str(GUILD), "channel_id": None, "connected": False}],
+        }
+    )
+
+    assert gateway.states == [(False, None), (False, None)]
+
+
 async def test_timer_and_reminder_polls_wait_for_bot_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

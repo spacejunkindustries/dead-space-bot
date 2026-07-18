@@ -176,3 +176,66 @@ def test_receipt_lines_are_phone_readable() -> None:
     assert "Applied: wake.threshold" in text
     assert "Engines reloaded: gazetteer" in text
     assert "Restart pending" in text and "stt.model" in text
+
+
+# ── the App's reload transaction validates routing.yaml up front ─────────────
+# (bot._load_routing_rules deliberately reports rejections via alarm cards
+# without raising, so without this gate a broken routing.yaml edit would get
+# a receipt reading "Reload applied. Engines reloaded: … routing".)
+
+
+def _app_for(tmp_path, config_dict, write_config):
+    from cortana.__main__ import App
+
+    (tmp_path / "gazetteer.yaml").write_text("include_all: true\n", encoding="utf-8")
+    return App(ConfigHolder(write_config(config_dict)))
+
+
+async def test_reload_rejects_broken_routing_yaml(tmp_path, config_dict, write_config) -> None:
+    app = _app_for(tmp_path, config_dict, write_config)
+    (tmp_path / "routing.yaml").write_text("rules:\n  - types: []\n", encoding="utf-8")
+
+    result = await app._reload_transaction()
+
+    assert result.ok is False
+    assert result.swapped is False  # the whole reload is rejected, all-or-nothing
+    assert any("routing.yaml" in reason for reason in result.rejected)
+
+
+async def test_reload_accepts_valid_routing_yaml(tmp_path, config_dict, write_config) -> None:
+    app = _app_for(tmp_path, config_dict, write_config)
+    (tmp_path / "routing.yaml").write_text(
+        'rules:\n  - role: "@Home-Defense"\n    types: [UNDER_ATTACK]\n'
+        "    scope: {}\n    escalate_at: never\n",
+        encoding="utf-8",
+    )
+
+    result = await app._reload_transaction()
+
+    assert result.ok is True
+    assert result.swapped is True
+
+
+async def test_reload_tolerates_absent_default_routing_yaml(
+    tmp_path, config_dict, write_config
+) -> None:
+    # No routing.file configured and no sibling routing.yaml: zero rules is
+    # a load-time alarm (ROUTING_ZERO_RULES), not a reload rejection.
+    app = _app_for(tmp_path, config_dict, write_config)
+
+    result = await app._reload_transaction()
+
+    assert result.ok is True
+
+
+async def test_reload_rejects_missing_explicit_routing_file(
+    tmp_path, config_dict, write_config
+) -> None:
+    config_dict["routing"] = {"file": str(tmp_path / "does-not-exist.yaml")}
+    app = _app_for(tmp_path, config_dict, write_config)
+
+    result = await app._reload_transaction()
+
+    assert result.ok is False
+    assert result.swapped is False
+    assert any("routing.file" in reason for reason in result.rejected)

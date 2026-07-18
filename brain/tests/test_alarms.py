@@ -224,3 +224,51 @@ async def test_interaction_errors_alarm_after_threshold(conn: sqlite3.Connection
     # A different command has its own counter and card.
     await bus.record_interaction_error("camp")
     assert len(poster.sent) == 1
+
+
+async def test_concurrent_raises_post_exactly_one_card(conn: sqlite3.Connection) -> None:
+    """Two raises of the same (code, key) in flight together — e.g. two
+    /hostiles both hitting POST_FAILURE — must produce ONE card. Without the
+    card lock both saw message_id None mid-send and double-posted, orphaning
+    the first card as a permanently-active embed no clear() would ever edit."""
+    import asyncio
+
+    class SlowPoster(FakePoster):
+        async def send(self, content: str, embed: dict | None) -> tuple[int, int] | None:
+            await asyncio.sleep(0.01)  # a real Discord POST yields mid-flight
+            return await super().send(content, embed)
+
+    poster = SlowPoster()
+    bus = make_bus(conn, poster)
+
+    await asyncio.gather(
+        bus.raise_alarm(AlarmCode.POST_FAILURE, AlarmSeverity.CRITICAL, "a", "fix"),
+        bus.raise_alarm(AlarmCode.POST_FAILURE, AlarmSeverity.CRITICAL, "b", "fix"),
+    )
+
+    assert len(poster.sent) == 1  # one card posted…
+    assert len(poster.edits) == 1  # …and the second raise edited it in place
+    assert bus.active_count() == 1
+
+    await bus.clear(AlarmCode.POST_FAILURE)
+    assert bus.active_count() == 0  # nothing orphaned: the one card resolved
+
+
+async def test_flush_racing_a_raise_does_not_double_post(conn: sqlite3.Connection) -> None:
+    import asyncio
+
+    class SlowPoster(FakePoster):
+        async def send(self, content: str, embed: dict | None) -> tuple[int, int] | None:
+            await asyncio.sleep(0.01)
+            return await super().send(content, embed)
+
+    poster = SlowPoster()
+    bus = make_bus(conn, poster)
+
+    await asyncio.gather(
+        bus.raise_alarm(AlarmCode.EARS_DOWN, AlarmSeverity.CRITICAL, "down", "fix"),
+        bus.flush(),
+        bus.flush(),
+    )
+
+    assert len(poster.sent) == 1

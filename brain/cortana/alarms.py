@@ -127,6 +127,11 @@ class AlarmBus:
         self._persisted: dict[str, dict[str, Any]] = {}
         self._loaded = False
         self._interaction_errors: dict[str, int] = {}
+        # Serialises card delivery: two concurrent raises of one (code, key)
+        # — e.g. two /hostiles both hitting POST_FAILURE — must not both see
+        # message_id None mid-send and double-post the card (which would
+        # orphan the first as a permanently-active 🚨 embed).
+        self._card_lock = asyncio.Lock()
 
     # ── the read surface (/botstatus) ────────────────────────────────────────
 
@@ -277,7 +282,17 @@ class AlarmBus:
 
     async def _sync(self, sk: str, alarm: ActiveAlarm) -> None:
         """Push one card's current state to Discord; on failure the card
-        stays dirty for :meth:`flush`. Never raises."""
+        stays dirty for :meth:`flush`. Never raises.
+
+        Serialised on ``_card_lock``: the message-id check and the send/edit
+        it gates must be atomic against concurrent syncs, or two raises in
+        flight both post and break the one-card invariant. A sync queued
+        behind another re-reads the (shared, mutated) alarm state, so it
+        edits the freshly posted card instead of posting a second one."""
+        async with self._card_lock:
+            await self._sync_locked(sk, alarm)
+
+    async def _sync_locked(self, sk: str, alarm: ActiveAlarm) -> None:
         embed = self._embed(alarm)
         try:
             if alarm.message_id is not None and alarm.channel_id is not None:

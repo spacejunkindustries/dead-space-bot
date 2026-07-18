@@ -1791,3 +1791,31 @@ async def test_medium_tier_timer_and_formup_ask_instead_of_acting(
     assert formup.outcome is Outcome.ASKED
     assert db.query(env.conn, "SELECT * FROM incidents") == []
     assert env.poster.posts == []
+
+
+def test_rules_path_resolver_is_reread_on_every_load(tmp_path: Path) -> None:
+    """routing.file is ENGINE-reload class: the engine resolves the
+    routing.yaml location through its resolver on EVERY (re)load, never a
+    path baked at construction — a /reload after a routing.file edit must
+    pick up the new file, not silently keep reading the old one."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    holder = StubHolder(make_config())
+    path_a = tmp_path / "a.yaml"
+    path_b = tmp_path / "b.yaml"
+    path_a.write_text(RULES_YAML, encoding="utf-8")
+    path_b.write_text("rules: []\n", encoding="utf-8")
+    active = {"path": path_a}
+    engine = IncidentEngine(
+        conn,
+        holder,  # type: ignore[arg-type]
+        FakeGazetteer(entries={}),  # type: ignore[arg-type]
+        Discipline(holder),  # type: ignore[arg-type]
+        FakePoster(),
+        lambda: active["path"],
+    )
+
+    assert engine.load_routing_rules(ROLE_IDS.get) == 2
+
+    active["path"] = path_b  # the operator repointed routing.file + /reload
+    assert engine.load_routing_rules(ROLE_IDS.get) == 0

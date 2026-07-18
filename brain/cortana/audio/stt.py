@@ -29,6 +29,7 @@ Audio is bytes in, text out — nothing in this module can touch disk
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import threading
@@ -272,7 +273,14 @@ class WhisperCppTranscriber:
         try:
             with urllib.request.urlopen(request, timeout=self._timeout_s) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            # OSError covers URLError, TimeoutError, and ConnectionResetError;
+            # HTTPException covers what urllib does NOT wrap — a server drop
+            # mid-request (deploy/OOM restart of whisper.cpp) escapes
+            # getresponse()/read() as raw RemoteDisconnected, IncompleteRead,
+            # or BadStatusLine. ValueError covers JSONDecodeError. Everything
+            # must surface as the clean SttError the caller contract promises
+            # (dialog "say again"), never a raw transport exception.
             raise SttError(f"whisper.cpp request failed: {exc}") from exc
         text = str(payload.get("text", "")).strip()
         return TranscriptResult(text=text, avg_logprob=_NO_CONFIDENCE_LOGPROB)
@@ -470,6 +478,20 @@ class TimeoutTranscriber:
 
     def _worker_loop(self, generation: int, inner: Transcriber) -> None:
         """Serve jobs one at a time until closed or abandoned by a respawn."""
+        # Load the model BEFORE picking up the first job. The caller's
+        # watchdog clock starts at job.started, so a lazy model load paid
+        # inside the first service window reads as a hang — after a watchdog
+        # respawn with jobs still queued, that false timeout cascades
+        # (respawn → reload inside the next window → respawn …) straight
+        # into the degraded latch. Warming here keeps load time out of every
+        # service-time measurement; a warm failure is swallowed because the
+        # decode itself surfaces the real error to the caller.
+        warm = getattr(inner, "warm", None)
+        if callable(warm):
+            try:
+                warm()
+            except Exception:  # noqa: BLE001 — the decode reports the real error
+                log.exception("stt_worker_warm_failed")
         while True:
             with self._work_ready:
                 while generation == self._generation and not self._closed and not self._queue:
@@ -520,10 +542,11 @@ class TimeoutTranscriber:
                     detail="STT disabled until /reload or restart; "
                     "voice commands will be rejected, slash commands unaffected",
                 )
-                fresh = None
             else:
+                # The fresh worker warms the new backend itself, before it
+                # picks up the first queued job (_worker_loop) — queued jobs
+                # never pay the model reload inside their watchdog window.
                 self._inner = self._factory()
-                fresh = self._inner
                 self._ensure_worker_locked()
                 self._work_ready.notify_all()
         # Close the wedged backend OUTSIDE the lock and on its own thread:
@@ -533,16 +556,15 @@ class TimeoutTranscriber:
         close = getattr(old, "close", None)
         if callable(close):
             threading.Thread(target=close, name="aura-stt-close", daemon=True).start()
-        if fresh is not None:
-            self._warm_off_path(fresh)
         return True
 
     @staticmethod
     def _warm_off_path(backend: Transcriber) -> None:
-        """Re-warm a fresh backend OFF the request path: without this, the
-        very next utterance pays the multi-second model reload inside its own
-        watchdog window — the reload→timeout→reload spiral the startup
-        ``warm()`` exists to prevent (GDD §20)."""
+        """Re-warm a fresh backend OFF the request path (used by
+        :meth:`reset_degraded`, which stands up a backend without starting a
+        worker): without this, the next utterance pays the multi-second model
+        reload before its decode — the reload→timeout→reload spiral the
+        startup ``warm()`` exists to prevent (GDD §20)."""
         warm = getattr(backend, "warm", None)
         if callable(warm):
             threading.Thread(target=warm, name="aura-stt-rewarm", daemon=True).start()

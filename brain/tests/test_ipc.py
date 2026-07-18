@@ -415,6 +415,50 @@ async def test_heartbeat_tracks_liveness_and_answers_hb_ack(harness: _Harness) -
     writer.close()
 
 
+async def test_hb_ack_is_never_starved_by_a_slow_control_handler(tmp_path) -> None:
+    """hb_ack is Ears' ONLY inbound-liveness signal (20 s of silence marks
+    the link Lost). It must be answered from the read path, ahead of the
+    serial control consumer — a handler stalled on Discord REST (alarm card
+    edits, the §19 announcement) must not delay the ack behind it."""
+    h = _Harness(str(tmp_path / "cortana.sock"))
+    handler_release = asyncio.Event()
+    original = h._on_control
+
+    async def stalling_handler(msg: dict) -> None:
+        await original(msg)
+        if msg.get("t") == "hello":
+            await handler_release.wait()  # a wedged app handler
+
+    h.server._on_control = stalling_handler  # type: ignore[assignment]
+    await h.server.start()
+    try:
+        reader, writer = await asyncio.open_unix_connection(h.path)
+        writer.write(FrameCodec.encode_control(_hello()))
+        writer.write(FrameCodec.encode_control({"t": "heartbeat", "ticks": 1}))
+        writer.write(FrameCodec.encode_control({"t": "heartbeat", "ticks": 2}))
+        await writer.drain()
+
+        # Both acks arrive while the hello handler is still stalled.
+        codec = FrameCodec()
+        acks: list[Any] = []
+
+        async def read_acks() -> None:
+            while len(acks) < 2:
+                acks.extend(codec.feed(await reader.read(4096)))
+
+        await asyncio.wait_for(read_acks(), timeout=2.0)
+        assert acks.count(ControlFrame(msg={"t": "hb_ack"})) == 2
+        # The consumer really is parked behind the stalled hello handler.
+        assert [m["t"] for m in h.control] == ["hello"]
+
+        handler_release.set()
+        await _eventually(lambda: len(h.control) == 3)
+        writer.close()
+    finally:
+        handler_release.set()
+        await h.server.stop()
+
+
 # ── server: outbound ─────────────────────────────────────────────────────────
 
 

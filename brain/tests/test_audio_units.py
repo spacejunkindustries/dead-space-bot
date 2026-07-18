@@ -497,6 +497,31 @@ def test_whisper_cpp_wraps_transport_errors(monkeypatch: pytest.MonkeyPatch) -> 
         transcriber.transcribe(FRAME, "")
 
 
+def test_whisper_cpp_wraps_mid_request_server_drop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """urllib only wraps errors from sending the request; a whisper.cpp
+    restart mid-decode (deploy, OOM) surfaces raw from getresponse()/read()
+    as RemoteDisconnected / IncompleteRead / BadStatusLine /
+    ConnectionResetError. Every one must become the clean SttError the caller
+    contract promises (the dialog "say again" path), never escape raw."""
+    import http.client
+
+    drops: tuple[BaseException, ...] = (
+        http.client.RemoteDisconnected("Remote end closed connection without response"),
+        http.client.IncompleteRead(b"partial"),
+        http.client.BadStatusLine("garbage"),
+        ConnectionResetError(104, "Connection reset by peer"),
+    )
+    for drop in drops:
+
+        def fake_urlopen(request: Any, timeout: float, _drop: BaseException = drop) -> None:
+            raise _drop
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        transcriber = WhisperCppTranscriber(make_stt_config(backend="whisper-cpp"))
+        with pytest.raises(SttError):
+            transcriber.transcribe(FRAME, "")
+
+
 # ── TimeoutTranscriber watchdog (GDD §20) ────────────────────────────────────
 
 
@@ -732,6 +757,73 @@ def test_completed_decode_resets_the_consecutive_respawn_count() -> None:
         assert wrapped.degraded is False
     finally:
         release.set()
+
+
+def test_respawned_backend_load_is_not_charged_to_queued_jobs() -> None:
+    """After a watchdog respawn with a job still queued, the fresh backend's
+    model load must run BEFORE the worker picks that job up (warm at worker
+    start), never inside its service window. Without this, one genuine hang
+    during a burst turns the reload into a false consecutive timeout and the
+    cascade latches degraded — the exact spiral _warm_off_path/GDD §20 exists
+    to prevent."""
+    release = threading.Event()
+
+    class _HangingFirst:
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+
+        def transcribe(self, pcm16k: bytes, bias: str) -> TranscriptResult:
+            self.entered.set()
+            release.wait(10.0)
+            raise SttError("released by test teardown")
+
+        def close(self) -> None:
+            pass
+
+    class _SlowLoad:
+        """Simulates faster-whisper: lazy model load on first use, warm()
+        preloads. The load takes 3x the watchdog deadline."""
+
+        def __init__(self) -> None:
+            self.loaded = threading.Event()
+
+        def warm(self) -> None:
+            time.sleep(0.3)
+            self.loaded.set()
+
+        def transcribe(self, pcm16k: bytes, bias: str) -> TranscriptResult:
+            if not self.loaded.is_set():
+                self.warm()  # lazy load INSIDE the service window
+            return TranscriptResult(text=bias, avg_logprob=-0.1)
+
+    hanging = _HangingFirst()
+    backends: list[Any] = [hanging, _SlowLoad()]
+    wrapped = TimeoutTranscriber(lambda: backends.pop(0), timeout_s=0.1, queue_depth=3)
+    results: dict[str, Any] = {}
+
+    def call(tag: str) -> None:
+        try:
+            results[tag] = wrapped.transcribe(FRAME, tag)
+        except SttError as exc:
+            results[tag] = exc
+
+    try:
+        head = threading.Thread(target=call, args=("head",), daemon=True)
+        head.start()
+        assert hanging.entered.wait(2.0)  # head is in service (and hung)
+        queued = threading.Thread(target=call, args=("queued",), daemon=True)
+        queued.start()
+        _wait_for_queue_depth(wrapped, 1)
+
+        head.join(5.0)
+        queued.join(5.0)
+        assert isinstance(results["head"], SttTimeoutError)  # the genuine hang
+        # The queued job survived the respawn: its watchdog clock started
+        # AFTER the fresh backend finished loading.
+        assert results["queued"].text == "queued"
+        assert wrapped.degraded is False
+    finally:
+        release.set()  # unblock the abandoned daemon worker
 
 
 # ── make_transcriber ─────────────────────────────────────────────────────────
