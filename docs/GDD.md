@@ -340,7 +340,7 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 |---|---|---|---|
 | "hostiles \<system\>" / "reds \<system\>" / "neuts \<system\>" | `HOSTILE_SPOTTED` | medium | role mention |
 | "under attack \<system\>" / "tackled \<system\>" / "point on me \<system\>" | `UNDER_ATTACK` | **high** | role mention + `@here` |
-| "need help \<system\>" / "need backup \<system\>" | `ASSIST_REQUEST` | **high** | role mention + `@here` |
+| "need help \<system\>" / "need backup \<system\>" / "request(ing) [heavy] assistance\|backup\|reinforcements\|support \<system\>" | `ASSIST_REQUEST` | **high** | role mention + `@here` |
 | "gate camp \<system\>" | `GATE_CAMP` | medium | role mention |
 | "clear \<system\>" | `RESOLVE` | none | edits card, no mention |
 | "timer \<system\> \<duration\>" | `TIMER` | none | schedules a future ping |
@@ -355,6 +355,8 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 | "stop pinging me" | `PING_ME_CLEAR` | none | spoken reply only |
 
 Higher-severity patterns are matched first, so *"tackled, need help in Kisogo"* resolves to `UNDER_ATTACK`, not a sighting. The personal-ping intents are the one exception: their utterances *contain* type words ("ping me for gate camps"), so `PING_ME`/`PING_ME_CLEAR` are matched before the type words can claim the utterance — a genuine distress call never contains "ping me".
+
+**Padding tolerance.** Stressed pilots narrate: *"please report that I am tackled by enemies in system M tack O and request heavy assistance please"* must parse exactly like *"tackled M-OEE8"* (and it does: `UNDER_ATTACK` — tackled outranks the assist phrasing — with the spelled system intact). Two mechanisms, still fixed grammar (constraint 6): intent keywords are matched on the **raw text first**, so no courtesy word can ever break recognition; and the **system window** is then cleaned aggressively — a finite courtesy vocabulary (*please, kindly, that, by enemies/hostiles, request(ing), heavy, immediate(ly), send, right now, …* plus the phrase forms *I am / we are / I've been / be advised / thank you*) is stripped, and when the pilot anchors the name with a preposition (*"in system X"*, *"in X"*, *"at X"*), everything before the **last** anchor is treated as narrative and discarded. The stripping applies to the system window only — `detail` stays verbatim (§6.3) and callsigns keep their words. The article *"a"* survives inside a spelling (*"one d q one tack a"* → 1DQ1-A, §8.2) but is stripped everywhere else. Note *assistance/backup/reinforcements/support* are `ASSIST_REQUEST` **type words** when prefixed by *need/request* — they are matched (and removed from the window) as whole intent phrases before the courtesy set touches anything.
 
 `PING_ME` (§10.3) reuses the type vocabulary above: *hostiles/reds/neuts* → `HOSTILE_SPOTTED`, *gate camp(s)* → `GATE_CAMP`, *under attack/attacks/tackled* → `UNDER_ATTACK`, *need help/need backup/assist request(s)* → `ASSIST_REQUEST`, and *"anything"/"everything"/"all"* (or no type word at all) → all four. The optional system window resolves through the same phonetic pipeline as reports (§8.2); anything below HIGH tier is treated as unresolved — a subscription silently scoped to the wrong system would never fire, so CORTANA answers *"Say again the system."* instead of guessing. No system means the subscription covers all systems. The recognised types travel to the engine encoded in `detail` (comma-separated `Intent` values), shared by the `/pingme` twin.
 
@@ -534,7 +536,8 @@ raw transcript
    │
    ├─► alias table lookup ────────────► exact hit? done.       [learned, §8.5]
    │
-   ├─► normalise (lowercase, strip filler, expand numerals)
+   ├─► normalise (lowercase, strip filler, expand numerals,
+   │              fuse spelled names — "m tack o double e 8" → "m-oee8")
    │
    ├─► sliding 1–3 token windows over the remainder
    │
@@ -550,6 +553,10 @@ raw transcript
 ```
 
 Levenshtein on raw text alone is the wrong tool: STT errors are **phonetic, not typographic**. Whisper writes *"oh tan you oh me"* — character-distance-far from *Otanuomi*, phonetically adjacent. Metaphone collapses that gap.
+
+**The "tack" convention — spelled system names.** EVE pilots speak the hyphen in a nullsec designation as *"tack"* (also *"dash"*, *"hyphen"*) and spell the characters: M-OEE8 is said *"m tack o double e 8"*, UMI-KK is *"u m i tack k k"*, 1DQ1-A is *"one d q one tack a"*. The normalise step folds these spellings before windowing: hyphen words become `-`, adjacent single letters/digits (and spoken digit words inside a spelling) fuse into one token, and *"double e"* / *"triple x"* expand to `ee` / `xxx`. So *"m tack o double e 8"* becomes the single token `m-oee8` and scores as an exact hit against `M-OEE8`. A bare pair of numerals (*"4 4"*) is not a spelling and keeps the standalone-numeral expansion.
+
+Hyphenated names are also matched by their **spoken short form** — the pre-hyphen prefix (*"UMI"* → UMI-KK, *"Moe 8"* → MOEE-8), promoted only when the abbreviation match is strong (≥ 0.78). Names with a **1-character head** (M-OEE8) have no speakable short form, so they get **unique-prefix promotion** instead: a collapsed spoken form (*"mo"*, *"moee"*) that is a prefix of **exactly one** active-set collapsed name promotes that name to a strong match (0.90 — HIGH-tier on its own; a deliberate spelling is not a fuzzy hearing). A prefix shared by several active names is ambiguous and never promotes — the confirm-flow (§8.3) owns that case, not a guess. Both promotions matter more in `include_all` mode (§8.1), where the wider set makes full-name scores drag.
 
 ### 8.3 Confidence tiers — CORTANA never silently guesses
 

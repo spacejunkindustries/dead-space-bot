@@ -78,6 +78,21 @@ _DIGIT_WORDS = {
     "9": "nine",
 }
 
+# ── the "tack" convention (GDD §8.2) ─────────────────────────────────────────
+# EVE pilots speak the hyphen in a nullsec designation as "tack" (also "dash"
+# or "hyphen") and spell the letters out: M-OEE8 is said "m tack o double e
+# eight". Whisper renders that as a string of single-letter tokens, which the
+# window matcher would otherwise treat as unrelated words.
+
+#: Spoken renderings of the hyphen inside a spelled system name.
+_HYPHEN_WORDS = frozenset(("tack", "tac", "dash", "hyphen"))
+
+#: "double e" → "ee", "triple x" → "xxx" — radio spelling multipliers.
+_MULTIPLIER_WORDS = {"double": 2, "triple": 3}
+
+#: Reverse of ``_DIGIT_WORDS`` — inside a spelled span, "eight" is the digit 8.
+_WORD_DIGITS = {word: digit for digit, word in _DIGIT_WORDS.items()}
+
 
 # ── Double Metaphone ─────────────────────────────────────────────────────────
 
@@ -291,13 +306,75 @@ def similarity(a: str, b: str) -> float:
     return 1.0 - levenshtein(a, b) / max(len(a), len(b))
 
 
-def normalize(text: str) -> list[str]:
-    """Lowercase, strip punctuation and filler, expand standalone numerals."""
-    tokens: list[str] = []
-    for raw in re.split(r"[^a-z0-9]+", text.lower()):
-        if not raw or raw in _FILLER:
+def _fuse_spelled(run: list[tuple[str, bool]]) -> str | None:
+    """Fuse one spelled-name span ("m", "tack", "o", "ee", "8" → "m-oee8").
+
+    A span fuses only when it is at least two tokens long and contains a
+    letter or a spoken hyphen — a bare pair of digits ("4 4") is two numerals,
+    not a spelling, and falls back to normal handling.
+    """
+    if len(run) < 2:
+        return None
+    anchored = False
+    parts: list[str] = []
+    for tok, forced in run:
+        if not forced and tok in _HYPHEN_WORDS:
+            parts.append("-")
+            anchored = True
             continue
-        tokens.append(_DIGIT_WORDS.get(raw, raw))
+        part = _WORD_DIGITS.get(tok, tok)
+        if forced or part.isalpha():
+            anchored = True
+        parts.append(part)
+    return "".join(parts) if anchored else None
+
+
+def normalize(text: str) -> list[str]:
+    """Lowercase, strip punctuation and filler, expand standalone numerals,
+    and fuse spelled system names (GDD §8.2 "tack" convention): hyphen words
+    fold to ``-``, adjacent single letters/digits fuse into one token, and
+    "double e"/"triple x" expand to "ee"/"xxx" — so *"m tack o double e 8"*
+    becomes the single token ``m-oee8``.
+    """
+    raw = [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+
+    # Expand "double <char>"/"triple <char>" into a forced spelled part.
+    expanded: list[tuple[str, bool]] = []
+    i = 0
+    while i < len(raw):
+        tok = raw[i]
+        if tok in _MULTIPLIER_WORDS and i + 1 < len(raw):
+            char = _WORD_DIGITS.get(raw[i + 1], raw[i + 1])
+            if len(char) == 1:
+                expanded.append((char * _MULTIPLIER_WORDS[tok], True))
+                i += 2
+                continue
+        expanded.append((tok, False))
+        i += 1
+
+    tokens: list[str] = []
+
+    def emit(run: list[tuple[str, bool]]) -> None:
+        fused = _fuse_spelled(run)
+        if fused is not None:
+            tokens.append(fused)
+            return
+        for tok, _ in run:  # not a spelling — normal filler/numeral handling
+            if tok not in _FILLER:
+                tokens.append(_DIGIT_WORDS.get(tok, tok))
+
+    run: list[tuple[str, bool]] = []
+    for tok, forced in expanded:
+        # Spelled-span members: forced expansions, hyphen words, single
+        # letters/digits, and spoken digit words ("one d q one tack a").
+        if forced or tok in _HYPHEN_WORDS or tok in _WORD_DIGITS or len(tok) == 1:
+            run.append((tok, forced))
+            continue
+        emit(run)
+        run = []
+        if tok not in _FILLER:
+            tokens.append(_DIGIT_WORDS.get(tok, tok))
+    emit(run)
     return tokens
 
 
@@ -308,9 +385,24 @@ def _phonetic_similarity(a: str, b: str) -> float:
     return max(similarity(pa, pb), similarity(pa, ab), similarity(aa, pb), similarity(aa, ab))
 
 
+def _collapse(text: str) -> str:
+    """Lowercase and drop everything but letters/digits — the comparison form
+    used for character-level scoring and prefix checks."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
 #: Minimum abbreviation-match score to promote a nullsec short-form match —
 #: high enough that only a clearly-spoken prefix ("UMI"→UMI-KK) counts.
 _ABBREV_PROMOTE_MIN = 0.78
+
+#: Score granted by a unique-prefix promotion (GDD §8.2). Clears the HIGH
+#: tier floor on its own — an unambiguous spelled prefix is a deliberate,
+#: exact utterance, not a fuzzy hearing.
+_PREFIX_PROMOTE_SCORE = 0.90
+
+#: Shortest collapsed window eligible for prefix promotion ("mo" for M-OEE8).
+#: Single characters are far too promiscuous to promote.
+_PREFIX_MIN_LEN = 2
 
 
 def eve_abbrev(name: str) -> str | None:
@@ -335,13 +427,13 @@ def base_score(window: str, name: str, cfg: MatchingConfig) -> float:
     short form (:func:`eve_abbrev`), so *"UMI"* matches *UMI-KK* and *"Moe 8"*
     matches *MOEE-8* — the full tail no longer drags the confidence down.
     """
-    a = re.sub(r"[^a-z0-9]", "", window.lower())
-    b = re.sub(r"[^a-z0-9]", "", name.lower())
+    a = _collapse(window)
+    b = _collapse(name)
     score = cfg.phonetic_weight * _phonetic_similarity(a, b) + cfg.text_weight * similarity(a, b)
 
     abbrev = eve_abbrev(name)
     if abbrev is not None:
-        c = re.sub(r"[^a-z0-9]", "", abbrev.lower())
+        c = _collapse(abbrev)
         # Score the window against the short form, but only *promote* the match
         # when it is strong (>= _ABBREV_PROMOTE_MIN) and the window is nearly
         # as long as the prefix. A clearly-spoken abbreviation ("UMI", "Moe")
@@ -355,6 +447,37 @@ def base_score(window: str, name: str, cfg: MatchingConfig) -> float:
             if abbrev_score >= _ABBREV_PROMOTE_MIN:
                 score = max(score, abbrev_score)
     return score
+
+
+def _promote_unique_prefixes(
+    windows: list[str],
+    best_base: dict[int, float],
+    names: dict[int, str],
+) -> None:
+    """Unique-prefix promotion for spelled 1-char-head names (GDD §8.2).
+
+    :func:`eve_abbrev` cannot cover names like ``M-OEE8`` — the pre-hyphen
+    head is a single character, so there is no spoken short form. Pilots say
+    them spelled ("m tack o", "m tack o double e"), which collapses to a
+    *prefix* of the collapsed name ("mo", "moee"). A window that is a prefix
+    of exactly ONE active-set collapsed name promotes that name to a strong
+    match; a prefix shared by several names is ambiguous and never promotes —
+    the confirm-flow (§8.3) owns that case, not a guess.
+    """
+    collapsed = {system_id: _collapse(name) for system_id, name in names.items()}
+    for window in windows:
+        w = _collapse(window)
+        if len(w) < _PREFIX_MIN_LEN:
+            continue
+        hits = [system_id for system_id, cname in collapsed.items() if cname.startswith(w)]
+        if len(hits) != 1:
+            continue
+        name = names[hits[0]]
+        # Only names with no spoken short form need this path; UMI-KK et al
+        # are already covered by the abbreviation promotion in base_score.
+        if "-" not in name or eve_abbrev(name) is not None:
+            continue
+        best_base[hits[0]] = max(best_base[hits[0]], _PREFIX_PROMOTE_SCORE)
 
 
 def _windows(tokens: list[str]) -> list[str]:
@@ -484,6 +607,8 @@ def resolve(
                 best = score
         best_base[entry.id] = best
         names[entry.id] = entry.name
+
+    _promote_unique_prefixes(windows, best_base, names)
 
     pool = sorted(best_base.items(), key=lambda kv: kv[1], reverse=True)[:_RERANK_POOL]
     rescored = [

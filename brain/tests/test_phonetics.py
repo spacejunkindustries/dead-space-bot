@@ -359,3 +359,101 @@ def test_eve_abbrev_only_hyphenated() -> None:
     assert eve_abbrev("UMI-KK") == "UMI"
     assert eve_abbrev("1DQ1-A") == "1DQ1"
     assert eve_abbrev("Jita") is None
+    # 1-char head → no spoken short form; the prefix promotion owns this gap.
+    assert eve_abbrev("M-OEE8") is None
+
+
+# ── spelled names: the "tack" convention (GDD §8.2) ──────────────────────────
+
+SPELLED_NAMES = ["M-OEE8", "UMI-KK", "1DQ1-A", "Kisogo", "Otanuomi"]
+SPELLED_GAZ = FakeGazetteer(names=SPELLED_NAMES)
+
+
+@pytest.mark.parametrize(
+    ("spoken", "tokens"),
+    [
+        ("m tack o", ["m-o"]),
+        ("m tack o double e 8", ["m-oee8"]),
+        ("m dash o double e 8", ["m-oee8"]),
+        ("m hyphen o double e eight", ["m-oee8"]),
+        ("u m i tack k k", ["umi-kk"]),
+        ("one d q one tack a", ["1dq1-a"]),
+        ("in system m tack o double e 8", ["m-oee8"]),
+        ("triple x", ["xxx"]),
+        # NOT spellings: bare numerals keep the existing word expansion, and
+        # multi-letter words never fuse.
+        ("system 4 4", ["four", "four"]),
+        ("oh tan you oh me", ["oh", "tan", "you", "oh", "me"]),
+    ],
+)
+def test_normalize_fuses_spelled_names(spoken: str, tokens: list[str]) -> None:
+    assert normalize(spoken) == tokens
+
+
+@pytest.mark.parametrize(
+    ("spoken", "expect"),
+    [
+        ("m tack o double e 8", "M-OEE8"),
+        ("in system m tack o double e 8", "M-OEE8"),
+        ("u m i tack k k", "UMI-KK"),
+        ("one d q one tack a", "1DQ1-A"),
+    ],
+)
+def test_spelled_names_resolve_high(spoken: str, expect: str) -> None:
+    r = resolve(spoken, SPELLED_GAZ, NO_PRIORS, CFG)
+    assert r.best is not None
+    assert r.best.name == expect
+    assert r.tier is Tier.HIGH
+
+
+# ── unique-prefix promotion for 1-char-head names (GDD §8.2) ─────────────────
+
+
+@pytest.mark.parametrize("spoken", ["m tack o", "moee"])
+def test_unique_prefix_promotes_single_match(spoken: str) -> None:
+    """ "mo"/"moee" collapse to a prefix of exactly one active name → strong."""
+    r = resolve(spoken, SPELLED_GAZ, NO_PRIORS, CFG)
+    assert r.best is not None
+    assert r.best.name == "M-OEE8"
+    assert r.tier is Tier.HIGH
+
+
+def test_ambiguous_prefix_never_promotes() -> None:
+    """ "mo" prefixes two active names → no promotion, no silent guess."""
+    gaz = FakeGazetteer(names=["M-OEE8", "M-OB4K", "Kisogo"])
+    r = resolve("m tack o", gaz, NO_PRIORS, CFG)
+    assert r.best is not None
+    assert r.best.score < CFG.tiers.high_min
+    assert r.tier is not Tier.HIGH
+    # A longer spelling that is unique again promotes.
+    r2 = resolve("m tack o double e", gaz, NO_PRIORS, CFG)
+    assert r2.best is not None
+    assert r2.best.name == "M-OEE8"
+    assert r2.tier is Tier.HIGH
+
+
+def test_prefix_promotion_skips_names_with_a_spoken_short_form() -> None:
+    """ "UMI-KK" has a real abbreviation path; a spelled "u m" (→ "um", a
+    unique prefix) must not ride the 1-char-head promotion."""
+    r = resolve("u m", SPELLED_GAZ, NO_PRIORS, CFG)
+    assert r.best is None or r.best.score < 0.90
+
+
+# ── the operator's acceptance sentence, end to end ───────────────────────────
+
+
+def test_spec_sentence_end_to_end() -> None:
+    from cortana.nlu.grammar import parse as parse_command
+    from cortana.types import Intent
+
+    cmd = parse_command(
+        "please report that i am tackled by enemies in system m tack o"
+        " and request heavy assistance please"
+    )
+    assert cmd is not None
+    assert cmd.intent is Intent.UNDER_ATTACK
+    assert cmd.system_text is not None
+    r = resolve(cmd.system_text, SPELLED_GAZ, NO_PRIORS, CFG)
+    assert r.best is not None
+    assert r.best.name == "M-OEE8"
+    assert r.tier is Tier.HIGH
