@@ -10,10 +10,10 @@ from pathlib import Path
 
 import pytest
 
-from aura.config import GazetteerConfig
-from aura.core import db
-from aura.core.incidents import parse_duration
-from aura.dsc.cogs.utility import (
+from cortana.config import GazetteerConfig
+from cortana.core import db
+from cortana.core.incidents import parse_duration
+from cortana.dsc.cogs.utility import (
     REMINDER_MAX_DURATION,
     add_reminder,
     close_poll,
@@ -34,7 +34,7 @@ from aura.dsc.cogs.utility import (
     reminder_fires_at,
     render_poll_embed,
 )
-from aura.nlu.gazetteer import Gazetteer
+from cortana.nlu.gazetteer import Gazetteer
 
 NOW = datetime(2026, 7, 17, 12, 0, 0, tzinfo=UTC)
 

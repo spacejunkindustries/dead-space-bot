@@ -1,4 +1,4 @@
-# CORTANA subscription routing rules — GDD §10.1. Production copy: /etc/aura/routing.yaml.
+# CORTANA subscription routing rules — GDD §10.1. Production copy: /etc/cortana/routing.yaml.
 # Routing = evaluate every rule against the incident → union the matching
 # roles → mention once. `escalate_at` may only name UNDER_ATTACK or
 # ASSIST_REQUEST — sightings never fire @here (CLAUDE.md constraint 11).

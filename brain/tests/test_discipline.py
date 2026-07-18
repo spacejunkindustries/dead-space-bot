@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from aura.config import (
+from cortana.config import (
     AuraConfig,
     CaptureConfig,
     ChannelsConfig,
@@ -24,7 +24,7 @@ from aura.config import (
     TtsConfig,
     WakeConfig,
 )
-from aura.core.discipline import Discipline
+from cortana.core.discipline import Discipline
 
 PILOT_ROLE = 111
 FC_ROLE = 222
@@ -84,7 +84,7 @@ def make_config(
             max_utterance_s=3.0,
         ),
         gazetteer=GazetteerConfig(file="gazetteer.yaml", home_system="Otanuomi"),
-        ipc=IpcConfig(socket="/run/aura/aura.sock"),
+        ipc=IpcConfig(socket="/run/cortana/cortana.sock"),
         health=HealthConfig(report_interval_min=60, voice_silence_alarm_s=60),
         database=DatabaseConfig(path=":memory:"),
     )

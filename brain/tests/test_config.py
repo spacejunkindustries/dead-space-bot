@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from aura.config import ConfigError, _build_stt, _build_wake
+from cortana.config import ConfigError, _build_stt, _build_wake
 
 _WAKE_BASE = {"model": "wake.onnx", "threshold": 0.55, "refractory_ms": 2000}
 
@@ -65,7 +65,7 @@ def test_wake_vad_threshold_default_and_bounds() -> None:
 
 
 def test_personality_accepts_bratty() -> None:
-    from aura.config import _personality
+    from cortana.config import _personality
 
     assert _personality("bratty") == "bratty"
     with pytest.raises(ConfigError, match="tts.personality"):
@@ -75,8 +75,8 @@ def test_personality_accepts_bratty() -> None:
 def test_unquoted_yaml_off_is_accepted_for_offable_keys() -> None:
     # YAML 1.1 parses a bare `off` as boolean False — an unquoted
     # `join_announcement: off` once crash-looped a deployment.
-    from aura.config import _build_discord
-    from aura.config import _build_stt as build_stt
+    from cortana.config import _build_discord
+    from cortana.config import _build_stt as build_stt
 
     base = {
         "discord": {

@@ -12,9 +12,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-from aura.core.personal_pings import PingSub
-from aura.dsc.cogs.subs import SubsCog
-from aura.types import IncidentOutcome, Intent, Outcome, SystemEntry, Tier
+from cortana.core.personal_pings import PingSub
+from cortana.dsc.cogs.subs import SubsCog
+from cortana.types import IncidentOutcome, Intent, Outcome, SystemEntry, Tier
 
 
 class _Response:

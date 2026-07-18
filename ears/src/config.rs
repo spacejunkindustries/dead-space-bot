@@ -3,7 +3,7 @@
 //! Ears is a dumb audio pump (GDD §3.2): its config carries plumbing only —
 //! where the socket lives, how much audio to buffer through a Brain restart,
 //! and a dev-only token fallback. Anything resembling a *meaning*-level knob
-//! belongs in Brain's `aura.yaml`, not here.
+//! belongs in Brain's `cortana.yaml`, not here.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-/// Contents of `/etc/aura/ears.yaml` (path overridable via `argv[1]`).
+/// Contents of `/etc/cortana/ears.yaml` (path overridable via `argv[1]`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EarsConfig {
@@ -33,11 +33,11 @@ pub struct EarsConfig {
 }
 
 fn default_token_file() -> PathBuf {
-    PathBuf::from("/etc/aura/token")
+    PathBuf::from("/etc/cortana/token")
 }
 
 fn default_socket_path() -> PathBuf {
-    PathBuf::from("/run/aura/aura.sock")
+    PathBuf::from("/run/cortana/cortana.sock")
 }
 
 fn default_buffer_seconds() -> u64 {
@@ -45,7 +45,7 @@ fn default_buffer_seconds() -> u64 {
 }
 
 /// Default config path when none is given on the command line.
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/aura/ears.yaml";
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/cortana/ears.yaml";
 
 /// Load the config from a YAML file.
 pub fn load(path: &Path) -> Result<EarsConfig> {
@@ -91,17 +91,17 @@ mod tests {
     fn parses_minimal_yaml_with_defaults() {
         let cfg: EarsConfig = serde_yaml::from_str("token_file: /tmp/tok\n").unwrap();
         assert_eq!(cfg.token_file, PathBuf::from("/tmp/tok"));
-        assert_eq!(cfg.socket_path, PathBuf::from("/run/aura/aura.sock"));
+        assert_eq!(cfg.socket_path, PathBuf::from("/run/cortana/cortana.sock"));
         assert_eq!(cfg.buffer_seconds, 60);
     }
 
     #[test]
     fn parses_full_yaml() {
         let cfg: EarsConfig = serde_yaml::from_str(
-            "token_file: /etc/aura/token\nsocket_path: /tmp/aura.sock\nbuffer_seconds: 30\n",
+            "token_file: /etc/cortana/token\nsocket_path: /tmp/cortana.sock\nbuffer_seconds: 30\n",
         )
         .unwrap();
-        assert_eq!(cfg.socket_path, PathBuf::from("/tmp/aura.sock"));
+        assert_eq!(cfg.socket_path, PathBuf::from("/tmp/cortana.sock"));
         assert_eq!(cfg.buffer_seconds, 30);
     }
 

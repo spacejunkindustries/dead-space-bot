@@ -15,10 +15,10 @@ against the held-out synthetic splits (positive_test and the adversarial
 negative_test — "aura", "commander", "concord", ... per GDD §5.2) and against
 the ~11 h real-speech validation feature stream, then prints false-reject and
 false-accept rates across a threshold sweep so the operator can pick
-wake.threshold for aura.yaml from data.
+wake.threshold for cortana.yaml from data.
 
 --bundle assembles the full ONNX chain (melspectrogram -> embedding ->
-wakeword) that deploys to /opt/aura/models/wake/ on the droplet.
+wakeword) that deploys to /opt/cortana/models/wake/ on the droplet.
 """
 
 from __future__ import annotations
@@ -162,7 +162,7 @@ def sweep(cfg: dict[str, Any], model_path: Path) -> None:
             f"{recommended:.2f}"
         )
         lines.append(
-            "starting point for wake.threshold in aura.yaml — confirm against real fleet "
+            "starting point for wake.threshold in cortana.yaml — confirm against real fleet "
             "comms before trusting it (CLAUDE.md: threshold tuning needs a human)."
         )
     report = "\n".join(lines)
@@ -178,7 +178,7 @@ def sweep(cfg: dict[str, Any], model_path: Path) -> None:
 
 
 def stage_bundle(cfg: dict[str, Any]) -> None:
-    """Assemble the ONNX chain exactly as it deploys to /opt/aura/models/wake/."""
+    """Assemble the ONNX chain exactly as it deploys to /opt/cortana/models/wake/."""
     import openwakeword
 
     bundle_dir = Path(cfg["deploy"]["bundle_dir"])
@@ -198,9 +198,9 @@ def stage_bundle(cfg: dict[str, Any]) -> None:
         shutil.copy2(src, bundle_dir / src.name)
     log.info("deploy bundle ready: %s", bundle_dir)
     log.info(
-        "deploy: scp %s/*.onnx aura@droplet:/opt/aura/models/wake/  then set "
-        "wake.model: /opt/aura/models/wake/%s and wake.threshold from the sweep table "
-        "in /etc/aura/aura.yaml",
+        "deploy: scp %s/*.onnx aura@droplet:/opt/cortana/models/wake/  then set "
+        "wake.model: /opt/cortana/models/wake/%s and wake.threshold from the sweep table "
+        "in /etc/cortana/cortana.yaml",
         bundle_dir,
         model.name,
     )

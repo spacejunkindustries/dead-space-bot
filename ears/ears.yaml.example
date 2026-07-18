@@ -1,17 +1,17 @@
-# CORTANA Ears configuration — /etc/aura/ears.yaml
+# CORTANA Ears configuration — /etc/cortana/ears.yaml
 #
 # Ears is a dumb audio pump: this file carries plumbing only. Every knob
-# about *meaning* (thresholds, matching, routing) lives in Brain's aura.yaml.
+# about *meaning* (thresholds, matching, routing) lives in Brain's cortana.yaml.
 #
 # The Discord token is provided by systemd LoadCredential= as
 # $CREDENTIALS_DIRECTORY/token in production; token_file is a dev-only
 # fallback and is ignored whenever the credential is present.
 
-token_file: /etc/aura/token
+token_file: /etc/cortana/token
 
 # Unix domain socket shared with Brain. Brain binds; Ears connects and
 # reconnects with backoff forever (GDD §15).
-socket_path: /run/aura/aura.sock
+socket_path: /run/cortana/cortana.sock
 
 # Seconds of outbound audio kept in RAM while Brain is unreachable.
 # Oldest frames are dropped first (GDD §20).

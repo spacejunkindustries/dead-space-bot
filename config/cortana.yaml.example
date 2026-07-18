@@ -1,0 +1,171 @@
+# CORTANA main configuration — GDD §16.
+# Production copy lives at /etc/cortana/cortana.yaml and is hot-reloaded on SIGHUP
+# (systemctl reload cortana-brain).
+#
+# HOT-RELOAD SCOPE: thresholds, weights, windows, channel/role ids, tts
+# lines/personality, and the whole chat: section apply on reload. Sections
+# that pick an ENGINE at startup need a full restart instead:
+#   stt: (backend/model/threads), capture.vad_aggressiveness,
+#   gazetteer: (file/scope), ipc.socket, database.path, discord.token_file.
+#
+# Every tunable in the system lives here; code contains no magic numbers.
+# The numeric defaults below are starting values tuned from real fleet audio —
+# expect them to move (see CLAUDE.md conventions).
+
+discord:
+  token_file: /etc/cortana/token          # dev fallback ONLY (0600, root:aura). Production
+                                       # reads $CREDENTIALS_DIRECTORY/token via systemd
+                                       # LoadCredential= — the token is never in this file.
+  guild_id: 000000000000000000         # the corp's guild (snowflake)
+  channels:
+    intel_alerts: 000000000000000000   # only incidents that mention a role (GDD §11.2)
+    intel_live:   000000000000000000   # every incident, no mentions — the firehose
+    health:       000000000000000000   # hourly self-reports and degradation alerts
+  roles:
+    pilot: 000000000000000000          # gate: only members with this role may trigger mentions
+    fc:    000000000000000000          # gate: only this role may voice-trigger under fleetmode
+  watch_voice_channels: [000000000000000000]  # voice channels CORTANA watches / auto-joins
+  auto_join: true                      # join when a pilot enters, leave when empty
+  mentions_enabled: true               # false = silent mode: post cards, ping nobody
+  here_on_severity: [high]             # ping @here by threat colour: high=RED, medium=ORANGE
+  join_announcement: daily             # §19 consent notice on voice join:
+                                       #   every = post on every join
+                                       #   daily = at most once per 24h (survives
+                                       #           restarts — stops rejoin spam)
+                                       #   off   = never (consent posture carried
+                                       #           by /optout + pinned docs)
+
+wake:
+  # The phrase itself ("hey cortana", GDD §5.2) is baked into the trained
+  # model below — changing it means training a new model, not editing config.
+  model:  /opt/cortana/models/wake/hey_cortana.onnx  # trained openWakeWord ONNX chain
+  threshold: 0.55                      # wake score needed to open a capture window.
+                                       # The trigger is single-frame (no debounce): below
+                                       # ~0.45 ambient chatter false-fires constantly, and
+                                       # every false wake is an STT decode + a junk relay.
+  refractory_ms: 2000                  # per-user dead time after a wake hit
+  vad_threshold: 0.0                   # OPT-IN Silero VAD gate inside openWakeWord:
+                                       # >0 means a wake trigger only counts when
+                                       # speech is detected simultaneously (cuts
+                                       # false fires from music/game audio). It once
+                                       # silently killed the wake word when enabled
+                                       # by default — try ~0.3-0.5 and VERIFY wake
+                                       # still fires. Needs a restart to apply.
+  ack: beep                            # how CORTANA acknowledges the wake word:
+                                       #   voice = speak "Go ahead." (talks back)
+                                       #   beep  = instant tone (no synth latency)
+                                       #   none  = silent
+
+
+capture:
+  preroll_ms: 300                      # RAM ring-buffer audio prepended to each capture
+  endpoint_silence_ms: 1000            # trailing silence that ends an utterance —
+                                       # ALSO the wall-clock gap for Discord's DTX
+                                       # (packets stop during pauses; floor 700ms).
+                                       # 400 clipped pilots at natural thinking
+                                       # pauses; 1000 costs ~+0.3s per command and
+                                       # lets mid-question pauses survive.
+  max_utterance_ms: 12000              # hard cap on a single capture window.
+                                       # 6000 truncated long override questions;
+                                       # reports still end early at the silence
+                                       # endpoint, so short commands stay fast.
+  vad_aggressiveness: 2                # webrtcvad mode, 0 (permissive) – 3 (aggressive)
+
+stt:
+  backend: faster-whisper              # or: whisper-cpp (same Transcriber protocol)
+  model: small                         # Whisper model size
+  compute_type: int8                   # CTranslate2 quantization
+  cpu_threads: 2                       # inference threads (droplet has 2 dedicated vCPUs)
+  bias_with_gazetteer: true            # pass system names as Whisper initial_prompt
+  whisper_cpp_url: http://127.0.0.1:8080/inference  # used only when backend: whisper-cpp
+  relay_min_logprob: -0.9              # freeform relays below this Whisper confidence are
+                                       # dropped with "Say again" instead of posted (GDD §8.6);
+                                       # recognised commands are never gated by this.
+  relay_mode: framed                   # what unmatched speech may become a relay card (§8.6):
+                                       #   framed = only explicitly framed intel — a "report …"
+                                       #            opener, a spoken colour code, or an
+                                       #            all-hands phrase. Mishearings never post.
+                                       #   open   = any unmatched transcript relays
+                                       #   off    = freeform relay disabled; commands only
+
+matching:
+  phonetic_weight: 0.6                 # weight of metaphone similarity (constraint 7)
+  text_weight: 0.4                     # weight of raw-text Levenshtein similarity
+  tiers:                               # confidence tiers — GDD §8.3
+    high_min: 0.80                     # top1 >= this ...
+    high_margin: 0.12                  # ... and top1 - top2 >= this → post immediately
+    medium_min: 0.55                   # top1 >= this → post flagged uncertain, with buttons
+  priors:                              # context reweighting — GDD §8.4
+    recency_weight: 0.35               # boost for systems with recent incidents
+    recency_window_min: 10             # how recent counts as recent
+    proximity_weight: 0.25             # boost for systems near an active incident
+    proximity_max_jumps: 5             # beyond this many jumps, no proximity boost
+    reporter_history_weight: 0.15      # boost for systems this pilot reports from often
+    home_weight: 0.10                  # standing boost for home and adjacent systems
+
+incidents:
+  dedupe_window_s: 90                  # same system + type within this window → fold (GDD §9.2)
+  stale_after_min: 20                  # no updates for this long → auto-STALE, silently
+  cancel_window_s: 30                  # "hey cortana, cancel" kills the user's last incident
+
+discipline:
+  user_cooldown_s: 30                  # min seconds between mentions from the same pilot
+  circuit_breaker:
+    max_mentions: 12                   # more than this many mentions ...
+    window_min: 10                     # ... in this many minutes → flood control (GDD §11.1)
+  personal_pings_max: 10               # max personal /pingme subscriptions per pilot (GDD §10.3)
+
+tts:
+  enabled: true                        # spoken back-channel on/off
+  voice: /opt/cortana/models/piper/en_US-amy-medium.onnx  # Piper voice model
+  binary: /usr/local/bin/piper         # Piper invoked as a subprocess (GDD §12 license note)
+  max_utterance_s: 3                   # hard cap; longer text goes to the channel instead
+  effect: none                         # none | holographic (chorus+reverb "ship AI" sheen)
+  personality: standard                # standard = exact GDD §12.1 lines;
+                                       # cortana = acknowledgement lines rotate
+                                       # ("Go ahead." / "Listening." / "Send it.")
+                                       # so CORTANA feels alive; info lines never vary.
+                                       # bratty = the rotation with attitude and
+                                       # sailor vocabulary ("Ugh, fine. Go." /
+                                       # "That was gibberish. Again.") — profanity
+                                       # in ACK lines only, an adult corp's choice.
+  # Ducking (60%) and talk-over suppression are fixed playback mechanics in
+  # Ears (ears/src/playback.rs, GDD §12.2) — not tunables.
+
+chat:                                  # "command override" assistant (GDD §6.6) — OFF by default
+  enabled: false                       # true = pilots can say "command override, <question>"
+                                       # (slash twin: /ask). Costs real money per question.
+  model: claude-haiku-4-5              # cheapest tier (~$0.002/question);
+                                       # claude-opus-4-8 = smarter, ~10x the price
+  api_key_file: /etc/cortana/anthropic    # dev fallback ONLY (0600). Production reads
+                                       # $CREDENTIALS_DIRECTORY/anthropic via systemd
+                                       # LoadCredential= — the key is never in this file.
+  max_tokens: 300                      # hard cap per answer
+  user_cooldown_s: 10                  # per-pilot throttle — the cost control
+  timeout_s: 25                        # wall-clock cap incl. web search
+  web_search: true                     # allow 1 live web search per question
+                                       # (weather etc.; each search bills ~1¢)
+  answer_channel: 000000000000000000   # where answers too long to speak post.
+                                       # 0 = intel_live — but chit-chat in an
+                                       # intel channel annoys; point this at a
+                                       # general/bot channel.
+
+gazetteer:
+  file: /etc/cortana/gazetteer.yaml       # scope rules: regions/within_jumps_of/include_all (GDD §8.1)
+  home_system: Otanuomi                # anchor for the home-bias prior (§8.4) and within_jumps_of.
+                                       # null (or empty) = no home system → home-bias prior off;
+                                       # this is the nomadic-corp setting (GDD §8.1).
+  include_all: false                   # nomadic override, mirrors gazetteer.yaml include_all —
+                                       # either being true activates the entire seeded map.
+
+ipc:
+  socket: /run/cortana/cortana.sock          # Brain binds; Ears connects (GDD §15)
+  # Ears' outbound ring size (buffer_seconds) lives in /etc/cortana/ears.yaml —
+  # the ring must survive Brain restarts, so Brain cannot own that knob.
+
+health:
+  report_interval_min: 60              # cadence of #bot-health self-reports
+  voice_silence_alarm_s: 60            # no VoiceTick this long with >=2 humans → degraded
+
+database:
+  path: /var/lib/cortana/cortana.db          # SQLite (WAL); backed up nightly (GDD §18)

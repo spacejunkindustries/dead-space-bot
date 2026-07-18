@@ -13,12 +13,12 @@ from typing import Any
 
 from discord import app_commands
 
-from aura import tts
-from aura.core import db
-from aura.core.discipline import Discipline
-from aura.core.incidents import IncidentEngine
-from aura.dsc.cogs.admin import AdminCog
-from aura.dsc.cogs.help import (
+from cortana import tts
+from cortana.core import db
+from cortana.core.discipline import Discipline
+from cortana.core.incidents import IncidentEngine
+from cortana.dsc.cogs.admin import AdminCog
+from cortana.dsc.cogs.help import (
     HELP_TOPICS,
     HelpCog,
     help_custom_id,
@@ -27,12 +27,12 @@ from aura.dsc.cogs.help import (
     topic_embed,
     visible_topics,
 )
-from aura.dsc.cogs.intel import IntelCog
-from aura.dsc.cogs.ops import OpsCog
-from aura.dsc.cogs.subs import SubsCog
-from aura.dsc.cogs.utility import UtilityCog
-from aura.nlu import grammar
-from aura.types import IncidentOutcome, Intent, Outcome, ParsedCommand
+from cortana.dsc.cogs.intel import IntelCog
+from cortana.dsc.cogs.ops import OpsCog
+from cortana.dsc.cogs.subs import SubsCog
+from cortana.dsc.cogs.utility import UtilityCog
+from cortana.nlu import grammar
+from cortana.types import IncidentOutcome, Intent, Outcome, ParsedCommand
 from tests.test_incidents import FakeGazetteer, FakePoster, StubHolder, make_config
 
 ALL_COGS = (IntelCog, SubsCog, OpsCog, UtilityCog, AdminCog, HelpCog)

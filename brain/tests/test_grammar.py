@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from aura.nlu.grammar import (
+from cortana.nlu.grammar import (
     bare_code,
     broadcast_severity,
     broadcast_text,
@@ -13,7 +13,7 @@ from aura.nlu.grammar import (
     sanitize_callsign,
     system_reply,
 )
-from aura.types import Intent, Severity
+from cortana.types import Intent, Severity
 
 # ── the GDD §6.5 examples ────────────────────────────────────────────────────
 
@@ -462,7 +462,7 @@ def test_signoff_only_at_the_tail() -> None:
 
 
 def test_broadcast_text_strips_wake_and_signoff() -> None:
-    from aura.nlu.grammar import broadcast_text
+    from cortana.nlu.grammar import broadcast_text
 
     assert broadcast_text("Hey Jarvis, blop fleet moving to Moe 8 gate, over") == (
         "blop fleet moving to Moe 8 gate"
@@ -471,7 +471,7 @@ def test_broadcast_text_strips_wake_and_signoff() -> None:
 
 
 def test_wants_all_hands() -> None:
-    from aura.nlu.grammar import wants_all_hands
+    from cortana.nlu.grammar import wants_all_hands
 
     assert wants_all_hands("cyno up in MOEE-8, all hands")
     assert not wants_all_hands("blop fleet moving to Moe 8")
@@ -581,7 +581,7 @@ def test_stuttered_hallucination_collapses_in_relay() -> None:
 
 
 def test_override_query_extracts_question() -> None:
-    from aura.nlu.grammar import override_query
+    from cortana.nlu.grammar import override_query
 
     q = override_query("hey cortana command override please tell me the weather in Chicago")
     assert q == "please tell me the weather in Chicago"
@@ -591,7 +591,7 @@ def test_override_query_extracts_question() -> None:
 
 
 def test_override_never_diverts_reports() -> None:
-    from aura.nlu.grammar import override_query
+    from cortana.nlu.grammar import override_query
 
     # "override" mid-sentence is a report word, not the doorway.
     assert override_query("hostiles are trying to override the gate in Kisogo") is None
@@ -602,7 +602,7 @@ def test_override_never_diverts_reports() -> None:
 
 def test_override_accepts_stt_phonetic_renderings() -> None:
     # STT renders "override" phonetically; the doorway must still open.
-    from aura.nlu.grammar import override_query
+    from cortana.nlu.grammar import override_query
 
     expected = "what's the weather in Chicago"
     for heard in (
@@ -621,7 +621,7 @@ def test_override_accepts_stt_phonetic_renderings() -> None:
 
 
 def test_relay_framed_accepts_explicit_frames() -> None:
-    from aura.nlu.grammar import relay_framed
+    from cortana.nlu.grammar import relay_framed
 
     assert relay_framed("report blop fleet on the Kisogo gate end report")
     assert relay_framed("hey jarvis reporting fleet movement to Rens, over")
@@ -630,7 +630,7 @@ def test_relay_framed_accepts_explicit_frames() -> None:
 
 
 def test_relay_framed_rejects_unframed_speech() -> None:
-    from aura.nlu.grammar import relay_framed
+    from cortana.nlu.grammar import relay_framed
 
     # The junk that used to become CODE YELLOW cards: crosstalk, lone system
     # names, hallucinated repeats.
@@ -645,7 +645,7 @@ def test_relay_framed_rejects_unframed_speech() -> None:
 
 
 def test_system_noise_word_is_stripped_from_the_window() -> None:
-    from aura.nlu.grammar import parse
+    from cortana.nlu.grammar import parse
 
     p = parse("I'm tackled code red in system UMI over")
     assert p is not None
@@ -660,7 +660,7 @@ def test_system_noise_word_is_stripped_from_the_window() -> None:
 
 
 def test_chase_update_parses_with_and_without_update_prefix() -> None:
-    from aura.nlu.grammar import parse
+    from cortana.nlu.grammar import parse
 
     for heard in ("update chase Kisogo", "chase Kisogo", "hey cortana update chase mode UMI over"):
         p = parse(heard)
@@ -670,7 +670,7 @@ def test_chase_update_parses_with_and_without_update_prefix() -> None:
 
 
 def test_bare_chase_mode_parses_without_system() -> None:
-    from aura.nlu.grammar import parse
+    from cortana.nlu.grammar import parse
 
     p = parse("hey cortana chase mode")
     assert p is not None
@@ -679,7 +679,7 @@ def test_bare_chase_mode_parses_without_system() -> None:
 
 
 def test_distress_words_always_beat_chase() -> None:
-    from aura.nlu.grammar import parse
+    from cortana.nlu.grammar import parse
 
     # "tackled ... chase" is a distress call, never a chase command.
     p = parse("I'm tackled in Kisogo they're giving chase")
@@ -688,7 +688,7 @@ def test_distress_words_always_beat_chase() -> None:
 
 
 def test_mid_sentence_chase_chatter_never_claims_the_intent() -> None:
-    from aura.nlu.grammar import parse
+    from cortana.nlu.grammar import parse
 
     # A live card must never be silently retargeted by chatter.
     assert parse("let's chase them down") is None
@@ -699,7 +699,7 @@ def test_mid_sentence_chase_chatter_never_claims_the_intent() -> None:
 
 
 def test_chase_terminators_never_become_system_names() -> None:
-    from aura.nlu.grammar import parse
+    from cortana.nlu.grammar import parse
 
     for heard in ("chase mode off", "chase is over", "chase done", "chase stopped"):
         p = parse(heard)
@@ -713,14 +713,14 @@ def test_chase_terminators_never_become_system_names() -> None:
 
 
 def test_chase_mode_mid_sentence_never_claims() -> None:
-    from aura.nlu.grammar import parse
+    from cortana.nlu.grammar import parse
 
     p = parse("we're in chase mode after the vexor")
     assert p is None or p.intent is not Intent.CHASE_UPDATE
 
 
 def test_callsign_starting_with_system_survives() -> None:
-    from aura.nlu.grammar import parse
+    from cortana.nlu.grammar import parse
 
     p = parse("register system junkie")
     assert p is not None and p.intent is Intent.REGISTER

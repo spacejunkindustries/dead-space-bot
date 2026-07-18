@@ -3,7 +3,7 @@
 # is what makes it impossible to accidentally wire up Python voice.
 
 discord.py>=2.4          # dsc/ — gateway, slash commands, components, roles, REST
-PyYAML>=6.0              # config.py, nlu/gazetteer.py — aura.yaml / gazetteer.yaml / routing.yaml
+PyYAML>=6.0              # config.py, nlu/gazetteer.py — cortana.yaml / gazetteer.yaml / routing.yaml
 structlog>=24.1          # everywhere — JSON structured logging
 webrtcvad-wheels>=2.0.14 # audio/vad.py — voice activity detection / utterance endpointing
 # openwakeword is installed with --no-deps (see deploy/install.sh): its Linux

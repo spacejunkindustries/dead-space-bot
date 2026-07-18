@@ -7,9 +7,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aura.core import db
-from aura.nlu import seed
-from aura.nlu.phonetics import double_metaphone
+from cortana.core import db
+from cortana.nlu import seed
+from cortana.nlu.phonetics import double_metaphone
 
 # Two k-space regions and one wormhole region (regionID >= 11_000_000).
 REGIONS_CSV = (
@@ -128,7 +128,7 @@ def _run_seed(tmp_path: Path, db_path: Path) -> int:
 
 
 def test_cli_seeds_metaphone_and_coords(tmp_path: Path) -> None:
-    db_path = tmp_path / "aura.db"
+    db_path = tmp_path / "cortana.db"
     assert _run_seed(tmp_path, db_path) == 0
 
     conn = db.connect(db_path)
@@ -148,7 +148,7 @@ def test_cli_seeds_metaphone_and_coords(tmp_path: Path) -> None:
 
 
 def test_cli_idempotent_rerun(tmp_path: Path) -> None:
-    db_path = tmp_path / "aura.db"
+    db_path = tmp_path / "cortana.db"
     assert _run_seed(tmp_path, db_path) == 0
     conn = db.connect(db_path)
     first_sys = db.query_value(conn, "SELECT COUNT(*) FROM systems")
@@ -169,7 +169,7 @@ def test_cli_reseed_with_referencing_rows(tmp_path: Path) -> None:
     systems(id). With ``foreign_keys=ON`` a naive ``DELETE FROM systems`` is
     rejected by those child FKs; the deferred-FK reload must succeed and keep
     the referencing rows intact."""
-    db_path = tmp_path / "aura.db"
+    db_path = tmp_path / "cortana.db"
     assert _run_seed(tmp_path, db_path) == 0
 
     # Simulate a live droplet: an operator correction (alias) and an open
@@ -210,6 +210,6 @@ def test_cli_reseed_with_referencing_rows(tmp_path: Path) -> None:
 
 def test_cli_local_requires_all_three(tmp_path: Path, capsys) -> None:
     # Only one of the three local paths given → clean nonzero exit, no wipe.
-    rc = seed.main(["--db", str(tmp_path / "aura.db"), "--systems-csv", "x.csv"])
+    rc = seed.main(["--db", str(tmp_path / "cortana.db"), "--systems-csv", "x.csv"])
     assert rc != 0
     assert "must be given together" in capsys.readouterr().err

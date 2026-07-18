@@ -14,8 +14,8 @@ phrase:
   target_phrases:
     - "hey cortana"
     - "hey cortauna"         # spelling variant nudging some TTS voices onto "kor-TAH-na"
-  # Becomes the output filename: <model_name>.onnx. Point aura.yaml's wake.model
-  # at /opt/aura/models/wake/hey_cortana.onnx once this is trained and deployed.
+  # Becomes the output filename: <model_name>.onnx. Point cortana.yaml's wake.model
+  # at /opt/cortana/models/wake/hey_cortana.onnx once this is trained and deployed.
   model_name: hey_cortana
 
   # Adversarial negatives (GDD §5.2 — the false-fire concern is the whole
@@ -121,7 +121,7 @@ training:
 
 validation:
   # Threshold sweep printed by train.py so the operator can pick
-  # wake.threshold for aura.yaml from data instead of folklore.
+  # wake.threshold for cortana.yaml from data instead of folklore.
   threshold_start: 0.30
   threshold_stop: 0.96
   threshold_step: 0.05
@@ -135,5 +135,5 @@ validation:
 
 deploy:
   # train.py --bundle assembles the full ONNX chain (melspectrogram →
-  # embedding → wakeword) here, ready to scp to /opt/aura/models/wake/.
+  # embedding → wakeword) here, ready to scp to /opt/cortana/models/wake/.
   bundle_dir: ./work/deploy_bundle

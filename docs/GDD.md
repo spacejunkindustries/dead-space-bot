@@ -1,6 +1,6 @@
 # CORTANA — Voice-Activated Fleet Intel Bot
 
-> **Naming.** The bot presents as **CORTANA** everywhere a user sees or hears it. The internal codename remains **aura**: the Python package, repository layout, systemd units (`aura-brain`/`aura-ears`), and filesystem paths (`/opt/aura`, `/etc/aura`, `/run/aura`) keep the old name deliberately — renaming live infrastructure buys no user-visible change and risks the running deployment.
+> **Naming.** The bot presents as **CORTANA** everywhere a user sees or hears it. The internal codename remains **aura**: the Python package, repository layout, systemd units (`cortana-brain`/`cortana-ears`), and filesystem paths (`/opt/cortana`, `/etc/cortana`, `/run/cortana`) keep the old name deliberately — renaming live infrastructure buys no user-visible change and risks the running deployment.
 
 **Game Design Document**
 EVE Echoes corp utility bot · self-hosted on DigitalOcean
@@ -138,7 +138,7 @@ Two processes on one droplet, joined by a Unix domain socket.
 │                                      │  SQLite            │  │
 │                                      └────────────────────┘  │
 │                                               │               │
-│                                      /var/lib/aura/aura.db    │
+│                                      /var/lib/cortana/cortana.db    │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -221,12 +221,12 @@ Every module in the finished system.
 
 | Path | Contents |
 |---|---|
-| `/opt/aura/models/wake/` | openWakeWord ONNX chain (melspec → embedding → wakeword) |
-| `/opt/aura/models/whisper/` | Whisper `small` int8 CTranslate2 weights |
-| `/opt/aura/models/piper/` | Piper voice `.onnx` + `.onnx.json` |
-| `/etc/aura/aura.yaml` | Main configuration (§16) |
-| `/etc/aura/routing.yaml` | Subscription rules (§12) |
-| `/var/lib/aura/aura.db` | SQLite |
+| `/opt/cortana/models/wake/` | openWakeWord ONNX chain (melspec → embedding → wakeword) |
+| `/opt/cortana/models/whisper/` | Whisper `small` int8 CTranslate2 weights |
+| `/opt/cortana/models/piper/` | Piper voice `.onnx` + `.onnx.json` |
+| `/etc/cortana/cortana.yaml` | Main configuration (§16) |
+| `/etc/cortana/routing.yaml` | Subscription rules (§12) |
+| `/var/lib/cortana/cortana.db` | SQLite |
 
 ---
 
@@ -271,7 +271,7 @@ Songbird VoiceTick (20ms, per-user decoded PCM 48kHz)
 
 ### 5.1 Wake word
 
-**Engine: openWakeWord** (Apache 2.0). Free, self-hosted, no per-seat licensing, and it benchmarks competitively against the leading commercial engine. Custom phrases are trained from a synthetic TTS pipeline; the trained ONNX chain ships in `/opt/aura/models/wake/`.
+**Engine: openWakeWord** (Apache 2.0). Free, self-hosted, no per-seat licensing, and it benchmarks competitively against the leading commercial engine. Custom phrases are trained from a synthetic TTS pipeline; the trained ONNX chain ships in `/opt/cortana/models/wake/`.
 
 *Porcupine is the mature commercial alternative — type-to-train, instant custom words — but its free tier is scoped to personal use and commercial licensing starts around $6k/yr. A 50-pilot corp bot is not a comfortable fit for the free tier. CORTANA does not require it.*
 
@@ -386,7 +386,7 @@ An **explicitly-invoked** chat channel, off by default (`chat.enabled`). When a 
 
 **Cost posture.** Default model is the cheapest Claude tier (fractions of a cent per question); replies are capped at `chat.max_tokens`, web search at one per question, and `chat.user_cooldown_s` throttles each pilot. The cooldown arms only on a successful answer — a failed request must not turn the pilot's retry into a throttle message. The API key rides systemd `LoadCredential=` (`anthropic:` credential; constraint 12), with `chat.api_key_file` as the 0600 dev fallback.
 
-**Liveness.** The whole `chat:` section applies on SIGHUP — flipping `chat.enabled` or dropping a key into place takes effect on `systemctl reload aura-brain`, no restart. A spoken "command override …" while the channel is down always gets the fixed *"Override channel unavailable."* line (never a silent fall-through to the grammar), and `/ask` distinguishes "not enabled" from "enabled but no key loaded".
+**Liveness.** The whole `chat:` section applies on SIGHUP — flipping `chat.enabled` or dropping a key into place takes effect on `systemctl reload cortana-brain`, no restart. A spoken "command override …" while the channel is down always gets the fixed *"Override channel unavailable."* line (never a silent fall-through to the grammar), and `/ask` distinguishes "not enabled" from "enabled but no key loaded".
 
 ---
 
@@ -446,7 +446,7 @@ set CORTANA will match a transcript against. The seed is wide on purpose so the
 scope can point anywhere without re-seeding; accuracy comes from the scope, not
 the seed.
 
-**Seeding — `python -m aura.nlu.seed`.** An operator CLI (`aura/nlu/seed.py`)
+**Seeding — `python -m cortana.nlu.seed`.** An operator CLI (`aura/nlu/seed.py`)
 downloads the three Fuzzwork SDE CSVs (`mapSolarSystems`, `mapSolarSystemJumps`,
 `mapRegions`), joins each system to its region name, and loads **all of k-space
 New Eden** (~5000 systems) plus the jump graph. Wormhole/abyssal space
@@ -540,7 +540,7 @@ Candidates are reweighted by what is plausible *right now*. A fleet fight is spa
 | **Reporter history** | This pilot has reported from Otanuomi six times this week. That is a prior. |
 | **Home bias** | Home and adjacent systems carry a standing boost. Inactive when `gazetteer.home_system` is `null` (nomadic corps, §8.1) — the prior simply does not fire. |
 
-Applied as a cheap multiplicative reweighting over the top-8 base-score candidates — wider than the final top-3 on purpose, so a strong prior can promote a lower-ranked but spatially plausible candidate into the top-3. Weights live in `aura.yaml`.
+Applied as a cheap multiplicative reweighting over the top-8 base-score candidates — wider than the final top-3 on purpose, so a strong prior can promote a lower-ranked but spatially plausible candidate into the top-3. Weights live in `cortana.yaml`.
 
 ### 8.5 Alias learning
 
@@ -788,7 +788,7 @@ SQLite. One corp, low write volume, no concurrency pressure — a managed databa
 
 ```sql
 -- ── gazetteer ────────────────────────────────────────────────
--- Populated by `python -m aura.nlu.seed` from the EVE SDE (k-space New Eden,
+-- Populated by `python -m cortana.nlu.seed` from the EVE SDE (k-space New Eden,
 -- ~5000 systems + the jump graph; §8.1). gazetteer.yaml scopes the ACTIVE
 -- subset at runtime — the tables hold the wide seed, not the active set.
 CREATE TABLE systems (
@@ -965,7 +965,7 @@ CREATE INDEX idx_cmdlog_at ON command_log(at);
 
 ## 15. IPC protocol
 
-Framed messages over `/run/aura/aura.sock`. **Brain binds; Ears connects and reconnects with backoff.** This ordering matters: it means Ears buffers when Brain restarts, rather than the reverse.
+Framed messages over `/run/cortana/cortana.sock`. **Brain binds; Ears connects and reconnects with backoff.** This ordering matters: it means Ears buffers when Brain restarts, rather than the reverse.
 
 ```
 Frame:  [4-byte BE length][1-byte type][body]
@@ -1003,11 +1003,11 @@ control task.
 
 ## 16. Configuration reference
 
-`/etc/aura/aura.yaml` — hot-reloaded on `SIGHUP`.
+`/etc/cortana/cortana.yaml` — hot-reloaded on `SIGHUP`.
 
 ```yaml
 discord:
-  token_file: /etc/aura/token          # 0600, root:aura
+  token_file: /etc/cortana/token          # 0600, root:aura
   guild_id: 000000000000000000
   channels:
     intel_alerts: 000000000000000000
@@ -1020,7 +1020,7 @@ discord:
   auto_join: true                       # join when a pilot enters, leave when empty
 
 wake:
-  model:  /opt/aura/models/wake/hey_cortana.onnx   # the phrase is baked into the model
+  model:  /opt/cortana/models/wake/hey_cortana.onnx   # the phrase is baked into the model
   threshold: 0.55
   refractory_ms: 2000
   ack: beep                             # voice = speak "Go ahead." | beep = tone | none
@@ -1070,7 +1070,7 @@ discipline:
 
 tts:
   enabled: true
-  voice: /opt/aura/models/piper/en_US-amy-medium.onnx
+  voice: /opt/cortana/models/piper/en_US-amy-medium.onnx
   binary: /usr/local/bin/piper
   max_utterance_s: 3
   # Ducking (60%) and talk-over suppression are fixed playback mechanics in
@@ -1079,23 +1079,23 @@ tts:
 chat:                                   # §6.6 override assistant — off by default
   enabled: false
   model: claude-haiku-4-5
-  api_key_file: /etc/aura/anthropic     # dev fallback; production = LoadCredential
+  api_key_file: /etc/cortana/anthropic     # dev fallback; production = LoadCredential
   max_tokens: 300
   user_cooldown_s: 10
   timeout_s: 25
   web_search: true
 
 gazetteer:
-  file: /etc/aura/gazetteer.yaml
+  file: /etc/cortana/gazetteer.yaml
   home_system: Otanuomi        # null/empty = no home system → home-bias prior
                                # off (nomadic corps, §8.1/§8.4)
   include_all: false           # nomadic override, mirrors gazetteer.yaml's flag;
                                # either being true activates the whole seeded map
 
 ipc:
-  socket: /run/aura/aura.sock
+  socket: /run/cortana/cortana.sock
   # Ears' outbound ring size (buffer_seconds) lives in Ears' own config,
-  # /etc/aura/ears.yaml (token_file, socket_path, buffer_seconds — see
+  # /etc/cortana/ears.yaml (token_file, socket_path, buffer_seconds — see
   # ears/ears.yaml.example): the ring must survive Brain restarts, so Brain
   # cannot own that knob.
 
@@ -1104,14 +1104,14 @@ health:
   voice_silence_alarm_s: 60
 ```
 
-`/etc/aura/gazetteer.yaml` — scope rules over the SDE-seeded tables (§8.1). The
-tables themselves are filled by `python -m aura.nlu.seed` (k-space New Eden),
+`/etc/cortana/gazetteer.yaml` — scope rules over the SDE-seeded tables (§8.1). The
+tables themselves are filled by `python -m cortana.nlu.seed` (k-space New Eden),
 which this file then scopes at runtime:
 
 ```yaml
 # false (default) = scoped by the rules below (home-region corps).
 # true = nomadic mode: the entire seeded map is active, regions/within_jumps_of
-# are ignored, exclude still removes. Set home_system: null in aura.yaml too.
+# are ignored, exclude still removes. Set home_system: null in cortana.yaml too.
 include_all: false
 
 regions:                 # scoped mode: regions included wholesale
@@ -1152,15 +1152,15 @@ DigitalOcean moved to **per-second billing (60s minimum) on January 1, 2026**. L
 ```
 Ubuntu 24.04 LTS
 ├── systemd
-│   ├── aura-ears.service     Rust binary,  Restart=always, RestartSec=5
-│   └── aura-brain.service    Python,       Restart=always, RestartSec=5
-├── /opt/aura/
-│   ├── bin/aura-ears
+│   ├── cortana-ears.service     Rust binary,  Restart=always, RestartSec=5
+│   └── cortana-brain.service    Python,       Restart=always, RestartSec=5
+├── /opt/cortana/
+│   ├── bin/cortana-ears
 │   ├── brain/                 venv + package
 │   └── models/{wake,whisper,piper}/
-├── /etc/aura/{aura.yaml,routing.yaml,gazetteer.yaml,token}
-├── /var/lib/aura/aura.db
-├── /run/aura/aura.sock        (tmpfiles.d, mode 0660, root:aura)
+├── /etc/cortana/{cortana.yaml,routing.yaml,gazetteer.yaml,token}
+├── /var/lib/cortana/cortana.db
+├── /run/cortana/cortana.sock        (tmpfiles.d, mode 0660, root:aura)
 ├── user: aura  (nologin, owns runtime dirs)
 └── ufw: deny incoming, allow SSH only — CORTANA opens no listening ports
 ```
@@ -1202,8 +1202,8 @@ piper                  # /usr/local/bin/piper
 | **Backups** | Nightly `sqlite3 .backup` → DigitalOcean Space, 30-day retention. The gazetteer tuning and alias table are the irreplaceable assets — the rest is reconstructible. |
 | **Monitoring** | External uptime check against a systemd watchdog; hourly self-report to `#bot-health`. |
 | **Logs** | `journalctl`, structured JSON, 14-day retention. Transcripts of triggered commands only. |
-| **Secrets** | Token in `/etc/aura/token`, mode 0600, loaded via `LoadCredential=` in the unit file. Never in the YAML, never in the environment, never in the repo. |
-| **Updates** | `systemctl reload aura-brain` for config; restart for code. Ears stays connected across Brain restarts. |
+| **Secrets** | Token in `/etc/cortana/token`, mode 0600, loaded via `LoadCredential=` in the unit file. Never in the YAML, never in the environment, never in the repo. |
+| **Updates** | `systemctl reload cortana-brain` for config; restart for code. Ears stays connected across Brain restarts. |
 | **Accuracy review** | Weekly `command_log` query: confidence distribution, mismatch rate by system, per-pilot failure rate. Feeds §8 tuning. |
 
 ---
@@ -1279,7 +1279,7 @@ Against 20–40 seconds for the manual path. That is the whole thesis, restated 
 - Token via `LoadCredential=`, never in config, environment, or repo.
 - Least-privilege bot permissions (§17.4). No Administrator.
 - `aura` runs as an unprivileged `nologin` user.
-- systemd hardening on both units: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `ReadWritePaths=/var/lib/aura /run/aura`.
+- systemd hardening on both units: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `ReadWritePaths=/var/lib/cortana /run/cortana`.
 - Mention capability is gated on the `@Pilot` role, so a compromised member account cannot mass-ping.
 
 ---

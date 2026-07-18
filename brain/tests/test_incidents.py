@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from aura.config import (
+from cortana.config import (
     AuraConfig,
     CaptureConfig,
     ChannelsConfig,
@@ -32,11 +32,11 @@ from aura.config import (
     TtsConfig,
     WakeConfig,
 )
-from aura.core import db
-from aura.core.discipline import Discipline
-from aura.core.incidents import IncidentEngine, parse_duration
-from aura.nlu import phonetics
-from aura.types import (
+from cortana.core import db
+from cortana.core.discipline import Discipline
+from cortana.core.incidents import IncidentEngine, parse_duration
+from cortana.nlu import phonetics
+from cortana.types import (
     AlertChannel,
     CardRender,
     Intent,
@@ -151,7 +151,7 @@ def make_config(
             max_utterance_s=3.0,
         ),
         gazetteer=GazetteerConfig(file="gazetteer.yaml", home_system="Otanuomi"),
-        ipc=IpcConfig(socket="/run/aura/aura.sock"),
+        ipc=IpcConfig(socket="/run/cortana/cortana.sock"),
         health=HealthConfig(report_interval_min=60, voice_silence_alarm_s=60),
         database=DatabaseConfig(path=":memory:"),
         chat=ChatConfig(enabled=chat_enabled, user_cooldown_s=1),
@@ -1141,7 +1141,7 @@ async def test_failed_post_rolls_the_incident_back(make_env: Callable[..., Env])
     # A 403/REST failure on the card post must not leave an invisible ACTIVE
     # incident: it would fold every duplicate report into a card that exists
     # nowhere. The row is rolled back and the pilot hears the failure.
-    from aura.types import PostError
+    from cortana.types import PostError
 
     env = make_env()
 
@@ -1171,7 +1171,7 @@ async def test_failed_post_rolls_the_incident_back(make_env: Callable[..., Env])
 async def test_failed_relay_post_is_rejected_and_not_marked_seen(
     make_env: Callable[..., Env],
 ) -> None:
-    from aura.types import PostError
+    from cortana.types import PostError
 
     env = make_env()
 

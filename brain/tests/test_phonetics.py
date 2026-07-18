@@ -8,10 +8,10 @@ from datetime import UTC, datetime
 
 import pytest
 
-from aura.config import MatchingConfig, PriorsConfig, TiersConfig
-from aura.core import db
-from aura.nlu import phonetics
-from aura.nlu.phonetics import (
+from cortana.config import MatchingConfig, PriorsConfig, TiersConfig
+from cortana.core import db
+from cortana.nlu import phonetics
+from cortana.nlu.phonetics import (
     base_score,
     double_metaphone,
     levenshtein,
@@ -20,7 +20,7 @@ from aura.nlu.phonetics import (
     similarity,
     tier_for,
 )
-from aura.types import MatchCandidate, PriorContext, SystemEntry, Tier
+from cortana.types import MatchCandidate, PriorContext, SystemEntry, Tier
 
 CFG = MatchingConfig(
     phonetic_weight=0.6,
@@ -354,7 +354,7 @@ def test_nullsec_abbreviation_resolves_to_full_system(spoken: str, expect: str) 
 
 
 def test_eve_abbrev_only_hyphenated() -> None:
-    from aura.nlu.phonetics import eve_abbrev
+    from cortana.nlu.phonetics import eve_abbrev
 
     assert eve_abbrev("UMI-KK") == "UMI"
     assert eve_abbrev("1DQ1-A") == "1DQ1"

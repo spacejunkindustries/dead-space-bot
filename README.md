@@ -61,7 +61,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pip install -e .
 ruff check . && ruff format --check .
 pytest
-python -m aura --config ../config/aura.dev.yaml   # paths under ./dev-data/
+python -m cortana --config ../config/cortana.dev.yaml   # paths under ./dev-data/
 ```
 
 Never add ffmpeg, PyNaCl, or `discord.py[voice]` — see CLAUDE.md constraints
@@ -69,22 +69,22 @@ Never add ffmpeg, PyNaCl, or `discord.py[voice]` — see CLAUDE.md constraints
 
 ### Droplet deploy
 
-CI builds the `aura-ears` release binary on every push (the 2 vCPU droplet
+CI builds the `cortana-ears` release binary on every push (the 2 vCPU droplet
 would thrash compiling Songbird with LTO — never build it there). Deploy:
 
 1. Provision per GDD §17.1 (CPU-Optimized 2 vCPU / 4 GB, Ubuntu 24.04, region
    nearest your Discord voice region).
-2. Download the `aura-ears` artifact from the latest green CI run.
-3. `sudo deploy/install.sh path/to/aura-ears` — idempotent; installs apt deps,
-   the `aura` user, `/opt/aura`, the Brain venv, config examples, systemd
+2. Download the `cortana-ears` artifact from the latest green CI run.
+3. `sudo deploy/install.sh path/to/cortana-ears` — idempotent; installs apt deps,
+   the `aura` user, `/opt/cortana`, the Brain venv, config examples, systemd
    units, and tmpfiles.
-4. Follow the printed checklist: token at `/etc/aura/token` (mode 0600, loaded
+4. Follow the printed checklist: token at `/etc/cortana/token` (mode 0600, loaded
    via systemd `LoadCredential=` — never in config or environment), model
-   files under `/opt/aura/models/`, edit the `/etc/aura/*.yaml` configs, seed
+   files under `/opt/cortana/models/`, edit the `/etc/cortana/*.yaml` configs, seed
    the gazetteer.
-5. `systemctl start aura-brain aura-ears`
+5. `systemctl start cortana-brain cortana-ears`
 
-Config reloads with `systemctl reload aura-brain`; code changes need a
+Config reloads with `systemctl reload cortana-brain`; code changes need a
 restart. Ears stays connected across Brain restarts.
 
 ## Privacy
@@ -109,6 +109,6 @@ feature list.
 - [`docs/GDD.md`](docs/GDD.md) — the full specification (the spec is the truth)
 - [`training/wake/`](training/wake/) — offline wake-word training pipeline
   (GPU box or Colab, never the droplet); produces the ONNX chain for
-  `/opt/aura/models/wake/`
+  `/opt/cortana/models/wake/`
 - [`docs/INTERFACES.md`](docs/INTERFACES.md) — Brain module interface contract
 - [`CLAUDE.md`](CLAUDE.md) — hard constraints and conventions for contributors

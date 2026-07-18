@@ -1,4 +1,4 @@
-"""Voice-pipeline wiring tests for ``aura.__main__.App`` — GDD §5, §8.3, §11.1.
+"""Voice-pipeline wiring tests for ``cortana.__main__.App`` — GDD §5, §8.3, §11.1.
 
 The App is assembled from stubs around the real ``_on_utterance`` flow: real
 grammar parse, real phonetic resolve (against a fake gazetteer), real
@@ -18,11 +18,11 @@ from typing import Any
 
 import pytest
 
-import aura.__main__ as app_main
-from aura.__main__ import App
-from aura.audio.stt import SttTimeoutError
-from aura.core.discipline import Discipline
-from aura.types import (
+import cortana.__main__ as app_main
+from cortana.__main__ import App
+from cortana.audio.stt import SttTimeoutError
+from cortana.core.discipline import Discipline
+from cortana.types import (
     IncidentOutcome,
     Intent,
     Outcome,
@@ -579,7 +579,7 @@ async def test_override_routes_to_chat_and_speaks_reply() -> None:
 
 
 async def test_override_failure_speaks_fixed_line() -> None:
-    from aura.chat import ChatError
+    from cortana.chat import ChatError
 
     app, engine, _, speaker, _ = make_app(
         roles=[PILOT_ROLE],
