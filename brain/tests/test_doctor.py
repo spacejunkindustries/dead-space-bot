@@ -190,6 +190,23 @@ def test_missing_wake_model_fails(healthy, tmp_path) -> None:
     assert exit_code(list(results.values())) == EXIT_FAIL
 
 
+def test_extra_wake_models_present_pass_and_missing_warn(healthy, tmp_path) -> None:
+    # Mirrors the runtime contract (GDD §5.1): a broken EXTRA is skipped, so
+    # the doctor reports WARN — only a broken primary is a FAIL.
+    (tmp_path / "jarvis.onnx").write_bytes(b"onnx")
+    data = yaml.safe_load(healthy.config_path.read_text())
+    data["wake"]["extra_models"] = [
+        str(tmp_path / "jarvis.onnx"),
+        str(tmp_path / "gone.onnx"),
+    ]
+    healthy.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    results = _by_check(run_offline_checks(healthy))
+    assert results["wake.extra_models[0]"].status is Status.PASS
+    assert results["wake.extra_models[1]"].status is Status.WARN
+    assert "gone.onnx" in results["wake.extra_models[1]"].detail
+    assert exit_code(list(results.values())) == EXIT_OK
+
+
 def test_missing_wake_feature_models_warn(healthy, tmp_path) -> None:
     (tmp_path / "melspectrogram.onnx").unlink()
     results = _by_check(run_offline_checks(healthy))

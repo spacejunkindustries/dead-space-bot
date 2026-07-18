@@ -80,6 +80,31 @@ def test_wake_vad_threshold_default_and_bounds() -> None:
         _build_wake(_wake({"vad_threshold": 1.5}))
 
 
+def test_wake_extra_models_defaults_empty_and_preserves_path_case() -> None:
+    assert _build_wake(_wake({})).extra_models == ()
+    cfg = _build_wake(
+        _wake({"extra_models": ["/opt/models/Hey_Jarvis.onnx", "/opt/models/glados.onnx"]})
+    )
+    # Linux paths are case-sensitive — the list must NOT be lowercased.
+    assert cfg.extra_models == ("/opt/models/Hey_Jarvis.onnx", "/opt/models/glados.onnx")
+
+
+def test_wake_extra_models_rejects_non_strings_and_non_lists() -> None:
+    with pytest.raises(ConfigError, match=r"wake.extra_models\[1\]: expected str"):
+        _build_wake(_wake({"extra_models": ["/ok.onnx", 7]}))
+    with pytest.raises(ConfigError, match=r"wake.extra_models: expected list"):
+        _build_wake(_wake({"extra_models": "/ok.onnx"}))
+
+
+def test_wake_extra_models_shares_wake_model_reload_class() -> None:
+    # Same reload class as wake.model: a SIGHUP list change rebuilds the
+    # per-user model banks through the pool, no restart.
+    from cortana.config_schema import key_by_path
+
+    assert key_by_path("wake.extra_models").reload is Reload.SIGHUP
+    assert key_by_path("wake.model").reload is Reload.SIGHUP
+
+
 def test_personality_accepts_bratty() -> None:
     from cortana.config import _personality
 

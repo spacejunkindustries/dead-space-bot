@@ -194,7 +194,7 @@ Every module in the finished system.
 | `config.py` | YAML load, schema validation, hot-reload on SIGHUP |
 | `ipc.py` | UDS server, frame codec, per-user stream demux, Ears liveness |
 | `audio/vad.py` | webrtcvad wrapper; utterance endpointing |
-| `audio/wake.py` | openWakeWord instances, per-user state, score thresholds; off-loop spare-model pool, fault latch, stage counters |
+| `audio/wake.py` | openWakeWord instances (one per configured phrase: `wake.model` + `wake.extra_models`, scored as a max), per-user state, score thresholds; off-loop spare-model pool, fault latch, stage counters |
 | `audio/capture.py` | Per-user capture state machine: pre-roll ring buffer → wake hit → capture → endpoint → emit; owns the wake refractory period |
 | `audio/stt.py` | `Transcriber` protocol; faster-whisper (default) and whisper.cpp HTTP backends; gazetteer prompt biasing; bounded serialized decode queue + `stt.watchdog_s` hang watchdog |
 | `nlu/grammar.py` | Intent extraction, group-alias extraction, detail capture |
@@ -277,6 +277,8 @@ Songbird VoiceTick (20ms, per-user decoded PCM 48kHz)
 
 *Porcupine is the mature commercial alternative — type-to-train, instant custom words — but its free tier is scoped to personal use and commercial licensing starts around $6k/yr. A 50-pilot corp bot is not a comfortable fit for the free tier. CORTANA does not require it.*
 
+**Multiple wake phrases.** `wake.model` is the primary phrase; `wake.extra_models` (default empty) lists additional ONNX chains scored **in parallel** — built for phrase transitions, e.g. keeping `hey_jarvis` live beside a freshly trained custom phrase until pilots retrain their reflexes. Every 80 ms chunk runs through every configured model; the chunk's score is the **max** across them, and `wake.threshold` applies to that max, so any listed phrase wakes CORTANA. Per-model thresholds are deliberately not supported — one bar, one knob to tune. Mechanics: each per-user unit is a *bank* holding one model instance per path, generation-tagged on the full model list (any list change — add, remove, reorder — rebuilds live banks through the spare pool on reload, no restart). A missing or broken **extra** model is logged once per config generation and skipped — the primary and the remaining extras keep running; only a broken **primary** latches the detector faulted (§20). The wake stage counters report hits per model (`hits[<model>]` in `#bot-health` / `/botstatus`), so an operator can see which phrase pilots actually use and retire the old one on evidence.
+
 ### 5.2 The wake phrase
 
 Two constraints govern the choice:
@@ -291,6 +293,8 @@ Two constraints govern the choice:
 | "Hey Overseer" | ✅ Good phonetics, low collision. Supported alternative. |
 
 The phrase is configurable. The 6-phoneme / no-collision rule is not optional — it is the difference between a tool and a nuisance.
+
+Every entry in `wake.extra_models` (§5.1) must pass the same two rules, and the accuracy cost is additive: each model brings its **own** false-fire budget — false accepts across models add up, they do not average out, and one sloppy extra phrase can undo a carefully tuned primary. Run **2–3 models at most**, treat the multi-phrase state as transitional, and drop the old phrase once the per-model hit counters show pilots have switched.
 
 ### 5.3 Speech recognition
 
@@ -1131,6 +1135,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `discord.join_announcement` | str | `'daily'` | hot | §19 consent notice cadence on voice join. One of: `every`, `daily`, `off`. |
 | **`wake:`** | | | | *openWakeWord model and trigger thresholds.* |
 | `wake.model` | str | **required** | sighup | Trained openWakeWord ONNX chain; per-user models are built from it at speaker onset and cached for the process lifetime. |
+| `wake.extra_models` | str_list | `()` | sighup | Additional openWakeWord ONNX chains scored in parallel with wake.model — any listed phrase wakes CORTANA; wake.threshold applies to the max score across all models. Broken/missing extras are logged once and skipped. Each extra adds its own false-fire budget: keep the total to 2-3 models (GDD §5.2). |
 | `wake.threshold` | float | **required** | hot | Wake score needed to open a capture window. |
 | `wake.refractory_ms` | int | **required** | hot | Per-user dead time after a wake hit. |
 | `wake.ack` | str | `'beep'` | hot | Wake acknowledgement: spoken, tone, or silent. One of: `voice`, `beep`, `none`. |

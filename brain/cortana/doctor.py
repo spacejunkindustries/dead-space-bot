@@ -252,6 +252,24 @@ def check_wake_files(ctx: DoctorContext) -> list[CheckResult]:
             )
         ]
     results = [CheckResult("wake.model", Status.PASS, f"{model.name} present")]
+    # Extra wake phrases (GDD §5.1): a broken extra is WARN, never FAIL —
+    # at runtime it is logged once and skipped while the primary keeps wake
+    # alive, and the doctor mirrors the runtime severity.
+    for i, extra in enumerate(ctx.cfg.wake.extra_models):
+        extra_path = Path(extra)
+        name = f"wake.extra_models[{i}]"
+        if not extra_path.is_file() or extra_path.stat().st_size == 0:
+            results.append(
+                CheckResult(
+                    name,
+                    Status.WARN,
+                    f"extra wake model missing or empty: {extra_path}",
+                    "fix the path or remove the entry — at runtime a broken "
+                    "extra is logged once and skipped",
+                )
+            )
+        else:
+            results.append(CheckResult(name, Status.PASS, f"{extra_path.name} present"))
     # openWakeWord also needs its melspectrogram + embedding feature models:
     # either shipped next to the wake model or in the package resources dir.
     feature_dirs = [model.parent]

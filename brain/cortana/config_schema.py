@@ -284,6 +284,17 @@ KEYS: Final[tuple[Key, ...]] = (
         "it at speaker onset and cached for the process lifetime.",
     ),
     Key(
+        "wake.extra_models",
+        "str_list",
+        Reload.SIGHUP,
+        "Additional openWakeWord ONNX chains scored in parallel with "
+        "wake.model — any listed phrase wakes CORTANA; wake.threshold "
+        "applies to the max score across all models. Broken/missing extras "
+        "are logged once and skipped. Each extra adds its own false-fire "
+        "budget: keep the total to 2-3 models (GDD §5.2).",
+        default=(),
+    ),
+    Key(
         "wake.threshold",
         "float",
         Reload.HOT,
