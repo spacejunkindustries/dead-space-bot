@@ -691,9 +691,13 @@ async def test_say_again_reopens_once_then_goes_silent() -> None:
     assert speaker.said == [(GUILD, "Say again?")]
     assert capture.reopened == [(USER, GUILD)]
 
-    # The retry is ALSO noise: silent drop, no second reopen, no speech.
+    # The retry is ALSO noise: speak the closing line ONCE (the pilot must
+    # know a fresh wake is needed) but never reopen — no feedback loop.
     await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert speaker.said == [(GUILD, "Say again?")]
+    assert speaker.said == [
+        (GUILD, "Say again?"),
+        (GUILD, "Couldn't parse that. Standing down. Wake me to retry."),
+    ]
     assert capture.reopened == [(USER, GUILD)]
     assert engine.broadcasts == []
 

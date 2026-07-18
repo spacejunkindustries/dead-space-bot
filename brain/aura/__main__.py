@@ -638,7 +638,11 @@ class App:
                     # talking (live incident). Second failure drops silently;
                     # the pilot re-wakes when they actually want to talk.
                     if say_again_armed is not None and loop.time() <= say_again_armed:
+                        # Second failure: close the dialogue AUDIBLY so the
+                        # pilot knows a fresh wake word is needed. Safe from
+                        # re-looping — this path never reopens the window.
                         log.info("say_again_loop_guard", user_id=user_id, text=result.text)
+                        await self._speak_or_post(guild_id, user_id, tts_mod.standing_down())
                         return
                     if self.capture is not None:
                         self.capture.reopen(user_id, guild_id)
@@ -659,6 +663,7 @@ class App:
                     )
                     if say_again_armed is not None and loop.time() <= say_again_armed:
                         log.info("say_again_loop_guard", user_id=user_id, text=result.text)
+                        await self._speak_or_post(guild_id, user_id, tts_mod.standing_down())
                         return
                     if self.capture is not None:
                         self.capture.reopen(user_id, guild_id)
