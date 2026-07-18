@@ -634,11 +634,18 @@ class Speaker:
             log.info("tts_warmed")
         except Exception as exc:  # noqa: BLE001 — warming is best-effort
             log.warning("tts_warm_failed", error=str(exc))
+
+    def start_priming(self) -> None:
+        """Fill the line cache in the background so the first "Go ahead." of
+        the day is already rendered. Called once the app is fully started —
+        never during setup, so a startup failure can't tear down the loop
+        while a Piper spawn is mid-flight (cancelling subprocess creation
+        during ``asyncio.run`` cleanup can wedge the interpreter). Best-effort:
+        a failure only means that line synthesises on first use instead."""
+        if self._closed or not self._holder.current.tts.enabled:
             return
-        # Fill the line cache in the background so the first "Go ahead." of
-        # the day is already rendered. Best-effort: a failure only means that
-        # line synthesises on first use instead.
-        self._prime_task = asyncio.create_task(self._prime_lines(), name="tts-prime")
+        if self._prime_task is None or self._prime_task.done():
+            self._prime_task = asyncio.create_task(self._prime_lines(), name="tts-prime")
 
     async def _prime_lines(self) -> None:
         primed = 0

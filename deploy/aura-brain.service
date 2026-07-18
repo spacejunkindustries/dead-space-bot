@@ -26,9 +26,14 @@ TimeoutStopSec=15
 
 # Secrets: token file 0600, surfaced read-only at $CREDENTIALS_DIRECTORY/token.
 LoadCredential=token:/etc/aura/token
-# Uncomment when enabling the chat override channel (chat.enabled in aura.yaml):
-# the Anthropic API key rides the same mechanism (constraint 12).
-#LoadCredential=anthropic:/etc/aura/anthropic
+# Anthropic API key for the chat override channel (constraint 12). Always
+# loaded: install.sh guarantees the source file exists (empty when the
+# channel is unused — an empty credential reads as "no key" and the channel
+# stays off). Kept unconditional so a re-run of install.sh can never
+# silently disable a configured override channel, which is exactly what
+# happened when this line shipped commented out and an install.sh re-run
+# clobbered a hand-edited unit.
+LoadCredential=anthropic:/etc/aura/anthropic
 
 # Hardening (GDD §22)
 NoNewPrivileges=true

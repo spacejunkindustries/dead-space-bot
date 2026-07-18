@@ -65,17 +65,27 @@ def read_api_key(api_key_file: str) -> str | None:
     cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
     if cred_dir:
         cred = Path(cred_dir) / "anthropic"
-        if cred.is_file():
-            key = cred.read_text(encoding="utf-8").strip()
-            if key:
-                log.info("chat_key_loaded", source=str(cred))
-                return key
+        try:
+            if cred.is_file():
+                key = cred.read_text(encoding="utf-8").strip()
+                if key:
+                    log.info("chat_key_loaded", source=str(cred))
+                    return key
+        except OSError as exc:
+            log.warning("chat_key_unreadable", source=str(cred), error=str(exc))
     fallback = Path(api_key_file)
-    if fallback.is_file():
-        key = fallback.read_text(encoding="utf-8").strip()
-        if key:
-            log.info("chat_key_loaded", source=api_key_file)
-            return key
+    try:
+        if fallback.is_file():
+            key = fallback.read_text(encoding="utf-8").strip()
+            if key:
+                log.info("chat_key_loaded", source=api_key_file)
+                return key
+    except OSError as exc:
+        # The dev-fallback file is root-owned when only LoadCredential= is
+        # meant to read it; a PermissionError here must degrade to "channel
+        # off", never crash Brain's startup (which is what an unhandled read
+        # error did when a service-file reinstall dropped LoadCredential=).
+        log.warning("chat_key_unreadable", source=api_key_file, error=str(exc))
     return None
 
 

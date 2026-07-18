@@ -279,6 +279,11 @@ class App:
         self._spawn("health-check", self._health_loop())
         self._spawn("silence-sweep", self._silence_sweep())
 
+        # Pre-render the scripted acknowledgement lines once the app is fully
+        # up (never during setup — see Speaker.start_priming).
+        assert self.speaker is not None
+        self.speaker.start_priming()
+
         log.info("aura_started")
         await self._shutdown.wait()
         await self._graceful_shutdown()

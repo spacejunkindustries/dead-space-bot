@@ -116,6 +116,30 @@ def test_read_api_key_prefers_credentials_directory(
     assert read_api_key(str(tmp_path / "missing")) is None
 
 
+def test_read_api_key_unreadable_file_degrades_to_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A root-owned 0600 key file read by the aura user raises PermissionError;
+    # that must mean "channel off", never a Brain startup crash.
+    fallback = tmp_path / "anthropic"
+    fallback.write_text("sk-secret\n")
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    def _denied(self: Path, *a: object, **k: object) -> str:
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(Path, "read_text", _denied)
+    assert read_api_key(str(fallback)) is None
+
+
+def test_read_api_key_empty_credential_means_no_key(tmp_path: Path) -> None:
+    # install.sh guarantees the credential source exists, empty when unused —
+    # an empty file must read as "no key", not a truthy empty string.
+    fallback = tmp_path / "anthropic"
+    fallback.write_text("")
+    assert read_api_key(str(fallback)) is None
+
+
 def test_chat_config_defaults_to_disabled() -> None:
     cfg = ChatConfig()
     assert cfg.enabled is False
