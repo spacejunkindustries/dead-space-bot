@@ -73,7 +73,9 @@ def score_clips(model_path: Path, wav_dir: Path, max_clips: int) -> list[float]:
     if max_clips > 0:
         wavs = wavs[:max_clips]
     if not wavs:
-        raise FileNotFoundError(f"no held-out clips in {wav_dir} — run generate_samples.py first")
+        raise FileNotFoundError(
+            f"no held-out clips in {wav_dir} — run generate_samples.py first"
+        )
     oww = Model(wakeword_models=[str(model_path)], inference_framework="onnx")
     scores: list[float] = []
     for i, wav in enumerate(wavs, start=1):
@@ -114,7 +116,9 @@ def sweep(cfg: dict[str, Any], model_path: Path) -> None:
     log.info("scoring held-out adversarial negatives (GDD §5.2 collision phrases)")
     neg = np.asarray(score_clips(model_path, clip_root / "negative_test", max_clips))
 
-    features_npy = Path(cfg["paths"]["feature_dir"]) / cfg["assets"]["feature_files"]["validation"]
+    features_npy = (
+        Path(cfg["paths"]["feature_dir"]) / cfg["assets"]["feature_files"]["validation"]
+    )
     stream = None
     hours = 0.0
     if features_npy.exists():
@@ -181,7 +185,11 @@ def stage_bundle(cfg: dict[str, Any]) -> None:
     bundle_dir.mkdir(parents=True, exist_ok=True)
     model = trained_model_path(cfg)
     resources = Path(openwakeword.__file__).parent / "resources" / "models"
-    for src in (model, resources / "melspectrogram.onnx", resources / "embedding_model.onnx"):
+    for src in (
+        model,
+        resources / "melspectrogram.onnx",
+        resources / "embedding_model.onnx",
+    ):
         if not src.exists():
             raise FileNotFoundError(
                 f"{src} missing — run training first (and generate_samples.py "

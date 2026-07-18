@@ -70,3 +70,33 @@ def test_personality_accepts_bratty() -> None:
     assert _personality("bratty") == "bratty"
     with pytest.raises(ConfigError, match="tts.personality"):
         _personality("feral")
+
+
+def test_unquoted_yaml_off_is_accepted_for_offable_keys() -> None:
+    # YAML 1.1 parses a bare `off` as boolean False — an unquoted
+    # `join_announcement: off` once crash-looped a deployment.
+    from aura.config import _build_discord
+    from aura.config import _build_stt as build_stt
+
+    base = {
+        "discord": {
+            "token_file": "/dev/null",
+            "guild_id": 1,
+            "channels": {"intel_alerts": 1, "intel_live": 2, "health": 3},
+            "roles": {"pilot": 1, "fc": 2},
+            "watch_voice_channels": [9],
+            "join_announcement": False,  # what YAML gives you for bare `off`
+        }
+    }
+    assert _build_discord(base).join_announcement == "off"
+    stt = {
+        "stt": {
+            "backend": "faster-whisper",
+            "model": "small",
+            "compute_type": "int8",
+            "cpu_threads": 2,
+            "whisper_cpp_url": "http://x/",
+            "relay_mode": False,
+        }
+    }
+    assert build_stt(stt).relay_mode == "off"
