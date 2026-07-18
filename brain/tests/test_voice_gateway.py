@@ -201,3 +201,75 @@ async def test_join_announcement_every_posts_each_join() -> None:
     await gw._send_join(CHANNEL, announce=True)
     await gw._send_join(CHANNEL, announce=True)
     assert announce.calls == 2
+
+
+# ── IPC v2: hello replay ordering and join results (GDD §15) ─────────────────
+
+
+async def test_hello_pushes_optouts_first_then_join() -> None:
+    """Ears fails closed until its first optouts frame: on hello the opt-out
+    push must be unconditional and precede the join replay."""
+    holder = _StubHolder()
+    ipc = _FakeIpc()
+    gw = VoiceGateway(holder, ipc, _db_conn(), _noop_announce, join_debounce_s=999)
+    gw._joined_channel_id = CHANNEL
+
+    await gw.on_ears_hello()
+
+    kinds = [c["t"] for c in ipc.controls]
+    assert kinds[0] == "optouts", f"optouts must be the first frame after hello, got {kinds}"
+    assert "join" in kinds
+    assert kinds.index("optouts") < kinds.index("join")
+
+
+async def test_hello_pushes_optouts_even_when_not_joined() -> None:
+    holder = _StubHolder()
+    ipc = _FakeIpc()
+    gw = VoiceGateway(holder, ipc, _db_conn(), _noop_announce, join_debounce_s=999)
+
+    await gw.on_ears_hello()
+
+    assert [c["t"] for c in ipc.controls] == ["optouts"]
+
+
+async def test_join_failed_clears_state_and_schedules_retry() -> None:
+    """Rejoin policy lives in Brain: a failed join clears the joined view and
+    retries via the normal debounce while pilots remain in the channel."""
+    ipc = _FakeIpc()
+    gw = _gateway(_StubHolder(), ipc)
+    gw._joined_channel_id = CHANNEL
+    gw._counts[CHANNEL] = 2  # pilots still present
+
+    await gw.on_join_failed(CHANNEL, "gateway timed out")
+
+    assert gw.joined_channel_id is None
+    assert gw._pending_channel_id == CHANNEL  # debounced retry scheduled
+    gw._cancel_pending_join()
+
+
+async def test_join_failed_empty_channel_does_not_retry() -> None:
+    ipc = _FakeIpc()
+    gw = _gateway(_StubHolder(), ipc)
+    gw._joined_channel_id = CHANNEL
+    gw._counts[CHANNEL] = 0
+
+    await gw.on_join_failed(CHANNEL, "channel deleted")
+
+    assert gw.joined_channel_id is None
+    assert gw._pending_channel_id is None
+
+
+async def test_join_failed_respects_auto_join_off() -> None:
+    ipc = _FakeIpc()
+    gw = _gateway(_StubHolder(auto_join=False), ipc)
+    gw._joined_channel_id = CHANNEL
+    gw._counts[CHANNEL] = 3
+
+    await gw.on_join_failed(CHANNEL, "4014")
+
+    assert gw._pending_channel_id is None
+
+
+async def test_join_ok_is_accepted() -> None:
+    gw = _gateway(_StubHolder(), _FakeIpc())
+    await gw.on_join_ok(CHANNEL)  # informational; must not raise

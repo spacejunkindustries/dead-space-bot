@@ -135,9 +135,11 @@ CI runs all of the above on every PR. **CI also builds the release binary** — 
 ```
 Frame: [4-byte BE length][1-byte type][body]
   0x01  JSON control (UTF-8)
-  0x02  Audio   Ears→Brain  [8B user_id LE][8B guild_id LE][i16 LE PCM 16kHz mono]
+  0x02  Audio   Ears→Brain  [8B user_id LE][8B guild_id LE][8B captured_at ms LE][i16 LE PCM 16kHz mono]
   0x03  TTS     Brain→Ears  [8B guild_id LE][1B priority][WAV bytes]
 ```
+
+The protocol is versioned (`IPC_PROTOCOL_VERSION`, both binaries, exchanged in `hello`); bump it with any wire change, in the same commit on both sides.
 
 **Brain binds the socket; Ears connects.** This ordering is deliberate — it means Ears buffers through a Brain restart rather than the reverse.
 

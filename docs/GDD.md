@@ -743,8 +743,9 @@ Personal-ping type words pluralize naturally: *hostiles*, *attacks*, *assist req
 
 ### 12.2 Speaking rules
 
-- **Never speak over a high-severity report in progress.** If VAD reports active speech, queue.
+- **Never speak over a high-severity report in progress.** If VAD reports active speech, queue. A non-alert utterance still blocked after **3 s** of continuous human speech is **dropped** (logged), never played late — a 3-seconds-stale "Go ahead." spoken over an FC mid-report is worse than none. Alerts always play.
 - Duck to 60% volume. CORTANA is not the FC. The duck level and talk-over suppression are fixed playback mechanics in Ears (`ears/src/playback.rs`), not config knobs.
+- Playback state (queue, playing slot, hold timer) and the speech-activity clock are **per guild** — speech in one voice call never gates or delays TTS in another.
 - Hard cap **3 seconds** per utterance. Information-carrying replies that do not fit go to the channel instead; **acknowledgement lines never do** — an unspoken ack ("Say again?", "Standing down…") is logged and dropped, because a retry prompt pasted into the intel channel is noise.
 - `/mute-voice` per user. Some pilots will hate this. They can silence it without leaving.
 
@@ -963,41 +964,81 @@ CREATE INDEX idx_cmdlog_at ON command_log(at);
 
 ---
 
-## 15. IPC protocol
+## 15. IPC protocol (v2)
 
 Framed messages over `/run/cortana/cortana.sock`. **Brain binds; Ears connects and reconnects with backoff.** This ordering matters: it means Ears buffers when Brain restarts, rather than the reverse.
 
 ```
 Frame:  [4-byte BE length][1-byte type][body]
+        length = 1 + len(body)  (counts every byte after the length field)
 
 type 0x01  JSON control   (UTF-8)
 type 0x02  Audio          Ears→Brain
-           [8B user_id LE][8B guild_id LE][i16 LE PCM, 16kHz mono]
+           [8B user_id LE][8B guild_id LE]
+           [8B captured_at ms-since-epoch LE][i16 LE PCM, 16kHz mono]
 type 0x03  TTS            Brain→Ears
            [8B guild_id LE][1B priority][WAV bytes]
 ```
 
-### Control messages
+### 15.1 Version handshake
+
+Both binaries embed an **IPC protocol version** constant (`IPC_PROTOCOL_VERSION`, currently **2** — `ears/src/ipc.rs` and `brain/cortana/ipc.py`, bumped in lockstep, same commit, always). The first frame on every connection is Ears' `hello`, carrying it as `proto`:
+
+```jsonc
+{ "t": "hello", "proto": 2, "version": "1.0.0" }   // version = ears build (Cargo)
+```
+
+On mismatch (or a missing `proto` — a pre-v2 Ears) Brain logs `ipc_protocol_mismatch` loudly and **refuses the client**; Ears keeps retrying with backoff, so a desynced deploy is noisy on both sides and works on neither. `cortana-ears --version` prints both the build and protocol versions so an operator can confirm a matched pair. Brain drops any frame that arrives before a valid `hello`.
+
+### 15.2 Audio timestamps and the age gate
+
+Ears stamps every 0x02 frame with the wall-clock capture time at receipt (`captured_at`, ms since epoch). Ears applies no judgement to it — it just stamps the truth. **Brain age-gates**: frames older than `MAX_AUDIO_AGE_S` (3 s, `brain/cortana/ipc.py`) are dropped before they reach wake/capture. Ears buffers up to 60 s of audio through a Brain outage and flushes it on reconnect; without the gate that flush would replay stale wake words and feed the wall-clock endpointer a minute of audio arriving in milliseconds.
+
+### 15.3 Control messages
 
 ```jsonc
 // Ears → Brain
-{ "t": "hello",     "version": "1.0" }
+{ "t": "hello",     "proto": 2, "version": "1.0.0" }        // first frame, always
+{ "t": "snapshot",  "guilds": [                              // immediately after hello
+    { "guild_id": "…", "channel_id": "…" /* or null */,
+      "connected": true,
+      "users": [ { "ssrc": 12345, "user_id": "…" }, … ] } ] }
 { "t": "speaking",  "user_id": "…", "guild_id": "…", "state": "start" }
 { "t": "left",      "user_id": "…", "guild_id": "…" }
+{ "t": "join_ok",   "guild_id": "…", "channel_id": "…" }
+{ "t": "join_failed", "guild_id": "…", "channel_id": "…", "reason": "…" }
+{ "t": "driver_disconnected", "guild_id": "…",
+  "kind": "connect" /* | "reconnect" | "runtime" */, "reason": "…" }
 { "t": "heartbeat", "ticks": 15021, "active_ssrcs": 4, "connected": true }
 
 // Brain → Ears
 { "t": "join",    "guild_id": "…", "channel_id": "…" }
 { "t": "leave",   "guild_id": "…" }
 { "t": "optouts", "user_ids": ["…", "…"] }   // enforced in Ears, pre-IPC
+{ "t": "hb_ack" }                            // answer to every heartbeat
 ```
 
-Brain replays the current `join` (and the opt-out set) the moment Ears
-(re)connects. A freshly started Ears process reaches the socket before its
-own Discord gateway is READY, so Ears **holds join/leave commands until
-READY** and executes them then — the Songbird manager cannot create calls
-before serenity initialises it, and acting early would crash the voice
-control task.
+**Snapshot replaces lossy deltas.** Control events generated during an IPC outage are discarded; instead, right after `hello`, Ears sends its full state — per-guild connected flag, joined channel, and the live SSRC↔user roster. Brain reconciles: users it still tracks that Ears no longer sees are purged exactly as if their `left` event had arrived. State is reset only where the views differ.
+
+**Join results are events, not assumptions.** Every `join` command is answered with `join_ok` or `join_failed(reason)`; a voice session dying mid-flight (DAVE crash, 4014, channel deleted) produces `driver_disconnected(kind, reason)`. The retry/rejoin **policy lives in Brain** (`voice_gateway.py` re-schedules a debounced join while pilots remain; `driver_disconnected` is logged and noted in health) — Ears only reports what happened. This implements §20's "DAVE session crash → rebuild with backoff" row.
+
+### 15.4 Replay on (re)connect
+
+Brain replays state the moment Ears (re)connects, **opt-outs first**: on every `hello` Brain unconditionally sends `optouts` before anything else, then the current `join`. Ordering matters because Ears **fails closed** — a fresh Ears process drops ALL audio until the first `optouts` frame of its lifetime is applied (§19), so the sooner it lands, the sooner pilots are heard.
+
+A freshly started Ears process reaches the socket before its own Discord gateway is READY, so Ears **holds join/leave commands until READY** and executes them then — the Songbird manager cannot create calls before serenity initialises it, and acting early would crash the voice control task. `join` is **idempotent**: already connected to the requested guild+channel means Ears answers `join_ok` and touches nothing — in particular it does NOT re-register receive handlers, because the SSRC↔user map lives in per-guild process state and Discord never re-announces mappings mid-session. Only a genuine driver (re)connect, where the SSRCs actually change, may clear attribution state. A routine Brain restart can therefore never deafen the bot.
+
+### 15.5 Buffering, backpressure, and liveness
+
+- **One ring, always on.** Ears' outbound audio ALWAYS flows through the bounded `AudioRing` (60 s / ~1.9 MB, oldest evicted first) — connected or not. A wedged-but-connected Brain costs bounded, observable audio loss, never unbounded memory.
+- **Write deadline.** Every Ears socket write carries a 5 s deadline; a miss marks the connection Lost (Brain stopped reading) and Ears reconnects with backoff.
+- **Inbound liveness.** Brain answers every heartbeat with `hb_ack`, so a healthy link carries Brain→Ears bytes at least every 5 s. Ears treats **20 s without any inbound bytes** as Lost.
+- **Ring flush gated on proof of liveness.** After connecting, Ears sends `hello` + `snapshot` and then HOLDS the ring until Brain's first control frame arrives (in practice the `optouts` replay, within milliseconds). Only then is the buffered audio flushed and the reconnect backoff reset. A crash-looping Brain that accepts the socket and dies before speaking cannot destroy the buffer — Ears escalates backoff as if the connect had failed, ring intact.
+- Brain-side sends (`send_tts`/`send_control`) return a bool: `False` when no Ears client is attached or the write failed. Callers treat `False` as "not spoken/delivered" and fall back to channel text — an Ears outage degrades loudly, never silently.
+
+### 15.6 Preflight
+
+`cortana-ears --check [config]` parses `ears.yaml` (unknown keys still rejected), verifies the credential is readable and the socket directory exists, and constructs the statically linked Opus decoder; exit 0 on success, 78 (`EX_CONFIG`) on config/credential problems. Wired for `ExecStartPre=` so a bad edit fails the restart, not the running service.
 
 ---
 

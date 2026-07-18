@@ -111,6 +111,11 @@ class HealthReporter:
         self._confidences: deque[float] = deque(maxlen=_CONFIDENCE_RING)
         self._low_streak = 0
 
+        # Most recent Ears driver_disconnected control event (IPC v2), kept
+        # for the ops surface: a voice session dying under Ears must never be
+        # invisible to whoever reads the health report.
+        self._last_driver_event: dict[str, Any] | None = None
+
     # ── signals ──────────────────────────────────────────────────────────────
 
     def note_audio(self) -> None:
@@ -125,6 +130,15 @@ class HealthReporter:
     def set_humans_present(self, count: int) -> None:
         """Unmuted human count in the watched voice channel (voice gateway)."""
         self._humans_present = count
+
+    def note_driver_event(self, msg: dict[str, Any]) -> None:
+        """An Ears ``driver_disconnected`` control event arrived (GDD §15)."""
+        self._last_driver_event = dict(msg)
+
+    @property
+    def last_driver_event(self) -> dict[str, Any] | None:
+        """The most recent Ears driver_disconnected event, verbatim."""
+        return self._last_driver_event
 
     # ── counters ─────────────────────────────────────────────────────────────
 
