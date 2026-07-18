@@ -264,6 +264,24 @@ async def test_long_text_never_cached(tmp_path, monkeypatch) -> None:
     await speaker.close()
 
 
+async def test_start_priming_renders_every_hot_line_once(tmp_path, monkeypatch) -> None:
+    tts.set_personality("standard")
+    pcm = b"\x01\x00" * 2205
+    calls = _patch_piper(monkeypatch, pcm)
+    ipc = _FakeIpc()
+    speaker = Speaker(_holder(tmp_path), ipc)  # type: ignore[arg-type]
+
+    speaker.start_priming()
+    assert speaker._prime_task is not None
+    await speaker._prime_task
+    assert len(calls) == len(tts.hot_lines())
+    # A primed line replays from cache — no further synthesis.
+    assert await speaker.say(1, "Go ahead.") is True
+    assert len(calls) == len(tts.hot_lines())
+    assert ipc.sent  # and it actually played
+    await speaker.close()
+
+
 def test_hot_lines_cover_the_ack_pool() -> None:
     tts.set_personality("standard")
     try:

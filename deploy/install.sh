@@ -139,6 +139,16 @@ for src in "${!CONFIGS[@]}"; do
     fi
 done
 
+# ---------------------------------------------------------------- credentials
+# aura-brain.service loads /etc/aura/anthropic unconditionally (LoadCredential=
+# fails unit start if the source is missing), so guarantee it exists. Empty is
+# fine: an empty credential reads as "no key" and the override channel stays
+# off. Never overwrite a real key.
+if [[ ! -f /etc/aura/anthropic ]]; then
+    install -m 0600 -o root -g root /dev/null /etc/aura/anthropic
+    echo "==> Created empty /etc/aura/anthropic (chat override channel off)"
+fi
+
 # ---------------------------------------------------------------- systemd
 echo "==> Installing systemd units and tmpfiles"
 install -m 0644 "${SCRIPT_DIR}/aura-brain.service" /etc/systemd/system/aura-brain.service
