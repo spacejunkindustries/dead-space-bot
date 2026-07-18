@@ -146,6 +146,9 @@ class TtsConfig:
     voice: str
     binary: str
     max_utterance_s: float
+    #: Post-synthesis effect over the voice: "none" or "holographic" (a chorus
+    #: + subtle reverb for a ship's-AI sheen — an effect, not a voice clone).
+    effect: str = "none"
     # Ducking level and talk-over suppression are fixed playback mechanics in
     # Ears (ears/src/playback.rs) — deliberately not tunables here.
 
@@ -422,6 +425,7 @@ def _build_tts(data: dict[str, Any]) -> TtsConfig:
         voice=_get(s, "tts.voice", str),
         binary=_get(s, "tts.binary", str),
         max_utterance_s=_positive(_get(s, "tts.max_utterance_s", float), "tts.max_utterance_s"),
+        effect=_get(s, "tts.effect", str, default="none"),
     )
 
 

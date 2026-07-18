@@ -74,6 +74,7 @@ tts:
   voice: /opt/aura/models/piper/en_US-amy-medium.onnx  # Piper voice model
   binary: /usr/local/bin/piper         # Piper invoked as a subprocess (GDD §12 license note)
   max_utterance_s: 3                   # hard cap; longer text goes to the channel instead
+  effect: none                         # none | holographic (chorus+reverb "ship AI" sheen)
   # Ducking (60%) and talk-over suppression are fixed playback mechanics in
   # Ears (ears/src/playback.rs, GDD §12.2) — not tunables.
 
