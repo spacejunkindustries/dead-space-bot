@@ -20,6 +20,9 @@ ExecStart=/opt/aura/brain/venv/bin/python -m aura --config /etc/aura/aura.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
+# Brain bounds its own graceful shutdown (~8s); this is the backstop so a wedged
+# close still restarts promptly instead of waiting the 90s default before SIGKILL.
+TimeoutStopSec=15
 
 # Secrets: token file 0600, surfaced read-only at $CREDENTIALS_DIRECTORY/token.
 LoadCredential=token:/etc/aura/token

@@ -69,6 +69,11 @@ _SWEEP_INTERVAL_S = 60.0
 _TIMER_POLL_INTERVAL_S = 15.0
 _HEALTH_CHECK_INTERVAL_S = 5.0
 
+#: Upper bound on graceful shutdown. Kept well under systemd's TimeoutStopSec
+#: so a hung close never escalates to SIGKILL (which slows restarts and forces
+#: Ears to re-negotiate DAVE on every rejoin).
+_SHUTDOWN_TIMEOUT_S = 8.0
+
 #: Wall-clock TTL for a pending LOW-tier retry (GDD §8.3). The reopened
 #: capture window is measured in fed frames and cannot expire while the user
 #: is not transmitting, so this TTL is deliberately generous relative to the
@@ -267,7 +272,11 @@ class App:
         async def _supervised() -> None:
             try:
                 await coro
-                log.error("critical_task_exited", task=name)
+                # A clean return during shutdown is expected (loops watch the
+                # shutdown event and fall out); only an exit while the process
+                # is meant to be running is a fault worth alarming on.
+                if not self._shutdown.is_set():
+                    log.error("critical_task_exited", task=name)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -288,6 +297,21 @@ class App:
 
     async def _graceful_shutdown(self) -> None:
         log.info("shutting_down")
+        # Bound the whole sequence: a hung close (Discord gateway, Ears socket)
+        # must not stall the process until systemd's SIGKILL — a 90s stop makes
+        # every restart churn Ears through repeated voice rejoins, which resets
+        # the DAVE handshake each time. Past the budget we drop straight to the
+        # DB close and let the process exit.
+        try:
+            await asyncio.wait_for(self._shutdown_sequence(), timeout=_SHUTDOWN_TIMEOUT_S)
+        except TimeoutError:
+            log.warning("shutdown_timed_out", timeout_s=_SHUTDOWN_TIMEOUT_S)
+        if self.conn is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(self.conn.close)
+        log.info("shutdown_complete")
+
+    async def _shutdown_sequence(self) -> None:
         if self.gateway is not None:
             with contextlib.suppress(Exception):
                 await self.gateway.close()
@@ -301,9 +325,6 @@ class App:
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        if self.conn is not None:
-            await asyncio.to_thread(self.conn.close)
-        log.info("shutdown_complete")
 
     # ── voice pipeline wiring (GDD §5) ───────────────────────────────────────
 
