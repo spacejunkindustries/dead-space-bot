@@ -214,6 +214,12 @@ class FakePoster:
         #: The MentionDecision grant per post — the AllowedMentions allowlist
         #: the real Poster would build (None = nothing may ping).
         self.mentions: list[Any] = []
+        #: The exact-channel override per post (None = AlertChannel lookup) —
+        #: re-posts pass the lost card's original channel id here.
+        self.post_channel_ids: list[int | None] = []
+        #: When set, every edit raises it (e.g. EditNotFound for a deleted
+        #: message) until the test clears it again.
+        self.edit_error: Exception | None = None
         self._msg = 5000
 
     async def post(
@@ -224,13 +230,17 @@ class FakePoster:
         card: CardRender,
         *,
         mentions: Any = None,
+        channel_id: int | None = None,
     ) -> tuple[int, int]:
         self._msg += 1
         self.posts.append((guild_id, channel, content, card))
         self.mentions.append(mentions)
-        return (900, self._msg)
+        self.post_channel_ids.append(channel_id)
+        return (channel_id if channel_id is not None else 900, self._msg)
 
     async def edit(self, channel_id: int, message_id: int, content: str, card: CardRender) -> None:
+        if self.edit_error is not None:
+            raise self.edit_error
         self.edits.append((channel_id, message_id, content, card))
 
 
@@ -709,7 +719,27 @@ async def test_timer_created_and_fires_when_due(make_env: Callable[..., Env]) ->
     assert pings[0].system_name == "Kisogo"
     assert pings[0].guild_id == GUILD
     assert pings[0].created_by == 42
-    assert await env.engine.fire_due_timers(T0 + timedelta(hours=5)) == []  # fired once
+    # Two-phase delivery (§13): the claim (fired=1) is not the announcement —
+    # only mark_timer_announced retires the timer for good.
+    row = db.query_one(env.conn, "SELECT fired, announced_at FROM timers")
+    assert row["fired"] == 1 and row["announced_at"] is None
+    await env.engine.mark_timer_announced(pings[0].timer_id)
+    assert await env.engine.fire_due_timers(T0 + timedelta(hours=5)) == []  # announced once
+
+
+async def test_unannounced_timer_claim_is_reoffered(make_env: Callable[..., Env]) -> None:
+    """At-least-once (§13): a claim whose announcement never confirmed (403,
+    crash mid-announce) re-offers on the next poll instead of being eaten."""
+    env = make_env()
+    await env.engine.report(GUILD, 42, cmd(Intent.TIMER, detail="one hour"), high(2, "Kisogo"))
+    first = await env.engine.fire_due_timers(T0 + timedelta(hours=1, seconds=1))
+    assert len(first) == 1  # claimed — but the announce "fails": no mark
+
+    again = await env.engine.fire_due_timers(T0 + timedelta(hours=1, minutes=1))
+    assert [p.timer_id for p in again] == [first[0].timer_id]  # re-offered
+
+    await env.engine.mark_timer_announced(first[0].timer_id)
+    assert await env.engine.fire_due_timers(T0 + timedelta(hours=2)) == []  # retired
 
 
 async def test_timer_mixed_duration_spoken_in_words(make_env: Callable[..., Env]) -> None:
@@ -1889,3 +1919,153 @@ async def test_clear_all_resolves_every_active_card(make_env: Callable[..., Env]
     assert len(env.poster.edits) >= 2
     again = await env.engine.clear_all(GUILD)
     assert again == []  # idempotent: nothing active remains
+
+
+# ── incident durability: render-then-deliver + lost-message recovery (§9.1) ──
+
+
+async def test_fold_reposts_when_card_message_deleted(make_env: Callable[..., Env]) -> None:
+    """A fold hitting a deleted card message re-posts the card and stores the
+    new ids — one incident, one LIVE message, never a silent ghost edit."""
+    from cortana.types import EditNotFound
+
+    env = make_env()
+    opened = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    assert len(env.poster.posts) == 1
+
+    env.poster.edit_error = EditNotFound("message gone")
+    env.clock.advance(10)
+    folded = await env.engine.report(GUILD, 43, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    assert folded.outcome is Outcome.FOLDED
+    assert folded.incident_id == opened.incident_id
+    assert len(env.poster.posts) == 2  # re-posted, not lost
+    # The re-post is mention-free and pinned to the ORIGINAL channel id —
+    # a replacement card never re-mentions and never migrates channels.
+    assert env.poster.mentions[-1] is None
+    assert env.poster.posts[-1][2] == ""
+    assert env.poster.post_channel_ids[-1] == 900
+    row = db.query_one(
+        env.conn,
+        "SELECT channel_id, message_id FROM incidents WHERE id = ?",
+        (opened.incident_id,),
+    )
+    assert (row["channel_id"], row["message_id"]) == (900, 5002)  # fresh ids stored
+
+    # With the ids healed, the next fold edits the NEW message.
+    env.poster.edit_error = None
+    env.clock.advance(10)
+    again = await env.engine.report(GUILD, 44, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    assert again.outcome is Outcome.FOLDED
+    assert env.poster.edits[-1][1] == 5002
+
+
+async def test_fold_reposts_when_message_ids_are_null(make_env: Callable[..., Env]) -> None:
+    """A NULL message id (crash between post and id store) recovers on the
+    next fold: the card re-posts to the severity fallback channel."""
+    env = make_env()
+    opened = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    db.execute(
+        env.conn,
+        "UPDATE incidents SET channel_id = NULL, message_id = NULL WHERE id = ?",
+        (opened.incident_id,),
+    )
+    env.clock.advance(10)
+    folded = await env.engine.report(GUILD, 43, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    assert folded.outcome is Outcome.FOLDED
+    assert len(env.poster.posts) == 2
+    assert env.poster.post_channel_ids[-1] is None  # no original channel to pin
+    row = db.query_one(
+        env.conn, "SELECT message_id FROM incidents WHERE id = ?", (opened.incident_id,)
+    )
+    assert row["message_id"] is not None  # healed
+
+
+async def test_resolve_reposts_lost_card_in_resolved_state(
+    make_env: Callable[..., Env],
+) -> None:
+    """A resolution the corp cannot see did not happen: clearing an incident
+    whose card was deleted re-posts the resolved card."""
+    from cortana.types import EditNotFound
+
+    env = make_env()
+    opened = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    env.poster.edit_error = EditNotFound("message gone")
+    out = await env.engine.resolve_system(GUILD, 42, 1)
+    assert out.outcome is Outcome.POSTED
+    assert len(env.poster.posts) == 2
+    _, _, content, card = env.poster.posts[-1]
+    assert content == "" and env.poster.mentions[-1] is None  # never re-mentions
+    assert "Resolved" in footer_text(card)
+    row = db.query_one(
+        env.conn, "SELECT message_id FROM incidents WHERE id = ?", (opened.incident_id,)
+    )
+    assert row["message_id"] == 5002
+
+
+async def test_sweep_stale_never_reposts_lost_cards(make_env: Callable[..., Env]) -> None:
+    """The silent bulk sweep must not resurrect deleted cards just to grey
+    them out — no re-post from sweep_stale."""
+    from cortana.types import EditNotFound
+
+    env = make_env()
+    await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    env.poster.edit_error = EditNotFound("message gone")
+    env.clock.advance(21 * 60)
+    stale = await env.engine.sweep_stale()
+    assert stale
+    assert len(env.poster.posts) == 1  # the original only — nothing re-posted
+
+
+# ── uncertain-card durability across restarts (§8.3 / §9.1) ──────────────────
+
+
+async def test_pending_candidates_survive_restart(make_env: Callable[..., Env]) -> None:
+    """The MEDIUM-tier confirm candidates persist on the incident row: after
+    a restart the card still renders unconfirmed with its pick buttons —
+    never as a silently-confirmed guess."""
+    env = make_env()
+    out = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), medium())
+    assert out.outcome is Outcome.ASKED
+    assert out.incident_id is not None
+    row = db.query_one(
+        env.conn, "SELECT pending_candidates FROM incidents WHERE id = ?", (out.incident_id,)
+    )
+    assert row["pending_candidates"] is not None  # mirrored to the row
+
+    # Simulate the restart: in-memory state gone, then the startup restore.
+    env.engine._pending_candidates.clear()
+    restored = await env.engine.load_pending_candidates()
+    assert restored == 1
+    assert out.incident_id in env.engine._pending_candidates
+
+    # The restored card still renders uncertain, pick buttons armed.
+    rsvp = await env.engine.respond(out.incident_id, 100, ResponderState.WATCHING)
+    assert rsvp.card is not None
+    ids = custom_ids(rsvp.card)
+    assert f"aura:inc:{out.incident_id}:pick:1" in ids
+    assert f"aura:inc:{out.incident_id}:fix" in ids
+
+
+async def test_correction_clears_persisted_candidates(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    out = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), medium())
+    assert out.incident_id is not None
+    await env.engine.correct_system(out.incident_id, 42, 2, "kiss a go")
+    row = db.query_one(
+        env.conn, "SELECT pending_candidates FROM incidents WHERE id = ?", (out.incident_id,)
+    )
+    assert row["pending_candidates"] is None
+    env.engine._pending_candidates.clear()
+    assert await env.engine.load_pending_candidates() == 0  # nothing to re-arm
+
+
+async def test_resolve_clears_persisted_candidates(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    out = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), medium())
+    assert out.incident_id is not None
+    # The uncertain card's best guess is system 1 — clear it.
+    await env.engine.resolve_system(GUILD, 42, 1)
+    row = db.query_one(
+        env.conn, "SELECT pending_candidates FROM incidents WHERE id = ?", (out.incident_id,)
+    )
+    assert row["pending_candidates"] is None

@@ -39,7 +39,15 @@ from cortana.core import db
 from cortana.core.discipline import Discipline
 from cortana.core.incidents import IncidentEngine
 from cortana.core.routing import MentionDecision
-from cortana.types import AlertChannel, CardRender, MatchCandidate, PostError, Resolution, Tier
+from cortana.types import (
+    AlertChannel,
+    CardRender,
+    EditNotFound,
+    MatchCandidate,
+    PostError,
+    Resolution,
+    Tier,
+)
 from cortana.voice_gateway import ANNOUNCEMENT
 
 if TYPE_CHECKING:  # pragma: no cover — wiring types only
@@ -523,6 +531,7 @@ class AuraBot(commands.Bot):
         card: CardRender,
         *,
         mentions: MentionDecision | None = None,
+        channel_id: int | None = None,
     ) -> tuple[int, int]:
         """Post an incident card; returns ``(channel_id, message_id)``.
 
@@ -533,6 +542,11 @@ class AuraBot(commands.Bot):
         ids, and ``everyone`` only when ``decision.here``. ``mentions=None``
         means nothing in the content may notify anyone.
 
+        ``channel_id`` overrides the :class:`AlertChannel` lookup with an
+        exact channel — the engine's re-post-on-lost-message path (§9.1) uses
+        it so a replacement card lands in the same channel the original
+        lived in, never migrating between #intel-alerts and #intel-live.
+
         Raises :class:`PostError` on any Discord failure (403 on the channel,
         deleted channel, REST error) so the engine rolls the incident back —
         a raw discord exception here used to orphan an invisible ACTIVE
@@ -541,7 +555,10 @@ class AuraBot(commands.Bot):
         from cortana.dsc.views import view_from_card
 
         try:
-            target = await self._alert_channel(channel)
+            if channel_id is not None:
+                target = await self._messageable(channel_id)
+            else:
+                target = await self._alert_channel(channel)
             # Silent mode hard-stop (belt for decide_mentions' braces): even
             # if a stray "@here" reached the content, Discord suppresses the
             # actual notification when mentions are disabled.
@@ -575,9 +592,12 @@ class AuraBot(commands.Bot):
     async def edit(self, channel_id: int, message_id: int, content: str, card: CardRender) -> None:
         """Edit the card in place — the only mutation an incident ever gets.
 
-        Never raises on Discord failures: an edit is best-effort (the card is
-        a view; the DB row is the state), and a 403/5xx propagating out of
-        here used to kill the stale sweep and take the whole process down.
+        Raises :class:`EditNotFound` when the message was deleted, so the
+        engine's deliverer can re-post the card and store the new ids (§9.1:
+        one LIVE message per incident). Every OTHER Discord failure stays
+        best-effort (the card is a view; the DB row is the state) — a 403/5xx
+        propagating out of here used to kill the stale sweep and take the
+        whole process down.
         """
         from cortana.dsc.views import view_from_card
 
@@ -590,8 +610,9 @@ class AuraBot(commands.Bot):
         try:
             target = await self._messageable(channel_id)
             await target.get_partial_message(message_id).edit(**kwargs)
-        except discord.NotFound:
+        except discord.NotFound as exc:
             log.warning("card_message_deleted", channel_id=channel_id, message_id=message_id)
+            raise EditNotFound(f"card message {message_id} is gone: {exc}") from exc
         except (discord.DiscordException, TypeError) as exc:
             log.warning(
                 "card_edit_failed",

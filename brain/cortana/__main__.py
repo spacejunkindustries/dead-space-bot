@@ -63,6 +63,11 @@ _SWEEP_INTERVAL_S = 60.0
 _TIMER_POLL_INTERVAL_S = 15.0
 _HEALTH_CHECK_INTERVAL_S = 5.0
 
+#: app_state key for the notification-discipline snapshot (fleetmode, the
+#: circuit-breaker window, per-user cooldowns) — restored at startup so a
+#: mid-flood restart cannot close the breaker and /fleetmode survives.
+_DISCIPLINE_STATE_KEY = "discipline_state"
+
 #: Upper bound on the startup STT model warm: enough for a cold model load on
 #: the droplet's disk, small enough that a stalled network download of
 #: ``stt.model`` cannot park setup() indefinitely behind a green unit status.
@@ -161,6 +166,9 @@ class App:
         self._boot_cfg = holder.current
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
+        # Keep-alive references for fire-and-forget discipline snapshot
+        # writes (asyncio drops task references it does not hold).
+        self._persist_tasks: set[asyncio.Task[None]] = set()
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -188,6 +196,23 @@ class App:
         await self.alarms.clear(AlarmCode.CONFIG_RESTART_PENDING)
 
         self.discipline = Discipline(self.holder)
+        # Restore the discipline snapshot (fleetmode + breaker window +
+        # cooldowns) BEFORE wiring persistence, so the restore itself does
+        # not trigger a redundant write. A mid-flood restart keeps the
+        # breaker open; /fleetmode on survives a restart mid-op.
+        snapshot = await asyncio.to_thread(
+            db.query_value,
+            self.conn,
+            "SELECT value FROM app_state WHERE key = ?",
+            (_DISCIPLINE_STATE_KEY,),
+        )
+        if snapshot is not None:
+            self.discipline.restore(str(snapshot))
+            if self.discipline.fleetmode:
+                # Non-default state restored: say so loudly — voice triggering
+                # is still FC-only until someone runs /fleetmode off.
+                log.warning("fleetmode_restored_active")
+        self.discipline.on_state_change = self._persist_discipline_state
         self.ipc = IpcServer(self.holder, self._on_audio, self._on_control)
         tts_mod.set_personality(cfg.tts.personality)
         self.speaker = Speaker(self.holder, self.ipc)
@@ -303,6 +328,33 @@ class App:
         # Prime the personal-ping mirror so routing sees subscriptions from
         # the first incident after a restart (GDD §10.3).
         await self.engine.personal_pings.load()
+        # Re-arm uncertain cards: persisted confirm candidates are restored so
+        # a restart never renders a MEDIUM-tier guess as confirmed (§9.1).
+        await self.engine.load_pending_candidates()
+
+    def _persist_discipline_state(self) -> None:
+        """Discipline change hook (sync, on the loop): snapshot to app_state.
+
+        Fire-and-forget by design — persistence must never block a mention
+        decision — with last-writer-wins upserts, so coalescing is free.
+        """
+        conn = self.conn
+        discipline = self.discipline
+        if conn is None or discipline is None:  # pragma: no cover — setup order
+            return
+        snapshot = discipline.snapshot()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                db.execute,
+                conn,
+                "INSERT INTO app_state (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (_DISCIPLINE_STATE_KEY, snapshot),
+            ),
+            name="discipline-persist",
+        )
+        self._persist_tasks.add(task)
+        task.add_done_callback(self._persist_tasks.discard)
 
     # ── run / shutdown ───────────────────────────────────────────────────────
 
@@ -670,16 +722,18 @@ class App:
         assert self.engine and self.bot
         while True:
             await asyncio.sleep(_TIMER_POLL_INTERVAL_S)
-            # fire_due_timers commits fired=1 before delivery, so never
-            # consume due rows while Discord is unusable (pre-login,
-            # fetch_channel raises AttributeError and the ping is lost).
+            # Timers are at-least-once (GDD §13): fire_due_timers CLAIMS due
+            # rows (fired=1) and only mark_timer_announced retires them, so a
+            # failed announce is re-offered next tick. Still don't claim
+            # while Discord is unusable — pointless churn pre-login.
             # is_ready() is MISSING-safe pre-login; wait_until_ready() is not.
             if not self.bot.is_ready():
                 continue
             try:
                 pings = await self.engine.fire_due_timers(datetime.now(UTC))
                 for ping in pings:
-                    await self._announce_timer(ping)
+                    if await self._announce_timer(ping):
+                        await self.engine.mark_timer_announced(ping.timer_id)
             except Exception:
                 log.exception("timer_iteration_failed")
 
@@ -709,7 +763,9 @@ class App:
             if self.alarms is not None:
                 await self.alarms.flush()
 
-    async def _announce_timer(self, ping: TimerPing) -> None:
+    async def _announce_timer(self, ping: TimerPing) -> bool:
+        """Announce one claimed timer; True confirms delivery (the caller
+        then retires the claim — undelivered claims re-offer next tick)."""
         where = f" {ping.system_name}" if ping.system_name else ""
         note = f" — {ping.note}" if ping.note else ""
         delivered = await self._send_channel(
@@ -717,20 +773,23 @@ class App:
             f"⏰ **Timer{where}** is due{note} (set by <@{ping.created_by}>)",
         )
         # A structure timer eaten by a 403 is exactly the loss the corp set
-        # the timer to avoid — degrade loudly (GDD §13 / §11.3).
+        # the timer to avoid — degrade loudly AND keep re-offering the claim
+        # until it lands (GDD §13 / §11.3).
         if self.alarms is not None:
             if not delivered:
                 await self.alarms.raise_alarm(
                     AlarmCode.TIMER_UNDELIVERED,
                     AlarmSeverity.CRITICAL,
-                    f"A timer ping{where or ''} fired but could not be posted to #intel-alerts.",
+                    f"A timer ping{where or ''} fired but could not be posted to "
+                    "#intel-alerts. It will be retried every poll tick until it lands.",
                     "check CORTANA's permissions on #intel-alerts; the timer "
                     "details are in the journal",
                 )
             else:
                 await self.alarms.clear(AlarmCode.TIMER_UNDELIVERED)
-        if self.speaker is not None and ping.system_name:
+        if delivered and self.speaker is not None and ping.system_name:
             await self.speaker.say(ping.guild_id, f"Timer {ping.system_name} due.", PRIORITY_NORMAL)
+        return delivered
 
     # ── discord-touching helpers (composition root only) ─────────────────────
 
