@@ -17,7 +17,7 @@ falling back to ``discord.token_file`` for development runs.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +79,35 @@ class WakeConfig:
     #: "voice" = speak "Go ahead." (Cortana talks back), "beep" = an instant
     #: tone (fast, no synthesis latency), "none" = silent. Default "beep".
     ack: str = "beep"
+
+
+@dataclass(frozen=True, slots=True)
+class ChatConfig:
+    """The "command override" out-of-band assistant (GDD §6.6).
+
+    Deliberately OFF by default and entirely separate from the command path —
+    constraint 6 (no LLM in the command path) stands: the incident grammar
+    never touches this. The override channel only runs when a pilot explicitly
+    says "command override …" (or uses the /ask slash twin)."""
+
+    enabled: bool = False
+    #: Claude model for override replies. Default is the cheapest tier
+    #: (fractions of a cent per question); claude-opus-4-8 is the smarter,
+    #: ~10x-the-price alternative.
+    model: str = "claude-haiku-4-5"
+    #: Dev fallback ONLY (0600). Production reads
+    #: $CREDENTIALS_DIRECTORY/anthropic via systemd LoadCredential=
+    #: (constraint 12) — the key itself is never in YAML.
+    api_key_file: str = "/etc/aura/anthropic"
+    max_tokens: int = 300
+    #: Per-user seconds between override questions — the cost throttle.
+    user_cooldown_s: int = 10
+    #: Wall-clock cap on one answer (includes any web search round-trips).
+    timeout_s: float = 25.0
+    #: Allow the model one live web search per question ("weather in
+    #: Chicago"). Each search bills separately (~a cent) — the cooldown above
+    #: is what keeps that bounded.
+    web_search: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +188,10 @@ class TtsConfig:
     #: Post-synthesis effect over the voice: "none" or "holographic" (a chorus
     #: + subtle reverb for a ship's-AI sheen — an effect, not a voice clone).
     effect: str = "none"
+    #: Spoken-line flavour: "standard" keeps the exact GDD §12.1 catalogue;
+    #: "cortana" rotates acknowledgement lines ("Go ahead." / "Listening." /
+    #: "Send it.") so AURA feels alive. Info-carrying lines never vary.
+    personality: str = "standard"
     # Ducking level and talk-over suppression are fixed playback mechanics in
     # Ears (ears/src/playback.rs) — deliberately not tunables here.
 
@@ -202,6 +235,7 @@ class AuraConfig:
     ipc: IpcConfig
     health: HealthConfig
     database: DatabaseConfig
+    chat: ChatConfig = field(default_factory=ChatConfig)
 
 
 # ── validation helpers ───────────────────────────────────────────────────────
@@ -441,6 +475,35 @@ def _build_tts(data: dict[str, Any]) -> TtsConfig:
         binary=_get(s, "tts.binary", str),
         max_utterance_s=_positive(_get(s, "tts.max_utterance_s", float), "tts.max_utterance_s"),
         effect=_get(s, "tts.effect", str, default="none"),
+        personality=_personality(_get(s, "tts.personality", str, default="standard")),
+    )
+
+
+def _personality(value: str) -> str:
+    v = value.lower()
+    if v not in ("standard", "cortana"):
+        raise ConfigError(f"tts.personality: must be standard or cortana, got {value!r}")
+    return v
+
+
+def _build_chat(data: dict[str, Any]) -> ChatConfig:
+    # The whole section is optional — an existing aura.yaml without it keeps
+    # loading, with the override channel simply off.
+    s = data.get("chat")
+    if not isinstance(s, dict):
+        return ChatConfig()
+    return ChatConfig(
+        enabled=_get(s, "chat.enabled", bool, default=False),
+        model=_get(s, "chat.model", str, default="claude-haiku-4-5"),
+        api_key_file=_get(s, "chat.api_key_file", str, default="/etc/aura/anthropic"),
+        max_tokens=_positive(_get(s, "chat.max_tokens", int, default=300), "chat.max_tokens"),
+        user_cooldown_s=_positive(
+            _get(s, "chat.user_cooldown_s", int, default=10), "chat.user_cooldown_s"
+        ),
+        timeout_s=_positive(
+            float(_get(s, "chat.timeout_s", float, default=25.0)), "chat.timeout_s"
+        ),
+        web_search=_get(s, "chat.web_search", bool, default=True),
     )
 
 
@@ -518,6 +581,7 @@ def load_config(path: str | Path) -> AuraConfig:
         ipc=_build_ipc(data),
         health=_build_health(data),
         database=_build_database(data),
+        chat=_build_chat(data),
     )
 
 

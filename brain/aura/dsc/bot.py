@@ -131,6 +131,8 @@ class AuraBot(commands.Bot):
         # announce helper, so it cannot exist before the bot does).
         self.voice_gateway: VoiceGateway | None = None
         self.health_reporter: HealthReporter | None = None
+        # The §6.6 out-of-band assistant; None = override channel disabled.
+        self.chat: Any | None = None
 
     # ── startup ──────────────────────────────────────────────────────────────
 

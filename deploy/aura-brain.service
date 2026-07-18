@@ -26,6 +26,9 @@ TimeoutStopSec=15
 
 # Secrets: token file 0600, surfaced read-only at $CREDENTIALS_DIRECTORY/token.
 LoadCredential=token:/etc/aura/token
+# Uncomment when enabling the chat override channel (chat.enabled in aura.yaml):
+# the Anthropic API key rides the same mechanism (constraint 12).
+#LoadCredential=anthropic:/etc/aura/anthropic
 
 # Hardening (GDD §22)
 NoNewPrivileges=true

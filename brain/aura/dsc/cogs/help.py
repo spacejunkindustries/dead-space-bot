@@ -223,6 +223,13 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "counts edited in place\n"
                 "• `/poll close id` — close it (author or admin)",
             ),
+            (
+                "Ask AURA (out-of-band)",
+                "• `/ask question` — the assistant channel; by voice it's "
+                '*"command override, …"* (e.g. *"command override, what\'s the '
+                'weather in Chicago?"*). Separate from intel — AURA never uses '
+                "it to interpret reports.",
+            ),
         ),
     ),
     "privacy": HelpTopic(

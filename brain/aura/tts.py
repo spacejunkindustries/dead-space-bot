@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import json
 import math
+import random
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,6 +88,27 @@ class SynthesisError(Exception):
 # ── §12.1 utterance catalogue ─────────────────────────────────────────────────
 # Short. Always short. AURA is talking over a fight. These are the exact
 # scripted strings from the GDD table; do not improvise variants elsewhere.
+#
+# Personality (GDD §12.4): under tts.personality "cortana", ACKNOWLEDGEMENT
+# lines rotate through short variants so AURA feels alive; every
+# information-carrying line (system names, counts, timers) stays fixed —
+# a pilot mid-fight must never have to parse a surprise phrasing for facts.
+
+_personality = "standard"
+
+
+def set_personality(style: str) -> None:
+    """Select the spoken-line flavour ("standard" | "cortana"). Called by the
+    App at startup and after each SIGHUP config reload."""
+    global _personality
+    _personality = style
+
+
+def _pick(standard: str, variants: tuple[str, ...]) -> str:
+    if _personality == "cortana":
+        return random.choice(variants)
+    return standard
+
 
 _NUMBER_WORDS = (
     "zero",
@@ -128,7 +150,10 @@ def say_again() -> str:
 def go_ahead() -> str:
     """*"Go ahead."* — spoken the instant the wake word fires, so the pilot
     knows AURA is listening before they start their report (§5 capture)."""
-    return "Go ahead."
+    return _pick(
+        "Go ahead.",
+        ("Go ahead.", "Listening.", "I'm here. Go ahead.", "Send it.", "Copy. Go ahead."),
+    )
 
 
 def responders(n: int, system: str) -> str:
@@ -174,14 +199,42 @@ def relayed() -> str:
     """*"Relayed."* — spoken after a freeform relay posts, so the pilot knows
     it landed and stops repeating themselves (each repeat is another card and
     another STT decode)."""
-    return "Relayed."
+    return _pick(
+        "Relayed.",
+        ("Relayed.", "Copy that. Relayed.", "On the wire.", "Sent it up the chain."),
+    )
 
 
 def code_ack(severity: Severity) -> str:
     """*"Code orange. Go ahead."* — a standalone spoken colour code opens a
     dialogue: AURA acknowledges and the report follows in a wake-free window
     (GDD §6.4)."""
-    return f"Code {_SEVERITY_SPOKEN[severity]}. Go ahead."
+    colour = _SEVERITY_SPOKEN[severity]
+    return _pick(
+        f"Code {colour}. Go ahead.",
+        (
+            f"Code {colour}. Go ahead.",
+            f"Code {colour} logged. Go ahead.",
+            f"Copy code {colour}. Send it.",
+        ),
+    )
+
+
+def override_unavailable() -> str:
+    """*"Override channel unavailable."* — the §6.6 assistant failed or is
+    disabled; the fixed line keeps errors off comms."""
+    return "Override channel unavailable."
+
+
+def override_cooldown() -> str:
+    """*"Override cooling down."* — per-pilot §6.6 cost throttle."""
+    return "Override cooling down."
+
+
+def override_posted() -> str:
+    """*"Answer posted to Discord."* — the reply was too long for the §12.2
+    spoken cap and went to the intel channel instead."""
+    return "Answer posted to Discord."
 
 
 def responder_named(name: str, system: str | None) -> str:

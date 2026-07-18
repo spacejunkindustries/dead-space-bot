@@ -467,6 +467,33 @@ class UtilityCog(commands.Cog):
     async def evetime(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(evetime_text(datetime.now(UTC)), ephemeral=True)
 
+    # ── /ask — slash twin of "command override" (GDD §6.6, constraint 10) ────
+
+    @app_commands.command(name="ask", description="Ask AURA a question (out-of-band assistant)")
+    @app_commands.describe(question="What do you want to know?")
+    async def ask(self, interaction: discord.Interaction, question: str) -> None:
+        from aura.chat import ChatCooldownError, ChatError  # lazy: optional feature
+
+        chat = self.bot.chat
+        if chat is None:
+            await interaction.response.send_message(
+                "The override channel is not enabled on this server.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(thinking=True)
+        timeout_s = self.bot.holder.current.chat.timeout_s
+        try:
+            reply = await asyncio.wait_for(
+                chat.ask(interaction.user.id, question), timeout=timeout_s
+            )
+        except ChatCooldownError:
+            await interaction.followup.send("Override cooling down — try again shortly.")
+            return
+        except (ChatError, TimeoutError):
+            await interaction.followup.send("Override channel unavailable.")
+            return
+        await interaction.followup.send(f"💬 {reply}")
+
     # ── /route ───────────────────────────────────────────────────────────────
 
     @app_commands.command(name="route", description="Full jump route between two systems")

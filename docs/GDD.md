@@ -374,6 +374,16 @@ Mapping: red → high, orange → medium, yellow → none/info. A leading *"repo
 
 Fifteen commands. Short enough that pilots remember them under fire, which is the only time they matter.
 
+### 6.6 The command override — out-of-band assistant
+
+*"Command override, what's the weather in Chicago?"*
+
+An **explicitly-invoked** chat channel, off by default (`chat.enabled`). When a pilot opens an utterance with *"command override"* (after the wake word), everything that follows goes to a cloud Claude model — general questions, banter, live facts via one web search — and the answer is spoken back (or posted to the intel channel when it exceeds the §12.2 cap, with *"Answer posted to Discord."* spoken instead). Slash twin: `/ask` (constraint 10), sharing the same client and the same per-pilot cooldown.
+
+**Constraint 6 is untouched.** The incident grammar never sees an LLM: the override prefix is matched *first* and only in leading position, so a report containing the word "override" mid-sentence can never be diverted, and a non-override utterance never reaches the model. The model is instructed to never invent in-game intel — hostiles, timers, and system status come only from AURA's own reports.
+
+**Cost posture.** Default model is the cheapest Claude tier (fractions of a cent per question); replies are capped at `chat.max_tokens`, web search at one per question, and `chat.user_cooldown_s` throttles each pilot. The API key rides systemd `LoadCredential=` (`anthropic:` credential; constraint 12), with `chat.api_key_file` as the 0600 dev fallback.
+
 ---
 
 ## 7. Slash command reference
@@ -722,6 +732,10 @@ Personal-ping type words pluralize naturally: *hostiles*, *attacks*, *assist req
 
 Piper emits raw s16le at the model's native rate. Brain wraps it in a WAV header in memory and ships the bytes to Ears, where Songbird's Symphonia layer parses the header and resamples to 48kHz internally. **No resampling code exists in Brain**, and no temporary files are written.
 
+### 12.4 Personality
+
+`tts.personality` selects the spoken-line flavour. `standard` keeps the exact §12.1 catalogue. `cortana` rotates **acknowledgement lines only** through short variants — *"Go ahead." / "Listening." / "Send it." / "Copy code orange. Send it." / "On the wire."* — so AURA feels alive rather than canned. Information-carrying lines (system names, counts, timers, callsigns) never vary: a pilot mid-fight must never parse a surprise phrasing for facts. This is scripted variation, not generation — no model is involved (constraint 6), and no real person's voice is imitated.
+
 ---
 
 ## 13. Fleet ops features
@@ -1022,6 +1036,15 @@ tts:
   max_utterance_s: 3
   # Ducking (60%) and talk-over suppression are fixed playback mechanics in
   # Ears (§12.2) — deliberately not tunables here.
+
+chat:                                   # §6.6 override assistant — off by default
+  enabled: false
+  model: claude-haiku-4-5
+  api_key_file: /etc/aura/anthropic     # dev fallback; production = LoadCredential
+  max_tokens: 300
+  user_cooldown_s: 10
+  timeout_s: 25
+  web_search: true
 
 gazetteer:
   file: /etc/aura/gazetteer.yaml
