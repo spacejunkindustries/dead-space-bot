@@ -37,6 +37,12 @@ Type=simple
 # -------------------------------------------------------------------------
 User=aura
 Group=aura
+# Hugging Face cache shared with install.sh's whisper prefetch: a size-name
+# stt.model (e.g. "small") resolves through this cache, so the weights staged
+# at deploy time are the ones the service loads — never a surprise ~460 MB
+# download as aura at the first utterance. Dev boxes without this env fall
+# back to ~/.cache/huggingface as usual.
+Environment=HF_HOME=/var/lib/cortana/hf
 ExecStart=/opt/cortana/current/venv/bin/python -m cortana --config /etc/cortana/cortana.yaml
 # SIGHUP → ConfigHolder.reload() (hot-reload cortana.yaml, GDD §16/§18)
 ExecReload=/bin/kill -HUP $MAINPID

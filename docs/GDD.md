@@ -222,7 +222,8 @@ Every module in the finished system.
 | Path | Contents |
 |---|---|
 | `/opt/cortana/models/wake/` | openWakeWord ONNX chain (melspec → embedding → wakeword) |
-| `/opt/cortana/models/whisper/` | Whisper `small` int8 CTranslate2 weights |
+| `/var/lib/cortana/hf/` | Whisper `small` int8 CTranslate2 weights — the Hugging Face cache shared between install.sh's prefetch and the service (`Environment=HF_HOME`), so a size-name `stt.model` never re-downloads at runtime |
+| `/opt/cortana/models/whisper/` | Hand-installed weights for a *path-based* `stt.model` only (unused by the shipped `model: small`) |
 | `/opt/cortana/models/piper/` | Piper voice `.onnx` + `.onnx.json` |
 | `/etc/cortana/cortana.yaml` | Main configuration (§16) |
 | `/etc/cortana/routing.yaml` | Subscription rules (§12) |
@@ -1256,6 +1257,7 @@ Ubuntu 24.04 LTS
 │   └── models/{wake,whisper,piper}/
 ├── /etc/cortana/{cortana.yaml,routing.yaml,gazetteer.yaml,token}
 ├── /var/lib/cortana/cortana.db
+├── /var/lib/cortana/hf/              shared HF cache (whisper weights; HF_HOME)
 ├── /run/cortana/cortana.sock        (tmpfiles.d, mode 0660, root:aura)
 ├── user: aura  (nologin, owns runtime dirs)
 └── ufw: deny incoming, allow SSH only — CORTANA opens no listening ports

@@ -23,6 +23,16 @@ configured channel is visible with SEND + EMBED permissions, and checks the
 configured role ids exist — network failures degrade to WARN, never FAIL,
 so a Discord outage cannot masquerade as a config failure.
 
+``--first-install`` (used by install.sh before the first release is live)
+downgrades FAILs for human-installed assets (``FIRST_INSTALL_ASSET_CHECKS``)
+to WARN, marked ``[first-install]`` — a fresh droplet must be able to finish
+its first deploy and print the setup checklist. Config errors still fail.
+
+Database reads use ``immutable=1`` (the doctor never writes, not even WAL
+side files); at the install gate the OLD brain may still be live and writing,
+so read errors while ``-wal``/``-shm`` side files are present degrade to
+WARN ("db busy") instead of aborting a valid deploy as "corrupt".
+
 Hard rules: the doctor NEVER writes anything (read-only sqlite, no mkdir,
 no socket bind) and NEVER starts an engine (no model loads — existence and
 cheap metadata only; the single subprocess allowed is ``piper --help``).
@@ -55,9 +65,12 @@ __all__ = [
     "EXIT_CONFIG_INVALID",
     "EXIT_FAIL",
     "EXIT_OK",
+    "FIRST_INSTALL_ASSET_CHECKS",
+    "FIRST_INSTALL_MARKER",
     "CheckResult",
     "DoctorContext",
     "Status",
+    "apply_first_install",
     "exit_code",
     "main",
     "render",
@@ -428,31 +441,21 @@ def check_database(ctx: DoctorContext) -> list[CheckResult]:
     try:
         # Read-only + immutable: a plain mode=ro open of a WAL database still
         # creates -shm/-wal side files, and the doctor NEVER writes anything.
-        # immutable assumes no concurrent writer — true for every doctor call
-        # site (ExecStartPre, the install gate, manual preflight).
+        # immutable assumes no concurrent writer, which is NOT always true:
+        # the install gate runs while the OLD brain is still live and writing.
+        # An immutable reader racing a WAL checkpoint can see torn pages
+        # (SQLITE_CORRUPT) — so any read error while a live writer is evident
+        # (-wal/-shm side files present) degrades to WARN instead of aborting
+        # a valid deploy with a bogus "corrupt database" verdict.
         conn = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
     except sqlite3.Error as exc:
-        return [
-            CheckResult(
-                "database",
-                Status.FAIL,
-                f"cannot open {path} read-only: {exc}",
-                "check the file exists, is a SQLite db, and is readable",
-            )
-        ]
+        return [_db_read_error(path, exc, "cannot open read-only")]
     try:
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         seeded = _count_systems(conn)
     except sqlite3.Error as exc:
         conn.close()
-        return [
-            CheckResult(
-                "database",
-                Status.FAIL,
-                f"cannot read {path}: {exc}",
-                "the database file may be corrupt — restore the nightly backup",
-            )
-        ]
+        return [_db_read_error(path, exc, "cannot read")]
     conn.close()
 
     results: list[CheckResult] = []
@@ -499,6 +502,30 @@ def check_database(ctx: DoctorContext) -> list[CheckResult]:
     else:
         results.append(CheckResult("gazetteer.rows", Status.PASS, f"{seeded} systems seeded"))
     return results
+
+
+def _live_writer_evident(path: Path) -> bool:
+    """True when WAL side files exist next to the db — an open writer
+    connection (the running service) keeps them on disk; a clean shutdown
+    removes them."""
+    return any(path.with_name(path.name + suffix).is_file() for suffix in ("-wal", "-shm"))
+
+
+def _db_read_error(path: Path, exc: sqlite3.Error, what: str) -> CheckResult:
+    if _live_writer_evident(path):
+        return CheckResult(
+            "database",
+            Status.WARN,
+            f"db busy — a live writer holds {path} ({exc}); check skipped",
+            "the service is running and writing; re-run the doctor after it "
+            "restarts (or stop it) for a full database check",
+        )
+    return CheckResult(
+        "database",
+        Status.FAIL,
+        f"{what} {path}: {exc}",
+        "the database file may be corrupt — restore the nightly backup",
+    )
 
 
 def _count_systems(conn: sqlite3.Connection) -> int | None:
@@ -881,6 +908,48 @@ async def _online_checks(ctx: DoctorContext, client: OnlineClient, token: str) -
     return results
 
 
+# ── first install (--first-install) ──────────────────────────────────────────
+
+#: Checks whose FAIL on a brand-new droplet means "a human has not installed
+#: this asset yet" (install.sh's checklist: wake model, piper binary + voice,
+#: path-based whisper weights, gazetteer seed) — not "this deploy is broken".
+#: ``--first-install`` downgrades exactly these to WARN so the very first
+#: deploy can complete enable-only and actually print that checklist.
+#: Config errors are never downgraded: a broken YAML is broken on day one too.
+FIRST_INSTALL_ASSET_CHECKS: frozenset[str] = frozenset(
+    {
+        "wake.model",
+        "stt.model",
+        "tts.voice",
+        "tts.voice.json",
+        "tts.binary",
+        "gazetteer.rows",
+    }
+)
+
+#: Marker appended to downgraded rows — install.sh greps for it to decide
+#: between a normal deploy and the enable-only first-install path.
+FIRST_INSTALL_MARKER = "[first-install]"
+
+
+def apply_first_install(results: list[CheckResult]) -> list[CheckResult]:
+    """Downgrade human-installed-asset FAILs to WARN (first install only)."""
+    out: list[CheckResult] = []
+    for r in results:
+        if r.status is Status.FAIL and not r.config_error and r.check in FIRST_INSTALL_ASSET_CHECKS:
+            out.append(
+                CheckResult(
+                    r.check,
+                    Status.WARN,
+                    f"{r.detail} {FIRST_INSTALL_MARKER}",
+                    r.fix_hint,
+                )
+            )
+        else:
+            out.append(r)
+    return out
+
+
 # ── rendering + exit codes ───────────────────────────────────────────────────
 
 
@@ -924,12 +993,21 @@ def main(argv: list[str] | None = None) -> int:
         help="additionally verify the Discord token, channel permissions, "
         "and role ids (network; degrades to WARN when unreachable)",
     )
+    parser.add_argument(
+        "--first-install",
+        action="store_true",
+        help="treat missing human-installed assets (wake model, piper, "
+        "gazetteer seed) as warnings — used by install.sh before the first "
+        "release is live; config errors still fail",
+    )
     args = parser.parse_args(argv)
 
     ctx = DoctorContext(config_path=Path(args.config))
     results = run_offline_checks(ctx)
     if args.online and ctx.cfg is not None:
         results.extend(asyncio.run(run_online_checks(ctx)))
+    if args.first_install:
+        results = apply_first_install(results)
     print(render(results, ctx.config_path))
     return exit_code(results)
 
