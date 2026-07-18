@@ -265,6 +265,8 @@ Songbird VoiceTick (20ms, per-user decoded PCM 48kHz)
        └─► refractory period: 2s per user after a hit
 ```
 
+**Wake acknowledgement.** The instant the capture window opens, AURA tells the pilot it is listening — so they know to start talking, not repeat the wake word. The form is `wake.ack`: `voice` speaks *"Go ahead."*, `beep` plays an instant tone, `none` is silent. `beep` is the default because the tone is instant, while a spoken cue costs one Piper synthesis; corps that want AURA to talk back set `voice`. The cue plays at ALERT priority (jumping the queue) and, since AURA never captures its own playback, never bleeds into the utterance being recorded.
+
 ### 5.1 Wake word
 
 **Engine: openWakeWord** (Apache 2.0). Free, self-hosted, no per-seat licensing, and it benchmarks competitively against the leading commercial engine. Custom phrases are trained from a synthetic TTS pipeline; the trained ONNX chain ships in `/opt/aura/models/wake/`.
@@ -671,6 +673,7 @@ Short. Always short. AURA is talking over a fight.
 
 | Event | Utterance |
 |---|---|
+| Wake acknowledged (`wake.ack: voice`) | *"Go ahead."* |
 | Ping sent | *"Hostiles Otanuomi, pinged."* |
 | Ping sent, scoped | *"Hostiles Otanuomi, pinged home defense."* |
 | Ambiguous system | *"Hostiles Otanuomi — say again to confirm."* |
@@ -954,6 +957,7 @@ wake:
   model:  /opt/aura/models/wake/aura_command.onnx   # the phrase is baked into the model
   threshold: 0.55
   refractory_ms: 2000
+  ack: beep                             # voice = speak "Go ahead." | beep = tone | none
 
 capture:
   preroll_ms: 300

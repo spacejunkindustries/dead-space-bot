@@ -197,6 +197,10 @@ def test_register_captures_title_cased_callsign() -> None:
         "call me space junkie",
         "register me as space junkie",
         "Aura Command, register Space Junkie",
+        # STT drift on the verb tense — Whisper writes what it hears.
+        "registered me as space junkie",
+        "registering space junkie",
+        "my callsign is space junkie",
     ],
 )
 def test_register_synonyms_and_filler(phrase: str) -> None:
@@ -213,7 +217,10 @@ def test_register_without_callsign_yields_no_detail() -> None:
     assert cmd.detail is None
 
 
-@pytest.mark.parametrize("phrase", ["unregister", "Aura Command, unregister me", "forget me"])
+@pytest.mark.parametrize(
+    "phrase",
+    ["unregister", "Aura Command, unregister me", "forget me", "unregistered me"],
+)
 def test_unregister_synonyms(phrase: str) -> None:
     cmd = parse(phrase)
     assert cmd is not None

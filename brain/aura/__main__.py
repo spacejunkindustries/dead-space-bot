@@ -346,17 +346,27 @@ class App:
                     self.capture.force_endpoint(user_id)
 
     def _on_capture_start(self, user_id: int, guild_id: int) -> None:
-        """Wake fired — speak "go ahead" so the pilot knows AURA is listening.
+        """Wake fired — acknowledge so the pilot knows AURA is listening.
 
-        Sync hot-path callback: it only schedules the spoken cue as a task, so
-        the audio thread never blocks. ALERT priority jumps the queue ahead of
-        any pending confirmations. AURA never captures its own playback, so the
-        cue cannot bleed into the utterance being recorded."""
+        Sync hot-path callback: it only schedules the cue as a task, so the
+        audio thread never blocks. ALERT priority jumps the queue ahead of any
+        pending confirmations. AURA never captures its own playback, so the cue
+        cannot bleed into the utterance being recorded.
+
+        The form of the cue is ``wake.ack``: "voice" speaks "Go ahead."
+        (Cortana talks back), "beep" plays an instant tone, "none" is silent.
+        A spoken cue costs one Piper synthesis; the tone is instant, which is
+        why "beep" stays the latency-safe default."""
         if self.speaker is None:
             return
-        # Instant tone, not a spoken line: acknowledging the wake word must not
-        # wait on a neural-voice synthesis (that was most of the 30s latency).
-        task = asyncio.create_task(self.speaker.chirp(guild_id, user_id=user_id))
+        ack = self.holder.current.wake.ack
+        if ack == "none":
+            return
+        if ack == "voice":
+            coro = self.speaker.say(guild_id, tts_mod.go_ahead(), PRIORITY_ALERT, user_id=user_id)
+        else:
+            coro = self.speaker.chirp(guild_id, user_id=user_id)
+        task = asyncio.create_task(coro)
         self._voice_tasks.add(task)
         task.add_done_callback(self._voice_tasks.discard)
 

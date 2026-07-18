@@ -110,9 +110,17 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
     (Intent.CANCEL, re.compile(r"\bcancel\b", re.I)),
     # Callsign registry (GDD §6.1). UNREGISTER before REGISTER so the longer
     # word can never be claimed by the shorter pattern.
-    (Intent.UNREGISTER, re.compile(r"\bunregister(?:\s+me)?\b|\bforget\s+me\b", re.I)),
+    (
+        Intent.UNREGISTER,
+        re.compile(r"\bunregister(?:ed|ing)?(?:\s+me)?\b|\bforget\s+me\b", re.I),
+    ),
     (Intent.WHOAMI, re.compile(r"\bwho\s+am\s+i\b|\bwhoami\b", re.I)),
-    (Intent.REGISTER, re.compile(r"\bregister\b|\bcall\s+me\b", re.I)),
+    # "register", plus STT drift ("registered"/"registering") and the natural
+    # phrasings "call me …" / "my callsign is …".
+    (
+        Intent.REGISTER,
+        re.compile(r"\bregister(?:ed|ing)?\b|\bcall\s+me\b|\bcallsign\b", re.I),
+    ),
 )
 
 # Group targeting (GDD §6.2). Deliberately few — every alias is another token
