@@ -343,7 +343,9 @@ def _build_discord(data: dict[str, Any]) -> DiscordConfig:
 def _join_announcement(s: dict[str, Any]) -> str:
     mode = str(_get(s, "discord.join_announcement", str, default="daily")).lower()
     if mode not in ("every", "daily", "off"):
-        raise ConfigError(f"discord.join_announcement: must be one of every|daily|off, got {mode!r}")
+        raise ConfigError(
+            f"discord.join_announcement: must be one of every|daily|off, got {mode!r}"
+        )
     return mode
 
 
