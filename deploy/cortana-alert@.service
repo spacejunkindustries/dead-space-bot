@@ -1,0 +1,26 @@
+# CORTANA failure alert — fired by OnFailure=cortana-alert@%n.service on the
+# brain and ears units. %i is the failing unit's name.
+#
+# Install: /etc/systemd/system/cortana-alert@.service (deploy/install.sh).
+# The hook script lives at the FIXED path /opt/cortana/alert.sh, deliberately
+# not under /opt/cortana/current/: OnFailure fires exactly when a deploy may
+# have left the current/ symlink broken, and the alerter must survive that.
+#
+# What it does (see deploy/alert.sh): appends a line to
+# /var/lib/cortana/alerts.log, and — only when /etc/cortana/alert_webhook
+# exists (mode 0600) — posts the failing unit's last 15 journal lines to that
+# webhook. A missing webhook degrades to log-only; it never fails the hook.
+#
+# Runs as root: it needs the full journal and must work when the aura-owned
+# runtime is exactly what is broken. It reads the webhook URL straight from
+# the 0600 root-owned file — never via environment, YAML, or unit Environment=
+# (constraint 12; LoadCredential= is unsuitable here because it hard-fails
+# unit start when the source file is absent, and the webhook is optional).
+
+[Unit]
+Description=CORTANA failure alert for %i
+# No OnFailure= here — the alerter must never alert about itself.
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cortana/alert.sh %i

@@ -6,24 +6,40 @@
 # It is Wants=, not Requires=: Ears reconnects with backoff forever, so it must
 # survive (and buffer across) Brain being down (GDD §15/§20).
 #
+# The binary runs from the /opt/cortana/current symlink; install.sh restarts
+# this unit only when the staged binary's sha256 differs from the live one,
+# so an IPC-desynced brain/ears pair cannot survive a deploy (GDD §15/§17).
 # Token comes ONLY via LoadCredential= (GDD §18/§22, CLAUDE.md constraint 12);
 # the process reads $CREDENTIALS_DIRECTORY/token.
 
 [Unit]
 Description=CORTANA Ears (Discord voice socket)
-Documentation=file:/opt/cortana/brain/docs/GDD.md
+Documentation=file:/opt/cortana/current/brain/docs/GDD.md
 After=network-online.target cortana-brain.service
 Wants=network-online.target cortana-brain.service
+# Stop-and-alert instead of an invisible unbounded crash-loop: five failed
+# starts inside five minutes fails the unit and fires OnFailure=.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+OnFailure=cortana-alert@%n.service
 
 [Service]
 Type=simple
 User=aura
 Group=aura
+# --- config preflight (once cortana-ears grows a --check subcommand) -----
+# A bad ears.yaml edit should fail the restart, never the running service,
+# and never silently. When the subcommand exists (exit 0 ok / 78 config):
+#   ExecStartPre=/opt/cortana/current/bin/cortana-ears --check /etc/cortana/ears.yaml
+# -------------------------------------------------------------------------
 # The config path is positional argv[1], not a --config flag — see
 # ears/src/config.rs (DEFAULT_CONFIG_PATH / load).
-ExecStart=/opt/cortana/bin/cortana-ears /etc/cortana/ears.yaml
+ExecStart=/opt/cortana/current/bin/cortana-ears /etc/cortana/ears.yaml
 Restart=always
 RestartSec=5
+# Exit 78 (EX_CONFIG) / 69 (EX_UNAVAILABLE: auth) are operator problems a
+# restart cannot fix — stop cleanly instead of looping.
+RestartPreventExitStatus=78 69
 
 # Secrets: token file 0600, surfaced read-only at $CREDENTIALS_DIRECTORY/token.
 LoadCredential=token:/etc/cortana/token
@@ -33,7 +49,10 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/cortana /run/cortana
+# /run/cortana ONLY: Ears never touches persistent storage — audio never
+# touches disk (constraint 5), and this sandbox line is the mechanical
+# backstop for that promise. The database directory belongs to Brain alone.
+ReadWritePaths=/run/cortana
 
 [Install]
 WantedBy=multi-user.target
