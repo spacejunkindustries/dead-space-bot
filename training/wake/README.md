@@ -66,21 +66,38 @@ the openWakeWord repo:
 
 ## Running it
 
+> **Python version matters.** The pin set targets **3.10** — `piper-phonemize`
+> and several upstream pins publish no wheels for 3.12, and a host on 3.12
+> (current Kaggle, recent Colab) aborts the install on the first missing wheel.
+> Don't fight the host's interpreter; create a 3.10 environment with
+> [`uv`](https://github.com/astral-sh/uv), which fetches a standalone 3.10
+> build on any machine. The scripts launch every subprocess with
+> `sys.executable`, so running them under the 3.10 venv keeps the whole
+> pipeline — including the cloned openWakeWord trainer — on 3.10.
+
 ```bash
-# On the GPU box / in Colab — Python 3.10 venv recommended (upstream's target)
 cd training/wake
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-train.txt
+
+# 3.10 environment, host-independent (works on 3.12 Kaggle/Colab too)
+pip install -q uv
+uv venv --python 3.10 .venv
+uv pip install --python .venv/bin/python -r requirements-train.txt
+PY=.venv/bin/python          # use this for every step below
 
 # 1. Fetch assets, generate + augment samples (hours; resumable per stage)
-python generate_samples.py --config config.yaml
+$PY generate_samples.py --config config.yaml
 
 # 2. Train, then print the threshold sweep
-python train.py --config config.yaml
+$PY train.py --config config.yaml
 
 # 3. Assemble the deployable ONNX chain
-python train.py --config config.yaml --skip-train --skip-validate --bundle
+$PY train.py --config config.yaml --skip-train --skip-validate --bundle
 ```
+
+On a box that already runs Python 3.10/3.11 a plain
+`python -m venv .venv && source .venv/bin/activate && pip install -r
+requirements-train.txt` works too — the `uv` step only exists to sidestep a
+3.12 host.
 
 Every knob — phrase, sample counts, adversarial phrases, noise sources,
 training targets, sweep range — lives in `config.yaml`. `generate_samples.py

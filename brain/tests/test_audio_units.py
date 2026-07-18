@@ -289,6 +289,41 @@ def test_wake_detector_rejects_bad_frame_size() -> None:
         detector.score(USER, b"\x00" * 10)
 
 
+def _emit_one_chunk(detector: OpenWakeWordDetector) -> None:
+    """Feed exactly four 20 ms frames so one 80 ms chunk is scored."""
+    for _ in range(4):
+        detector.score(USER, FRAME)
+
+
+def test_near_miss_above_floor_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    import aura.audio.wake as wake_mod
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        wake_mod.log, "info", lambda event, **kw: events.append((event, kw)), raising=False
+    )
+    detector, _ = make_detector([0.42], threshold=0.55)
+    _emit_one_chunk(detector)
+
+    near = [kw for event, kw in events if event == "wake_near_miss"]
+    assert near and near[0]["score"] == pytest.approx(0.42)
+    assert near[0]["threshold"] == 0.55
+    assert not any(event == "wake_hit" for event, _ in events)
+
+
+def test_quiet_audio_below_floor_logs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import aura.audio.wake as wake_mod
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        wake_mod.log, "info", lambda event, **kw: events.append(event), raising=False
+    )
+    detector, _ = make_detector([0.05], threshold=0.55)
+    _emit_one_chunk(detector)
+
+    assert "wake_near_miss" not in events
+
+
 # ── pcm_to_wav_bytes ─────────────────────────────────────────────────────────
 
 

@@ -48,6 +48,15 @@ __all__ = [
 OWW_CHUNK_SAMPLES = 1280
 OWW_CHUNK_BYTES = OWW_CHUNK_SAMPLES * 2  # s16le
 
+#: A below-threshold peak this high means the phrase was clearly heard but
+#: didn't clear the bar — the one signal that tells an operator to lower
+#: ``wake.threshold`` rather than chase a phantom audio fault. Logged as
+#: ``wake_near_miss``; below this floor the channel stays quiet in the log.
+_NEAR_MISS_FLOOR = 0.3
+#: Only re-log a near-miss once it climbs this much higher, so one utterance
+#: emits a couple of lines, not fifty.
+_NEAR_MISS_STEP = 0.05
+
 
 class WakeDetector(Protocol):
     """Per-user streaming wake-word scorer (docs/INTERFACES.md)."""
@@ -67,6 +76,9 @@ class _UserWakeState:
 
     pending: bytearray = field(default_factory=bytearray)
     last_score: float = 0.0
+    #: Highest near-miss already logged this episode; reset when the score
+    #: falls back under the floor or a hit re-arms the detector.
+    peak_logged: float = 0.0
     model: Any = None  # openwakeword.model.Model, created lazily
 
 
@@ -97,11 +109,26 @@ class OpenWakeWordDetector:
             del state.pending[:OWW_CHUNK_BYTES]
             state.last_score = self._predict_chunk(state, chunk)
 
-        if state.last_score >= self._holder.current.wake.threshold:
+        threshold = self._holder.current.wake.threshold
+        if state.last_score >= threshold:
             hit_score = state.last_score
             self._rearm_after_hit(state)
             log.info("wake_hit", user_id=user_id, score=round(hit_score, 3))
             return hit_score
+        # Near-miss visibility: without this, a phrase that scores just under
+        # the threshold is indistinguishable from silence in the log — the exact
+        # ambiguity that makes "the wake word doesn't work" impossible to triage.
+        if state.last_score >= _NEAR_MISS_FLOOR:
+            if state.last_score >= state.peak_logged + _NEAR_MISS_STEP:
+                state.peak_logged = state.last_score
+                log.info(
+                    "wake_near_miss",
+                    user_id=user_id,
+                    score=round(state.last_score, 3),
+                    threshold=threshold,
+                )
+        else:
+            state.peak_logged = 0.0
         return state.last_score
 
     def reset(self, user_id: int) -> None:
@@ -113,6 +140,7 @@ class OpenWakeWordDetector:
     def _rearm_after_hit(state: _UserWakeState) -> None:
         """Clear the streaming state after a hit so the detector re-arms clean."""
         state.last_score = 0.0
+        state.peak_logged = 0.0
         state.pending.clear()
         if state.model is not None and hasattr(state.model, "reset"):
             state.model.reset()
