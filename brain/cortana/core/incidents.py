@@ -914,6 +914,12 @@ class IncidentEngine:
             else:
                 # Unmatched location: post it verbatim. Dedupe on the raw text
                 # so repeats of the same spoken location still fold to one card.
+                # BUT a "location" longer than a few words is a swallowed
+                # sentence, not a system (live junk card: an assist request
+                # whose System field read "Please list all available
+                # commands") — ask for the system instead of posting it.
+                if parsed.system_text and len(parsed.system_text.split()) > 3:
+                    return IncidentOutcome(Outcome.REJECTED, tts.say_again(), None, None)
                 system_name = parsed.system_text or _UNKNOWN_LOCATION
                 existing_id = await asyncio.to_thread(
                     db.query_value,
@@ -1494,6 +1500,49 @@ class IncidentEngine:
         if stale:
             log.info("incidents_stale", ids=[i.id for i in stale])
         return [i.id for i in stale]
+
+    async def clear_all(self, guild_id: int) -> list[int]:
+        """Resolve EVERY active incident in one sweep (``/clearall``, GDD §7).
+
+        The board-wipe for after an op (or a testing session): each card is
+        marked RESOLVED and edited in place — never deleted, the history
+        stays readable. Admin/FC-gated at the cog; the engine just executes.
+        """
+        async with self._lock:
+
+            def _clear() -> list[Incident]:
+                rows = db.query(
+                    self._conn,
+                    "SELECT id FROM incidents WHERE guild_id = ? AND status = 'ACTIVE'",
+                    (guild_id,),
+                )
+                cleared: list[Incident] = []
+                for row in rows:
+                    db.execute(
+                        self._conn,
+                        "UPDATE incidents SET status = 'RESOLVED' WHERE id = ?",
+                        (row["id"],),
+                    )
+                    incident = _load_incident(self._conn, row["id"])
+                    if incident is not None:
+                        cleared.append(incident)
+                return cleared
+
+            cleared = await asyncio.to_thread(_clear)
+            cards: list[tuple[Incident, CardRender]] = []
+            for incident in cleared:
+                self._pending_candidates.pop(incident.id, None)
+                system_name = self._system_name(
+                    incident.system_id, incident.raw_system_text or "unknown"
+                )
+                cards.append((incident, self._render(incident, system_name)))
+        # Edits outside the lock, same reasoning as sweep_stale.
+        for incident, card in cards:
+            if incident.channel_id is not None and incident.message_id is not None:
+                await self._poster.edit(incident.channel_id, incident.message_id, "", card)
+        if cleared:
+            log.info("incidents_cleared_all", guild_id=guild_id, count=len(cleared))
+        return [i.id for i in cleared]
 
     # ── timers and form-ups (GDD §13) ────────────────────────────────────────
 

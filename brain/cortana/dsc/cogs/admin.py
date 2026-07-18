@@ -225,6 +225,30 @@ class AdminCog(commands.Cog):
         )
         await interaction.response.send_message(text, ephemeral=True)
 
+    # ── /clearall ────────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="clearall", description="(admin) Resolve EVERY active incident card at once"
+    )
+    @app_commands.check(_is_admin)
+    async def clearall(self, interaction: discord.Interaction) -> None:
+        """The board-wipe: after an op (or a pile of test cards), close every
+        active incident in one go. Cards are edited to RESOLVED in place —
+        history stays readable, nothing is deleted."""
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        cleared = await self.bot.engine.clear_all(interaction.guild_id)
+        log.info("clearall_via_slash", user_id=interaction.user.id, count=len(cleared))
+        if not cleared:
+            await interaction.followup.send("Board already clear — no active incidents.")
+        else:
+            await interaction.followup.send(
+                f"🧹 Cleared **{len(cleared)}** active incident"
+                f"{'s' if len(cleared) != 1 else ''} — cards marked resolved."
+            )
+
     # ── /health ──────────────────────────────────────────────────────────────
 
     @app_commands.command(

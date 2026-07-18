@@ -68,6 +68,55 @@ class HelpTopic:
 
 
 HELP_TOPICS: dict[str, HelpTopic] = {
+    "voice": HelpTopic(
+        key="voice",
+        label="Voice commands (quick list)",
+        emoji="🎙️",
+        title="🎙️ Voice commands — the quick list",
+        description=(
+            "Say the wake phrase, wait for the chirp, then speak. One page, "
+            "every phrase that works. Colour codes and system names can ride "
+            "anywhere in the sentence."
+        ),
+        fields=(
+            (
+                "Report",
+                "• *“hostiles / reds / neuts <system>”* — sighting 🟠\n"
+                "• *“under attack / tackled / point on me <system>”* — 🔴\n"
+                "• *“need help / need backup <system>”* — 🔴\n"
+                "• *“gate camp <system>”* — 🟠\n"
+                "• *“report … end report”* — freeform intel relay\n"
+                "• *“code red / orange / yellow”* — alone opens a two-step "
+                "report; inline it colours the report it rides in",
+            ),
+            (
+                "Manage",
+                "• *“clear <system>”* — resolve the card\n"
+                "• *“cancel”* — retract your last report (30s)\n"
+                "• *“update chase <system>”* — chase mode retarget; "
+                "*“chase clear”* ends it\n"
+                "• *“status”* — active incidents readback\n"
+                "• *“timer <system> <duration>”* — structure timer\n"
+                "• *“form up …”* — rally card",
+            ),
+            (
+                "Personal",
+                "• *“ping me for <type> in <system>”* — personal ping\n"
+                "• *“stop pinging me”* — clear personal pings\n"
+                "• *“this is <callsign>”* — set your callsign\n"
+                "• *“command override <question>”* — ask the assistant "
+                "(needs the override channel enabled)\n"
+                "• *“help”* — speaks a hint and posts this guide",
+            ),
+            (
+                "How she behaves",
+                "Misheard? She says *“Say again?”* and listens without a new "
+                "wake word — twice max, then *“Standing down”* means wake her "
+                "again. If the system name doesn't match the map, the report "
+                "still posts with the name you said, verbatim.",
+            ),
+        ),
+    ),
     "reporting": HelpTopic(
         key="reporting",
         label="Reporting intel",
@@ -294,7 +343,9 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "• `/health` — pipeline status, STT confidence, incident counts "
                 "(hourly self-reports also land in #bot-health)\n"
                 "• `/botstatus` · `/doctor` · `/reload` — one-screen ops status, "
-                "offline preflight checks, and the SIGHUP-equivalent config reload",
+                "offline preflight checks, and the SIGHUP-equivalent config reload\n"
+                "• `/clearall` — resolve EVERY active incident card at once (the "
+                "board-wipe after an op or a test session)",
             ),
             (
                 "Config files (hot-reload: SIGHUP or the reload commands)",

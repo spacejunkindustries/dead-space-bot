@@ -725,3 +725,29 @@ def test_callsign_starting_with_system_survives() -> None:
     p = parse("register system junkie")
     assert p is not None and p.intent is Intent.REGISTER
     assert p.detail == "System Junkie"
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "pin me for gate camps in moee 8",  # the live mis-hearing
+        "pink me for gate camp and moee 8",
+        "pinging me for hostiles in otanuomi",
+        "ping-me for camps in kisogo",
+    ],
+)
+def test_ping_me_survives_phonetic_mangling(heard: str) -> None:
+    """Live incident: STT wrote 'ping me' as pin/pink/pinging me, the strict
+    pattern missed, and 'gate camp' fell through to GATE_CAMP — posting a
+    junk camp card instead of subscribing. Constraint 7 applies to command
+    words too."""
+    cmd = parse(heard)
+    assert cmd is not None
+    assert cmd.intent is Intent.PING_ME
+
+
+def test_stop_pinging_survives_phonetic_mangling() -> None:
+    for heard in ("stop pinning me", "stop pinking me", "stop pings"):
+        cmd = parse(heard)
+        assert cmd is not None
+        assert cmd.intent is Intent.PING_ME_CLEAR

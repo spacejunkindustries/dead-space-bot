@@ -137,8 +137,14 @@ def _normalize_jargon(text: str) -> str:
 # words ("ping me for gate camps"); PING_ME_CLEAR before PING_ME so "stop
 # pinging me" can never be claimed as a new subscription.
 _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
-    (Intent.PING_ME_CLEAR, re.compile(r"\bstop\s+ping(?:ing|s)?(?:\s+me)?\b", re.I)),
-    (Intent.PING_ME, re.compile(r"\bping\s+me\b", re.I)),
+    # STT writes "ping me" as pin/pink/pinging me routinely (live incident:
+    # a mangled "ping me for gate camp" fell through to GATE_CAMP and
+    # posted a junk camp card) — match the phonetic neighbourhood.
+    (
+        Intent.PING_ME_CLEAR,
+        re.compile(r"\bstop\s+(?:ping|pin|pink)(?:n?ing|s)?(?:\s+me)?\b", re.I),
+    ),
+    (Intent.PING_ME, re.compile(r"\b(?:ping|pin|pink|pinging)[\s-]*me\b", re.I)),
     (Intent.UNDER_ATTACK, re.compile(r"\bunder\s+attack\b|\btackled\b|\bpoint\s+on\s+me\b", re.I)),
     (Intent.ASSIST_REQUEST, re.compile(r"\bneed\s+(?:help|backup|back\s*up)\b", re.I)),
     (Intent.HOSTILE_SPOTTED, re.compile(r"\bhostiles?\b|\breds?\b|\bneuts?\b", re.I)),
