@@ -651,3 +651,20 @@ def test_compute_channel_permissions_role_and_member_overwrites() -> None:
         ],
     )
     assert regranted & _SEND
+
+
+def test_systemd_managed_credentials_never_warn_on_mode(tmp_path) -> None:
+    """Field report: /doctor warned about systemd's own LoadCredential
+    runtime copies (mode 440 by design, recreated every start, inside a
+    service-only directory). systemd-managed credentials PASS on any
+    readable mode; the 600 policy applies only to operator-managed files."""
+    from cortana.doctor import _credential_result
+
+    cred = tmp_path / "token"
+    cred.write_text("secret")
+    cred.chmod(0o440)
+    managed = _credential_result("credentials.token", cred, "fix", systemd_managed=True)
+    assert managed.status is Status.PASS
+
+    unmanaged = _credential_result("credentials.token", cred, "fix", systemd_managed=False)
+    assert unmanaged.status is Status.WARN
