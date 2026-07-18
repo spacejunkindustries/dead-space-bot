@@ -55,3 +55,10 @@ def test_relay_mode_accepts_valid(value: str) -> None:
 def test_relay_mode_rejects_unknown() -> None:
     with pytest.raises(ConfigError, match="stt.relay_mode"):
         _build_stt(_stt({"relay_mode": "loose"}))
+
+
+def test_wake_vad_threshold_default_and_bounds() -> None:
+    assert _build_wake(_wake({})).vad_threshold == 0.5
+    assert _build_wake(_wake({"vad_threshold": 0.0})).vad_threshold == 0.0
+    with pytest.raises(ConfigError, match="wake.vad_threshold"):
+        _build_wake(_wake({"vad_threshold": 1.5}))

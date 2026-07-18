@@ -114,10 +114,17 @@ class OpenWakeWordDetector:
     def _build_model(self) -> Any:
         from openwakeword.model import Model  # lazy
 
-        return Model(
-            wakeword_models=[self._holder.current.wake.model],
-            inference_framework="onnx",
-        )
+        cfg = self._holder.current.wake
+        kwargs: dict[str, Any] = {
+            "wakeword_models": [cfg.model],
+            "inference_framework": "onnx",
+        }
+        # Silero VAD gate (GDD §5.3): a wake trigger only counts when the VAD
+        # simultaneously scores speech — music/game-audio/keyboard noise on
+        # busy comms can no longer false-fire on its own. 0.0 disables.
+        if cfg.vad_threshold > 0.0:
+            kwargs["vad_threshold"] = cfg.vad_threshold
+        return Model(**kwargs)
 
     def score(self, user_id: int, frame: bytes) -> float:
         if len(frame) != FRAME_BYTES:
