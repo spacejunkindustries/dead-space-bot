@@ -344,3 +344,65 @@ async def test_timer_and_reminder_polls_wait_for_bot_ready(
             await timer_task
         with contextlib.suppress(asyncio.CancelledError):
             await reminder_task
+
+
+# ── task supervision & bounded shutdown ──────────────────────────────────────
+
+
+class _RecordingLog:
+    """Captures log calls so a test can assert what was (not) emitted."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def _record(self, level: str):
+        def _log(event: str, **_: object) -> None:
+            self.calls.append((level, event))
+
+        return _log
+
+    def __getattr__(self, name: str):
+        return self._record(name)
+
+
+async def _returns_immediately() -> None:
+    return None
+
+
+async def test_clean_task_exit_during_shutdown_does_not_alarm(monkeypatch) -> None:
+    app, *_ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+    rec = _RecordingLog()
+    monkeypatch.setattr(app_main, "log", rec)
+    app._shutdown.set()  # process is already shutting down
+
+    app._spawn("noop", _returns_immediately())
+    await asyncio.gather(*app._tasks)
+
+    assert ("error", "critical_task_exited") not in rec.calls
+
+
+async def test_task_exit_while_running_alarms_and_triggers_shutdown(monkeypatch) -> None:
+    app, *_ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+    rec = _RecordingLog()
+    monkeypatch.setattr(app_main, "log", rec)
+    assert not app._shutdown.is_set()
+
+    app._spawn("noop", _returns_immediately())
+    await asyncio.gather(*app._tasks)
+
+    assert ("error", "critical_task_exited") in rec.calls
+    assert app._shutdown.is_set()  # a task dying mid-run brings the process down
+
+
+async def test_graceful_shutdown_is_bounded(monkeypatch) -> None:
+    app, *_ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+
+    async def _hang() -> None:
+        await asyncio.sleep(100)
+
+    monkeypatch.setattr(app, "_shutdown_sequence", _hang)
+    monkeypatch.setattr(app_main, "_SHUTDOWN_TIMEOUT_S", 0.05)
+
+    # A wedged close must not hang the process: the wait_for bound returns
+    # control promptly instead of blocking until systemd's SIGKILL.
+    await asyncio.wait_for(app._graceful_shutdown(), timeout=2)
