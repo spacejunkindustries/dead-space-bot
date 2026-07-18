@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from aura.config import ConfigError, _build_wake
+from aura.config import ConfigError, _build_stt, _build_wake
 
 _WAKE_BASE = {"model": "wake.onnx", "threshold": 0.55, "refractory_ms": 2000}
 
@@ -28,3 +28,30 @@ def test_wake_ack_accepts_valid_and_normalises_case(value: str) -> None:
 def test_wake_ack_rejects_unknown() -> None:
     with pytest.raises(ConfigError, match="wake.ack"):
         _build_wake(_wake({"ack": "chime"}))
+
+
+_STT_BASE = {
+    "backend": "faster-whisper",
+    "model": "small",
+    "compute_type": "int8",
+    "cpu_threads": 2,
+    "whisper_cpp_url": "http://127.0.0.1:8080/inference",
+}
+
+
+def _stt(extra: dict[str, object]) -> dict[str, dict[str, object]]:
+    return {"stt": {**_STT_BASE, **extra}}
+
+
+def test_relay_mode_defaults_to_framed() -> None:
+    assert _build_stt(_stt({})).relay_mode == "framed"
+
+
+@pytest.mark.parametrize("value", ["framed", "open", "off"])
+def test_relay_mode_accepts_valid(value: str) -> None:
+    assert _build_stt(_stt({"relay_mode": value})).relay_mode == value
+
+
+def test_relay_mode_rejects_unknown() -> None:
+    with pytest.raises(ConfigError, match="stt.relay_mode"):
+        _build_stt(_stt({"relay_mode": "loose"}))

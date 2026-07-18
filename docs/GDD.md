@@ -546,7 +546,15 @@ Within a month of real use, your corp's specific accents, specific mics, and spe
 
 Pilots use phone mics, in noisy rooms, with a game running, stressed and talking fast. AURA is engineered on the assumption that **the transcript is sometimes wrong** — not as a limitation to apologise for, but as a fact the design absorbs. The confirmation loop, the correction buttons, the confidence tiers, and the alias table are not garnish; they are the mechanism by which an imperfect signal produces a reliable tool.
 
-**The freeform relay is confidence-gated.** A transcript that matched no intent posts to the intel channel verbatim (the catch-all) — but only when Whisper's `avg_logprob` clears `stt.relay_min_logprob`. Below that, the transcript is treated as decoded noise ("Rens, Rens, Rens" hallucinated from silence) and AURA says *"Say again the system."* instead of posting garbage. Recognised commands are **never** gated — a distress call always posts. Stuttered three-plus word repeats in relay text collapse to one word, and every relay logs its confidence to `command_log` so the threshold is tuned from data. A successful relay is acknowledged with a spoken *"Relayed."* — without the ack, pilots repeat themselves, and every repeat is another card and another STT decode.
+**The freeform relay is framed by default.** `stt.relay_mode` decides what unmatched speech may become a relay card:
+
+- **`framed`** (default) — only *explicitly framed* intel relays: a *"report …"* opener, a spoken colour code (inline, or inherited from a §6.4 code dialogue), or an all-hands phrase. Anything else that matched no intent gets a spoken *"Say again?"* and posts nothing. The reasoning: an unmatched, unframed transcript is far more likely an STT mishearing or channel crosstalk than intel, and every junk card costs the intel channel trust. Framing is one word of radio procedure the corp already uses.
+- **`open`** — the old catch-all: any unmatched transcript relays.
+- **`off`** — the freeform relay never posts; recognised commands only.
+
+**The relay is also confidence-gated.** Whatever the mode, a relay posts only when Whisper's `avg_logprob` clears `stt.relay_min_logprob`. Below that, the transcript is treated as decoded noise ("Rens, Rens, Rens" hallucinated from silence) and AURA says *"Say again the system."* instead of posting garbage. Recognised commands are **never** gated — a distress call always posts. Stuttered three-plus word repeats in relay text collapse to one word, and every relay logs its confidence to `command_log` so the threshold is tuned from data.
+
+**Relays dedupe like incidents.** Identical relay text (case-insensitive) within `incidents.dedupe_window_s` folds — the pilot hears *"Relayed."* again, but no second card posts. Pilots repeat when they miss the ack; a repeat is not fresh intel. A successful relay is acknowledged with a spoken *"Relayed."* — without the ack, pilots repeat themselves, and every repeat is another card and another STT decode.
 
 ---
 
@@ -700,6 +708,7 @@ Short. Always short. AURA is talking over a fight.
 | Ping sent, scoped | *"Hostiles Otanuomi, pinged home defense."* |
 | Ambiguous system | *"Hostiles Otanuomi — say again to confirm."* |
 | Unresolved system | *"Say again the system."* |
+| No command, no relay frame (§8.6) | *"Say again?"* |
 | Responders | *"Space Junkie responding to Otanuomi."* (callsign/display name; count as fallback) |
 | Resolved | *"Otanuomi clear."* |
 | Timer set | *"Timer Kisogo, four hours."* |
@@ -731,6 +740,8 @@ Personal-ping type words pluralize naturally: *hostiles*, *attacks*, *assist req
 ### 12.3 Audio path
 
 Piper emits raw s16le at the model's native rate. Brain wraps it in a WAV header in memory and ships the bytes to Ears, where Songbird's Symphonia layer parses the header and resamples to 48kHz internally. **No resampling code exists in Brain**, and no temporary files are written.
+
+Piper reloads its voice model on every subprocess spawn (~1s on the droplet), so the short scripted §12.1 lines are rendered once and replayed from an in-memory cache — acknowledgements like *"Go ahead."* and *"Relayed."* play near-instantly. The cache is primed in the background at startup, keyed by (text, voice, effect) so a SIGHUP voice swap misses cleanly, and bounded to the scripted-line pool (long, variable text always synthesises fresh).
 
 ### 12.4 Personality
 
@@ -961,6 +972,13 @@ type 0x03  TTS            Brain→Ears
 { "t": "optouts", "user_ids": ["…", "…"] }   // enforced in Ears, pre-IPC
 ```
 
+Brain replays the current `join` (and the opt-out set) the moment Ears
+(re)connects. A freshly started Ears process reaches the socket before its
+own Discord gateway is READY, so Ears **holds join/leave commands until
+READY** and executes them then — the Songbird manager cannot create calls
+before serenity initialises it, and acting early would crash the voice
+control task.
+
 ---
 
 ## 16. Configuration reference
@@ -1001,6 +1019,7 @@ stt:
   bias_with_gazetteer: true
   whisper_cpp_url: http://127.0.0.1:8080/inference
   relay_min_logprob: -0.9               # freeform-relay confidence gate (§8.6)
+  relay_mode: framed                    # framed | open | off (§8.6)
 
 matching:
   phonetic_weight: 0.6

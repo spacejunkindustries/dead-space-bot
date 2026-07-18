@@ -132,6 +132,13 @@ class SttConfig:
     #: of posting hallucinated noise to the intel channel. Recognised commands
     #: are never gated by this (a distress call always posts).
     relay_min_logprob: float = -0.9
+    #: What unmatched speech may become a relay card (GDD §8.6):
+    #:   framed — only explicitly framed intel ("report …", a spoken colour
+    #:            code, or an all-hands phrase); everything else gets
+    #:            "Say again". The default: mishearings never become cards.
+    #:   open   — any unmatched transcript relays (confidence-gated).
+    #:   off    — the freeform relay never posts; commands only.
+    relay_mode: str = "framed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,11 +363,17 @@ def _build_capture(data: dict[str, Any]) -> CaptureConfig:
     )
 
 
+RELAY_MODES = ("framed", "open", "off")
+
+
 def _build_stt(data: dict[str, Any]) -> SttConfig:
     s = _section(data, "stt")
     backend = _get(s, "stt.backend", str)
     if backend not in STT_BACKENDS:
         raise ConfigError(f"stt.backend: must be one of {list(STT_BACKENDS)}, got {backend!r}")
+    relay_mode = _get(s, "stt.relay_mode", str, default="framed")
+    if relay_mode not in RELAY_MODES:
+        raise ConfigError(f"stt.relay_mode: must be one of {list(RELAY_MODES)}, got {relay_mode!r}")
     return SttConfig(
         backend=backend,
         model=_get(s, "stt.model", str),
@@ -369,6 +382,7 @@ def _build_stt(data: dict[str, Any]) -> SttConfig:
         bias_with_gazetteer=_get(s, "stt.bias_with_gazetteer", bool, default=True),
         whisper_cpp_url=_get(s, "stt.whisper_cpp_url", str),
         relay_min_logprob=float(_get(s, "stt.relay_min_logprob", float, default=-0.9)),
+        relay_mode=relay_mode,
     )
 
 

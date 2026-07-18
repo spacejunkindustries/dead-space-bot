@@ -513,7 +513,23 @@ class App:
                 # (GDD §8.6): post whatever was said to the intel channel rather
                 # than drop it. A nullsec corp's comms are lively and
                 # unstructured — fleet movements, region callsigns, sitreps.
-                # Gate on STT confidence first: a hallucinated transcript
+                # Under relay_mode "framed" (default) only *explicitly framed*
+                # speech qualifies — a "report …" opener, a spoken colour code
+                # (inline or inherited from a code dialogue), or an all-hands
+                # phrase. An unmatched, unframed transcript is far more likely
+                # a mishearing than intel; it gets "Say again", never a card.
+                framed = inherited is not None or grammar.relay_framed(result.text)
+                if cfg.stt.relay_mode == "off" or (cfg.stt.relay_mode == "framed" and not framed):
+                    self.health.record_rejected()
+                    log.info(
+                        "relay_unframed_dropped",
+                        user_id=user_id,
+                        relay_mode=cfg.stt.relay_mode,
+                        text=result.text,
+                    )
+                    await self._speak_or_post(guild_id, user_id, tts_mod.not_understood())
+                    return
+                # Gate on STT confidence: a hallucinated transcript
                 # ("Rens, Rens, Rens" decoded from noise) must not become a
                 # card. Recognised commands are never gated — this protects
                 # the relay path only.

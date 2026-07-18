@@ -107,6 +107,7 @@ def test_catalogue_matches_gdd_12_1_exactly() -> None:
     assert tts.ping_sent("Otanuomi", "home defense") == "Hostiles Otanuomi, pinged home defense."
     assert tts.ambiguous("Hostiles", "Otanuomi") == "Hostiles Otanuomi — say again to confirm."
     assert tts.say_again() == "Say again the system."
+    assert tts.not_understood() == "Say again?"
     assert tts.responders(2, "Otanuomi") == "Two responding to Otanuomi."
     assert tts.resolved("Otanuomi") == "Otanuomi clear."
     assert tts.timer_set("Kisogo", "four hours") == "Timer Kisogo, four hours."
@@ -232,6 +233,52 @@ async def test_say_under_cap_sends_wav(tmp_path, monkeypatch) -> None:
     assert calls[0][0] == "/nonexistent/piper"
     assert "--model" in calls[0] and "--output-raw" in calls[0]
     await speaker.close()
+
+
+async def test_short_line_synthesised_once_then_cached(tmp_path, monkeypatch) -> None:
+    # Piper reloads its model every spawn; scripted lines render once and
+    # replay from the line cache.
+    pcm = b"\x01\x00" * 22050
+    calls = _patch_piper(monkeypatch, pcm)
+    ipc = _FakeIpc()
+    speaker = Speaker(_holder(tmp_path), ipc)  # type: ignore[arg-type]
+
+    assert await speaker.say(1, "Go ahead.") is True
+    assert await speaker.say(1, "Go ahead.") is True
+    assert len(calls) == 1  # second play served from cache
+    assert len(ipc.sent) == 2
+    assert ipc.sent[0][2] == ipc.sent[1][2]  # identical WAV bytes
+    await speaker.close()
+
+
+async def test_long_text_never_cached(tmp_path, monkeypatch) -> None:
+    pcm = b"\x01\x00" * 22050
+    calls = _patch_piper(monkeypatch, pcm)
+    ipc = _FakeIpc()
+    speaker = Speaker(_holder(tmp_path), ipc)  # type: ignore[arg-type]
+
+    long_text = "the situation in the north is developing and " * 3  # > 80 chars
+    assert await speaker.say(1, long_text) is True
+    assert await speaker.say(1, long_text) is True
+    assert len(calls) == 2  # variable text synthesises fresh every time
+    await speaker.close()
+
+
+def test_hot_lines_cover_the_ack_pool() -> None:
+    tts.set_personality("standard")
+    try:
+        lines = tts.hot_lines()
+        assert "Go ahead." in lines
+        assert "Say again?" in lines
+        assert "Relayed." in lines
+        assert "Code orange. Go ahead." in lines
+        assert "Listening." not in lines  # cortana variants only under cortana
+        tts.set_personality("cortana")
+        cortana_lines = tts.hot_lines()
+        assert "Listening." in cortana_lines
+        assert set(lines) <= set(cortana_lines)
+    finally:
+        tts.set_personality("standard")
 
 
 async def test_say_over_cap_drops_and_returns_false(tmp_path, monkeypatch) -> None:

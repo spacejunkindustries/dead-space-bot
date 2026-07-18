@@ -526,6 +526,12 @@ class IncidentEngine:
         # restart an uncertain card keeps its already-posted buttons (persistent
         # views) but re-renders fall back to a confirmed layout.
         self._pending_candidates: dict[int, tuple[MatchCandidate, ...]] = {}
+        # Freeform-relay dedupe (constraint 9 spirit): identical relay text
+        # within incidents.dedupe_window_s folds instead of posting a second
+        # card — pilots repeat when they miss the ack, and STT decodes the
+        # same phrase again. Keyed (guild_id, casefolded text); in-memory
+        # only, bounded by pruning on every use.
+        self._recent_relays: dict[tuple[int, str], datetime] = {}
         # Test seam: all time flows through this attribute; tests replace it.
         self._clock: Callable[[], datetime] = _utcnow
 
@@ -701,6 +707,18 @@ class IncidentEngine:
         card_severity = severity if severity is not None else Severity.NONE
         async with self._lock:
             now = self._clock()
+            # Dedupe: the same relay text again within the incident dedupe
+            # window is a repeat (missed ack, STT double-decode), not fresh
+            # intel — ack the pilot, post nothing.
+            window = timedelta(seconds=self._holder.current.incidents.dedupe_window_s)
+            self._recent_relays = {
+                k: at for k, at in self._recent_relays.items() if now - at <= window
+            }
+            relay_key = (guild_id, text.casefold())
+            if relay_key in self._recent_relays:
+                log.info("relay_deduped", reporter_id=reporter_id, text=text)
+                return IncidentOutcome(Outcome.FOLDED, tts.relayed(), None, None)
+            self._recent_relays[relay_key] = now
             who = self._callsigns.lookup(reporter_id) or f"<@{reporter_id}>"
             content = ""
             cfg = self._holder.current.discord
