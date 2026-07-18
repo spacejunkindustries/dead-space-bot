@@ -1850,3 +1850,42 @@ async def test_responder_click_keeps_verbatim_system_on_unmatched_incident(
     await env.engine.sweep_stale()
     _, _, _, card = env.poster.edits[-1]
     assert field_value(card, "System") == "Taisy"
+
+
+async def test_swallowed_sentence_never_becomes_a_verbatim_card(
+    make_env: Callable[..., Env],
+) -> None:
+    """Live junk card: an assist request whose 'system' was the swallowed
+    sentence 'Please list all available commands' posted as a CODE RED with
+    that text in the System field. A verbatim location longer than 3 words
+    is a mishearing — ask again instead of posting."""
+    import dataclasses as _dc
+
+    env = make_env()
+    parsed = _dc.replace(
+        cmd(Intent.ASSIST_REQUEST, raw="need help please list all available commands"),
+        system_text="Please list all available commands",
+    )
+    outcome = await env.engine.report(GUILD, 42, parsed, None)
+    assert outcome.outcome is Outcome.REJECTED
+    assert env.poster.posts == []  # no junk card
+
+    # Short verbatim locations still ride (the flexible-resolution promise):
+    short = _dc.replace(cmd(Intent.UNDER_ATTACK, raw="under attack moee 8"), system_text="moee 8")
+    outcome = await env.engine.report(GUILD, 42, short, None)
+    assert outcome.outcome is Outcome.POSTED
+    assert field_value(env.poster.posts[-1][3], "System") == "moee 8"
+
+
+async def test_clear_all_resolves_every_active_card(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    a = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    b = await env.engine.report(GUILD, 43, cmd(Intent.GATE_CAMP), high(2, "Kisogo"))
+    assert a.incident_id and b.incident_id
+
+    cleared = await env.engine.clear_all(GUILD)
+    assert sorted(cleared) == sorted([a.incident_id, b.incident_id])
+    # Cards edited in place to a resolved render; rows terminal:
+    assert len(env.poster.edits) >= 2
+    again = await env.engine.clear_all(GUILD)
+    assert again == []  # idempotent: nothing active remains
