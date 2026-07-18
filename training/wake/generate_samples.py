@@ -263,7 +263,15 @@ def stage_rirs(cfg: dict[str, Any]) -> None:
 
 
 def stage_audioset(cfg: dict[str, Any]) -> None:
-    """Fetch one AudioSet shard and convert clips to 16 kHz WAV background noise."""
+    """Fetch one AudioSet shard and convert clips to 16 kHz WAV background noise.
+
+    The upstream mirror (``agkphysics/AudioSet``) restructured in 2026 from
+    tar-of-flac shards (``data/bal_train09.tar``) to parquet shards
+    (``data/bal_train/09.parquet``) — the old paths now 404. Both layouts are
+    supported: ``assets.audioset_file`` names the shard, and the extension
+    picks the decoder. ``assets.audioset_tar`` is honoured as a legacy alias.
+    """
+    import io
     import math
 
     import soundfile as sf
@@ -276,36 +284,68 @@ def stage_audioset(cfg: dict[str, Any]) -> None:
         return
     out_dir.mkdir(parents=True, exist_ok=True)
     work_dir = Path(cfg["paths"]["work_dir"])
-    tar_name = cfg["assets"]["audioset_tar"]
-    tar_path = Path(
+    assets = cfg["assets"]
+    shard_name = assets.get("audioset_file") or assets.get("audioset_tar")
+    if not shard_name:
+        raise RuntimeError("config assets: set audioset_file (or legacy audioset_tar)")
+    shard_path = Path(
         hf_hub_download(
-            repo_id=cfg["assets"]["audioset_repo"],
-            filename=tar_name,
+            repo_id=assets["audioset_repo"],
+            filename=shard_name,
             repo_type="dataset",
             local_dir=str(work_dir / "audioset_raw"),
         )
     )
-    max_clips = int(cfg["assets"]["max_audioset_clips"])
+    max_clips = int(assets["max_audioset_clips"])
+
+    def _write_clip(audio: Any, sr: int, name: str) -> None:
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if sr != 16000:
+            g = math.gcd(16000, sr)
+            audio = resample_poly(audio, 16000 // g, sr // g)
+        write_wav_16k(out_dir / name, audio)
+
     count = 0
-    with tarfile.open(tar_path) as tar:
-        for member in tar:
+    if shard_path.suffix == ".parquet":
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(shard_path)
+        if "audio" not in pf.schema_arrow.names:
+            raise RuntimeError(
+                f"AudioSet parquet shard {shard_name!r} has no 'audio' column "
+                f"(columns: {pf.schema_arrow.names}) — upstream layout changed again"
+            )
+        for batch in pf.iter_batches(batch_size=16, columns=["audio"]):
+            for rec in batch.column("audio").to_pylist():
+                if count >= max_clips:
+                    break
+                raw = rec.get("bytes") if isinstance(rec, dict) else None
+                if not raw:
+                    continue
+                audio, sr = sf.read(io.BytesIO(raw))
+                stem = Path(str(rec.get("path") or f"audioset_{count:05d}")).stem
+                _write_clip(audio, sr, f"{stem}.wav")
+                count += 1
+                if count % 200 == 0:
+                    log.info("AudioSet clips written: %d", count)
             if count >= max_clips:
                 break
-            if not member.isfile() or not member.name.endswith(".flac"):
-                continue
-            fobj = tar.extractfile(member)
-            if fobj is None:
-                continue
-            audio, sr = sf.read(fobj)
-            if audio.ndim > 1:
-                audio = audio.mean(axis=1)
-            if sr != 16000:
-                g = math.gcd(16000, sr)
-                audio = resample_poly(audio, 16000 // g, sr // g)
-            write_wav_16k(out_dir / (Path(member.name).stem + ".wav"), audio)
-            count += 1
-            if count % 200 == 0:
-                log.info("AudioSet clips written: %d", count)
+    else:
+        with tarfile.open(shard_path) as tar:
+            for member in tar:
+                if count >= max_clips:
+                    break
+                if not member.isfile() or not member.name.endswith(".flac"):
+                    continue
+                fobj = tar.extractfile(member)
+                if fobj is None:
+                    continue
+                audio, sr = sf.read(fobj)
+                _write_clip(audio, sr, Path(member.name).stem + ".wav")
+                count += 1
+                if count % 200 == 0:
+                    log.info("AudioSet clips written: %d", count)
     log.info("AudioSet stage done: %d clips in %s", count, out_dir)
 
 

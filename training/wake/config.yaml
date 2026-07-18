@@ -85,7 +85,11 @@ assets:
     validation: validation_set_features.npy
   rir_repo: davidscripka/MIT_environmental_impulse_responses
   audioset_repo: agkphysics/AudioSet
-  audioset_tar: data/bal_train09.tar   # one shard is plenty for augmentation
+  audioset_file: data/bal_train/09.parquet  # one shard is plenty for augmentation.
+                                       # Upstream restructured 2026: parquet shards
+                                       # replaced the old data/bal_trainNN.tar files
+                                       # (which now 404). A .tar path still works
+                                       # against older mirrors.
   fma_repo: rudraml/fma
   fma_subset: small
   max_audioset_clips: 4000
