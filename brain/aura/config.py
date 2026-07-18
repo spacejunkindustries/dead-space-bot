@@ -350,8 +350,19 @@ def _build_discord(data: dict[str, Any]) -> DiscordConfig:
     )
 
 
+def _yaml_offable(value: Any) -> Any:
+    """YAML 1.1 parses a bare ``off``/``no`` as boolean False (and ``on``/
+    ``yes`` as True). For keys whose legal values include the WORD "off",
+    coerce the boolean back to the word so operators don't need quotes —
+    an unquoted ``join_announcement: off`` once crash-looped a deployment."""
+    if value is False:
+        return "off"
+    return value
+
+
 def _join_announcement(s: dict[str, Any]) -> str:
-    mode = str(_get(s, "discord.join_announcement", str, default="daily")).lower()
+    raw = _yaml_offable(_get(s, "discord.join_announcement", object, default="daily"))
+    mode = str(raw).lower()
     if mode not in ("every", "daily", "off"):
         raise ConfigError(
             f"discord.join_announcement: must be one of every|daily|off, got {mode!r}"
@@ -404,7 +415,8 @@ def _build_stt(data: dict[str, Any]) -> SttConfig:
     backend = _get(s, "stt.backend", str)
     if backend not in STT_BACKENDS:
         raise ConfigError(f"stt.backend: must be one of {list(STT_BACKENDS)}, got {backend!r}")
-    relay_mode = _get(s, "stt.relay_mode", str, default="framed")
+    relay_mode = _yaml_offable(_get(s, "stt.relay_mode", object, default="framed"))
+    relay_mode = str(relay_mode).lower()
     if relay_mode not in RELAY_MODES:
         raise ConfigError(f"stt.relay_mode: must be one of {list(RELAY_MODES)}, got {relay_mode!r}")
     return SttConfig(

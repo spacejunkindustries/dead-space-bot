@@ -73,7 +73,14 @@ def load_config(path: Path) -> dict[str, Any]:
     deploy = cfg.setdefault("deploy", {})
     if "bundle_dir" in deploy:
         deploy["bundle_dir"] = str((base / deploy["bundle_dir"]).resolve())
-    for section in ("phrase", "samples", "assets", "augmentation", "training", "validation"):
+    for section in (
+        "phrase",
+        "samples",
+        "assets",
+        "augmentation",
+        "training",
+        "validation",
+    ):
         if section not in cfg:
             raise KeyError(f"config.yaml is missing the '{section}' section")
     return cfg
@@ -120,7 +127,9 @@ def render_oww_config(cfg: dict[str, Any]) -> Path:
         "steps": int(training["steps"]),
         "target_accuracy": float(training["target_accuracy"]),
         "target_recall": float(training["target_recall"]),
-        "target_false_positives_per_hour": float(training["target_false_positives_per_hour"]),
+        "target_false_positives_per_hour": float(
+            training["target_false_positives_per_hour"]
+        ),
         "max_negative_weight": int(training["max_negative_weight"]),
         "batch_n_per_class": dict(training["batch_n_per_class"]),
     }
@@ -196,7 +205,9 @@ def background_dir(cfg: dict[str, Any], index: int) -> str:
 def stage_repos(cfg: dict[str, Any]) -> None:
     """Clone piper-sample-generator and openWakeWord."""
     repos = {
-        cfg["paths"]["piper_sample_generator"]: "https://github.com/rhasspy/piper-sample-generator",
+        cfg["paths"][
+            "piper_sample_generator"
+        ]: "https://github.com/rhasspy/piper-sample-generator",
         cfg["paths"]["openwakeword_repo"]: "https://github.com/dscripka/openWakeWord",
     }
     for dest, url in repos.items():
