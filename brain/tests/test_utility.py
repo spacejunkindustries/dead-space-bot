@@ -7,6 +7,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -35,6 +37,12 @@ from cortana.dsc.cogs.utility import (
     render_poll_embed,
 )
 from cortana.nlu.gazetteer import Gazetteer
+
+
+def _gaz_holder(cfg: GazetteerConfig) -> Any:
+    """Minimal ConfigHolder stand-in (Gazetteer reads holder.current.gazetteer)."""
+    return SimpleNamespace(current=SimpleNamespace(gazetteer=cfg))
+
 
 NOW = datetime(2026, 7, 17, 12, 0, 0, tzinfo=UTC)
 
@@ -75,7 +83,9 @@ def conn() -> sqlite3.Connection:
 def gaz(conn: sqlite3.Connection, tmp_path: Path) -> Gazetteer:
     scope = tmp_path / "gazetteer.yaml"
     scope.write_text("regions:\n  - Home-Region\n", encoding="utf-8")
-    gazetteer = Gazetteer(conn, GazetteerConfig(file=str(scope), home_system="Otanuomi"))
+    gazetteer = Gazetteer(
+        conn, _gaz_holder(GazetteerConfig(file=str(scope), home_system="Otanuomi"))
+    )
     gazetteer.load()
     return gazetteer
 
@@ -110,7 +120,7 @@ def test_path_disconnected_is_none(conn: sqlite3.Connection, tmp_path: Path) -> 
     )
     scope = tmp_path / "gazetteer.yaml"
     scope.write_text("regions:\n  - Home-Region\n", encoding="utf-8")
-    gaz = Gazetteer(conn, GazetteerConfig(file=str(scope), home_system="Otanuomi"))
+    gaz = Gazetteer(conn, _gaz_holder(GazetteerConfig(file=str(scope), home_system="Otanuomi")))
     gaz.load()
     assert gaz.path(1, 7) is None
 

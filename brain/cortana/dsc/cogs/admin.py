@@ -18,10 +18,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from cortana.core import db
-from cortana.core.routing import RoutingConfigError
 
 if TYPE_CHECKING:  # pragma: no cover
     from cortana.dsc.bot import AuraBot
+    from cortana.reload import ReloadResult
 
 __all__ = ["AdminCog"]
 
@@ -58,8 +58,33 @@ class AdminCog(commands.Cog):
                 await interaction.response.send_message(
                     "Admin only — needs Manage Guild or the FC role.", ephemeral=True
                 )
-            return
-        raise error
+        # Anything else falls through to the tree-level error boundary
+        # (AuraBot._on_app_command_error), which is invoked regardless.
+
+    async def _run_reload(self, interaction: discord.Interaction) -> ReloadResult | None:
+        """Run the one reload transaction (the SIGHUP/​/reload door) and
+        report internal failures ephemerally; None means already answered.
+
+        All three config files are validated together and swapped
+        all-or-nothing — a bad gazetteer.yaml or routing.yaml comes back as
+        a rejection line in the receipt (GazetteerError / RoutingConfigError
+        included), never as an unhandled exception + eternal spinner."""
+        request_reload = getattr(self.bot, "request_reload", None)
+        if request_reload is None:
+            await interaction.followup.send(
+                "Reload isn't wired in this process — restart the service instead.",
+                ephemeral=True,
+            )
+            return None
+        try:
+            return await request_reload()
+        except Exception:
+            log.exception("reload_via_slash_failed")
+            await interaction.followup.send(
+                "❌ Reload failed internally — logged. The old config stays in force.",
+                ephemeral=True,
+            )
+            return None
 
     # ── /routing ─────────────────────────────────────────────────────────────
 
@@ -75,19 +100,15 @@ class AdminCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         if action == "reload":
-            roles_by_name = {r.name: r.id for r in guild.roles}
-
-            def resolve_role(name: str) -> int | None:
-                return roles_by_name.get(name.lstrip("@"))
-
-            try:
-                count = await asyncio.to_thread(self.bot.engine.load_routing_rules, resolve_role)
-            except RoutingConfigError as exc:
-                await interaction.followup.send(f"❌ routing.yaml rejected: {exc}", ephemeral=True)
+            result = await self._run_reload(interaction)
+            if result is None:
                 return
+            count = len(getattr(self.bot.engine, "_rules", []))
             log.info("routing_reloaded_via_slash", count=count, user_id=interaction.user.id)
+            marker = "✅" if result.ok else "⚠️"
             await interaction.followup.send(
-                f"✅ Reloaded routing rules: {count} active.", ephemeral=True
+                f"{marker} {result.summary()}\nRouting rules active: {count}.",
+                ephemeral=True,
             )
             return
         await interaction.followup.send(embed=self._rules_embed(guild), ephemeral=True)
@@ -148,8 +169,13 @@ class AdminCog(commands.Cog):
             return
         # reload and prune both rebuild the active set from gazetteer.yaml's
         # scope rules — pruning IS the reload (GDD §8.1: the set stays small).
+        # Runs through the one reload transaction so all three config files
+        # stay in lockstep, and a bad gazetteer.yaml reports its rejection
+        # instead of leaving the admin staring at an eternal spinner.
         before = len(gaz.systems)
-        await asyncio.to_thread(gaz.load)
+        result = await self._run_reload(interaction)
+        if result is None:
+            return
         after = len(gaz.systems)
         log.info(
             "gazetteer_reloaded_via_slash",
@@ -158,8 +184,9 @@ class AdminCog(commands.Cog):
             after=after,
             user_id=interaction.user.id,
         )
+        marker = "✅" if result.ok else "⚠️"
         await interaction.followup.send(
-            f"✅ Gazetteer rebuilt: {before} → {after} systems in the active set.",
+            f"{marker} {result.summary()}\nGazetteer active set: {before} → {after} systems.",
             ephemeral=True,
         )
 

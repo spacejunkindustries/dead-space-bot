@@ -724,6 +724,25 @@ mirrored or reposted.
 
 `#bot-health` receives hourly self-reports: pipeline status, STT confidence distribution, incident counts, mention counts, wake-word false-accept estimate.
 
+**Alarm cards.** Every "I dropped something the corp expects" event flows through the AlarmBus (`brain/cortana/alarms.py`) and appears in `#bot-health` as **one edited-in-place card per active `(code, key)`** — the incident-card invariant (§9.1) applied to operations. A card shows first-seen, last-seen, an occurrence count, and a phone-readable fix hint; repeats edit the card, and on recovery it is edited to a ✅ *resolved* state rather than deleted, so the operator sees that it broke *and* that it healed. Card message ids are persisted in `app_state` (key `alarm:<code>:<key>`), so a Brain restart re-adopts the existing card — restarts never duplicate cards, and an alarm raised before the restart (e.g. `CONFIG_RESTART_PENDING`) is resolved on the same card after it. Raising an alarm before Discord is ready is safe: the card queues dirty and is flushed from the health loop once the bot is up. Every raise/clear is mirrored to journald **code-first** — the structured log *event* is the alarm code, so `journalctl -u cortana-brain | grep EARS_DOWN` works.
+
+The alarm codes are a **closed** enum — a failure class earns a code or it does not get raised:
+
+| Code | Meaning | Raised by / cleared when |
+|---|---|---|
+| `ROUTING_ZERO_RULES` | Zero routing rules active (guild missing, routing.yaml rejected, or genuinely empty) — cards post, nobody is mentioned | rule load at `on_ready` and every reload; cleared when >0 rules load |
+| `ROLE_UNRESOLVED` | routing.yaml names roles that don't exist in the guild; those rules are skipped | rule load; cleared when all names resolve |
+| `CHANNEL_UNWRITABLE` | A configured channel can't be posted to (keyed by channel id) | composition-root channel sends; cleared on the next successful send |
+| `WAKE_FAULTED` | Wake model pool latched after a build failure — frames flow, nothing is scored | health check on the wake fault latch; cleared on rebuild |
+| `STT_DEGRADED` | Transcription degraded: `watchdog` key = respawn-cap latch (cleared by `/reload`/restart); `confidence` key = §20's 10-consecutive-LOW streak | health checks; cleared on unlatch / next confident resolution |
+| `EARS_DOWN` | Ears heartbeat missed or never seen — voice is down, slash path unaffected | health check; cleared on heartbeat recovery or the next Ears `hello` |
+| `CONFIG_RESTART_PENDING` | Restart-class config keys edited but not live | the reload transaction; cleared by a reload with none pending, or by the restart itself |
+| `TREE_SYNC_STALE` | Slash-command sync failed; the previous sync keeps serving | the background tree sync; cleared on the next successful/skipped sync |
+| `TIMER_UNDELIVERED` | A fired timer ping could not be posted to `#intel-alerts` | the timer announcer; cleared on the next delivered ping |
+| `INTERACTION_ERRORS` | A command/component handler failed repeatedly (keyed by command name; card after 3 failures) | the interaction error boundary |
+| `POST_FAILURE` | An incident card post/edit failed (permissions, deleted channel) | the Poster; cleared on the next successful post |
+| `VOICE_ABSENT` | No audio for `health.voice_silence_alarm_s` while Ears is connected and ≥2 unmuted pilots are present (§20 row 1) | health check; cleared when audio flows |
+
 ### 11.4 Fleet-ops mode
 
 `/fleetmode on` restricts voice triggering to the FC role for the duration of a structured op. Slash commands remain open to everyone. This exists because §1.2 is real: during a fleet fight, twenty pilots talking to a bot is worse than no bot.
@@ -1241,6 +1260,15 @@ piper                  # /usr/local/bin/piper
 | **Secrets** | Token in `/etc/cortana/token`, mode 0600, loaded via `LoadCredential=` in the unit file. Never in the YAML, never in the environment, never in the repo. |
 | **Updates** | `systemctl reload cortana-brain` for config; restart for code. Ears stays connected across Brain restarts. |
 | **Accuracy review** | Weekly `command_log` query: confidence distribution, mismatch rate by system, per-pilot failure rate. Feeds §8 tuning. |
+| **Operator slash commands** | `/botstatus`, `/doctor`, `/reload` (all admin-gated: Manage Guild or the FC role). Slash-only is fine — constraint 10 governs the voice→slash direction only. |
+
+**`/botstatus`** — one phone-sized embed: Ears heartbeat state and age, voice-channel presence, STT health (watchdog latch / low-confidence degradation), wake pipeline counters and fault state, dialog sessions in flight, incidents in the last hour, fleet-ops mode, uptime, and the active alarm cards (§11.3). Named `botstatus` because `/status` is the voice QUERY intent's slash twin (the pilots' active-incident summary, §7) and cannot be repurposed.
+
+**`/doctor`** — runs the **offline** preflight checks (`cortana.doctor`, §17) in a worker thread and replies with the PASS/WARN/FAIL table ephemerally, chunked when long. Online checks stay CLI-only (`python -m cortana.doctor --online`) — this command exists precisely for when Discord-adjacent things are broken, so it depends on nothing beyond one followup message.
+
+**`/reload`** — the slash twin of SIGHUP. Both doors call the **same** reload transaction (`cortana.reload.reload_all`, wired by the composition root): all three config files validated together, swapped all-or-nothing, hot/sighup keys applied, engines rebuilt, and the receipt (`ReloadResult.summary()`) returned to the admin and posted to `#bot-health`. The transaction also resets the STT watchdog latch and raises/clears `CONFIG_RESTART_PENDING` (§11.3). `/routing reload` and `/gazetteer reload|prune` run through this same transaction, so the three files can never drift apart, and a rejected file always comes back as a receipt line — never an unanswered spinner.
+
+**Journal grammar** — every alarm transition logs with the alarm code as the event name: `journalctl -u cortana-brain -o cat | grep '"event": "EARS_DOWN"'` (or simply `grep EARS_DOWN`). Slash-command sync activity logs as `app_commands_synced` / `app_commands_sync_skipped` / `app_commands_sync_failed`; command-tree syncs run in the background, gated on a payload hash persisted in `app_state`, and never block or kill startup.
 
 ---
 

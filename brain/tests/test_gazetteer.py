@@ -5,12 +5,21 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from cortana.config import GazetteerConfig
 from cortana.core import db
 from cortana.nlu.gazetteer import Gazetteer, GazetteerError
+
+
+def gaz_holder(cfg: GazetteerConfig) -> Any:
+    """A minimal ConfigHolder stand-in: Gazetteer reads
+    ``holder.current.gazetteer`` inside load() (the holder-snapshot fix)."""
+    return SimpleNamespace(current=SimpleNamespace(gazetteer=cfg))
+
 
 # A small universe: two regions plus a far-away hub chain.
 #
@@ -55,7 +64,7 @@ def make_gazetteer(
     conn: sqlite3.Connection, tmp_path: Path, scope_yaml: str, home: str = "Otanuomi"
 ) -> Gazetteer:
     path = write_scope(tmp_path, scope_yaml)
-    gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system=home))
+    gaz = Gazetteer(conn, gaz_holder(GazetteerConfig(file=str(path), home_system=home)))
     gaz.load()
     return gaz
 
@@ -150,7 +159,8 @@ def test_include_all_config_flag_also_activates(conn: sqlite3.Connection, tmp_pa
     path = write_scope(tmp_path, "regions:\n  - Home-Region\n")
     from cortana.config import GazetteerConfig
 
-    gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system="Otanuomi", include_all=True))
+    cfg = GazetteerConfig(file=str(path), home_system="Otanuomi", include_all=True)
+    gaz = Gazetteer(conn, gaz_holder(cfg))
     gaz.load()
     assert len(gaz.systems) == 6
 
@@ -162,7 +172,7 @@ def test_null_home_system_disables_bias(conn: sqlite3.Connection, tmp_path: Path
     path = write_scope(tmp_path, "regions:\n  - Home-Region\n")
     from cortana.config import GazetteerConfig
 
-    gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system=None))
+    gaz = Gazetteer(conn, gaz_holder(GazetteerConfig(file=str(path), home_system=None)))
     gaz.load()
     assert gaz.home_system_id is None  # home-bias prior inactive, no crash
     names = {e.name for e in gaz.systems}
@@ -178,7 +188,7 @@ def test_empty_systems_table_actionable_error(tmp_path: Path) -> None:
     path = write_scope(tmp_path, "regions:\n  - Home-Region\n")
     from cortana.config import GazetteerConfig
 
-    gaz = Gazetteer(empty, GazetteerConfig(file=str(path), home_system="Otanuomi"))
+    gaz = Gazetteer(empty, gaz_holder(GazetteerConfig(file=str(path), home_system="Otanuomi")))
     with pytest.raises(GazetteerError) as excinfo:
         gaz.load()
     assert str(excinfo.value) == (
@@ -255,38 +265,61 @@ def test_prompt_bias_empty_gazetteer(conn: sqlite3.Connection, tmp_path: Path) -
 
 
 def test_missing_scope_file_raises(conn: sqlite3.Connection, tmp_path: Path) -> None:
-    gaz = Gazetteer(conn, GazetteerConfig(file=str(tmp_path / "nope.yaml"), home_system="X"))
+    cfg = GazetteerConfig(file=str(tmp_path / "nope.yaml"), home_system="X")
+    gaz = Gazetteer(conn, gaz_holder(cfg))
     with pytest.raises(GazetteerError):
         gaz.load()
 
 
 def test_bad_scope_shape_raises(conn: sqlite3.Connection, tmp_path: Path) -> None:
     path = write_scope(tmp_path, "regions: notalist\n")
-    gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system="Otanuomi"))
+    gaz = Gazetteer(conn, gaz_holder(GazetteerConfig(file=str(path), home_system="Otanuomi")))
     with pytest.raises(GazetteerError, match="regions"):
         gaz.load()
 
 
 def test_bad_within_jumps_raises(conn: sqlite3.Connection, tmp_path: Path) -> None:
     path = write_scope(tmp_path, "within_jumps_of:\n  system: Otanuomi\n  jumps: nope\n")
-    gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system="Otanuomi"))
+    gaz = Gazetteer(conn, gaz_holder(GazetteerConfig(file=str(path), home_system="Otanuomi")))
     with pytest.raises(GazetteerError, match="within_jumps_of"):
         gaz.load()
 
 
 def test_unknown_anchor_raises(conn: sqlite3.Connection, tmp_path: Path) -> None:
     path = write_scope(tmp_path, "within_jumps_of:\n  system: Nowhere\n  jumps: 2\n")
-    gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system="Otanuomi"))
+    gaz = Gazetteer(conn, gaz_holder(GazetteerConfig(file=str(path), home_system="Otanuomi")))
     with pytest.raises(GazetteerError, match="Nowhere"):
         gaz.load()
 
 
 def test_failed_reload_keeps_previous_state(conn: sqlite3.Connection, tmp_path: Path) -> None:
     path = write_scope(tmp_path, "regions:\n  - Home-Region\n")
-    gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system="Otanuomi"))
+    gaz = Gazetteer(conn, gaz_holder(GazetteerConfig(file=str(path), home_system="Otanuomi")))
     gaz.load()
     before = gaz.systems
     path.write_text("regions: broken\n", encoding="utf-8")
     with pytest.raises(GazetteerError):
         gaz.load()
     assert gaz.systems == before
+
+
+def test_load_reads_holder_at_point_of_use(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    """The holder-snapshot fix: a config swap (SIGHUP / /reload) changing
+    gazetteer.* is picked up by the NEXT load(), not pinned at construction."""
+    home_scope = write_scope(tmp_path, "regions:\n  - Home-Region\n")
+    holder = gaz_holder(GazetteerConfig(file=str(home_scope), home_system="Otanuomi"))
+    gaz = Gazetteer(conn, holder)
+    gaz.load()
+    assert {e.name for e in gaz.systems} == {"Otanuomi", "Kisogo", "Tannolen"}
+    assert gaz.home_system_id == 1
+
+    # Simulate the reload transaction swapping in a new config: different
+    # scope file, different home system, nomadic include_all.
+    border = tmp_path / "gazetteer2.yaml"
+    border.write_text("regions:\n  - Border-Region\n", encoding="utf-8")
+    holder.current = SimpleNamespace(
+        gazetteer=GazetteerConfig(file=str(border), home_system="Jita")
+    )
+    gaz.load()
+    assert {e.name for e in gaz.systems} == {"Alenia", "Hulmate", "Jita"}
+    assert gaz.home_system_id == 5
