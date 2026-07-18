@@ -250,7 +250,7 @@ cat <<'CHECKLIST'
 
   3. Model files (GDD §4 Assets):
        /opt/cortana/models/wake/     openWakeWord ONNX chain (melspec, embedding,
-                                  and the trained "aura command" model)
+                                  and the trained "hey cortana" model)
        /opt/cortana/models/whisper/  Whisper small int8 CTranslate2 weights
        /opt/cortana/models/piper/    Piper voice .onnx + .onnx.json
 

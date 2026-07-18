@@ -21,9 +21,13 @@ discord:
     intel_alerts: 000000000000000000   # only incidents that mention a role (GDD §11.2)
     intel_live:   000000000000000000   # every incident, no mentions — the firehose
     health:       000000000000000000   # hourly self-reports and degradation alerts
-  roles:
-    pilot: 000000000000000000          # gate: only members with this role may trigger mentions
-    fc:    000000000000000000          # gate: only this role may voice-trigger under fleetmode
+  roles:                               # OPTIONAL — leave keys out (or the whole
+                                       # section) to run without role gates
+    pilot: 000000000000000000          # gate: only members with this role may trigger
+                                       # mentions. Unset/0 = anyone may
+    fc:    000000000000000000          # gate: only this role may voice-trigger under
+                                       # fleetmode (and use admin commands without
+                                       # Manage Guild). Unset/0 = fleetmode restricts nobody
   watch_voice_channels: [000000000000000000]  # voice channels CORTANA watches / auto-joins
   auto_join: true                      # join when a pilot enters, leave when empty
   mentions_enabled: true               # false = silent mode: post cards, ping nobody

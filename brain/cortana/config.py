@@ -47,8 +47,14 @@ class ChannelsConfig:
 
 @dataclass(frozen=True, slots=True)
 class RolesConfig:
-    pilot: int  # gate: may trigger mentions
-    fc: int  # gate under fleetmode
+    """Role-ID gates. 0 = not configured — that gate is simply off: without a
+    pilot role anyone may trigger mentions, without an FC role fleetmode
+    cannot restrict the voice path. The whole ``discord.roles`` section is
+    optional for exactly this reason (an empty ``roles:`` once crash-looped
+    a deployment)."""
+
+    pilot: int = 0  # gate: may trigger mentions
+    fc: int = 0  # gate under fleetmode; also grants admin commands
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +285,19 @@ def _section(data: dict[str, Any], dotted: str) -> dict[str, Any]:
     value = data.get(dotted.rsplit(".", 1)[-1], _MISSING)
     if value is _MISSING:
         raise ConfigError(f"{dotted}: missing required section")
+    # A bare `section:` header with every key commented out parses as None.
+    # Treat it as empty so the error the operator sees names the missing KEY
+    # ("...: missing required key"), not "expected a mapping, got NoneType".
+    if value is None:
+        return {}
+    return _mapping(value, dotted)
+
+
+def _optional_section(data: dict[str, Any], dotted: str) -> dict[str, Any]:
+    """Like :func:`_section` but a missing or empty section is just ``{}``."""
+    value = data.get(dotted.rsplit(".", 1)[-1])
+    if value is None:
+        return {}
     return _mapping(value, dotted)
 
 
@@ -331,7 +350,7 @@ def _non_negative(value: float, dotted: str) -> Any:
 def _build_discord(data: dict[str, Any]) -> DiscordConfig:
     s = _section(data, "discord")
     channels = _section(s, "discord.channels")
-    roles = _section(s, "discord.roles")
+    roles = _optional_section(s, "discord.roles")
     return DiscordConfig(
         token_file=_get(s, "discord.token_file", str),
         guild_id=_get(s, "discord.guild_id", int),
@@ -341,8 +360,8 @@ def _build_discord(data: dict[str, Any]) -> DiscordConfig:
             health=_get(channels, "discord.channels.health", int),
         ),
         roles=RolesConfig(
-            pilot=_get(roles, "discord.roles.pilot", int),
-            fc=_get(roles, "discord.roles.fc", int),
+            pilot=_get(roles, "discord.roles.pilot", int, default=0),
+            fc=_get(roles, "discord.roles.fc", int, default=0),
         ),
         watch_voice_channels=_int_list(s, "discord.watch_voice_channels"),
         auto_join=_get(s, "discord.auto_join", bool, default=True),
