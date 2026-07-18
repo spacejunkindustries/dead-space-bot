@@ -34,6 +34,9 @@ torch-audiomentations==0.11.0
 acoustics==0.2.6
 pronouncing==0.2.0
 datasets==2.14.6
+pyarrow<21                    # datasets 2.14.6 uses pyarrow.PyExtensionType,
+                              # removed in pyarrow 21 — unpinned installs die
+                              # with AttributeError in the RIR download stage
 deep-phonemizer==0.0.19
 
 # Dataset downloads (features, RIRs, AudioSet, FMA)
