@@ -309,12 +309,18 @@ class TimeoutTranscriber:
             if self._generation != stale_generation:
                 return  # a concurrent timeout already respawned
             log.warning("stt_watchdog_fired", timeout_s=self._timeout_s)
-            close = getattr(self._inner, "close", None)
-            if callable(close):
-                close()
+            old = self._inner
             self._inner = self._factory()
             self._generation += 1
             fresh = self._inner
+        # Close the wedged backend OUTSIDE self._lock and on its own thread:
+        # FasterWhisperTranscriber.close() takes the model lock, which the
+        # hung worker may hold for the duration of a stalled load — closing
+        # inline under self._lock would deadlock every future transcribe()
+        # at its lock acquisition, wedging all voice commands permanently.
+        close = getattr(old, "close", None)
+        if callable(close):
+            threading.Thread(target=close, name="aura-stt-close", daemon=True).start()
         # Re-warm the respawned backend OFF the request path: without this,
         # the very next utterance pays the multi-second model reload inside
         # its own watchdog window — the reload→timeout→reload spiral the

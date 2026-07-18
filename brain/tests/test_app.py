@@ -138,9 +138,13 @@ class _Speaker:
 @dataclass
 class _Capture:
     reopened: list[tuple[int, int]] = field(default_factory=list)
+    dropped: list[int] = field(default_factory=list)
 
     def reopen(self, user_id: int, guild_id: int) -> None:
         self.reopened.append((user_id, guild_id))
+
+    def drop_user(self, user_id: int) -> None:
+        self.dropped.append(user_id)
 
 
 class _Bot:
@@ -589,13 +593,55 @@ async def test_override_failure_speaks_fixed_line() -> None:
     assert engine.broadcasts == []
 
 
-async def test_override_disabled_falls_through_to_relay() -> None:
-    # chat.enabled false (default): the same words flow to the normal path.
-    app, engine, _, _, _ = make_app(
+async def test_refresh_chat_follows_config_and_key_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SIGHUP path: flipping chat.enabled (or a key appearing) takes effect on
+    # reload — it used to require a full restart, silently.
+    app, *_ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+    app.holder = StubHolder(make_config(chat_enabled=True))  # type: ignore[assignment]
+    monkeypatch.setattr(app_main, "read_api_key", lambda path: "sk-test")
+    app._refresh_chat()
+    assert app.chat is not None
+    assert app._chat_status == "ready"
+
+    monkeypatch.setattr(app_main, "read_api_key", lambda path: None)
+    app._refresh_chat()
+    assert app.chat is None
+    assert app._chat_status == "no_key"
+
+    app.holder = StubHolder(make_config(chat_enabled=False))  # type: ignore[assignment]
+    app._refresh_chat()
+    assert app.chat is None
+    assert app._chat_status == "disabled"
+
+
+async def test_left_control_purges_per_user_state() -> None:
+    # §19 posture: when a pilot leaves voice, every per-user trace goes.
+    app, _, _, _, capture = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+    stale = ParsedCommand(
+        intent=Intent.HOSTILE_SPOTTED, system_text="x", group_alias=None, detail=None, raw="x"
+    )
+    app._pending_retry[USER] = (stale, 999.0)
+    app._pending_severity[USER] = (Severity.HIGH, 999.0)
+    app._last_audio_at[USER] = 1.0
+    await app._on_control({"t": "left", "user_id": str(USER)})
+    assert capture.dropped == [USER]
+    assert USER not in app._pending_retry
+    assert USER not in app._pending_severity
+    assert USER not in app._last_audio_at
+
+
+async def test_override_while_disabled_speaks_unavailable() -> None:
+    # chat.enabled false: an explicit override request gets the fixed
+    # unavailable line — never a silent fall-through to the grammar, which
+    # used to disguise a down channel as a mishearing/relay.
+    app, engine, _, speaker, _ = make_app(
         roles=[PILOT_ROLE],
         transcriber=_Transcriber(["command override what's the weather in Chicago"]),
         relay_mode="open",
     )
     app.chat = None  # type: ignore[assignment]
     await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert len(engine.broadcasts) == 1  # relayed, not asked
+    assert engine.broadcasts == [] and engine.reports == []
+    assert speaker.said == [(GUILD, "Override channel unavailable.")]

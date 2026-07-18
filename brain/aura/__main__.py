@@ -155,6 +155,8 @@ class App:
         self.gateway: VoiceGateway | None = None
         self.reminders: ReminderService | None = None
         self.chat: ChatClient | None = None
+        self._chat_status = "disabled"
+        self._feed_errors = 0
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         # Fire-and-forget spoken cues (the "go ahead" ack); kept referenced so
@@ -192,13 +194,7 @@ class App:
         self.speaker = Speaker(self.holder, self.ipc)
         await self.speaker.warm()  # prime Piper's model into cache off the hot path
 
-        if cfg.chat.enabled:
-            key = read_api_key(cfg.chat.api_key_file)
-            if key:
-                self.chat = ChatClient(self.holder, key)
-                log.info("override_channel_ready", model=cfg.chat.model)
-            else:
-                log.warning("override_channel_no_key", api_key_file=cfg.chat.api_key_file)
+        self._refresh_chat()
 
         self.transcriber = await asyncio.to_thread(make_transcriber, cfg.stt)
         # Load the Whisper weights now, off the request path: the first real
@@ -235,6 +231,7 @@ class App:
         )
         late_poster.bind(self.bot)
         self.bot.chat = self.chat  # /ask slash twin (GDD §6.6, constraint 10)
+        self.bot.chat_status = self._chat_status
         self.reminders = ReminderService(self.conn, self.bot)
 
         self.gateway = VoiceGateway(self.holder, self.ipc, self.conn, self.bot.announce_join)
@@ -318,6 +315,35 @@ class App:
             log.error("config_reload_failed", error=str(exc))
         else:
             tts_mod.set_personality(self.holder.current.tts.personality)
+            # The override channel follows the reload: flipping chat.enabled
+            # (or dropping a key into place) now takes effect on SIGHUP —
+            # it used to require a full restart, silently.
+            self._refresh_chat()
+
+    def _refresh_chat(self) -> None:
+        """(Re)build the §6.6 ChatClient from the current config + key state.
+
+        Called at setup and after every successful SIGHUP reload. Keeps a
+        status string alongside so /ask can tell an operator *why* the
+        channel is down ("disabled" vs "no key") instead of a generic line.
+        """
+        cfg = self.holder.current
+        if not cfg.chat.enabled:
+            self.chat = None
+            self._chat_status = "disabled"
+        else:
+            key = read_api_key(cfg.chat.api_key_file)
+            if key:
+                if self.chat is None:
+                    self.chat = ChatClient(self.holder, key)
+                self._chat_status = "ready"
+            else:
+                self.chat = None
+                self._chat_status = "no_key"
+        log.info("override_channel_status", status=self._chat_status, model=cfg.chat.model)
+        if self.bot is not None:
+            self.bot.chat = self.chat
+            self.bot.chat_status = self._chat_status
 
     async def _graceful_shutdown(self) -> None:
         log.info("shutting_down")
@@ -361,7 +387,15 @@ class App:
         # is how we detect end-of-speech.
         self._last_audio_at[user_id] = self._loop_time()
         if self.capture is not None:
-            self.capture.feed(user_id, guild_id, pcm)
+            # An exception here would kill the IPC read loop — one bad frame
+            # (or a wake-model failure for one user) must never take down the
+            # whole audio path. Log sparsely: this fires every 20 ms.
+            try:
+                self.capture.feed(user_id, guild_id, pcm)
+            except Exception:
+                self._feed_errors += 1
+                if self._feed_errors == 1 or self._feed_errors % 500 == 0:
+                    log.exception("audio_feed_failed", user_id=user_id, count=self._feed_errors)
 
     @staticmethod
     def _loop_time() -> float:
@@ -426,8 +460,15 @@ class App:
                 await self.gateway.on_ears_hello()
         elif t == "left":
             user_id = msg.get("user_id")
-            if user_id is not None and self.capture is not None:
-                self.capture.drop_user(int(user_id))
+            if user_id is not None:
+                uid = int(user_id)
+                if self.capture is not None:
+                    self.capture.drop_user(uid)
+                # Purge the App-side per-user state too (§19 posture — and
+                # otherwise these dicts grow for every pilot ever heard).
+                self._last_audio_at.pop(uid, None)
+                self._pending_retry.pop(uid, None)
+                self._pending_severity.pop(uid, None)
         elif t == "speaking":
             pass  # informational; talk-over suppression happens in Ears
         else:
@@ -487,11 +528,19 @@ class App:
         # (GDD §6.6). Checked before the grammar so a question containing
         # command words ("what's the status of the war?") is never misread as
         # a report; a non-override utterance passes through untouched.
-        if self.chat is not None and cfg.chat.enabled:
-            query = grammar.override_query(result.text)
-            if query is not None:
+        # An override request while the channel is down gets the fixed
+        # unavailable line — falling through to the grammar used to turn it
+        # into a "Say again"/relay, masquerading as a mishearing.
+        query = grammar.override_query(result.text)
+        if query is not None:
+            if self.chat is not None and cfg.chat.enabled:
                 await self._command_override(guild_id, user_id, query)
-                return
+            else:
+                log.info(
+                    "override_requested_unavailable", user_id=user_id, status=self._chat_status
+                )
+                await self._speak_or_post(guild_id, user_id, tts_mod.override_unavailable())
+            return
 
         parsed = grammar.parse(result.text)
         if parsed is None:
@@ -718,7 +767,15 @@ class App:
         assert self.engine
         while True:
             await asyncio.sleep(_SWEEP_INTERVAL_S)
-            stale = await self.engine.sweep_stale()
+            # Per-iteration guard: a transient Discord/DB error in one sweep
+            # must not kill the supervised task — _spawn treats that as fatal
+            # and restarts the whole process (churning Ears through a DAVE
+            # renegotiation) over what was a one-off REST failure.
+            try:
+                stale = await self.engine.sweep_stale()
+            except Exception:
+                log.exception("sweep_iteration_failed")
+                continue
             if stale:
                 log.info("incidents_marked_stale", ids=stale)
 
@@ -732,9 +789,12 @@ class App:
             # is_ready() is MISSING-safe pre-login; wait_until_ready() is not.
             if not self.bot.is_ready():
                 continue
-            pings = await self.engine.fire_due_timers(datetime.now(UTC))
-            for ping in pings:
-                await self._announce_timer(ping)
+            try:
+                pings = await self.engine.fire_due_timers(datetime.now(UTC))
+                for ping in pings:
+                    await self._announce_timer(ping)
+            except Exception:
+                log.exception("timer_iteration_failed")
 
     async def _reminder_loop(self) -> None:
         assert self.reminders and self.bot
@@ -742,7 +802,10 @@ class App:
             await asyncio.sleep(_TIMER_POLL_INTERVAL_S)
             if not self.bot.is_ready():
                 continue  # don't consume due reminders before Discord is usable
-            await self.reminders.deliver_due(datetime.now(UTC))
+            try:
+                await self.reminders.deliver_due(datetime.now(UTC))
+            except Exception:
+                log.exception("reminder_iteration_failed")
 
     async def _health_loop(self) -> None:
         assert self.health

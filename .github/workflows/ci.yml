@@ -6,10 +6,16 @@ on:
   push:
     paths:
       - "brain/**"
+      # The brain test suite reads the repo-level example configs
+      # (tests/test_routing.py loads config/routing.yaml.example), so a
+      # config-only change must run CI too or a breaking example edit
+      # surfaces later on some unrelated brain PR.
+      - "config/**"
       - ".github/workflows/ci.yml"
   pull_request:
     paths:
       - "brain/**"
+      - "config/**"
       - ".github/workflows/ci.yml"
 
 jobs:

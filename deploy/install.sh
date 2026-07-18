@@ -5,11 +5,13 @@
 #   sudo deploy/install.sh [path/to/aura-ears]
 #
 # The aura-ears binary is NOT built here. The droplet is 2 vCPU and will
-# thrash compiling Songbird with LTO — CI builds the release binary and
-# uploads it as the `aura-ears` workflow artifact (.github/workflows/ci.yml).
-# Download that artifact and pass its path as $1, or place it at
-# deploy/aura-ears before running. If neither exists, the install completes
-# and the checklist tells you what is missing.
+# thrash compiling Songbird with LTO — the RUST workflow
+# (.github/workflows/rust.yml) builds the release binary on every merge to
+# main touching ears/ and publishes it to the `ears-bin` branch, which this
+# script fetches automatically with the clone's credentials. (The same
+# workflow also uploads an `aura-ears` artifact, but artifacts expire after
+# 90 days — the ears-bin branch is the canonical source.) To override, pass
+# a binary path as $1 or place it at deploy/aura-ears before running.
 #
 # This script downloads nothing secret and writes no secrets. The Discord
 # token is provided by YOU at /etc/aura/token (mode 0600) and reaches the
@@ -60,6 +62,13 @@ install -d -m 0755 /opt/aura /opt/aura/bin /opt/aura/brain
 install -d -m 0755 /opt/aura/models/wake /opt/aura/models/whisper /opt/aura/models/piper
 install -d -m 0750 -o root -g aura /etc/aura
 install -d -m 0750 -o aura -g aura /var/lib/aura
+# Pre-create the database with the right owner: the natural way to run the
+# gazetteer seeder is plain `sudo python -m aura.nlu.seed ...`, which would
+# otherwise create aura.db as root:root and crash aura-brain (User=aura)
+# with "attempt to write a readonly database" on its first migration.
+if [[ ! -f /var/lib/aura/aura.db ]]; then
+    install -m 0640 -o aura -g aura /dev/null /var/lib/aura/aura.db
+fi
 
 # ---------------------------------------------------------------- ears binary
 # Stage to a temp file then atomically rename into place. rename(2) succeeds
@@ -120,6 +129,31 @@ fi
 # bytecode now so the runtime never tries to write __pycache__.
 /opt/aura/brain/venv/bin/python -m compileall -q /opt/aura/brain/aura
 
+# ---------------------------------------------------------------- models
+# openWakeWord's melspectrogram/embedding ONNX pair lives in its package
+# resources dir and is NOT shipped in the wheel — without this download the
+# first speech frame kills the audio path at runtime (and ProtectSystem=
+# strict makes a runtime self-download impossible: /opt is read-only to the
+# service). Install-time is the only moment this can happen. Best-effort:
+# a warning here beats a silent runtime failure later.
+echo "==> Fetching openWakeWord feature models (melspec + embedding)"
+/opt/aura/brain/venv/bin/python - <<'PYEOF' || echo "WARNING: openWakeWord model download failed — voice will not start until it succeeds (re-run install.sh with network access)"
+import openwakeword.utils
+# No-arg call fetches the feature models plus the pretrained wake models
+# (~50 MB total) — includes hey_jarvis, the interim wake phrase.
+openwakeword.utils.download_models()
+PYEOF
+
+# Whisper weights: pre-fetch into the model dir the GDD documents so first
+# start never blocks on (or crash-loops against) HuggingFace. Best-effort.
+if [[ ! -d /opt/aura/models/whisper/small ]]; then
+    echo "==> Fetching faster-whisper 'small' weights to /opt/aura/models/whisper/small"
+    /opt/aura/brain/venv/bin/python - <<'PYEOF' || echo "WARNING: whisper download failed — stt.model: small will fetch from HuggingFace at first start instead"
+from faster_whisper import download_model
+download_model("small", output_dir="/opt/aura/models/whisper/small")
+PYEOF
+fi
+
 # ---------------------------------------------------------------- config
 # Copy examples only if absent — never clobber a live, tuned config.
 echo "==> Installing config examples (existing files untouched)"
@@ -158,6 +192,17 @@ systemd-tmpfiles --create /etc/tmpfiles.d/aura.conf
 systemctl daemon-reload
 systemctl enable aura-brain.service aura-ears.service
 
+# A live Brain keeps running OLD code after the rsync above — worse, its lazy
+# imports (first voice "help", first STT load) would then read NEW module
+# files mid-flight, raising ImportError hours later at 02:00. Restart it now
+# if it is running; a stopped/fresh install is left alone (the checklist's
+# `systemctl start` covers that). Ears is safe live (atomic rename, old
+# inode) and restarts on its own schedule.
+if systemctl is-active --quiet aura-brain.service; then
+    echo "==> Restarting aura-brain (source tree was just replaced under it)"
+    systemctl restart aura-brain.service
+fi
+
 # ---------------------------------------------------------------- checklist
 cat <<'CHECKLIST'
 
@@ -181,9 +226,13 @@ cat <<'CHECKLIST'
 
   5. Seed the gazetteer (scoped to your region, ~100-500 systems — do NOT
      load the full SDE) and run /gazetteer rebuild once the bot is up.
+     Run the seeder AS THE SERVICE USER so the database stays writable:
+       sudo -u aura /opt/aura/brain/venv/bin/python -m aura.nlu.seed \
+           --db /var/lib/aura/aura.db ...
 
-  6. If /opt/aura/bin/aura-ears is missing, fetch the 'aura-ears' artifact
-     from the latest green CI run and install it there (mode 0755).
+  6. If /opt/aura/bin/aura-ears is missing, re-run this script once the
+     ears-bin branch exists (rust.yml publishes it on every merge to main
+     touching ears/), or install a binary there yourself (mode 0755).
 
   7. Firewall: ufw deny incoming except SSH. AURA opens no listening ports.
 

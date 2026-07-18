@@ -89,8 +89,13 @@ class IntelCog(commands.Cog):
             await interaction.response.send_message("Guild only.", ephemeral=True)
             return
         member = interaction.user
-        if intent in _MENTION_INTENTS and not self.bot.discipline.may_mention(
-            r.id for r in member.roles
+        # Constraint 10 parity with the voice path: silent mode lifts the
+        # Pilot gate — with pings off there is no mention to protect, so
+        # anyone may post (and no roles need wiring up first).
+        if (
+            self.bot.holder.current.discord.mentions_enabled
+            and intent in _MENTION_INTENTS
+            and not self.bot.discipline.may_mention(r.id for r in member.roles)
         ):
             await interaction.response.send_message(
                 "Reporting requires the Pilot role (GDD §11.1).", ephemeral=True

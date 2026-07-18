@@ -59,6 +59,7 @@ from aura.types import (
     MatchCandidate,
     Outcome,
     ParsedCommand,
+    PostError,
     PriorContext,
     Resolution,
     ResponderState,
@@ -742,7 +743,12 @@ class IncidentEngine:
                     "footer": {"text": "AURA voice relay"},
                 }
             )
-            await self._poster.post(guild_id, AlertChannel.ALERTS, content, card)
+            try:
+                await self._poster.post(guild_id, AlertChannel.ALERTS, content, card)
+            except PostError as exc:
+                del self._recent_relays[relay_key]  # a failed relay is not "seen"
+                log.warning("relay_post_failed", reporter_id=reporter_id, error=str(exc))
+                return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
         await asyncio.to_thread(
             db.execute,
             self._conn,
@@ -955,7 +961,21 @@ class IncidentEngine:
             if flood_announced
             else _mention_content(decision)
         )
-        channel_id, message_id = await self._poster.post(guild_id, decision.channel, content, card)
+        try:
+            channel_id, message_id = await self._poster.post(
+                guild_id, decision.channel, content, card
+            )
+        except PostError as exc:
+            # Roll the incident back: an ACTIVE row with no message would
+            # silently fold every duplicate report into a card that exists
+            # nowhere — pilots would hear confirmations for an alert nobody
+            # can see. The pilot is told the post failed instead.
+            self._pending_candidates.pop(incident_id, None)
+            await asyncio.to_thread(
+                db.execute, self._conn, "DELETE FROM incidents WHERE id = ?", (incident_id,)
+            )
+            log.warning("incident_rolled_back_post_failed", incident_id=incident_id, error=str(exc))
+            return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
         await asyncio.to_thread(
             db.execute,
             self._conn,
@@ -1226,14 +1246,23 @@ class IncidentEngine:
                 return stale
 
             stale = await asyncio.to_thread(_sweep)
+            cards: list[tuple[Incident, CardRender]] = []
             for incident in stale:
+                # STALE is a terminal state for unconfirmed cards — drop their
+                # candidate lists or they leak for the process lifetime.
+                self._pending_candidates.pop(incident.id, None)
                 system_name = self._system_name(incident.system_id, "unknown")
-                card = self._render(incident, system_name)
-                if incident.channel_id is not None and incident.message_id is not None:
-                    await self._poster.edit(incident.channel_id, incident.message_id, "", card)
-            if stale:
-                log.info("incidents_stale", ids=[i.id for i in stale])
-            return [i.id for i in stale]
+                cards.append((incident, self._render(incident, system_name)))
+        # Card edits happen OUTSIDE the engine lock: discord.py can sleep on
+        # rate-limit buckets mid-edit, and holding the lock through a
+        # multi-card sweep would block every report, fold, and button press
+        # for the duration (button interactions have a 3s answer window).
+        for incident, card in cards:
+            if incident.channel_id is not None and incident.message_id is not None:
+                await self._poster.edit(incident.channel_id, incident.message_id, "", card)
+        if stale:
+            log.info("incidents_stale", ids=[i.id for i in stale])
+        return [i.id for i in stale]
 
     # ── timers and form-ups (GDD §13) ────────────────────────────────────────
 

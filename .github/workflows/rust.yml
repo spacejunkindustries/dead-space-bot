@@ -20,7 +20,11 @@ on:
 jobs:
   rust:
     name: ears (Rust)
-    runs-on: ubuntu-latest
+    # Pinned to the droplet's OS (deploy/install.sh targets Ubuntu 24.04):
+    # the published binary must link the droplet's glibc. ubuntu-latest will
+    # eventually retarget to a newer release whose glibc the droplet lacks —
+    # the sha256 check can't catch that (it authenticates content, not ABI).
+    runs-on: ubuntu-24.04
     permissions:
       contents: write   # push the built binary to the ears-bin branch
     defaults:

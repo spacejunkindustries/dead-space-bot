@@ -30,6 +30,7 @@ __all__ = [
     "MatchCandidate",
     "Outcome",
     "ParsedCommand",
+    "PostError",
     "PriorContext",
     "Resolution",
     "ResponderState",
@@ -39,6 +40,13 @@ __all__ = [
     "Tier",
     "TranscriptResult",
 ]
+
+
+class PostError(RuntimeError):
+    """A Discord card post failed (permissions, deleted channel, REST error).
+
+    Raised by the Poster so the engine can roll back the incident row instead
+    of leaving an invisible ACTIVE incident that folds away later reports."""
 
 
 class Intent(StrEnum):

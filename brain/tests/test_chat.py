@@ -78,6 +78,15 @@ async def test_cooldown_is_per_user_and_shared_across_surfaces() -> None:
     await client.ask(43, "different pilot")  # unaffected
 
 
+async def test_failed_ask_does_not_burn_cooldown() -> None:
+    # The cooldown arms on SUCCESS only: after "Override unavailable" the
+    # pilot's immediate retry must reach the API, not a throttle message.
+    client, _ = make_client([_response("", stop_reason="refusal"), _response("recovered")])
+    with pytest.raises(ChatError):
+        await client.ask(42, "q")
+    assert await client.ask(42, "q") == "recovered"
+
+
 async def test_pause_turn_is_resumed() -> None:
     paused = SimpleNamespace(
         stop_reason="pause_turn",
