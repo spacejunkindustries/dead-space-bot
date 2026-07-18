@@ -111,9 +111,13 @@ if [[ -f "${EARS_BINARY}" ]]; then
     echo "==> Installing cortana-ears binary from ${EARS_BINARY}"
     install -m 0755 "${EARS_BINARY}" "${EARS_TMP}"
     mv -f "${EARS_TMP}" "${EARS_DEST}"
-elif git -C "${REPO_ROOT}" fetch --quiet --depth 1 origin ears-bin 2>/dev/null; then
+elif git -C "${REPO_ROOT}" fetch --quiet --depth 1 origin ears-bin 2>/dev/null \
+        && git -C "${REPO_ROOT}" cat-file -e FETCH_HEAD:cortana-ears 2>/dev/null; then
     # CI publishes the release binary (built on every merge to main) to the
     # ears-bin branch, reachable with the same credentials as the clone.
+    # The cat-file guard matters: running install.sh in the minute before CI
+    # finishes publishing used to hard-abort the whole script mid-install
+    # (set -e) — leaving migrations done but no service units installed.
     echo "==> Installing cortana-ears binary from origin/ears-bin"
     git -C "${REPO_ROOT}" show FETCH_HEAD:cortana-ears > "${EARS_TMP}"
     git -C "${REPO_ROOT}" show FETCH_HEAD:cortana-ears.sha256 \
