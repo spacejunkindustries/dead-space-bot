@@ -460,3 +460,14 @@ def test_wants_all_hands() -> None:
 
     assert wants_all_hands("cyno up in MOEE-8, all hands")
     assert not wants_all_hands("blop fleet moving to Moe 8")
+
+
+@pytest.mark.parametrize(
+    "signoff",
+    ["over", "over!", "rover", "over and out", "over out", "ova"],
+)
+def test_over_variants_stripped(signoff: str) -> None:
+    p = parse(f"hostiles Jita {signoff}")
+    assert p is not None
+    assert p.intent is Intent.HOSTILE_SPOTTED
+    assert p.system_text == "Jita"

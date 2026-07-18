@@ -29,7 +29,7 @@ import asyncio
 import re
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -88,17 +88,25 @@ _TYPE_LABELS: dict[Intent, str] = {
 _SEVERITY_EMOJI: dict[Severity, str] = {
     Severity.HIGH: "🔴",
     Severity.MEDIUM: "🟠",
-    Severity.NONE: "🔵",
+    Severity.NONE: "🟡",
+}
+
+#: Spoken/written threat level shown on the card — red/orange/yellow so the
+#: severity reads at a glance (and can drive pings via discord.here_on_severity).
+_SEVERITY_CODE: dict[Severity, str] = {
+    Severity.HIGH: "CODE RED",
+    Severity.MEDIUM: "CODE ORANGE",
+    Severity.NONE: "CODE YELLOW",
 }
 
 _COLOR_BY_SEVERITY: dict[Severity, int] = {
     Severity.HIGH: 0xED4245,  # red
     Severity.MEDIUM: 0xE67E22,  # orange
-    Severity.NONE: 0x3498DB,  # blue
+    Severity.NONE: 0xF1C40F,  # yellow
 }
 _COLOR_RESOLVED = 0x95A5A6  # grey
 _COLOR_STALE = 0x607D8B  # dim slate
-_COLOR_BROADCAST = 0x3498DB  # blue — freeform intel relay (GDD §8.6)
+_COLOR_BROADCAST = 0xF1C40F  # yellow — freeform intel relay is CODE YELLOW (GDD §8.6)
 
 _GROUP_ALIAS_SPOKEN: dict[str, str] = {
     "miners": "miners",
@@ -342,7 +350,9 @@ def render_card(
         color = _COLOR_BY_SEVERITY[incident.severity]
 
     label = _TYPE_LABELS.get(incident.type, str(incident.type))
-    title = f"{emoji} {label} — {system_name}"
+    code = _SEVERITY_CODE.get(incident.severity) if status is IncidentStatus.ACTIVE else None
+    prefix = f"{emoji} {code} · " if code else f"{emoji} "
+    title = f"{prefix}{label} — {system_name}"
 
     desc_lines: list[str] = []
     if incident.detail:
@@ -687,7 +697,7 @@ class IncidentEngine:
                 content = "@here"
             card = CardRender(
                 embed={
-                    "title": "📡 Intel relay",
+                    "title": "🟡 CODE YELLOW · Intel relay",
                     "description": text,
                     "color": _COLOR_BROADCAST,
                     "timestamp": _iso(now),
@@ -872,6 +882,11 @@ class IncidentEngine:
             personal=self._personal_pings.rules_for(guild_id),
         )
         decision = apply_group_alias(decision, parsed.group_alias, self._rules, self._alias_roles)
+        # Ping-by-colour (GDD §11.3): a threat level in here_on_severity fires
+        # an @here on its own, so a corp gets CODE RED alerts without wiring up
+        # a single routing rule. Silent mode still wins below.
+        if str(severity) in self._holder.current.discord.here_on_severity:
+            decision = replace(decision, here=True)
         if not self._holder.current.discord.mentions_enabled:
             decision = suppress_decision(decision)  # silent mode: post, ping nobody
         flood_announced = False

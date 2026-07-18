@@ -1079,15 +1079,16 @@ async def test_personal_ping_rides_reporter_cooldown(make_env: Callable[..., Env
     assert out.utterance == "Gate camp Kisogo, posted."
 
 
-async def test_ping_me_never_causes_here_even_for_escalatable_types(
+async def test_personal_ping_never_manufactures_here_on_non_red(
     make_env: Callable[..., Env],
 ) -> None:
-    """UNDER_ATTACK escalates via the HD role rule; strip the roles and a
-    personal subscriber alone must never produce @here (constraint 11)."""
+    """A personal subscriber alone must never produce @here on a non-CODE-RED
+    incident (constraint 11): a CODE ORANGE sighting stays a user mention only.
+    (CODE RED @heres by severity — see test_here_on_severity_pings_red.)"""
     env = make_env()
     env.engine._rules = []  # noqa: SLF001 — isolate the personal path
-    await env.engine.report(GUILD, 99, ping_cmd("UNDER_ATTACK"), None)
-    await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    await env.engine.report(GUILD, 99, ping_cmd("HOSTILE_SPOTTED"), None)
+    await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
     _, _, content, _ = env.poster.posts[-1]
     assert content == "<@99>"
     assert "@here" not in content
@@ -1138,3 +1139,27 @@ async def test_silent_mode_posts_without_pinging(make_env: Callable[..., Env]) -
     b = await env.engine.broadcast(GUILD, 42, "cyno up, all hands", here=True)
     assert b.outcome is Outcome.POSTED
     assert env.poster.posts[-1][2] == ""  # silent even with all-hands
+
+
+async def test_card_shows_threat_code(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    _, _, _, card = env.poster.posts[-1]
+    assert "CODE RED" in card.embed["title"]
+    await env.engine.report(GUILD, 43, cmd(Intent.HOSTILE_SPOTTED), high(2, "Kisogo"))
+    _, _, _, card2 = env.poster.posts[-1]
+    assert "CODE ORANGE" in card2.embed["title"]
+
+
+async def test_here_on_severity_pings_red_without_rules(make_env: Callable[..., Env]) -> None:
+    # Ping-by-colour: CODE RED fires @here even with no routing rules, when
+    # mentions are enabled and "high" is in here_on_severity (the default).
+    env = make_env()  # mentions_enabled defaults True, here_on_severity ("high",)
+    out = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    assert out.outcome is Outcome.POSTED
+    _, _, content, _ = env.poster.posts[-1]
+    assert "@here" in content
+    # CODE ORANGE (medium) does not, by default.
+    await env.engine.report(GUILD, 43, cmd(Intent.HOSTILE_SPOTTED), high(2, "Kisogo"))
+    _, _, content2, _ = env.poster.posts[-1]
+    assert "@here" not in content2

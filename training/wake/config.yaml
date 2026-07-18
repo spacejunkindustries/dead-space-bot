@@ -12,11 +12,11 @@ phrase:
   # fair game; unrelated phrases are not (train a separate model instead —
   # e.g. "hey overseer", the GDD §5.2 supported alternative).
   target_phrases:
-    - "aura command"
-    - "ora command"          # same pronunciation, nudges some TTS voices off "OW-ra"
-  # Becomes the output filename: <model_name>.onnx. aura.yaml expects
-  # /opt/aura/models/wake/aura_command.onnx, so keep this in sync.
-  model_name: aura_command
+    - "hey cortana"
+    - "hey cortauna"         # spelling variant nudging some TTS voices onto "kor-TAH-na"
+  # Becomes the output filename: <model_name>.onnx. Point aura.yaml's wake.model
+  # at /opt/aura/models/wake/hey_cortana.onnx once this is trained and deployed.
+  model_name: hey_cortana
 
   # Adversarial negatives (GDD §5.2 — the false-fire concern is the whole
   # point). Phonetically-adjacent phrases and EVE comms vocabulary that fleet
@@ -24,26 +24,24 @@ phrase:
   # openWakeWord additionally auto-generates adversarial texts derived from
   # the target phrase itself, so this list is a supplement, not the universe.
   custom_negative_phrases:
-    - "aura"
-    - "or a command"
-    - "our command"
-    - "a command"
-    - "the command"
-    - "commander"
-    - "aura commander"
-    - "on our command"
-    - "your command"
-    - "at your command"
-    - "an hour of command"
-    - "aura come on"
-    - "aura calm down"
+    - "cortana"
+    - "hey cortan"
+    - "hey katana"
+    - "hey cordova"
+    - "hey karina"
+    - "hey montana"
+    - "cortana's"
+    - "hey cortina"
+    - "hey quran"
+    - "corp tana"
+    - "hey there"
+    - "hey córdoba"
     - "concord"
     - "capsuleer"
     - "fleet command"
     - "fleet commander"
-    - "warp command"
-    - "corp command"
-    - "wing command"
+    - "corp comms"
+    - "wing commander"
 
 samples:
   # Positive clips for training / for held-out validation. The upstream

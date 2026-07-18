@@ -73,7 +73,12 @@ _JARGON_NORMALIZE: tuple[tuple[re.Pattern[str], str], ...] = (
 # part of the report, so they are stripped before parsing (the trailing
 # silence after them is what actually ends the capture).
 _SIGNOFF_RE = re.compile(
-    r"[\s,.;:!?-]*\b(?:over\s+and\s+out|over|out|copy|roger)\b[\s,.;:!?-]*$", re.I
+    r"[\s,.;:!?-]*\b(?:"
+    r"over\s+and\s+out|over\s+out|overandout|over|out|copy|roger|clear\s+skies"
+    # common STT renderings of "over" at the tail of a transmission
+    r"|rover|ova|oveur|ovah"
+    r")\b[\s,.;:!?-]*$",
+    re.I,
 )
 
 
