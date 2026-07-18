@@ -299,6 +299,30 @@ The phrase is configurable. The 6-phoneme / no-collision rule is not optional �
 
 **Gazetteer biasing** is applied on every call: the active system list is passed as Whisper's `initial_prompt`, pulling decoding toward real system names instead of English word salad.
 
+### 5.4 The dialog engine — one state machine, one clock, one door
+
+Everything conversational — say-again retries, the "code *colour*" opener, the bare "command override" question flow, endpointing, timeouts — runs through **one per-user state machine** (`brain/cortana/dialog/`). This section is the contract; the transition function is pure and table-tested against it.
+
+*History note: dialog state used to be five independent wall-clock dicts plus a frame-counted reopen window. Discord DTX sends no packets during silence, so the frame-counted half could never expire while the meaning half aged out on its own clock — the direct cause of the say-again loop, stuck-open wake-free windows, and mid-question interruption incidents. This design replaces that, and its three rules are what make those classes unreachable.*
+
+**States.** `IDLE → LISTENING (capture open) → THINKING (STT/engine) → IDLE`, plus four `AWAIT_*` states in which a wake-free window is armed: `AWAIT_REPEAT` (say-again), `AWAIT_RETRY_SYSTEM` (§8.3 LOW-tier rebind), `AWAIT_SEVERITY_REPORT` (§6.4 code opener), `AWAIT_OVERRIDE_QUESTION` (§6.6).
+
+**Rule 1 — one door.** The machine's `fail()` / `open_subdialog()` helpers are the *only* code paths that can arm a wake-free capture window. Every failure class — STT error, unmatched speech, low-confidence transcript, override noise, LOW-tier rejection — flows through the same door and draws on one per-dialog **retry budget** (`dialog.max_retries`, default 2, shared with deliberate subdialog openers). Only a fresh wake refills the budget; exhaustion always terminates *audibly* ("Standing down. Wake me to retry."). A self-sustaining reopen loop is structurally impossible, not merely guarded against.
+
+**Rule 2 — one clock.** All dialog timing lives in the engine's 100 ms wheel on the event loop's monotonic clock: DTX-tolerant utterance endpointing (`max(capture.endpoint_silence_ms, dialog.endpoint_gap_floor_ms)` of packet silence, gated by `dialog.ack_grace_ms` after any prompt), armed-window expiry (`dialog.window_ms` of real time, frames or no frames), and the `AWAIT_*` TTLs (same deadline as their window). The capture layer keeps exactly one frame-counted duration — the hard cap — because frames flow while a pilot is actually talking.
+
+**Rule 3 — generation tokens.** Every window arm and capture open mints/carries a generation token; emissions, STT results, and deadlines are dropped when their token is stale instead of being misattributed to a newer dialog. Pending context (an inherited severity, a retry rebind, an open override question) lives *in the session* and is consumed by the utterance its window actually captured — STT latency can never expire it mid-flight.
+
+Further contract points:
+
+- A capture that sees **zero speech frames** after opening (a wake-word tail and nothing else) is discarded before STT: no decode, no "Say again?", no retry spent, and the buffer is dropped at the capture layer (constraint 5).
+- A window-opened capture never plays the wake acknowledgement — the prompt that armed the window *was* the acknowledgement.
+- An inherited severity ("code orange" → next utterance) marks the continuation **severity-carrying but not framed**: it must still pass `relay_framed()` or parse as a command. Hallucinated noise can no longer mint a coloured card.
+- Override continuations are confidence-gated (`stt.relay_min_logprob`) before any paid API call.
+- Sessions are purged redundantly — IPC `left`, `on_voice_state_update` (authoritative; survives an Ears outage), and wholesale on every Ears `hello` — so no single restarting component can strand a wake-free window.
+
+Config: the optional `dialog:` section (`window_ms`, `ack_grace_ms`, `endpoint_gap_floor_ms`, `max_retries`) — §16. The timing defaults are the values tuned on live fleet audio; expect them to move.
+
 ---
 
 ## 6. Voice command reference
