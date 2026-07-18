@@ -12,9 +12,9 @@ mod playback;
 mod state;
 mod voice;
 
+use std::process::ExitCode;
 use std::sync::Arc;
 
-use anyhow::{Context as AnyhowContext, Result};
 use serenity::async_trait;
 use serenity::client::{Client, Context, EventHandler};
 use serenity::model::gateway::{GatewayIntents, Ready};
@@ -41,8 +41,10 @@ impl EventHandler for GatewayHandler {
 
 /// `sysexits.h` EX_CONFIG: configuration error. The deploy units set
 /// `RestartPreventExitStatus=78` so a bad config edit stops the service
-/// cleanly instead of crash-looping it.
-const EXIT_CONFIG: i32 = 78;
+/// cleanly instead of crash-looping it. Both the `--check` preflight and
+/// the service path itself exit with this code on config-class failures
+/// (unreadable/invalid config file, unreadable token credential).
+const EXIT_CONFIG: u8 = 78;
 
 /// Parsed command line: `cortana-ears [--version|--check] [CONFIG]`.
 struct Cli {
@@ -73,7 +75,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
 /// actually constructs. Returns the process exit code and prints one human
 /// line per problem — this is an interactive CLI mode, deliberately stdout,
 /// not tracing.
-fn run_check(config_path: &str) -> i32 {
+fn run_check(config_path: &str) -> u8 {
     let cfg = match config::load(std::path::Path::new(config_path)) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -115,7 +117,7 @@ fn run_check(config_path: &str) -> i32 {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     let cli = parse_cli(std::env::args().skip(1));
     if cli.version {
         // Human/CLI output on purpose (matches --check): the protocol version
@@ -125,17 +127,32 @@ async fn main() -> Result<()> {
             env!("CARGO_PKG_VERSION"),
             ipc::IPC_PROTOCOL_VERSION
         );
-        return Ok(());
+        return ExitCode::SUCCESS;
     }
     if cli.check {
-        std::process::exit(run_check(&cli.config_path));
+        return ExitCode::from(run_check(&cli.config_path));
     }
 
     init_tracing();
 
+    // Config-class failures exit EXIT_CONFIG (78), same as `--check`, so the
+    // unit's `RestartPreventExitStatus=78` stops the service cleanly instead
+    // of crash-looping a bad config edit.
     let cfg_path = cli.config_path;
-    let cfg = config::load(std::path::Path::new(&cfg_path))?;
-    let token = config::read_token(&cfg)?;
+    let cfg = match config::load(std::path::Path::new(&cfg_path)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            error!(error = format!("{e:#}"), config = %cfg_path, "config load failed");
+            return ExitCode::from(EXIT_CONFIG);
+        },
+    };
+    let token = match config::read_token(&cfg) {
+        Ok(token) => token,
+        Err(e) => {
+            error!(error = format!("{e:#}"), "token credential unreadable");
+            return ExitCode::from(EXIT_CONFIG);
+        },
+    };
     info!(
         config = %cfg_path,
         socket = %cfg.socket_path.display(),
@@ -157,11 +174,17 @@ async fn main() -> Result<()> {
     let (ready_tx, ready_rx) = watch::channel(false);
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
-    let mut client = Client::builder(&token, intents)
+    let mut client = match Client::builder(&token, intents)
         .event_handler(GatewayHandler { ready_tx })
         .register_songbird_with(Arc::clone(&manager))
         .await
-        .context("building serenity client")?;
+    {
+        Ok(client) => client,
+        Err(e) => {
+            error!(error = %e, "building serenity client failed");
+            return ExitCode::FAILURE;
+        },
+    };
 
     let ipc_task = tokio::spawn(ipc::run_ipc(
         cfg.socket_path.clone(),
@@ -192,16 +215,22 @@ async fn main() -> Result<()> {
         shard_manager.shutdown_all().await;
     });
 
-    if let Err(e) = client.start().await {
+    // A fatal client error (revoked token, unrecoverable gateway failure)
+    // must exit nonzero — systemd treats exit 0 as "Succeeded" and an
+    // operator scanning `systemctl status` would never look twice at it.
+    let exit = if let Err(e) = client.start().await {
         error!(error = %e, "serenity client exited with error");
-    }
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    };
 
     // Gateway is down; stop the worker tasks.
     ipc_task.abort();
     voice_task.abort();
     playback_task.abort();
     info!("ears stopped");
-    Ok(())
+    exit
 }
 
 /// Wait for SIGINT or SIGTERM; returns the signal name for logging.
