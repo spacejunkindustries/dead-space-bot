@@ -1819,3 +1819,34 @@ def test_rules_path_resolver_is_reread_on_every_load(tmp_path: Path) -> None:
 
     active["path"] = path_b  # the operator repointed routing.file + /reload
     assert engine.load_routing_rules(ROLE_IDS.get) == 0
+
+
+async def test_responder_click_keeps_verbatim_system_on_unmatched_incident(
+    make_env: Callable[..., Env],
+) -> None:
+    """Live incident (review finding #19): a report whose system never
+    resolved posts the heard name verbatim — and the FIRST responder button
+    press re-rendered the card with 'unknown' because respond() reloaded the
+    incident without raw_system_text. Every re-render path must keep the
+    verbatim name."""
+    env = make_env()
+    import dataclasses as _dc
+
+    parsed = _dc.replace(
+        cmd(Intent.UNDER_ATTACK, raw="under attack Taisy send hope"), system_text="Taisy"
+    )
+    posted = await env.engine.report(GUILD, 42, parsed, None)  # no resolution at all
+    assert posted.incident_id is not None
+    card = env.poster.posts[-1][3]
+    assert field_value(card, "System") == "Taisy"
+
+    # The button press — respond() reloads from the DB and re-renders:
+    await env.engine.respond(posted.incident_id, 100, ResponderState.OTW)
+    _, _, _, card = env.poster.edits[-1]
+    assert field_value(card, "System") == "Taisy"  # NOT "unknown"
+
+    # The stale sweep re-renders too:
+    env.clock.advance(120 * 60)
+    await env.engine.sweep_stale()
+    _, _, _, card = env.poster.edits[-1]
+    assert field_value(card, "System") == "Taisy"

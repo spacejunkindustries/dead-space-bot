@@ -496,6 +496,7 @@ def _load_incident(conn: sqlite3.Connection, incident_id: int) -> Incident | Non
         guild_id=row["guild_id"],
         system_id=row["system_id"],
         system_confidence=row["system_confidence"],
+        raw_system_text=row["raw_system_text"],
         type=Intent(row["type"]),
         severity=Severity(row["severity"]),
         reporter_id=row["reporter_id"],
@@ -1303,7 +1304,9 @@ class IncidentEngine:
             if incident is None:
                 return IncidentOutcome(Outcome.REJECTED, "Nothing to cancel.", None, None)
             self._pending_candidates.pop(incident.id, None)
-            system_name = self._system_name(incident.system_id, "unknown")
+            system_name = self._system_name(
+                incident.system_id, incident.raw_system_text or "unknown"
+            )
             card = self._render(incident, system_name, cancelled=True)
             if incident.channel_id is not None and incident.message_id is not None:
                 await self._poster.edit(incident.channel_id, incident.message_id, "", card)
@@ -1352,7 +1355,9 @@ class IncidentEngine:
             incident, previous = await asyncio.to_thread(_respond)
             if incident is None:
                 return IncidentOutcome(Outcome.REJECTED, None, None, None)
-            system_name = self._system_name(incident.system_id, "unknown")
+            system_name = self._system_name(
+                incident.system_id, incident.raw_system_text or "unknown"
+            )
             card = self._render(incident, system_name)
             if incident.channel_id is not None and incident.message_id is not None:
                 await self._poster.edit(incident.channel_id, incident.message_id, "", card)
@@ -1475,7 +1480,9 @@ class IncidentEngine:
                 # STALE is a terminal state for unconfirmed cards — drop their
                 # candidate lists or they leak for the process lifetime.
                 self._pending_candidates.pop(incident.id, None)
-                system_name = self._system_name(incident.system_id, "unknown")
+                system_name = self._system_name(
+                    incident.system_id, incident.raw_system_text or "unknown"
+                )
                 cards.append((incident, self._render(incident, system_name)))
         # Card edits happen OUTSIDE the engine lock: discord.py can sleep on
         # rate-limit buckets mid-edit, and holding the lock through a
@@ -1630,7 +1637,8 @@ class IncidentEngine:
         rows = await asyncio.to_thread(
             db.query,
             self._conn,
-            "SELECT system_id FROM incidents WHERE guild_id = ? AND status = 'ACTIVE'"
+            "SELECT system_id, raw_system_text FROM incidents"
+            " WHERE guild_id = ? AND status = 'ACTIVE'"
             " ORDER BY updated_at DESC",
             (guild_id,),
         )
@@ -1638,7 +1646,7 @@ class IncidentEngine:
             return IncidentOutcome(Outcome.POSTED, "All clear, no active incidents.", None, None)
         names: list[str] = []
         for row in rows[:3]:
-            name = self._system_name(row["system_id"], "unknown")
+            name = self._system_name(row["system_id"], row["raw_system_text"] or "unknown")
             if name not in names:
                 names.append(name)
         count = len(rows)
