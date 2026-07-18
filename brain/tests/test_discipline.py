@@ -218,3 +218,72 @@ def test_unconfigured_fc_role_means_fleetmode_restricts_nobody() -> None:
     d.set_fleetmode(True)
     assert d.may_voice_trigger([])
     assert d.check([555], "voice")
+
+
+# ── durability: snapshot / restore / rollback (restart survival) ─────────────
+
+
+def test_snapshot_restore_round_trips_state() -> None:
+    d = make_discipline(user_cooldown_s=30, max_mentions=3, window_min=10)
+    d.set_fleetmode(True)
+    for i in range(4):
+        d.record_mention(100 + i, T0 + timedelta(seconds=i))
+    assert d.breaker_open(T0 + timedelta(seconds=5))
+
+    fresh = make_discipline(user_cooldown_s=30, max_mentions=3, window_min=10)
+    fresh.restore(d.snapshot())
+    # A mid-flood restart no longer closes the breaker …
+    assert fresh.breaker_open(T0 + timedelta(seconds=5))
+    # … cooldowns survive …
+    assert not fresh.allow_mention(103, T0 + timedelta(seconds=10))
+    # … and fleetmode is still on.
+    assert fresh.fleetmode
+    fresh.set_fleetmode(False)
+    assert not fresh.fleetmode
+
+
+def test_restore_tolerates_garbage() -> None:
+    d = make_discipline()
+    d.restore("not json at all")
+    d.restore('{"fleetmode": "yes", "last_mention": 7}')
+    assert not d.fleetmode  # discarded, defaults intact
+    assert d.allow_mention(1, T0)
+
+
+def test_unrecord_mention_rolls_back_cooldown_and_breaker() -> None:
+    """The failed-post rollback: a charge taken under the engine lock is
+    fully undone — no phantom cooldown, no phantom breaker pressure."""
+    d = make_discipline(user_cooldown_s=30, max_mentions=3, window_min=10)
+    d.record_mention(1, T0)  # a real, earlier mention
+    previous = d.last_mention_at(1)
+    charge_at = T0 + timedelta(seconds=40)
+    d.record_mention(1, charge_at)
+    d.unrecord_mention(1, charge_at, previous)
+    # Cooldown anchor restored to the REAL mention, not the phantom:
+    assert d.last_mention_at(1) == T0
+    assert d.allow_mention(1, T0 + timedelta(seconds=40))
+    # The phantom left the breaker window too: with 1 real entry, exactly 2
+    # more stay at the max=3 threshold (the phantom would have tipped it).
+    d.record_mention(100, T0 + timedelta(seconds=1))
+    d.record_mention(101, T0 + timedelta(seconds=2))
+    assert not d.breaker_open(T0 + timedelta(seconds=5))
+    d.record_mention(102, T0 + timedelta(seconds=3))
+    assert d.breaker_open(T0 + timedelta(seconds=5))
+
+
+def test_unrecord_mention_first_charge_clears_anchor() -> None:
+    d = make_discipline(user_cooldown_s=30)
+    d.record_mention(1, T0)
+    d.unrecord_mention(1, T0, None)
+    assert d.last_mention_at(1) is None
+    assert d.allow_mention(1, T0)
+
+
+def test_on_state_change_fires_on_every_persistent_mutation() -> None:
+    d = make_discipline()
+    calls: list[int] = []
+    d.on_state_change = lambda: calls.append(1)
+    d.set_fleetmode(True)
+    d.record_mention(1, T0)
+    d.unrecord_mention(1, T0, None)
+    assert len(calls) == 3

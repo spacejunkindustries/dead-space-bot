@@ -638,6 +638,12 @@ Incident
 - Someone scrolling back reads **state**, not archaeology.
 - No updates for 20 minutes → auto-marked **STALE**, silently. Form-ups are exempt: a rally card legitimately sits quiet until it fires — its staleness is anchored by its countdown timer (§13), not by update chatter.
 
+**Render-then-deliver.** Every engine method mutates the database and renders the card *under* the engine lock, then hands the Discord I/O to a single deliverer that runs *after* the lock is released. Discord can sleep on rate-limit buckets mid-call; under flood conditions a rate-limited edit must never block the 3-second button-interaction window. One failure policy covers every path: a fresh card's **post** failure raises `PostError` and rolls the incident row (and any discipline charge) back; an **edit** is best-effort — the DB row is the state — except for a lost message.
+
+**Lost-message recovery.** The invariant is one **LIVE** message per incident, not one message id forever. A fold, responder press, correction, chase, resolve, or cancel that hits a NULL message id or a deleted message (`EditNotFound`) **re-posts the card and stores the new ids** — mention-free, pinned to the original channel (severity fallback when no channel was ever recorded) — instead of silently editing a ghost. The bulk sweeps (`sweep_stale`, `/clearall`) are the deliberate exception: resurrecting a lost card just to grey it out is noise, so they never re-post.
+
+**Uncertain cards survive restarts.** A MEDIUM-tier card's confirm candidates are persisted on the incident row (`pending_candidates`) and restored at startup, so a restart never re-renders a 0.55-confidence guess as a confirmed system; the column is cleared the moment the card is confirmed, corrected, retargeted, resolved, or swept.
+
 ### 9.2 Dedupe rule
 
 > Same system + same type + within 90 seconds → **fold into the existing incident**, increment the reporter count, **do not re-mention**.
@@ -759,6 +765,8 @@ The alarm codes are a **closed** enum — a failure class earns a code or it doe
 
 `/fleetmode on` restricts voice triggering to the FC role for the duration of a structured op. Slash commands remain open to everyone. This exists because §1.2 is real: during a fleet fight, twenty pilots talking to a bot is worse than no bot.
 
+Fleetmode — together with the circuit-breaker window and per-user cooldowns (§11.1) — is snapshotted to `app_state` (key `discipline_state`) on every change and restored at startup: a Brain restart mid-op keeps the FC gate up, and a restart mid-flood does **not** close the breaker. When the restore leaves fleetmode active, startup logs `fleetmode_restored_active` so the non-default state is visible.
+
 ---
 
 ## 12. Voice back-channel
@@ -836,6 +844,7 @@ Beyond intel, CORTANA carries the utilities a corp actually asks for. Each is vo
 | Feature | Voice | Value |
 |---|---|---|
 | **Structure timers** | *"Hey Cortana, timer Kisogo four hours"* | Schedules a mention ahead of a structure coming out. Enormous value in EVE, and a natural voice command — you're looking at the timer in-game right now. |
+| | | Delivery is **at-least-once, two-phase**: the poll CLAIMS due rows (`fired = 1`), and only a confirmed announcement retires them (`announced_at`). A claim whose post never landed (403, crash mid-announce) is re-offered every poll tick — with the `TIMER_UNDELIVERED` alarm raised in `#bot-health` so the retrying is visible, and the spoken "timer due" line held until the channel post actually lands. A structure timer eaten silently is exactly the loss the corp set the timer to avoid. |
 | **Form-ups** | *"Hey Cortana, form up Otanuomi fifteen minutes"* | Posts an op card with RSVP buttons and a countdown. |
 | **Roll call** | `/rollcall` | Who's in voice, who's subscribed, who's responding. |
 | **Jump distance** | *"Hey Cortana, jumps to Jita"* | Spoken reply, no post. BFS over the adjacency graph. |
@@ -902,8 +911,12 @@ CREATE TABLE incidents (
     status             TEXT NOT NULL DEFAULT 'ACTIVE',
     message_id         INTEGER,
     channel_id         INTEGER,
-    raw_system_text    TEXT               -- transcript window that named the
+    raw_system_text    TEXT,              -- transcript window that named the
                                           -- system; alias key for [Wrong — fix]
+    pending_candidates TEXT               -- MEDIUM-tier confirm candidates
+                                          -- (JSON [[id, name, score], …]);
+                                          -- NULL once confirmed — restarts
+                                          -- re-arm the pick buttons (§9.1)
 );
 CREATE INDEX idx_inc_active ON incidents(guild_id, status, system_id, type, opened_at);
 
@@ -950,14 +963,17 @@ CREATE TABLE personal_pings (
 CREATE INDEX idx_personal_pings_guild ON personal_pings(guild_id);
 
 -- ── scheduled ────────────────────────────────────────────────
+-- Two-phase, at-least-once delivery (§13): fired=1 is the CLAIM,
+-- announced_at the confirmed delivery; unannounced claims re-offer.
 CREATE TABLE timers (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id    INTEGER NOT NULL,
-    system_id   INTEGER REFERENCES systems(id),
-    fires_at    TEXT NOT NULL,
-    note        TEXT,
-    created_by  INTEGER NOT NULL,
-    fired       INTEGER NOT NULL DEFAULT 0
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    system_id    INTEGER REFERENCES systems(id),
+    fires_at     TEXT NOT NULL,
+    note         TEXT,
+    created_by   INTEGER NOT NULL,
+    fired        INTEGER NOT NULL DEFAULT 0,
+    announced_at TEXT
 );
 CREATE INDEX idx_timers_pending ON timers(fired, fires_at);
 
@@ -1013,6 +1029,15 @@ CREATE TABLE callsigns (
     registered_at  TEXT NOT NULL
 );
 
+-- ── process-level state that must survive restarts ───────────
+-- Key/value store: join-announcement cadence (§19), alarm-card message
+-- ids (§11.3, alarm:<code>:<key>), the synced command-tree payload hash,
+-- and the notification-discipline snapshot (§11.4, discipline_state).
+CREATE TABLE IF NOT EXISTS app_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 -- ── observability: transcripts only, never audio ─────────────
 CREATE TABLE command_log (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1029,6 +1054,8 @@ CREATE INDEX idx_cmdlog_at ON command_log(at);
 ```
 
 `command_log` is the accuracy dashboard. Queried weekly, it shows which systems mismatch, whose voice fails most often, and how confidence is distributed — the feedback loop that tunes §8.
+
+Schema revisions are tracked with `PRAGMA user_version` and applied by the runner in `core/db.py` (`brain/migrations/NNNN_*.sql`, one transaction per file); `brain/schema.sql` is the regenerated reference snapshot, never executed directly. Concurrent runners **serialize**: each file's transaction opens `BEGIN IMMEDIATE` and re-checks `user_version` inside it, so Brain startup and the gazetteer seeder migrating the same database at once end with the loser skipping — never a re-executed `CREATE TABLE`.
 
 ---
 

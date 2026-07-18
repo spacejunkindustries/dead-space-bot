@@ -25,8 +25,9 @@ The dedupe window (layer 1) lives in the incident engine and quiet hours
 
 from __future__ import annotations
 
+import json
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 from typing import Literal
 
@@ -48,6 +49,12 @@ class Discipline:
     All time-dependent methods take ``now`` explicitly; state advances only
     through those calls. Config is read from ``holder.current`` at the point
     of use so a SIGHUP reload takes effect immediately.
+
+    The class stays pure (no I/O): durability is provided by the composition
+    root, which restores :meth:`snapshot` output at startup and persists a
+    fresh snapshot whenever :attr:`on_state_change` fires — so a mid-flood
+    restart does not close the breaker and ``/fleetmode on`` survives a
+    restart instead of silently reopening voice to everyone mid-op.
     """
 
     def __init__(self, holder: ConfigHolder) -> None:
@@ -56,6 +63,55 @@ class Discipline:
         self._mentions: deque[datetime] = deque()
         self._fleetmode = False
         self._flood_announced = False
+        #: Fired (sync, no args) after every persistent-state mutation —
+        #: fleetmode toggles and mention (un)records. The composition root
+        #: wires this to schedule an ``app_state`` snapshot write; ``None``
+        #: (tests, seeder) means no persistence.
+        self.on_state_change: Callable[[], None] | None = None
+
+    # ── durability snapshot (restored by the composition root) ───────────────
+
+    def snapshot(self) -> str:
+        """JSON snapshot of the persistent state: fleetmode, the breaker
+        window, and per-user cooldowns. Stale entries are pruned on the read
+        paths after restore, so the snapshot is a plain dump."""
+        return json.dumps(
+            {
+                "fleetmode": self._fleetmode,
+                "last_mention": {str(u): t.isoformat() for u, t in self._last_mention.items()},
+                "mentions": [t.isoformat() for t in self._mentions],
+            },
+            separators=(",", ":"),
+        )
+
+    def restore(self, snapshot: str) -> None:
+        """Restore a :meth:`snapshot`. Tolerant: unreadable state is discarded
+        with a warning — discipline state is a blast-radius bound, never worth
+        failing startup over."""
+        try:
+            data = json.loads(snapshot)
+            fleetmode = bool(data.get("fleetmode", False))
+            last_mention = {
+                int(user_id): datetime.fromisoformat(at)
+                for user_id, at in dict(data.get("last_mention", {})).items()
+            }
+            mentions = deque(sorted(datetime.fromisoformat(at) for at in data.get("mentions", [])))
+        except (ValueError, TypeError, AttributeError) as exc:
+            log.warning("discipline_snapshot_unreadable", error=str(exc))
+            return
+        self._fleetmode = fleetmode
+        self._last_mention = last_mention
+        self._mentions = mentions
+        log.info(
+            "discipline_state_restored",
+            fleetmode=fleetmode,
+            mentions_in_window=len(mentions),
+            cooldowns=len(last_mention),
+        )
+
+    def _notify(self) -> None:
+        if self.on_state_change is not None:
+            self.on_state_change()
 
     # ── per-user cooldown + circuit breaker ──────────────────────────────────
 
@@ -76,6 +132,33 @@ class Discipline:
         """Record that a mention triggered by ``user_id`` was sent at ``now``."""
         self._last_mention[user_id] = now
         self._mentions.append(now)
+        self._notify()
+
+    def last_mention_at(self, user_id: int) -> datetime | None:
+        """This user's recorded cooldown anchor — captured by the engine
+        before :meth:`record_mention` so a failed post can roll the charge
+        back with :meth:`unrecord_mention`."""
+        return self._last_mention.get(user_id)
+
+    def unrecord_mention(self, user_id: int, now: datetime, previous: datetime | None) -> None:
+        """Roll back one :meth:`record_mention` charge (the post failed).
+
+        ``now`` is the exact timestamp that was recorded; ``previous`` is the
+        user's cooldown anchor from :meth:`last_mention_at` captured before
+        the charge. A phantom mention from a failed post must never run a
+        cooldown or open the breaker — but the charge itself happens under
+        the engine lock *before* delivery so concurrent reports still
+        serialize against the cooldown.
+        """
+        try:
+            self._mentions.remove(now)
+        except ValueError:  # pragma: no cover — double rollback; nothing to undo
+            return
+        if previous is None:
+            self._last_mention.pop(user_id, None)
+        else:
+            self._last_mention[user_id] = previous
+        self._notify()
 
     def breaker_open(self, now: datetime) -> bool:
         """True while more than ``max_mentions`` were sent in the last window.
@@ -148,9 +231,11 @@ class Discipline:
     # ── fleet-ops mode ────────────────────────────────────────────────────────
 
     def set_fleetmode(self, enabled: bool) -> None:
-        """Toggle fleet-ops mode (``/fleetmode`` — GDD §11.4)."""
+        """Toggle fleet-ops mode (``/fleetmode`` — GDD §11.4). Persisted via
+        :attr:`on_state_change` so a mid-op restart keeps the gate up."""
         self._fleetmode = enabled
         log.info("fleetmode_set", enabled=enabled)
+        self._notify()
 
     @property
     def fleetmode(self) -> bool:

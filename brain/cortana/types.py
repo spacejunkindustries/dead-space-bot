@@ -20,6 +20,7 @@ __all__ = [
     "AlertChannel",
     "ButtonSpec",
     "CardRender",
+    "EditNotFound",
     "INTENT_SEVERITY",
     "MENTION_INTENTS",
     "Incident",
@@ -47,6 +48,15 @@ class PostError(RuntimeError):
 
     Raised by the Poster so the engine can roll back the incident row instead
     of leaving an invisible ACTIVE incident that folds away later reports."""
+
+
+class EditNotFound(PostError):
+    """The card's Discord message no longer exists (deleted by a moderator).
+
+    Raised by the Poster's ``edit`` so the engine's deliverer can re-post the
+    card and store the new ids — the §9.1 invariant is one LIVE message per
+    incident, not silent edits against a ghost. Every other edit failure stays
+    best-effort (logged + alarmed inside the Poster, never raised)."""
 
 
 class Intent(StrEnum):

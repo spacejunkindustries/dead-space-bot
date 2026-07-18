@@ -108,6 +108,13 @@ def migrate(conn: sqlite3.Connection, migrations_dir: Path | None = None) -> int
     Each file runs in its own transaction; ``user_version`` is bumped in the
     same commit, so a failed migration leaves the database at the previous
     version. Raises :class:`MigrationError` on any inconsistency.
+
+    Concurrent runners serialize instead of crashing: each file's transaction
+    opens with ``BEGIN IMMEDIATE`` (a write lock up front, waited on via the
+    connection's ``busy_timeout``) and re-checks ``user_version`` *inside* the
+    transaction. When Brain startup and the gazetteer seeder migrate the same
+    database at once, the loser of the lock race sees the winner's bumped
+    version and no-ops — never a re-executed ``CREATE TABLE``.
     """
     directory = migrations_dir if migrations_dir is not None else MIGRATIONS_DIR
     migrations = _discover_migrations(directory)
@@ -123,8 +130,18 @@ def migrate(conn: sqlite3.Connection, migrations_dir: Path | None = None) -> int
         sql = path.read_text(encoding="utf-8")
         # Explicit BEGIN: pysqlite's implicit transactions do not cover DDL,
         # so `with conn:` alone would autocommit each CREATE statement.
+        # IMMEDIATE: take the write lock NOW so a concurrent migrator blocks
+        # here (busy_timeout) instead of failing mid-file.
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
+            # Re-check under the lock: a concurrent migrator may have applied
+            # this file (or more) between our snapshot and our lock grab.
+            applied = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if applied >= version:
+                conn.rollback()
+                log.info("db_migration_skipped_concurrent", version=version, applied=applied)
+                current = applied
+                continue
             for statement in _split_statements(sql):
                 conn.execute(statement)
             conn.execute(f"PRAGMA user_version = {version}")
