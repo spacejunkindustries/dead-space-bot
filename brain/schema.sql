@@ -1,4 +1,4 @@
--- AURA data model — GDD §14.
+-- CORTANA data model — GDD §14.
 --
 -- This file is the reference snapshot of the current schema. It is applied to a
 -- fresh database only via the migration runner in aura/core/db.py, which tracks

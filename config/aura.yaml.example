@@ -1,4 +1,4 @@
-# AURA main configuration — GDD §16.
+# CORTANA main configuration — GDD §16.
 # Production copy lives at /etc/aura/aura.yaml and is hot-reloaded on SIGHUP
 # (systemctl reload aura-brain).
 #
@@ -24,7 +24,7 @@ discord:
   roles:
     pilot: 000000000000000000          # gate: only members with this role may trigger mentions
     fc:    000000000000000000          # gate: only this role may voice-trigger under fleetmode
-  watch_voice_channels: [000000000000000000]  # voice channels AURA watches / auto-joins
+  watch_voice_channels: [000000000000000000]  # voice channels CORTANA watches / auto-joins
   auto_join: true                      # join when a pilot enters, leave when empty
   mentions_enabled: true               # false = silent mode: post cards, ping nobody
   here_on_severity: [high]             # ping @here by threat colour: high=RED, medium=ORANGE
@@ -36,15 +36,15 @@ discord:
                                        #           by /optout + pinned docs)
 
 wake:
-  # The phrase itself ("aura command", GDD §5.2) is baked into the trained
+  # The phrase itself ("hey cortana", GDD §5.2) is baked into the trained
   # model below — changing it means training a new model, not editing config.
-  model:  /opt/aura/models/wake/aura_command.onnx  # trained openWakeWord ONNX chain
+  model:  /opt/aura/models/wake/hey_cortana.onnx  # trained openWakeWord ONNX chain
   threshold: 0.55                      # wake score needed to open a capture window.
                                        # The trigger is single-frame (no debounce): below
                                        # ~0.45 ambient chatter false-fires constantly, and
                                        # every false wake is an STT decode + a junk relay.
   refractory_ms: 2000                  # per-user dead time after a wake hit
-  ack: beep                            # how AURA acknowledges the wake word:
+  ack: beep                            # how CORTANA acknowledges the wake word:
                                        #   voice = speak "Go ahead." (talks back)
                                        #   beep  = instant tone (no synth latency)
                                        #   none  = silent
@@ -91,7 +91,7 @@ matching:
 incidents:
   dedupe_window_s: 90                  # same system + type within this window → fold (GDD §9.2)
   stale_after_min: 20                  # no updates for this long → auto-STALE, silently
-  cancel_window_s: 30                  # "aura command, cancel" kills the user's last incident
+  cancel_window_s: 30                  # "hey cortana, cancel" kills the user's last incident
 
 discipline:
   user_cooldown_s: 30                  # min seconds between mentions from the same pilot
@@ -109,7 +109,7 @@ tts:
   personality: standard                # standard = exact GDD §12.1 lines;
                                        # cortana = acknowledgement lines rotate
                                        # ("Go ahead." / "Listening." / "Send it.")
-                                       # so AURA feels alive; info lines never vary.
+                                       # so CORTANA feels alive; info lines never vary.
   # Ducking (60%) and talk-over suppression are fixed playback mechanics in
   # Ears (ears/src/playback.rs, GDD §12.2) — not tunables.
 

@@ -8,7 +8,7 @@
 /optout       exclude the member's audio entirely — the refreshed opt-out set
               is pushed to Ears immediately, where the drop is enforced BEFORE
               frames cross the IPC boundary (CLAUDE.md: opt-out lives in Ears)
-/mute-voice   stop AURA speaking to this member (GDD §12.2)
+/mute-voice   stop CORTANA speaking to this member (GDD §12.2)
 /register     register a pilot callsign — the slash twin of the voice command
 /unregister   delete the callsign row
 /whoami       speak back the registered callsign
@@ -237,7 +237,7 @@ class SubsCog(commands.Cog):
     # ── /optout (GDD §19) ────────────────────────────────────────────────────
 
     @app_commands.command(
-        name="optout", description="Toggle: exclude your audio from AURA entirely"
+        name="optout", description="Toggle: exclude your audio from CORTANA entirely"
     )
     async def optout(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -257,13 +257,13 @@ class SubsCog(commands.Cog):
                 "processing — it never reaches the recogniser. `/optout` again to opt back in."
             )
         else:
-            text = "🎙️ You are opted back in. AURA will listen for the wake phrase from you."
+            text = "🎙️ You are opted back in. CORTANA will listen for the wake phrase from you."
         await interaction.followup.send(text, ephemeral=True)
 
     # ── /mute-voice (GDD §12.2) ──────────────────────────────────────────────
 
     @app_commands.command(
-        name="mute-voice", description="Toggle: stop AURA speaking replies to you"
+        name="mute-voice", description="Toggle: stop CORTANA speaking replies to you"
     )
     async def mute_voice(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -272,9 +272,9 @@ class SubsCog(commands.Cog):
         self.bot.speaker.set_muted(user_id, muted)
         log.info("voice_mute_toggled", user_id=user_id, muted=muted)
         text = (
-            "🔕 AURA will not speak replies to your commands. `/mute-voice` again to undo."
+            "🔕 CORTANA will not speak replies to your commands. `/mute-voice` again to undo."
             if muted
-            else "🔔 AURA will speak replies to your commands again."
+            else "🔔 CORTANA will speak replies to your commands again."
         )
         await interaction.followup.send(text, ephemeral=True)
 

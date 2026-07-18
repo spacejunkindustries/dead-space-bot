@@ -105,7 +105,7 @@ def subscription_custom_id(role_id: int) -> str:
 
 
 def parse_custom_id(custom_id: str) -> ComponentAction | None:
-    """Parse any AURA component ``custom_id``; None for foreign/invalid ids."""
+    """Parse any CORTANA component ``custom_id``; None for foreign/invalid ids."""
     m = _INCIDENT_RE.match(custom_id)
     if m is not None:
         incident_id = int(m.group("incident"))
@@ -313,9 +313,9 @@ async def dispatch_subscription_toggle(
     await interaction.response.defer()
     try:
         if subscribed:
-            await member.remove_roles(role, reason="AURA /subscribe toggle")
+            await member.remove_roles(role, reason="CORTANA /subscribe toggle")
         else:
-            await member.add_roles(role, reason="AURA /subscribe toggle")
+            await member.add_roles(role, reason="CORTANA /subscribe toggle")
     except discord.Forbidden:
         await interaction.followup.send(
             f"I can't manage **{role.name}** — my role must sit above it and I need "

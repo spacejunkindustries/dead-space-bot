@@ -1,4 +1,4 @@
-//! AURA Ears — the DAVE-capable Discord audio pump (GDD §3, §4).
+//! CORTANA Ears — the DAVE-capable Discord audio pump (GDD §3, §4).
 //!
 //! Ears is deliberately thin: it maintains the gateway and voice connections,
 //! decodes per-user PCM, decimates it, pushes frames to Brain over a Unix

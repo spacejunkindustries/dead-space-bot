@@ -109,6 +109,21 @@ class FasterWhisperTranscriber:
         self._cfg = cfg
         self._model: Any = None
         self._model_lock = threading.Lock()
+        self._transcribe_params_cache: frozenset[str] | None = None
+
+    def _transcribe_params(self, model: Any) -> frozenset[str]:
+        """The installed faster-whisper's transcribe() parameter names,
+        probed once — drives graceful degradation of optional kwargs."""
+        if self._transcribe_params_cache is None:
+            import inspect
+
+            try:
+                self._transcribe_params_cache = frozenset(
+                    inspect.signature(model.transcribe).parameters
+                )
+            except (TypeError, ValueError):  # pragma: no cover — exotic backends
+                self._transcribe_params_cache = frozenset()
+        return self._transcribe_params_cache
 
     def transcribe(self, pcm16k: bytes, bias: str) -> TranscriptResult:
         import numpy as np  # lazy
@@ -131,9 +146,30 @@ class FasterWhisperTranscriber:
             # segments only propagates a hallucination into the next one.
             "condition_on_previous_text": False,
             "without_timestamps": True,
+            # Chatter defence (GDD §5.3): Silero VAD inside faster-whisper
+            # trims non-speech from the clip before decoding. Fleet comms are
+            # full of keyboard noise, breath, and game audio bleed — decoding
+            # those spans is where "Rens, Rens, Rens" hallucinations grow.
+            "vad_filter": True,
         }
         if self._cfg.bias_with_gazetteer and bias:
             kwargs["initial_prompt"] = bias  # gazetteer biasing, GDD §5.3
+            # hotwords bias the decoder toward these tokens on EVERY window
+            # (initial_prompt only prefixes the first) — helps short system
+            # names survive noisy audio.
+        # Feature-probe the installed faster-whisper ONCE instead of
+        # try/except TypeError around the call: vad_filter runs Silero
+        # eagerly inside transcribe(), so a real TypeError from that path
+        # would be indistinguishable from an unsupported-kwarg signature
+        # error — and a blanket retry would silently disable the chatter
+        # defence while hiding the actual bug.
+        supported = self._transcribe_params(model)
+        for optional in ("vad_filter", "hotwords"):
+            if optional in kwargs and optional not in supported:
+                log.warning("stt_kwarg_unsupported", kwarg=optional)
+                del kwargs[optional]
+        if self._cfg.bias_with_gazetteer and bias and "hotwords" in supported:
+            kwargs["hotwords"] = bias
         segments, _info = model.transcribe(audio, **kwargs)
 
         texts: list[str] = []

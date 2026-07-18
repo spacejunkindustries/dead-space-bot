@@ -1,4 +1,4 @@
-"""AURA Brain — the Python half of the voice-activated fleet intel bot.
+"""CORTANA Brain — the Python half of the voice-activated fleet intel bot.
 
 Brain owns everything that requires judgement: wake word, STT, grammar,
 gazetteer, incident engine, routing, discipline, TTS synthesis, and the

@@ -11,10 +11,10 @@ via IPC control messages (GDD §15, ids as strings):
 
 No discord import here — the dsc layer feeds :meth:`on_voice_update` with
 ``(channel_id, present_count, unmuted_count)`` whenever a watched channel's
-census changes: presence (mute-agnostic) drives join/leave so AURA stays with
+census changes: presence (mute-agnostic) drives join/leave so CORTANA stays with
 a muted-but-present pilot, and the unmuted count feeds the §20 silence alarm.
 The dsc layer also supplies an async ``announce_fn(channel_id)`` used for the
-§19 consent announcement, posted **every single time** AURA joins.
+§19 consent announcement, posted **every single time** CORTANA joins.
 
 Joins are debounced (5 s): a pilot popping into an empty channel and
 straight back out must not drag the bot in and out behind them. Leaves are
@@ -47,7 +47,7 @@ log = structlog.get_logger(__name__)
 #: §19: posted on every join, verbatim. This is the consent notice the corp
 #: was promised; do not shorten, reword, or make it conditional.
 ANNOUNCEMENT = (
-    "🎙️ AURA is listening for commands. Audio is not recorded. `/optout` to exclude yourself."
+    "🎙️ CORTANA is listening for commands. Audio is not recorded. `/optout` to exclude yourself."
 )
 
 #: Wait this long after the first pilot arrives before joining, so a
@@ -116,7 +116,7 @@ class VoiceGateway:
         """A watched channel's census changed.
 
         ``present_count`` is every non-bot human in the channel (mute-agnostic)
-        and drives auto-join/leave: AURA stays with a pilot who sits muted until
+        and drives auto-join/leave: CORTANA stays with a pilot who sits muted until
         they need to talk. ``unmuted_count`` (defaults to ``present_count`` when
         omitted) feeds the §20 voice-silence alarm via the census listener.
 

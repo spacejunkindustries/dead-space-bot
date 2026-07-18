@@ -414,7 +414,7 @@ def _prior_multiplier(
 
 
 def tier_for(candidates: list[MatchCandidate], tiers: TiersConfig) -> Tier:
-    """Confidence tiers — GDD §8.3. AURA never silently guesses."""
+    """Confidence tiers — GDD §8.3. CORTANA never silently guesses."""
     if not candidates:
         return Tier.LOW
     top1 = candidates[0].score

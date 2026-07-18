@@ -1,4 +1,4 @@
-# AURA CI — Rust (ears). Runs only when ears/ or this workflow changes.
+# CORTANA CI — Rust (ears). Runs only when ears/ or this workflow changes.
 #
 # Compiling Songbird (DAVE/MLS + Symphonia) takes minutes, so gating this on
 # ears/** keeps brain-only changes — the large majority — off the Rust runner.

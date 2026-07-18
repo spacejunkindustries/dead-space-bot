@@ -1,6 +1,6 @@
 """Degradation detection and #bot-health reporting — GDD §20 / §16 (health).
 
-AURA is engineered to survive the loss of its own headline feature: voice
+CORTANA is engineered to survive the loss of its own headline feature: voice
 receive is undocumented and can break without notice. This module watches
 for exactly the failure signatures the §20 table names and raises the
 ``degraded`` flag the rest of the system keys off (the engine speaks/posts
@@ -205,7 +205,7 @@ class HealthReporter:
             log.warning("post_failures_announced", count=self._post_failures)
             await self._post(
                 "⚠️ **Discord post failed** — a card could not be posted or "
-                "edited (check AURA's channel permissions: View Channel, Send "
+                "edited (check CORTANA's channel permissions: View Channel, Send "
                 "Messages, Embed Links). Details are in the journal.",
                 None,
             )
@@ -215,7 +215,7 @@ class HealthReporter:
         alive = seen is not None and (now - seen) <= self._heartbeat_timeout_s
         # Never-connected counts as down too: an Ears that fails at boot sends
         # no heartbeat at all, and gating the alarm on "saw one once" left
-        # AURA silently deaf with a green systemd status. Give startup one
+        # CORTANA silently deaf with a green systemd status. Give startup one
         # timeout window of grace before alarming.
         never_connected = seen is None and (now - self._started_at) > self._heartbeat_timeout_s
         if never_connected and not self._ears_down:
@@ -334,7 +334,7 @@ class HealthReporter:
             {"name": "Pilots in voice", "value": str(self._humans_present), "inline": True},
         ]
         return {
-            "title": "AURA health report",
+            "title": "CORTANA health report",
             "color": 0xE74C3C if self.degraded else 0x2ECC71,
             "timestamp": now.isoformat(),
             "fields": fields,

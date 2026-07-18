@@ -111,7 +111,7 @@ def test_round_trip_matches_engine_rendered_ids() -> None:
         "aura:sub:notanumber",
         "aura:fix:12:30001234",  # the pre-contract shape — must NOT parse
         "other:inc:12:otw",
-        "AURA:INC:12:OTW",  # scheme is case-sensitive
+        "CORTANA:INC:12:OTW",  # scheme is case-sensitive
     ],
 )
 def test_parse_rejects_malformed(bad: str) -> None:

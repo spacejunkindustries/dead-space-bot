@@ -97,7 +97,7 @@ def _iso(dt: datetime) -> str:
 
 def evetime_text(now: datetime) -> str:
     """EVE time is UTC; the ``<t:…:t>`` token renders in the viewer's locale,
-    which is the "local offset hint" without AURA ever knowing a timezone."""
+    which is the "local offset hint" without CORTANA ever knowing a timezone."""
     utc = now.astimezone(UTC)
     unix = int(utc.timestamp())
     return (
@@ -469,7 +469,7 @@ class UtilityCog(commands.Cog):
 
     # ── /ask — slash twin of "command override" (GDD §6.6, constraint 10) ────
 
-    @app_commands.command(name="ask", description="Ask AURA a question (out-of-band assistant)")
+    @app_commands.command(name="ask", description="Ask CORTANA a question (out-of-band assistant)")
     @app_commands.describe(question="What do you want to know?")
     async def ask(self, interaction: discord.Interaction, question: str) -> None:
         from aura.chat import ChatCooldownError, ChatError  # lazy: optional feature

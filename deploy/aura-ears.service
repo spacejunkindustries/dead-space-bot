@@ -1,4 +1,4 @@
-# AURA Ears — Rust: Songbird ≥0.6 voice socket (DAVE + receive), TTS playback.
+# CORTANA Ears — Rust: Songbird ≥0.6 voice socket (DAVE + receive), TTS playback.
 # Deliberately thin; everything requiring judgement lives in Brain.
 #
 # Ordered after aura-brain.service because Brain BINDS the IPC socket and Ears
@@ -10,7 +10,7 @@
 # the process reads $CREDENTIALS_DIRECTORY/token.
 
 [Unit]
-Description=AURA Ears (Discord voice socket)
+Description=CORTANA Ears (Discord voice socket)
 Documentation=file:/opt/aura/brain/docs/GDD.md
 After=network-online.target aura-brain.service
 Wants=network-online.target aura-brain.service

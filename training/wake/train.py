@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and validate the AURA wake-word model.
+"""Train and validate the CORTANA wake-word model.
 
 OFFLINE pipeline — runs on a GPU box or Colab, never on the droplet, and is
 never imported by brain/. Run generate_samples.py first; see
@@ -204,7 +204,7 @@ def stage_bundle(cfg: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Train the AURA wake-word model via openWakeWord and print a threshold "
+            "Train the CORTANA wake-word model via openWakeWord and print a threshold "
             "sweep for picking wake.threshold (offline; GPU box or Colab)."
         )
     )
@@ -228,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         "--tflite",
         action="store_true",
         help="also export a .tflite model (needs the optional tensorflow deps; "
-        "AURA itself deploys ONNX only)",
+        "CORTANA itself deploys ONNX only)",
     )
     parser.add_argument(
         "--bundle",

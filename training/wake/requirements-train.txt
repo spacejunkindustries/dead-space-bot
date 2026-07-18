@@ -1,4 +1,4 @@
-# AURA wake-word TRAINING dependencies — OFFLINE pipeline only.
+# CORTANA wake-word TRAINING dependencies — OFFLINE pipeline only.
 #
 # Install into a dedicated venv on a GPU box or Colab. These packages must
 # NEVER be added to brain/requirements.txt and never installed on the droplet;
@@ -42,7 +42,7 @@ deep-phonemizer==0.0.19
 # Dataset downloads (features, RIRs, AudioSet, FMA)
 huggingface_hub
 
-# Optional — ONLY for `train.py --tflite`. AURA deploys ONNX, so these stay
+# Optional — ONLY for `train.py --tflite`. CORTANA deploys ONNX, so these stay
 # commented out unless you specifically need a .tflite export. They are the
 # reason upstream pins Python 3.10.
 # tensorflow-cpu==2.8.1

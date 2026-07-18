@@ -1,4 +1,4 @@
-# AURA Brain runtime dependencies.
+# CORTANA Brain runtime dependencies.
 # Hard constraint 2 (CLAUDE.md): NO PyNaCl, NO discord.py[voice] — their absence
 # is what makes it impossible to accidentally wire up Python voice.
 
@@ -7,7 +7,7 @@ PyYAML>=6.0              # config.py, nlu/gazetteer.py — aura.yaml / gazetteer
 structlog>=24.1          # everywhere — JSON structured logging
 webrtcvad-wheels>=2.0.14 # audio/vad.py — voice activity detection / utterance endpointing
 # openwakeword is installed with --no-deps (see deploy/install.sh): its Linux
-# dependency pin tflite-runtime has no wheels for Python >=3.12, and AURA uses
+# dependency pin tflite-runtime has no wheels for Python >=3.12, and CORTANA uses
 # only the ONNX inference path (audio/wake.py passes inference_framework="onnx").
 # The dependencies it actually needs at runtime are listed explicitly here.
 onnxruntime>=1.16        # audio/wake.py — openwakeword ONNX inference backend

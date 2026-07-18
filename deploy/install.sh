@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AURA droplet install — Ubuntu 24.04 LTS (GDD §17).
+# CORTANA droplet install — Ubuntu 24.04 LTS (GDD §17).
 #
 # Idempotent: safe to re-run for upgrades. Run as root from a checkout:
 #   sudo deploy/install.sh [path/to/aura-ears]
@@ -28,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 EARS_BINARY="${1:-${SCRIPT_DIR}/aura-ears}"
 
-echo "==> AURA install from ${REPO_ROOT}"
+echo "==> CORTANA install from ${REPO_ROOT}"
 
 # ---------------------------------------------------------------- apt deps
 # GDD §17.3. Deliberately absent (CLAUDE.md hard constraints):
@@ -121,7 +121,7 @@ fi
 /opt/aura/brain/venv/bin/pip install --quiet --upgrade pip
 /opt/aura/brain/venv/bin/pip install --quiet -r /opt/aura/brain/requirements.txt
 # openwakeword pins tflite-runtime on Linux, which has no wheels for
-# Python >=3.12. AURA only uses its ONNX path (inference_framework="onnx"),
+# Python >=3.12. CORTANA only uses its ONNX path (inference_framework="onnx"),
 # so install it without deps; its real runtime deps are in requirements.txt.
 /opt/aura/brain/venv/bin/pip install --quiet --no-deps "openwakeword>=0.6.0"
 /opt/aura/brain/venv/bin/pip install --quiet -e /opt/aura/brain
@@ -206,7 +206,7 @@ fi
 # ---------------------------------------------------------------- checklist
 cat <<'CHECKLIST'
 
-==> Install complete. Before starting AURA, finish these by hand:
+==> Install complete. Before starting CORTANA, finish these by hand:
 
   1. Token (never in config, env, or repo — GDD §22):
        printf '%s' 'YOUR_BOT_TOKEN' > /etc/aura/token
@@ -234,7 +234,7 @@ cat <<'CHECKLIST'
      ears-bin branch exists (rust.yml publishes it on every merge to main
      touching ears/), or install a binary there yourself (mode 0755).
 
-  7. Firewall: ufw deny incoming except SSH. AURA opens no listening ports.
+  7. Firewall: ufw deny incoming except SSH. CORTANA opens no listening ports.
 
   Then:
        systemctl start aura-brain aura-ears

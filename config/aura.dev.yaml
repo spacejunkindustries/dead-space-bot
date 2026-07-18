@@ -1,4 +1,4 @@
-# AURA development configuration — same structure as aura.yaml.example,
+# CORTANA development configuration — same structure as aura.yaml.example,
 # all paths under ./dev-data/ so a dev run never touches system locations.
 # Run from the repo root: python -m aura --config ../config/aura.dev.yaml
 

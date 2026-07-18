@@ -1,4 +1,4 @@
-# AURA gazetteer scope — GDD §8.1 / §16. Production copy: /etc/aura/gazetteer.yaml.
+# CORTANA gazetteer scope — GDD §8.1 / §16. Production copy: /etc/aura/gazetteer.yaml.
 # The systems + adjacency tables are seeded from the EVE SDE (k-space) by
 # `python -m aura.nlu.seed`; these rules pick the ACTIVE subset at runtime,
 # editable by the FC without touching code.

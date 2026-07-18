@@ -1,4 +1,4 @@
-"""Interactive /help: what AURA is, every command, and the admin runbook.
+"""Interactive /help: what CORTANA is, every command, and the admin runbook.
 
 The slash twin of the voice ``HELP`` intent (GDD §6.1) — voice gets the spoken
 hint *"Check help in Discord."* through the same ``IncidentEngine.report``
@@ -88,8 +88,19 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "roles + `@here`\n"
                 "• *“gate camp <system>”* → `/camp` — 🟠 medium, pings subscribed roles\n"
                 "• *“clear <system>”* → `/clear` — resolves the card, no mention\n"
+                "• *“update chase <system>”* → `/chase` — chase mode: retargets "
+                "your live card as the target moves, no new post\n"
                 "• *“status”* → `/status` — active incidents, spoken/ephemeral reply\n"
                 "• *“cancel”* → `/cancel` — retracts your last report (30s window)",
+            ),
+            (
+                "Colour codes stack inline",
+                "Say the threat colour anywhere in the report and it rides along: "
+                "*“I'm tackled, **code red**, in system UMI, over”* → one 🔴 CODE RED "
+                "card for UMI, and CORTANA reads it back: *“Tackled UMI, code red, "
+                "posted.”* Codes: **code red** 🔴 / **code orange** 🟠 / "
+                "**code yellow** 🟡. A standalone *“code orange”* opens a "
+                "wake-free window for the report that follows.",
             ),
             (
                 "Who gets pinged",
@@ -101,12 +112,15 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "*“all hands”* narrows or widens the audience.",
             ),
             (
-                "When AURA mishears",
+                "When CORTANA mishears",
+                "**A distress call always posts** — an unknown or misheard system "
+                "goes on the card verbatim instead of being dropped, and CORTANA "
+                "reads the report back so you hear exactly what landed.\n"
                 "• Fairly sure: the card posts flagged ❓ *unconfirmed* with candidate "
-                "buttons and **[Wrong — fix]** — AURA says *“… — say again to "
-                "confirm.”* Tap the right system; corrections are learned.\n"
-                "• Not sure: nothing posts, AURA says *“Say again the system.”* and "
-                "listens ~4s — answer with just the system name, no wake phrase.",
+                "buttons and **[Wrong — fix]** — tap the right system; corrections "
+                "are learned.\n"
+                "• Wrong on the card? Say *“cancel”* (30s) and re-report, or press "
+                "**[Wrong — fix]**.",
             ),
         ),
     ),
@@ -129,7 +143,7 @@ HELP_TOPICS: dict[str, HelpTopic] = {
             ),
             (
                 "The spoken count",
-                "On the first **On my way** (and each new responder) AURA speaks the "
+                "On the first **On my way** (and each new responder) CORTANA speaks the "
                 "running count into voice — *“Two responding to Otanuomi.”* — so the "
                 "pilot in trouble hears help coming without touching Discord.",
             ),
@@ -159,7 +173,7 @@ HELP_TOPICS: dict[str, HelpTopic] = {
             ),
             (
                 "Personal pings — just you",
-                "*“Aura Command, ping me for gate camps in Otanuomi”* or "
+                "*“Hey Cortana, ping me for gate camps in Otanuomi”* or "
                 "`/pingme type [system]` — a direct @mention when a matching incident "
                 "posts. Use it for a specific interest (your mining hole, your route) "
                 "without joining a role. No system = everywhere; max 10.\n"
@@ -174,7 +188,7 @@ HELP_TOPICS: dict[str, HelpTopic] = {
         emoji="🪪",
         title="🪪 Callsigns",
         description=(
-            "A display name AURA uses for you, keyed on your **Discord account** — "
+            "A display name CORTANA uses for you, keyed on your **Discord account** — "
             "identity comes from Discord's user id on each utterance, never from a "
             "voiceprint or anything derived from audio."
         ),
@@ -184,7 +198,7 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "• *“register <callsign>”* / *“call me <callsign>”* → "
                 "`/register callsign` — the typed form stores it exactly as typed, "
                 "which is also how you fix a misheard spelling\n"
-                "• *“who am I”* → `/whoami` — AURA answers *“You are Space Junkie.”*\n"
+                "• *“who am I”* → `/whoami` — CORTANA answers *“You are Space Junkie.”*\n"
                 "• *“unregister”* / *“forget me”* → `/unregister` — deletes it",
             ),
             (
@@ -205,9 +219,9 @@ HELP_TOPICS: dict[str, HelpTopic] = {
             (
                 "Scheduling",
                 "• `/timer Kisogo 4 hours armor timer` — mention ahead of a structure "
-                "timer (*“Aura Command, timer Kisogo four hours”*)\n"
+                "timer (*“Hey Cortana, timer Kisogo four hours”*)\n"
                 "• `/formup Otanuomi 15 minutes kitchen sink` — op card with RSVP "
-                "buttons (*“Aura Command, form up Otanuomi fifteen minutes”*)\n"
+                "buttons (*“Hey Cortana, form up Otanuomi fifteen minutes”*)\n"
                 "• `/remindme 45 minutes check the pos` — personal DM reminder",
             ),
             (
@@ -224,10 +238,10 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "• `/poll close id` — close it (author or admin)",
             ),
             (
-                "Ask AURA (out-of-band)",
+                "Ask CORTANA (out-of-band)",
                 "• `/ask question` — the assistant channel; by voice it's "
                 '*"command override, …"* (e.g. *"command override, what\'s the '
-                'weather in Chicago?"*). Separate from intel — AURA never uses '
+                'weather in Chicago?"*). Separate from intel — CORTANA never uses '
                 "it to interpret reports.",
             ),
         ),
@@ -238,7 +252,7 @@ HELP_TOPICS: dict[str, HelpTopic] = {
         emoji="🔒",
         title="🔒 Privacy & consent",
         description=(
-            "**AURA records nothing.** Audio lives only in a RAM buffer overwritten "
+            "**CORTANA records nothing.** Audio lives only in a RAM buffer overwritten "
             "every 1.5 seconds — never written to disk, freed the instant "
             "speech-to-text returns."
         ),
@@ -254,9 +268,9 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "• `/optout` — your audio is dropped **inside the Rust voice process, "
                 "before any processing** and before it ever crosses to the rest of "
                 "the bot. An actual drop, not a filter. Toggle again to opt back in.\n"
-                "• `/mute-voice` — AURA stops speaking replies to *you*; everything "
+                "• `/mute-voice` — CORTANA stops speaking replies to *you*; everything "
                 "else still works.\n"
-                "AURA also announces itself in channel text every time it joins voice.",
+                "CORTANA also announces itself in channel text every time it joins voice.",
             ),
         ),
     ),
@@ -308,12 +322,12 @@ HELP_TOPICS: dict[str, HelpTopic] = {
 # ── main page ────────────────────────────────────────────────────────────────
 
 _MAIN_DESCRIPTION = (
-    "AURA sits in your corp's voice channel and turns a spoken report into a "
+    "CORTANA sits in your corp's voice channel and turns a spoken report into a "
     "live incident card, role pings, and a spoken confirmation — in about a "
     "second and a half. Every voice command has a slash twin, so everything "
     "keeps working from chat alone.\n\n"
-    "**Say:** *“Aura Command, hostiles Otanuomi, three battleships”*\n"
-    "**AURA answers in voice:** *“Hostiles Otanuomi, pinged.”* — and the card "
+    "**Say:** *“Hey Cortana, hostiles Otanuomi, three battleships”*\n"
+    "**CORTANA answers in voice:** *“Hostiles Otanuomi, pinged.”* — and the card "
     "is already posted.\n\n"
     "Pick a topic below, or jump straight there with `/help topic:…`."
 )
@@ -323,7 +337,7 @@ _MAIN_FIELDS: tuple[tuple[str, str], ...] = (
         "Channels",
         "• **#intel-alerts** — incidents that mention a role: the loud feed\n"
         "• **#intel-live** — every incident, mention-free: the quiet feed\n"
-        "• **#bot-health** — AURA's hourly self-reports, for the admins",
+        "• **#bot-health** — CORTANA's hourly self-reports, for the admins",
     ),
     (
         "Privacy",
@@ -336,11 +350,11 @@ _MAIN_FIELDS: tuple[tuple[str, str], ...] = (
 def main_embed() -> dict[str, object]:
     """The /help front page as an embed dict (``discord.Embed.from_dict`` shape)."""
     return {
-        "title": "AURA — voice-activated fleet intel",
+        "title": "CORTANA — voice-activated fleet intel",
         "description": _MAIN_DESCRIPTION,
         "color": 0x3498DB,
         "fields": [{"name": n, "value": v, "inline": False} for n, v in _MAIN_FIELDS],
-        "footer": {"text": "AURA · /help"},
+        "footer": {"text": "CORTANA · /help"},
     }
 
 
@@ -352,7 +366,7 @@ def topic_embed(key: str) -> dict[str, object]:
         "description": topic.description,
         "color": 0x3498DB,
         "fields": [{"name": n, "value": v, "inline": False} for n, v in topic.fields],
-        "footer": {"text": "AURA · /help"},
+        "footer": {"text": "CORTANA · /help"},
     }
 
 
@@ -462,7 +476,7 @@ class HelpCog(commands.Cog):
     def __init__(self, bot: AuraBot) -> None:
         self.bot = bot
 
-    @app_commands.command(name="help", description="How AURA works: commands, voice, privacy")
+    @app_commands.command(name="help", description="How CORTANA works: commands, voice, privacy")
     @app_commands.describe(topic="Jump straight to one help page")
     @app_commands.choices(
         topic=[app_commands.Choice(name=t.label, value=t.key) for t in HELP_TOPICS.values()]

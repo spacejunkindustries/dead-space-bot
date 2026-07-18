@@ -1,4 +1,4 @@
-"""AURA Brain entrypoint: composition root, task supervision, shutdown.
+"""CORTANA Brain entrypoint: composition root, task supervision, shutdown.
 
 ``python -m aura --config /etc/aura/aura.yaml``
 
@@ -425,11 +425,11 @@ class App:
                     self.capture.force_endpoint(user_id)
 
     def _on_capture_start(self, user_id: int, guild_id: int) -> None:
-        """Wake fired — acknowledge so the pilot knows AURA is listening.
+        """Wake fired — acknowledge so the pilot knows CORTANA is listening.
 
         Sync hot-path callback: it only schedules the cue as a task, so the
         audio thread never blocks. ALERT priority jumps the queue ahead of any
-        pending confirmations. AURA never captures its own playback, so the cue
+        pending confirmations. CORTANA never captures its own playback, so the cue
         cannot bleed into the utterance being recorded.
 
         The form of the cue is ``wake.ack``: "voice" speaks "Go ahead."
@@ -861,7 +861,7 @@ def build_app(holder: ConfigHolder) -> App:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="aura", description="AURA Brain")
+    parser = argparse.ArgumentParser(prog="aura", description="CORTANA Brain")
     parser.add_argument("--config", required=True, metavar="PATH", help="path to aura.yaml")
     args = parser.parse_args(argv)
 

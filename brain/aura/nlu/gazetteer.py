@@ -1,6 +1,6 @@
 """Constrained gazetteer — GDD §8.1.
 
-AURA does NOT load New Eden. It loads the corp's operational area — roughly
+CORTANA does NOT load New Eden. It loads the corp's operational area — roughly
 100–500 systems (constraint 8: the small gazetteer IS the accuracy decision,
 not a shortcut). The ``systems`` and ``system_adjacency`` tables are seeded
 from the EVE SDE once at install time; this module prunes that set at runtime

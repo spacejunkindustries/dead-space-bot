@@ -1,7 +1,7 @@
 """Operator CLI: seed the ``systems`` + ``system_adjacency`` gazetteer tables
 from the EVE static data export (GDD §8.1, §14).
 
-AURA's gazetteer is *scoped at runtime* by ``gazetteer.yaml`` (see
+CORTANA's gazetteer is *scoped at runtime* by ``gazetteer.yaml`` (see
 :mod:`aura.nlu.gazetteer`). This tool fills the underlying tables the scope
 rules prune from: it loads **k-space New Eden** — every non-wormhole solar
 system and the jump graph between them — so a nomadic corp can point
@@ -243,7 +243,7 @@ def _acquire(args: argparse.Namespace) -> tuple[str, str, str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m aura.nlu.seed",
-        description="Seed the AURA gazetteer tables from the EVE SDE (GDD §8.1).",
+        description="Seed the CORTANA gazetteer tables from the EVE SDE (GDD §8.1).",
     )
     parser.add_argument(
         "--db", required=True, metavar="PATH", help="path to aura.db (e.g. /var/lib/aura/aura.db)"

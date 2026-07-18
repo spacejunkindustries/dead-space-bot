@@ -1,4 +1,4 @@
-# AURA wake-word training pipeline — configuration.
+# CORTANA wake-word training pipeline — configuration.
 #
 # OFFLINE pipeline. This file is read only by training/wake/generate_samples.py
 # and training/wake/train.py, on a GPU box or Colab — never on the droplet,

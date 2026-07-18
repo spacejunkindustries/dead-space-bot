@@ -1,4 +1,4 @@
-# AURA CI — Python (brain). Runs only when brain/ or this workflow changes,
+# CORTANA CI — Python (brain). Runs only when brain/ or this workflow changes,
 # so brain-only work does not pay for the Rust/Songbird compile (see rust.yml).
 name: brain (Python)
 

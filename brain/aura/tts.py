@@ -45,6 +45,9 @@ __all__ = [
     "SynthesisError",
     "ambiguous",
     "build_wav",
+    "chase_hint",
+    "chase_no_incident",
+    "chase_updated",
     "degraded",
     "flood_control",
     "help_hint",
@@ -96,11 +99,11 @@ class SynthesisError(Exception):
 
 
 # ── §12.1 utterance catalogue ─────────────────────────────────────────────────
-# Short. Always short. AURA is talking over a fight. These are the exact
+# Short. Always short. CORTANA is talking over a fight. These are the exact
 # scripted strings from the GDD table; do not improvise variants elsewhere.
 #
 # Personality (GDD §12.4): under tts.personality "cortana", ACKNOWLEDGEMENT
-# lines rotate through short variants so AURA feels alive; every
+# lines rotate through short variants so CORTANA feels alive; every
 # information-carrying line (system names, counts, timers) stays fixed —
 # a pilot mid-fight must never have to parse a surprise phrasing for facts.
 
@@ -159,8 +162,24 @@ def say_again() -> str:
 
 def not_understood() -> str:
     """*"Say again?"* — the utterance matched no command and no relay frame
-    (GDD §8.6 framed mode): AURA heard something but won't post it."""
+    (GDD §8.6 framed mode): CORTANA heard something but won't post it."""
     return "Say again?"
+
+
+def chase_updated(system: str) -> str:
+    """*"Chase updated, Kisogo."* — the live card now points at the new system."""
+    return f"Chase updated, {system}."
+
+
+def chase_no_incident() -> str:
+    """*"No active incident to chase."* — chase needs a live report first."""
+    return "No active incident to chase."
+
+
+def chase_hint() -> str:
+    """*"Say update chase and a system, or clear to finish."* — a bare
+    "chase mode", or a chase terminator ("chase mode off") with no system."""
+    return "Say update chase and a system, or clear to finish."
 
 
 def post_failed() -> str:
@@ -172,7 +191,7 @@ def post_failed() -> str:
 
 def go_ahead() -> str:
     """*"Go ahead."* — spoken the instant the wake word fires, so the pilot
-    knows AURA is listening before they start their report (§5 capture)."""
+    knows CORTANA is listening before they start their report (§5 capture)."""
     return _pick(
         "Go ahead.",
         ("Go ahead.", "Listening.", "I'm here. Go ahead.", "Send it.", "Copy. Go ahead."),
@@ -230,7 +249,7 @@ def relayed() -> str:
 
 def code_ack(severity: Severity) -> str:
     """*"Code orange. Go ahead."* — a standalone spoken colour code opens a
-    dialogue: AURA acknowledges and the report follows in a wake-free window
+    dialogue: CORTANA acknowledges and the report follows in a wake-free window
     (GDD §6.4)."""
     colour = _SEVERITY_SPOKEN[severity]
     return _pick(
@@ -420,7 +439,7 @@ def holographic(pcm_s16le: bytes, sample_rate: int) -> bytes:
 
     A light modulated-delay chorus (the shimmer) plus a few decaying reflections
     (a spacious, projected feel). This is an audio *effect* over an ordinary
-    synthetic voice — it clones no one; it just makes AURA sound less like a
+    synthetic voice — it clones no one; it just makes CORTANA sound less like a
     plain TTS and more like a ship's AI. numpy is imported lazily (audio dep).
     Returns s16le at the same rate; empty input passes through untouched."""
     import numpy as np  # lazy — audio dependency

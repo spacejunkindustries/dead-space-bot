@@ -47,7 +47,7 @@ class MigrationError(RuntimeError):
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    """Open (creating if needed) the AURA database with the required pragmas.
+    """Open (creating if needed) the CORTANA database with the required pragmas.
 
     Applies ``journal_mode=WAL`` and ``foreign_keys=ON`` (plus a 5s busy
     timeout) and sets ``row_factory`` to :class:`sqlite3.Row`. Does NOT run
