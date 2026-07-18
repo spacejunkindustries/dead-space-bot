@@ -37,8 +37,10 @@ Control message shapes are exactly GDD §15: ``hello``, ``snapshot``,
 ``speaking``, ``left``, ``join_ok``, ``join_failed``, ``driver_disconnected``,
 ``heartbeat`` inbound; ``join``, ``leave``, ``optouts``, ``hb_ack`` outbound
 (ids as strings). Ears liveness is tracked from ``heartbeat`` control
-messages; Brain answers each heartbeat with ``hb_ack`` so Ears can detect a
-wedged-but-connected Brain by inbound-byte silence.
+messages; Brain answers each heartbeat with ``hb_ack`` — sent straight from
+the read path, ahead of the control queue, so a slow app handler can never
+starve it — letting Ears detect a wedged-but-connected Brain by
+inbound-byte silence.
 
 Plane separation: the read loop does ONLY ``readexactly`` plus the sync audio
 feed. Control frames are pushed onto an :class:`asyncio.Queue` consumed by an
@@ -289,8 +291,9 @@ class IpcServer:
 
     Liveness: every ``{"t": "heartbeat", ...}`` control message stamps
     :attr:`last_heartbeat` (monotonic seconds); :meth:`is_alive` compares it
-    against a timeout, and the control consumer answers with ``hb_ack`` so
-    Ears can detect a wedged Brain. The clocks are injectable for tests.
+    against a timeout, and the read path answers with ``hb_ack`` (as its own
+    task, never behind the app's control handlers) so Ears can detect a
+    wedged Brain. The clocks are injectable for tests.
     """
 
     def __init__(
@@ -320,6 +323,9 @@ class IpcServer:
         self._prehello_dropped = 0
         self._control_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._control_task: asyncio.Task[None] | None = None
+        # Strong refs to in-flight hb_ack sends (fired from the read path,
+        # never awaited there) — a bare create_task result can be GC'd.
+        self._hb_ack_tasks: set[asyncio.Task[bool]] = set()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -540,20 +546,28 @@ class IpcServer:
         if t == "heartbeat":
             self._last_heartbeat = self._clock()
             self._last_heartbeat_msg = msg
+            # hb_ack is Ears' ONLY inbound-liveness signal (GDD §15.5: 20 s
+            # of inbound silence marks the link Lost). It is answered from
+            # HERE, the read path, as its own task — never behind the serial
+            # control consumer, where one slow app handler (Discord REST in
+            # the alarm/announce paths) would starve the ack and false-
+            # trigger Ears' Lost + reconnect while the link is healthy.
+            task = asyncio.create_task(self.send_control({"t": "hb_ack"}), name="ipc-hb-ack")
+            self._hb_ack_tasks.add(task)
+            task.add_done_callback(self._hb_ack_tasks.discard)
         self._control_queue.put_nowait(msg)
 
     async def _control_consumer(self) -> None:
         """Drain the control queue independently of the audio read loop.
 
-        Answers heartbeats with ``hb_ack`` (Ears' inbound-liveness signal),
-        then hands the message to the app's ``on_control``. A crashing
-        handler is logged and skipped — it must never kill this task, or
-        every later join/leave/hello would silently queue forever.
+        Hands each message to the app's ``on_control``. A crashing handler
+        is logged and skipped — it must never kill this task, or every later
+        join/leave/hello would silently queue forever. (Heartbeats are acked
+        from the read path — see ``_dispatch_control`` — so a slow handler
+        here can never starve Ears' inbound-liveness signal.)
         """
         while True:
             msg = await self._control_queue.get()
-            if msg.get("t") == "heartbeat":
-                await self.send_control({"t": "hb_ack"})
             try:
                 await self._on_control(msg)
             except asyncio.CancelledError:

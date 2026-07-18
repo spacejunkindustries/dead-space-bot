@@ -520,7 +520,7 @@ class IncidentEngine:
         gazetteer: Gazetteer,
         discipline: Discipline,
         poster: Poster,
-        rules_path: str | Path,
+        rules_path: str | Path | Callable[[], Path],
         *,
         on_mention: Callable[[], None] | None = None,
     ) -> None:
@@ -532,7 +532,17 @@ class IncidentEngine:
         # Fired once per mention actually sent (health counter); optional so
         # the engine stays decoupled from HealthReporter.
         self._on_mention = on_mention
-        self._rules_path = Path(rules_path)
+        # ``rules_path`` may be a callable so the EFFECTIVE routing.yaml
+        # location is re-resolved on every (re)load — ``routing.file`` is an
+        # ENGINE-reload-class key, and a path baked in at construction would
+        # silently pin a /reload to the old file (review finding). The
+        # composition root passes a holder-backed resolver; tests pass a
+        # plain path.
+        if callable(rules_path):
+            self._rules_path: Callable[[], Path] = rules_path
+        else:
+            fixed = Path(rules_path)
+            self._rules_path = lambda: fixed
         self._rules: list[RoutingRule] = []
         self._alias_roles: dict[str, int] = {}
         self._lock = asyncio.Lock()
@@ -572,10 +582,14 @@ class IncidentEngine:
         """(Re)load ``routing.yaml``. Blocking file I/O — call via ``to_thread``.
 
         ``resolve_role`` maps role names to ids (the bot supplies a guild
-        lookup). Returns the number of active rules.
+        lookup). The rules path is resolved NOW, through the constructor's
+        resolver, so a reloaded ``routing.file`` edit takes effect on the
+        next reload rather than the next restart. Returns the number of
+        active rules.
         """
-        self._rules = load_routing_rules_file(self._rules_path, self._gazetteer, resolve_role)
-        self._alias_roles = load_group_aliases(self._rules_path, resolve_role)
+        rules_path = self._rules_path()
+        self._rules = load_routing_rules_file(rules_path, self._gazetteer, resolve_role)
+        self._alias_roles = load_group_aliases(rules_path, resolve_role)
         return len(self._rules)
 
     # ── the single entry point (constraint 10) ───────────────────────────────

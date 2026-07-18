@@ -237,14 +237,18 @@ class App:
         self.health.set_stt_probe(lambda: bool(getattr(transcriber, "degraded", False)))
 
         late_poster = _LatePoster()
-        rules_path = self.holder.current.routing.resolve(self.holder.path)
+        # A RESOLVER, not a resolved path: routing.file is ENGINE-reload
+        # class, so the effective routing.yaml location must be re-read from
+        # the live config on every rules (re)load — a path baked in here
+        # would pin /reload to the boot-time file until a restart.
+        holder = self.holder
         self.engine = IncidentEngine(
             self.conn,
             self.holder,
             self.gazetteer,
             self.discipline,
             late_poster,
-            rules_path,
+            lambda: holder.current.routing.resolve(holder.path),
             on_mention=self.health.record_mention,
         )
         self.bot = AuraBot(
@@ -374,11 +378,29 @@ class App:
         all-or-nothing, apply by reload class, post the receipt, and drive
         the CONFIG_RESTART_PENDING alarm. Backs BOTH doors — SIGHUP and the
         ``/reload`` slash command (which needs the returned receipt)."""
+        from cortana.core.routing import load_group_aliases, load_rules
+        from cortana.doctor import _NullGazetteer
         from cortana.nlu.gazetteer import _load_scope
         from cortana.reload import reload_all
 
         def _validate_gazetteer(cfg: Any) -> None:
             _load_scope(Path(cfg.gazetteer.file))
+
+        def _validate_routing(cfg: Any) -> None:
+            # Structural validation with a dummy role resolver (doctor.py's
+            # check_routing_yaml pattern): a broken routing.yaml edit must
+            # REJECT the whole reload up front — the engine reloader path
+            # (bot._load_routing_rules) reports failures via alarm cards but
+            # deliberately does not raise, so without this gate the receipt
+            # would read "Engines reloaded: routing" over a rejected file.
+            path = cfg.routing.resolve(self.holder.path)
+            if not path.is_file():
+                if cfg.routing.file:
+                    raise ConfigError(f"routing.file points at {path}, which does not exist")
+                return  # optional default file absent: zero rules, alarmed at load
+            gazetteer = _NullGazetteer()
+            load_rules(path, gazetteer, lambda _name: 1)  # type: ignore[arg-type]
+            load_group_aliases(path, lambda _name: 1)
 
         async def _reload_gazetteer(cfg: Any) -> None:
             if self.gazetteer is not None:
@@ -390,7 +412,10 @@ class App:
 
         result = await reload_all(
             self.holder,
-            file_validators={"gazetteer.yaml": _validate_gazetteer},
+            file_validators={
+                "gazetteer.yaml": _validate_gazetteer,
+                "routing.yaml": _validate_routing,
+            },
             engine_reloaders={
                 "gazetteer": _reload_gazetteer,
                 "routing": _reload_routing,
@@ -481,6 +506,9 @@ class App:
         log.info("shutdown_complete")
 
     async def _shutdown_sequence(self) -> None:
+        # gateway.close() sends NO leave: Ears keeps its voice connection
+        # (and DAVE session) alive across a routine Brain restart, and the
+        # fresh Brain's hello replay re-syncs the join state (GDD §15.4).
         if self.gateway is not None:
             with contextlib.suppress(Exception):
                 await self.gateway.close()
@@ -523,29 +551,44 @@ class App:
         if self.dialog is not None:
             self.dialog.reset_user(uid)
 
-    def _reconcile_snapshot(self, msg: dict[str, Any]) -> None:
-        """Reconcile Brain's per-user view against Ears' state snapshot.
+    async def _reconcile_snapshot(self, msg: dict[str, Any]) -> None:
+        """Reconcile Brain's view against Ears' state snapshot.
 
         Ears sends a full snapshot (per-guild connected state + SSRC↔user
         roster) right after every hello (GDD §15), replacing the lossy event
         deltas an IPC outage would have eaten. Users Brain is still tracking
         that Ears no longer sees (left during the outage) are purged exactly
-        as if their ``left`` event had arrived. State is reset only where the
-        views actually differ — the hello replay already handled the rest.
+        as if their ``left`` event had arrived. The per-guild connect state
+        goes to the voice gateway, which owns the rejoin/adopt/leave
+        judgement — after an unclean Brain death (SIGKILL/OOM never runs the
+        graceful path) this is how a fresh Brain learns Ears is still parked
+        in a voice channel. State is reset only where the views actually
+        differ — the hello replay already handled the rest.
         """
         roster: set[int] = set()
+        connected = False
+        channel_id: int | None = None
+        want_guild = str(self.holder.current.discord.guild_id)
         for guild in msg.get("guilds", []) or []:
             for entry in guild.get("users", []) or []:
                 user_id = entry.get("user_id")
                 if user_id is not None:
                     with contextlib.suppress(ValueError, TypeError):
                         roster.add(int(user_id))
+            if str(guild.get("guild_id")) == want_guild:
+                connected = bool(guild.get("connected"))
+                raw_channel = guild.get("channel_id")
+                if raw_channel is not None:
+                    with contextlib.suppress(ValueError, TypeError):
+                        channel_id = int(raw_channel)
         tracked: set[int] = self.dialog.tracked_users() if self.dialog is not None else set()
         stale = tracked - roster
         for uid in stale:
             self._purge_user(uid)
         if stale:
             log.info("ears_snapshot_reconciled", purged_users=len(stale))
+        if self.gateway is not None:
+            await self.gateway.on_ears_state(connected, channel_id)
 
     async def _on_control(self, msg: dict[str, Any]) -> None:
         t = msg.get("t")
@@ -567,7 +610,7 @@ class App:
             if self.gateway is not None:
                 await self.gateway.on_ears_hello()
         elif t == "snapshot":
-            self._reconcile_snapshot(msg)
+            await self._reconcile_snapshot(msg)
         elif t == "join_ok":
             if self.gateway is not None:
                 await self.gateway.on_join_ok(int(msg.get("channel_id") or 0))

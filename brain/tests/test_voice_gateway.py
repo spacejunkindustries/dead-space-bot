@@ -20,11 +20,19 @@ CHANNEL = 9
 
 
 class _FakeIpc:
-    def __init__(self) -> None:
-        self.controls: list[dict[str, Any]] = []
+    """send_control mirrors IpcServer's v2 contract: True when the frame was
+    handed to a connected Ears, False when it was not delivered (the gateway
+    must then log honestly and skip the §19 announcement)."""
 
-    async def send_control(self, msg: dict[str, Any]) -> None:
+    def __init__(self, *, connected: bool = True) -> None:
+        self.controls: list[dict[str, Any]] = []
+        self.connected = connected
+
+    async def send_control(self, msg: dict[str, Any]) -> bool:
+        if not self.connected:
+            return False
         self.controls.append(msg)
+        return True
 
 
 class _StubHolder:
@@ -273,3 +281,157 @@ async def test_join_failed_respects_auto_join_off() -> None:
 async def test_join_ok_is_accepted() -> None:
     gw = _gateway(_StubHolder(), _FakeIpc())
     await gw.on_join_ok(CHANNEL)  # informational; must not raise
+
+
+# ── shutdown: Ears stays in voice across Brain restarts (GDD §15.4) ──────────
+
+
+async def test_close_does_not_send_leave() -> None:
+    """A routine Brain shutdown must not evict Ears from voice: `leave` on
+    close would tear down the DAVE session on every deploy, contradicting
+    §15.4 ("a routine Brain restart can never deafen the bot"). The fresh
+    Brain's hello replay re-syncs the join state instead."""
+    ipc = _FakeIpc()
+    gw = _gateway(_StubHolder(), ipc)
+    gw._joined_channel_id = CHANNEL
+
+    await gw.close()
+
+    assert not any(c["t"] == "leave" for c in ipc.controls)
+
+
+async def test_close_cancels_pending_join() -> None:
+    ipc = _FakeIpc()
+    gw = _gateway(_StubHolder(), ipc)
+    await gw.on_voice_update(CHANNEL, 1, 1)  # schedules the debounced join
+    assert gw._pending_channel_id == CHANNEL
+
+    await gw.close()
+
+    assert gw._pending_channel_id is None
+    assert not any(c["t"] == "join" for c in ipc.controls)
+
+
+# ── §19: the hello replay announces through the cadence gate ─────────────────
+
+
+async def test_hello_replay_announces_a_fresh_ears_join() -> None:
+    """A hello from a NEW Ears process performs a genuinely new voice join —
+    the §19 consent notice must go through the cadence gate, not be skipped
+    outright (join_announcement="every" has to actually mean every join)."""
+    holder = _StubHolder(join_announcement="every")
+    announce = _CountingAnnounce()
+    gw = VoiceGateway(holder, _FakeIpc(), _db_conn(), announce, join_debounce_s=999)
+    gw._joined_channel_id = CHANNEL
+
+    await gw.on_ears_hello()
+
+    assert announce.calls == 1
+
+
+async def test_hello_replay_daily_gate_suppresses_replay_spam() -> None:
+    """Under "daily" the cadence gate absorbs reconnect churn: a replay
+    within the window posts nothing new."""
+    holder = _StubHolder(join_announcement="daily")
+    announce = _CountingAnnounce()
+    gw = VoiceGateway(holder, _FakeIpc(), _db_conn(), announce, join_debounce_s=999)
+    await gw._send_join(CHANNEL, announce=True)
+    assert announce.calls == 1
+
+    await gw.on_ears_hello()  # Ears bounced within the 24h window
+
+    assert announce.calls == 1
+
+
+# ── GDD §15.5: send results are honoured, never assumed ──────────────────────
+
+
+async def test_undelivered_join_skips_announcement_but_keeps_state() -> None:
+    """A join that never reached Ears is not a join: no §19 notice. The
+    joined belief IS kept — it is what makes the next hello replay re-send
+    the join (and announce) once Ears is back."""
+    holder = _StubHolder(join_announcement="every")
+    announce = _CountingAnnounce()
+    gw = VoiceGateway(holder, _FakeIpc(connected=False), _db_conn(), announce, join_debounce_s=999)
+
+    await gw._send_join(CHANNEL, announce=True)
+
+    assert announce.calls == 0
+    assert gw.joined_channel_id == CHANNEL
+
+
+async def test_push_optouts_returns_delivery_result() -> None:
+    holder = _StubHolder()
+    conn = _db_conn()
+    up = VoiceGateway(holder, _FakeIpc(), conn, _noop_announce, join_debounce_s=999)
+    down = VoiceGateway(
+        holder, _FakeIpc(connected=False), conn, _noop_announce, join_debounce_s=999
+    )
+
+    assert await up.push_optouts() is True
+    assert await down.push_optouts() is False
+
+
+# ── snapshot reconcile: Ears' connect state → gateway judgement (GDD §15) ────
+
+
+async def test_snapshot_adopts_ears_channel_after_unclean_death() -> None:
+    """Ears still parked in a watched channel while a fresh Brain has no
+    joined state (SIGKILL/OOM never ran the graceful path): adopt it, so the
+    census-driven leave path works again."""
+    ipc = _FakeIpc()
+    gw = _gateway(_StubHolder(), ipc)
+
+    await gw.on_ears_state(True, CHANNEL)
+
+    assert gw.joined_channel_id == CHANNEL
+    assert not any(c["t"] in ("join", "leave") for c in ipc.controls)
+
+
+async def test_snapshot_adoption_leaves_a_known_empty_channel() -> None:
+    """The channel emptied during the Brain outage and the census already
+    seeded: adoption must fire the leave nobody else ever would — Ears
+    lingering in an empty channel looks like lurking (§19)."""
+    ipc = _FakeIpc()
+    gw = _gateway(_StubHolder(), ipc)
+    await gw.on_voice_update(CHANNEL, 0, 0)  # census knows: empty
+
+    await gw.on_ears_state(True, CHANNEL)
+
+    assert gw.joined_channel_id is None
+    assert any(c["t"] == "leave" for c in ipc.controls)
+
+
+async def test_snapshot_unwatched_channel_is_left() -> None:
+    ipc = _FakeIpc()
+    gw = _gateway(_StubHolder(), ipc)
+
+    await gw.on_ears_state(True, CHANNEL + 1)  # not a watched channel
+
+    assert gw.joined_channel_id is None
+    assert any(c["t"] == "leave" for c in ipc.controls)
+
+
+async def test_snapshot_agreeing_or_disconnected_views_are_a_noop() -> None:
+    ipc = _FakeIpc()
+    gw = _gateway(_StubHolder(), ipc)
+    gw._joined_channel_id = CHANNEL
+
+    await gw.on_ears_state(True, CHANNEL)  # views agree
+    await gw.on_ears_state(False, None)  # the hello replay owns not-connected
+
+    assert gw.joined_channel_id == CHANNEL
+    assert ipc.controls == []
+
+
+async def test_snapshot_adoption_cancels_a_redundant_pending_join() -> None:
+    ipc = _FakeIpc()
+    gw = _gateway(_StubHolder(), ipc)
+    await gw.on_voice_update(CHANNEL, 2, 2)  # pilots present → debounced join
+    assert gw._pending_channel_id == CHANNEL
+
+    await gw.on_ears_state(True, CHANNEL)  # Ears is ALREADY there
+
+    assert gw._pending_channel_id is None
+    assert gw.joined_channel_id == CHANNEL
+    assert not any(c["t"] == "join" for c in ipc.controls)

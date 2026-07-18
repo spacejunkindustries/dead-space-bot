@@ -467,6 +467,60 @@ async def test_voice_swap_on_reload_refreshes_sample_rate(tmp_path, monkeypatch)
     await speaker.close()
 
 
+async def test_render_uses_one_config_snapshot_for_key_synthesis_and_rate(
+    tmp_path, monkeypatch
+) -> None:
+    """A SIGHUP voice swap landing between _render's config read and the
+    Piper invocation must not synthesise with the NEW voice while caching
+    under the OLD voice's key and wrapping in the OLD rate's header: one
+    snapshot flows through the whole render."""
+    voice_b = tmp_path / "voice_b.onnx"
+    (tmp_path / "voice_b.onnx.json").write_text(
+        json.dumps({"audio": {"sample_rate": 16000}}), encoding="utf-8"
+    )
+
+    class _SwapMidRender:
+        """holder.current returns voice A for a limited number of reads, then
+        voice B — simulating the reload swap landing mid-render."""
+
+        def __init__(self, cfg_a: Any, cfg_b: Any) -> None:
+            self.cfg_a, self.cfg_b = cfg_a, cfg_b
+            self.reads_of_a = 10**9
+
+        @property
+        def current(self) -> Any:
+            if self.reads_of_a > 0:
+                self.reads_of_a -= 1
+                return self.cfg_a
+            return self.cfg_b
+
+    cfg_a = _holder(tmp_path).current  # voice A: 22050 Hz
+    cfg_b = SimpleNamespace(
+        tts=SimpleNamespace(
+            enabled=True,
+            voice=str(voice_b),
+            binary="/nonexistent/piper",
+            max_utterance_s=3.0,
+            effect="none",
+        )
+    )
+    holder = _SwapMidRender(cfg_a, cfg_b)
+    pcm = b"\x01\x00" * 22050
+    calls = _patch_piper(monkeypatch, pcm)
+    speaker = Speaker(holder, _FakeIpc())  # type: ignore[arg-type]
+
+    # The NEXT holder read (_render's snapshot) sees voice A; every read
+    # after that — including any synthesize() re-read — would see voice B.
+    holder.reads_of_a = 1
+    rendered_pcm, rate = await speaker._render("Go ahead.")
+
+    model = calls[0][calls[0].index("--model") + 1]
+    assert model == cfg_a.tts.voice  # synthesised with the snapshot's voice…
+    assert rate == 22050  # …and reported at that voice's rate
+    assert speaker._line_cache[("Go ahead.", cfg_a.tts.voice, "none")] == rendered_pcm
+    await speaker.close()
+
+
 async def test_close_flushes_pending_jobs_false(tmp_path, monkeypatch) -> None:
     _patch_piper(monkeypatch, b"\x01\x00" * 100)
     speaker = Speaker(_holder(tmp_path), _FakeIpc())  # type: ignore[arg-type]
