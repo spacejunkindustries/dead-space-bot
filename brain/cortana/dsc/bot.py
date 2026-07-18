@@ -105,7 +105,10 @@ async def sync_command_tree(
     never kill startup. Returns ``"synced" | "skipped" | "failed"``.
     """
     payloads = [command.to_dict(tree) for command in tree.get_commands(guild=guild)]
-    digest = tree_payload_hash(payloads)
+    # The digest is guild-scoped: a guild_id change (or kick/re-invite, which
+    # deletes guild commands server-side) must never be masked by a hash
+    # computed for a different guild (review finding).
+    digest = f"{guild.id}:{tree_payload_hash(payloads)}"
     stored = await asyncio.to_thread(
         db.query_value, conn, "SELECT value FROM app_state WHERE key = ?", (_TREE_HASH_KEY,)
     )
@@ -293,8 +296,11 @@ class AuraBot(commands.Bot):
         (no eternal 'thinking…' spinner mid-fight) and count it into the
         AlarmBus so repeats surface in #bot-health."""
         if isinstance(error, app_commands.CheckFailure):
-            # Gate refusals are user-facing, not faults (AdminCog already
-            # words its own; this covers any future check).
+            # Gate refusals are user-facing, not faults. The owning cog's
+            # cog_app_command_error usually answered already — a second
+            # tree-level reply doubled every refusal (review finding).
+            if interaction.response.is_done():
+                return
             from cortana.dsc.views import answer_interaction_error
 
             await answer_interaction_error(

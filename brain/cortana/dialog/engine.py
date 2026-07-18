@@ -222,13 +222,18 @@ class DialogEngine:
         bias = self._gazetteer.prompt_bias_text() if cfg.stt.bias_with_gazetteer else ""
         try:
             result = await asyncio.to_thread(self._transcriber.transcribe, pcm, bias)
-        except SttError as exc:
+        except Exception as exc:
+            # ANY backend failure — SttError, but also raw ctranslate2 /
+            # model-load errors the watchdog re-raises verbatim — must flow
+            # through the machine's fail() door: swallowing it here left the
+            # session stuck THINKING with the pilot hearing dead air.
             del pcm  # constraint 5: audio dropped even on failure
             self._health.record_rejected()
             log.warning(
                 "stt_failed",
                 user_id=s.user_id,
                 timed_out=isinstance(exc, SttTimeoutError),
+                stt_error=isinstance(exc, SttError),
                 error=str(exc),
             )
             await self._apply(
@@ -324,7 +329,24 @@ class DialogEngine:
             log.info("utterance_no_intent", user_id=s.user_id, reason=action.reason)
 
     def _arm_window(self, s: DialogSession, gen: int) -> None:
-        """Arm the wake-free window and start its WALL-CLOCK lifetime."""
+        """Arm the wake-free window and start its WALL-CLOCK lifetime.
+
+        Executed AFTER the spoken prompt resolves, which can be seconds under
+        TTS-queue backlog — long enough for the pilot to have re-woken. A
+        fresh wake supersedes the dialog (new gen), so an ArmWindow whose gen
+        no longer matches the live session is stale and must be dropped, not
+        executed: arming it would destroy the in-flight capture (confirmed
+        live-class defect) or strand a window no deadline owns.
+        """
+        live = self._sessions.get(s.user_id)
+        if live is None or live.gen != gen:
+            log.info(
+                "window_arm_dropped_stale",
+                user_id=s.user_id,
+                gen=gen,
+                live_gen=live.gen if live is not None else None,
+            )
+            return
         dcfg = self._dcfg()
         if self._capture is not None:
             self._capture.arm_window(s.user_id, s.guild_id, gen)
@@ -430,6 +452,17 @@ class DialogEngine:
 
             await self._send_channel(cfg.discord.channels.intel_live, "", embed=main_embed())
 
+        effective = (
+            parsed.severity
+            if parsed.severity is not None
+            else INTENT_SEVERITY.get(parsed.intent, Severity.NONE)
+        )
+        # Speak the outcome FIRST, then arm the retry window: the window's
+        # wall-clock lifetime must not start ticking while the rejection
+        # line is still queued behind other synthesis (review finding — the
+        # pilot could lose 1-2s of a 4s window before hearing the prompt).
+        await self._reply(s, effective, outcome)
+
         # LOW tier (GDD §8.3): feed the rejection back — the machine decides
         # whether the retry budget still covers a wake-free rebind window.
         if (
@@ -442,13 +475,6 @@ class DialogEngine:
                 self._session(s.user_id, s.guild_id),
                 DialogEvent(Ev.ENGINE_REJECTED_LOW, parsed=parsed),
             )
-
-        effective = (
-            parsed.severity
-            if parsed.severity is not None
-            else INTENT_SEVERITY.get(parsed.intent, Severity.NONE)
-        )
-        await self._reply(s, effective, outcome)
 
     async def _relay(self, s: DialogSession, action: Relay) -> None:
         """Freeform intel relay (GDD §8.6) through the broadcast path.

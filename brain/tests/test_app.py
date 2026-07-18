@@ -935,3 +935,23 @@ async def test_refresh_chat_follows_config_and_key_state(
     app._refresh_chat()
     assert app.chat is None
     assert app._chat_status == "disabled"
+
+
+async def test_stale_arm_window_action_is_dropped() -> None:
+    # Regression (confirmed review finding): ArmWindow executes after the
+    # spoken prompt resolves; if the pilot re-woke in that gap the session
+    # gen has advanced and the stale arm must be a no-op — executing it
+    # would destroy the in-flight capture or strand an unowned window.
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["mumble static"]))
+    await utter_wake(rig)  # fails -> AWAIT with an armed window (gen N+1)
+    stale_session = rig.dialog._sessions[USER]
+    armed_before = len(rig.capture.armed)
+
+    # Pilot re-wakes: fresh dialog supersedes the AWAIT gen.
+    wake_open(rig)
+    await drain(rig)
+
+    # The stale ArmWindow from the superseded dialog fires late:
+    rig.dialog._arm_window(stale_session, stale_session.gen)
+    assert len(rig.capture.armed) == armed_before  # dropped, not armed
+    assert USER not in rig.dialog._deadlines  # no unowned deadline created

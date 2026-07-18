@@ -173,10 +173,18 @@ class CaptureManager:
         Called only by the dialog engine's ArmWindow executor. The window has
         NO lifetime here — the engine's wall-clock wheel calls :meth:`disarm`
         when it expires, so DTX silence cannot freeze it open.
+
+        Refused while a capture is OPEN: the executor runs after awaiting the
+        spoken prompt, and a pilot who re-woke during that gap has a live
+        capture buffer that a stale window must never destroy (the engine
+        also gen-gates the action; this is the capture-side backstop).
         """
         state = self._states.get(user_id)
         if state is None:
             state = self._states[user_id] = _UserState()
+        if state.phase is Phase.CAPTURING:
+            log.warning("window_arm_refused_capturing", user_id=user_id, gen=gen)
+            return
         state.guild_id = guild_id
         state.phase = Phase.ARMED
         state.armed_gen = gen

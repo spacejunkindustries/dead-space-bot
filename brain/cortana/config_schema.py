@@ -279,7 +279,7 @@ KEYS: Final[tuple[Key, ...]] = (
     Key(
         "wake.model",
         "str",
-        Reload.RESTART,
+        Reload.SIGHUP,
         "Trained openWakeWord ONNX chain; per-user models are built from "
         "it at speaker onset and cached for the process lifetime.",
     ),
@@ -310,8 +310,9 @@ KEYS: Final[tuple[Key, ...]] = (
     Key(
         "wake.vad_threshold",
         "float",
-        Reload.RESTART,
-        "OPT-IN Silero VAD gate inside openWakeWord (0.0 = off). Applied at model build.",
+        Reload.SIGHUP,
+        "OPT-IN Silero VAD gate inside openWakeWord (0.0 = off). Applied at "
+        "model build; the pool rebuilds per-user models live on reload.",
         default=0.0,
         minimum=0.0,
         maximum=1.0,

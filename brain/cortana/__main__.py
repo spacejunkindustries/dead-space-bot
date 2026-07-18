@@ -47,7 +47,7 @@ from cortana.core import db
 from cortana.core.discipline import Discipline
 from cortana.core.incidents import IncidentEngine, Poster, TimerPing
 from cortana.dialog import DialogEngine
-from cortana.dsc.bot import AuraBot, read_token
+from cortana.dsc.bot import AuraBot, TokenError, read_token
 from cortana.dsc.cogs.utility import ReminderService
 from cortana.health import HealthReporter
 from cortana.ipc import PRIORITY_NORMAL, IpcServer
@@ -112,12 +112,22 @@ class _LatePoster:
         return self._poster
 
     async def post(
-        self, guild_id: int, channel: Any, content: str, card: CardRender
+        self,
+        guild_id: int,
+        channel: Any,
+        content: str,
+        card: CardRender,
+        **kwargs: Any,
     ) -> tuple[int, int]:
-        return await self._target().post(guild_id, channel, content, card)
+        # **kwargs: forward every keyword (mentions=...) verbatim — this
+        # proxy must never lag the Poster protocol again (a missing kwarg
+        # here broke every production post while tests passed on fakes).
+        return await self._target().post(guild_id, channel, content, card, **kwargs)
 
-    async def edit(self, channel_id: int, message_id: int, content: str, card: CardRender) -> None:
-        await self._target().edit(channel_id, message_id, content, card)
+    async def edit(
+        self, channel_id: int, message_id: int, content: str, card: CardRender, **kwargs: Any
+    ) -> None:
+        await self._target().edit(channel_id, message_id, content, card, **kwargs)
 
 
 class App:
@@ -144,6 +154,11 @@ class App:
         self._chat_status = "disabled"
         self._chat_key: str | None = None
         self._reload_task: asyncio.Task[None] | None = None
+        # Config this PROCESS was built from: restart-pending detection diffs
+        # against this, not the last swap — otherwise a second no-op reload
+        # would resolve the alarm while the edit is still not live (review
+        # finding: the receipt lied after a /reload double-tap).
+        self._boot_cfg = holder.current
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
 
@@ -392,15 +407,23 @@ class App:
         reset_degraded = getattr(self.transcriber, "reset_degraded", None)
         if callable(reset_degraded):
             reset_degraded()
-        # Restart-bound edits are never silently absorbed: raise the alarm
-        # while any are pending, resolve its card when a reload shows none.
+        # Restart-bound edits are never silently absorbed. Pending-ness is
+        # CUMULATIVE against the config this process booted with — a later
+        # reload only resolves the card when the file has actually returned
+        # to the running values (or the process restarted).
+        from cortana.config import diff_configs
+        from cortana.config_schema import Reload
+
+        pending_since_boot = tuple(
+            diff_configs(self._boot_cfg, self.holder.current).get(Reload.RESTART, ())
+        )
         if self.alarms is not None:
-            if result.restart_pending:
+            if pending_since_boot:
                 await self.alarms.raise_alarm(
                     AlarmCode.CONFIG_RESTART_PENDING,
                     AlarmSeverity.WARNING,
-                    "Restart-bound config keys were edited and are NOT live "
-                    "yet: " + ", ".join(result.restart_pending),
+                    "Restart-bound config keys differ from what this process "
+                    "is running: " + ", ".join(pending_since_boot),
                     "`systemctl restart cortana-brain` to apply them",
                 )
             elif result.swapped:
@@ -632,7 +655,12 @@ class App:
         assert self.health
         while True:
             await asyncio.sleep(_HEALTH_CHECK_INTERVAL_S)
-            await self.health.check()
+            # Per-iteration guard, same reasoning as the other loops: one
+            # failed hourly report must not shut the whole process down.
+            try:
+                await self.health.check()
+            except Exception:
+                log.exception("health_iteration_failed")
             # Retry any alarm card that couldn't reach Discord when raised
             # (pre-ready startup alarms land here once the bot is up).
             if self.alarms is not None:
@@ -680,7 +708,10 @@ class App:
                 log.error("channel_unavailable", channel_id=channel_id, error=str(exc))
                 await self._channel_alarm(channel_id, str(exc))
                 return False
-        kwargs: dict[str, Any] = {}
+        # Nothing sent through this helper may ping: override answers carry
+        # verbatim LLM output, and card mentions flow through the Poster's
+        # decide_mentions allowlist — never through here (review finding).
+        kwargs: dict[str, Any] = {"allowed_mentions": discord.AllowedMentions.none()}
         if embed is not None:
             kwargs["embed"] = discord.Embed.from_dict(embed)
         try:
@@ -801,8 +832,17 @@ def main(argv: list[str] | None = None) -> int:
 
     app = build_app(holder)
     # Signal handlers normally shut down first; a stray ^C must still exit 0.
-    with contextlib.suppress(KeyboardInterrupt):
-        app.run()
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            app.run()
+    except TokenError:
+        log.error("token_missing")
+        return 69  # EX_NOAUTH-ish: paired with RestartPreventExitStatus=69
+    except Exception as exc:  # discord.LoginFailure without importing discord here
+        if type(exc).__name__ == "LoginFailure":
+            log.error("token_rejected", error=str(exc))
+            return 69
+        raise
     return 0
 
 

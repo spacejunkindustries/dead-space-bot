@@ -86,9 +86,15 @@ def transition(s: DialogSession, ev: DialogEvent, max_retries: int) -> Transitio
         return TransitionResult(s)
 
     if ev.kind is Ev.CAPTURE_ABANDONED:
-        # Zero speech after the capture opened (wake-tail only): discard
-        # silently — nothing reaches STT, no retry is consumed.
+        # Zero speech after the capture opened: discard silently — nothing
+        # reaches STT. For a WAKE capture (no pending context) that ends the
+        # dialog free of charge. Inside a subdialog, a VAD noise blip that
+        # opened-then-abandoned the window must NOT silently strand the
+        # pilot's pending context (review finding): re-arm through the one
+        # budgeted door instead, silent (no prompt — nothing was heard).
         if s.state is DialogState.LISTENING and ev.gen == s.gen:
+            if s.pending is not PendingKind.NONE:
+                return _fail(s, None, keep_ctx=True)
             return TransitionResult(s.idle())
         return TransitionResult(s)
 
@@ -127,8 +133,12 @@ def _classified(s: DialogSession, c: Classified) -> TransitionResult:
             return _fail(s, Line.SAY_AGAIN, keep_ctx=True)
         return TransitionResult(s.idle(), (RunOverride(query),))
 
-    # 2. Explicit "command override <question>" prefix.
+    # 2. Explicit "command override <question>" prefix. Confidence-gated
+    #    exactly like the continuation path: a hallucinated decode that
+    #    happens to start with the prefix must not burn a paid API call.
     if c.override_query is not None:
+        if not c.confident:
+            return _fail(s, Line.SAY_AGAIN, keep_ctx=True)
         if not c.chat_available:
             return TransitionResult(s.idle(), (Speak(Line.OVERRIDE_UNAVAILABLE),))
         return TransitionResult(s.idle(), (RunOverride(c.override_query),))
@@ -161,11 +171,13 @@ def _classified(s: DialogSession, c: Classified) -> TransitionResult:
     inherited = s.ctx_severity if s.pending is PendingKind.SEVERITY else None
     if c.relay_mode == "off":
         return _rejected_fail(s, "relay_off", Line.NOT_UNDERSTOOD, keep_ctx=False)
+    # ctx worth keeping through a retry: an inherited severity OR a LOW-tier
+    # rebind — one garbled decode must not permanently kill either (review
+    # finding: ctx_retry used to be dropped here).
+    keep = s.pending in (PendingKind.SEVERITY, PendingKind.RETRY_SYSTEM)
     if c.relay_mode == "framed" and not c.framed:
-        keep = s.pending is PendingKind.SEVERITY
         return _rejected_fail(s, "relay_unframed", Line.NOT_UNDERSTOOD, keep_ctx=keep)
     if not c.confident:
-        keep = s.pending is PendingKind.SEVERITY
         return _rejected_fail(s, "relay_low_confidence", Line.SAY_AGAIN, keep_ctx=keep)
     if len(c.relay_text) < 3:
         return TransitionResult(s.idle(), (NoteRejected("relay_too_short"),))

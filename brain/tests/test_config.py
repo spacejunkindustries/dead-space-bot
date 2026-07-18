@@ -429,13 +429,17 @@ def test_restart_bound_keys_are_classified_restart() -> None:
         "stt.model",
         "stt.watchdog_s",
         "capture.vad_aggressiveness",
-        "wake.model",
-        "wake.vad_threshold",
         "ipc.socket",
         "database.path",
         "discord.token_file",
     ):
         assert key_by_path(path).reload is Reload.RESTART, path
+    # The wake model pool rebuilds per-user models live on config-generation
+    # change (audio workstream), so wake.model / wake.vad_threshold are
+    # sighup-class — the receipt must not claim a restart is needed when the
+    # detector already applied the edit (review finding).
+    for path in ("wake.model", "wake.vad_threshold"):
+        assert key_by_path(path).reload is Reload.SIGHUP, path
 
 
 def test_routing_file_config_is_frozen_default() -> None:

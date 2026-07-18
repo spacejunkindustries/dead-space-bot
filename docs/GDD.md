@@ -1122,11 +1122,11 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `discord.here_on_severity` | str_list | `('high',)` | hot | Threat colours that fire @here: high=RED, medium=ORANGE, none=YELLOW (never fires). One of: `high`, `medium`, `none`. |
 | `discord.join_announcement` | str | `'daily'` | hot | §19 consent notice cadence on voice join. One of: `every`, `daily`, `off`. |
 | **`wake:`** | | | | *openWakeWord model and trigger thresholds.* |
-| `wake.model` | str | **required** | restart | Trained openWakeWord ONNX chain; per-user models are built from it at speaker onset and cached for the process lifetime. |
+| `wake.model` | str | **required** | sighup | Trained openWakeWord ONNX chain; per-user models are built from it at speaker onset and cached for the process lifetime. |
 | `wake.threshold` | float | **required** | hot | Wake score needed to open a capture window. |
 | `wake.refractory_ms` | int | **required** | hot | Per-user dead time after a wake hit. |
 | `wake.ack` | str | `'beep'` | hot | Wake acknowledgement: spoken, tone, or silent. One of: `voice`, `beep`, `none`. |
-| `wake.vad_threshold` | float | `0.0` | restart | OPT-IN Silero VAD gate inside openWakeWord (0.0 = off). Applied at model build. |
+| `wake.vad_threshold` | float | `0.0` | sighup | OPT-IN Silero VAD gate inside openWakeWord (0.0 = off). Applied at model build; the pool rebuilds per-user models live on reload. |
 | **`capture:`** | | | | *Utterance capture windows and VAD mode.* |
 | `capture.preroll_ms` | int | **required** | hot | Ring-buffer audio prepended to each capture. Must fit inside the fixed 1500 ms privacy ring (cross-checked). |
 | `capture.endpoint_silence_ms` | int | **required** | hot | Trailing silence that ends an utterance (wall-clock under DTX). |

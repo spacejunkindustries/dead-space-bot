@@ -507,3 +507,22 @@ async def test_force_endpoint_emits_open_capture() -> None:
     assert manager.phase_of(USER_A) is Phase.IDLE
     # Idempotent: nothing to end now.
     assert manager.force_endpoint(USER_A) is False
+
+
+async def test_arm_window_refused_while_capturing() -> None:
+    # Regression (confirmed review finding): a stale ArmWindow executing after
+    # its spoken prompt must never destroy a live capture opened by a re-wake
+    # during the TTS gap.
+    manager, recorder, _ = make_manager()
+    manager.feed(USER_A, GUILD, MARKER)
+    cmd = speech(1500)
+    manager.feed(USER_A, GUILD, cmd)
+    assert manager.is_capturing(USER_A)
+
+    manager.arm_window(USER_A, GUILD, gen=99)  # stale window: refused
+    assert manager.is_capturing(USER_A)  # capture untouched
+
+    assert manager.force_endpoint(USER_A) is True
+    await settle()
+    assert len(recorder.emitted) == 1
+    assert recorder.emitted[0][2] == b"".join([MARKER, cmd])

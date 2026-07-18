@@ -88,7 +88,8 @@ async def test_first_sync_runs_and_stores_hash(conn: sqlite3.Connection) -> None
     assert outcome == "synced"
     assert tree.sync_calls == 1
     stored = db.query_value(conn, "SELECT value FROM app_state WHERE key = ?", (_TREE_HASH_KEY,))
-    assert stored == tree_payload_hash(PAYLOADS)
+    # Guild-scoped digest: a guild_id change must invalidate the stored hash.
+    assert stored == f"{GUILD.id}:{tree_payload_hash(PAYLOADS)}"
     assert AlarmCode.TREE_SYNC_STALE in bus.cleared
 
 
@@ -223,3 +224,17 @@ async def test_boundary_survives_missing_bus_and_dead_interaction() -> None:
         raise RuntimeError("original failure")
 
     await run_component_action(interaction, "subscription-toggle", dispatch())  # no raise
+
+
+async def test_guild_change_invalidates_stored_hash(conn: sqlite3.Connection) -> None:
+    # Kick/re-invite or a guild_id config change deletes/moves the guild
+    # commands server-side — the sync gate must not skip based on a hash
+    # computed for a DIFFERENT guild (review finding).
+    from types import SimpleNamespace
+
+    tree = _Tree(PAYLOADS)
+    await sync_command_tree(conn, tree, GUILD, None)
+    other = SimpleNamespace(id=GUILD.id + 1)
+    outcome = await sync_command_tree(conn, tree, other, None)  # type: ignore[arg-type]
+    assert outcome == "synced"
+    assert tree.sync_calls == 2
