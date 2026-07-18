@@ -135,6 +135,11 @@ class DialogEngine:
         s = self._sessions.get(user_id)
         return s.state if s is not None else DialogState.IDLE
 
+    @property
+    def sessions_active(self) -> int:
+        """Dialog sessions currently in flight (non-IDLE) — for /botstatus."""
+        return sum(1 for s in self._sessions.values() if s.state is not DialogState.IDLE)
+
     def reset_user(self, user_id: int) -> None:
         """Purge one user's dialog + capture state. Safe from any caller —
         IPC 'left', discord voice_state, or tests — and idempotent."""

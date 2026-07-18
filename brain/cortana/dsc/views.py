@@ -24,9 +24,9 @@ tested without any Discord objects (``tests/test_views.py``).
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Coroutine, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import discord
 import structlog
@@ -44,15 +44,65 @@ __all__ = [
     "SubscriptionButton",
     "SubscriptionView",
     "SystemFixModal",
+    "answer_interaction_error",
     "incident_button_rows",
     "incident_custom_id",
     "parse_custom_id",
+    "run_component_action",
     "subscription_buttons",
     "subscription_custom_id",
     "view_from_card",
 ]
 
 log = structlog.get_logger(__name__)
+
+# ── the interaction error boundary (GDD §11.3) ───────────────────────────────
+
+#: What a pilot sees when a handler blows up — short, honest, phone-sized.
+INTERACTION_ERROR_REPLY = "Something broke — logged."
+
+
+async def answer_interaction_error(
+    interaction: discord.Interaction,
+    message: str = INTERACTION_ERROR_REPLY,
+    *,
+    ephemeral: bool = True,
+) -> None:
+    """ALWAYS close the interaction — a pilot mid-fight must never be left
+    staring at an eternal 'thinking…' spinner. Best-effort: the interaction
+    itself may already be dead, in which case we only log."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(message, ephemeral=ephemeral)
+    except Exception:  # noqa: BLE001 — the boundary must never raise
+        log.warning("interaction_error_reply_failed")
+
+
+async def run_component_action(
+    interaction: discord.Interaction, name: str, action: Coroutine[Any, Any, None]
+) -> None:
+    """The single error boundary for component/modal dispatch.
+
+    discord.py swallows exceptions inside DynamicItem callbacks ("Ignoring
+    exception in dynamic item callback") — the pilot got no feedback and
+    #bot-health no signal. Every dynamic-item callback and modal submit wraps
+    its dispatcher in this: on failure the interaction is answered
+    ephemerally and the error is counted into the AlarmBus
+    (INTERACTION_ERRORS, keyed by component name)."""
+    try:
+        await action
+    except Exception:  # noqa: BLE001 — the boundary is the last line
+        log.exception("component_dispatch_failed", component=name)
+        await answer_interaction_error(interaction)
+        bus = getattr(interaction.client, "alarms", None)
+        if bus is not None:
+            try:
+                await bus.record_interaction_error(name)
+            except Exception:  # noqa: BLE001 — never let accounting re-raise
+                log.exception("interaction_error_count_failed", component=name)
+
 
 # ── pure helpers: custom_id build / parse / layout ───────────────────────────
 
@@ -366,7 +416,9 @@ class IncidentButton(
         action = parse_custom_id(self.item.custom_id or "")
         if action is None:  # pragma: no cover — template guarantees a parse
             return
-        await dispatch_incident_action(interaction, action)
+        await run_component_action(
+            interaction, "incident-card", dispatch_incident_action(interaction, action)
+        )
 
 
 class SubscriptionButton(
@@ -392,7 +444,9 @@ class SubscriptionButton(
         action = parse_custom_id(self.item.custom_id or "")
         if action is None:  # pragma: no cover — template guarantees a parse
             return
-        await dispatch_subscription_toggle(interaction, action)
+        await run_component_action(
+            interaction, "subscription-toggle", dispatch_subscription_toggle(interaction, action)
+        )
 
 
 # ── [Wrong — fix] system entry (GDD §8.5) ────────────────────────────────────
@@ -444,3 +498,13 @@ class SystemFixModal(discord.ui.Modal, title="Correct the system"):
         await interaction.followup.send(
             outcome.utterance or f"Corrected to {entry.name}.", ephemeral=True
         )
+
+    async def on_error(  # type: ignore[override]
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        """Modal leg of the single interaction error boundary (GDD §11.3)."""
+        log.error("system_fix_modal_failed", incident_id=self._incident_id, error=repr(error))
+        await answer_interaction_error(interaction)
+        bus = getattr(interaction.client, "alarms", None)
+        if bus is not None:
+            await bus.record_interaction_error("system-fix-modal")

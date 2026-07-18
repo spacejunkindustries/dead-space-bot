@@ -36,6 +36,7 @@ from typing import Any
 import structlog
 
 from cortana import tts as tts_mod
+from cortana.alarms import AlarmBus, AlarmCode, AlarmSeverity
 from cortana.audio.capture import CaptureManager, CaptureMeta, CaptureOrigin
 from cortana.audio.stt import Transcriber, make_transcriber
 from cortana.audio.vad import VadGate
@@ -51,6 +52,7 @@ from cortana.dsc.cogs.utility import ReminderService
 from cortana.health import HealthReporter
 from cortana.ipc import PRIORITY_NORMAL, IpcServer
 from cortana.nlu.gazetteer import Gazetteer
+from cortana.reload import ReloadResult
 from cortana.tts import Speaker
 from cortana.types import INTENT_SEVERITY, CardRender, Severity
 from cortana.voice_gateway import VoiceGateway
@@ -135,6 +137,7 @@ class App:
         self.engine: IncidentEngine | None = None
         self.bot: AuraBot | None = None
         self.health: HealthReporter | None = None
+        self.alarms: AlarmBus | None = None
         self.gateway: VoiceGateway | None = None
         self.reminders: ReminderService | None = None
         self.chat: ChatClient | None = None
@@ -155,9 +158,19 @@ class App:
         applied = await asyncio.to_thread(db.migrate, self.conn)
         log.info("db_ready", path=cfg.database.path, migrations_applied=applied)
 
-        self.gazetteer = Gazetteer(self.conn, cfg.gazetteer)
+        # The gazetteer takes the HOLDER (not a config snapshot) so reloads
+        # see gazetteer.* edits — the holder-snapshot fix.
+        self.gazetteer = Gazetteer(self.conn, self.holder)
         await asyncio.to_thread(self.gazetteer.load)
         log.info("gazetteer_loaded", systems=len(self.gazetteer.systems))
+
+        # The operator alarm surface (GDD §11.3). Safe from here on even
+        # though Discord isn't up yet: cards queue dirty and flush from the
+        # health loop once the bot is ready.
+        self.alarms = AlarmBus(self.conn, send=self._alarm_send, edit=self._alarm_edit)
+        # This process IS the restart that applies any pending restart-class
+        # edits — resolve the card the previous lifetime raised.
+        await self.alarms.clear(AlarmCode.CONFIG_RESTART_PENDING)
 
         self.discipline = Discipline(self.holder)
         self.ipc = IpcServer(self.holder, self._on_audio, self._on_control)
@@ -200,6 +213,7 @@ class App:
 
         # Health before the engine: the engine reports mentions into it.
         self.health = HealthReporter(self.holder, self._post_health)
+        self.health.set_alarm_bus(self.alarms)
         # Audio-pipeline probes: the wake stage counters/fault latch and the
         # STT watchdog latch become #bot-health alerts + report lines instead
         # of silent deaths behind a green status.
@@ -224,6 +238,13 @@ class App:
         late_poster.bind(self.bot)
         self.bot.chat = self.chat  # /ask slash twin (GDD §6.6, constraint 10)
         self.bot.chat_status = self._chat_status
+        self.bot.alarms = self.alarms
+        # /reload is the slash twin of SIGHUP — the SAME transaction.
+        self.bot.request_reload = self._reload_transaction
+        self.bot.ipc_status = self._ipc_status
+        self.bot.dialog_sessions = lambda: (
+            self.dialog.sessions_active if self.dialog is not None else 0
+        )
         self.reminders = ReminderService(self.conn, self.bot)
 
         # The voice dialog engine (GDD §5.4) — drives the same IncidentEngine
@@ -331,8 +352,13 @@ class App:
         self._reload_task = asyncio.create_task(self._reload())
 
     async def _reload(self) -> None:
-        """The reload transaction (GDD §16): validate everything, swap
-        all-or-nothing, apply by reload class, and post the receipt."""
+        await self._reload_transaction()
+
+    async def _reload_transaction(self) -> ReloadResult:
+        """The one reload transaction (GDD §16): validate everything, swap
+        all-or-nothing, apply by reload class, post the receipt, and drive
+        the CONFIG_RESTART_PENDING alarm. Backs BOTH doors — SIGHUP and the
+        ``/reload`` slash command (which needs the returned receipt)."""
         from cortana.nlu.gazetteer import _load_scope
         from cortana.reload import reload_all
 
@@ -361,12 +387,31 @@ class App:
         # Unconditional: catches a rotated on-disk API key even when no
         # chat.* KEY changed (appliers only fire on key changes).
         self._refresh_chat()
+        # A reload is the operator's sanctioned "try again" for the STT
+        # watchdog latch (stt.py: latched until /reload or restart).
+        reset_degraded = getattr(self.transcriber, "reset_degraded", None)
+        if callable(reset_degraded):
+            reset_degraded()
+        # Restart-bound edits are never silently absorbed: raise the alarm
+        # while any are pending, resolve its card when a reload shows none.
+        if self.alarms is not None:
+            if result.restart_pending:
+                await self.alarms.raise_alarm(
+                    AlarmCode.CONFIG_RESTART_PENDING,
+                    AlarmSeverity.WARNING,
+                    "Restart-bound config keys were edited and are NOT live "
+                    "yet: " + ", ".join(result.restart_pending),
+                    "`systemctl restart cortana-brain` to apply them",
+                )
+            elif result.swapped:
+                await self.alarms.clear(AlarmCode.CONFIG_RESTART_PENDING)
         log.info("config_reload_result", summary=result.summary(), ok=result.ok)
         # The receipt goes to #bot-health so the operator sees exactly what
         # applied and what still needs a restart — never silently absorbed.
         if self.bot is not None and self.bot.is_ready():
             with contextlib.suppress(Exception):
                 await self._post_health(f"🔄 {result.summary()}", None)
+        return result
 
     def _refresh_chat(self) -> None:
         """(Re)build the §6.6 ChatClient from the current config + key state.
@@ -492,6 +537,10 @@ class App:
             # differently.
             if self.dialog is not None:
                 self.dialog.reset_all()
+            # A hello IS Ears liveness — resolve the card immediately rather
+            # than waiting for the next heartbeat check cycle.
+            if self.alarms is not None:
+                await self.alarms.clear(AlarmCode.EARS_DOWN)
             if self.gateway is not None:
                 await self.gateway.on_ears_hello()
         elif t == "snapshot":
@@ -584,14 +633,31 @@ class App:
         while True:
             await asyncio.sleep(_HEALTH_CHECK_INTERVAL_S)
             await self.health.check()
+            # Retry any alarm card that couldn't reach Discord when raised
+            # (pre-ready startup alarms land here once the bot is up).
+            if self.alarms is not None:
+                await self.alarms.flush()
 
     async def _announce_timer(self, ping: TimerPing) -> None:
         where = f" {ping.system_name}" if ping.system_name else ""
         note = f" — {ping.note}" if ping.note else ""
-        await self._send_channel(
+        delivered = await self._send_channel(
             self.holder.current.discord.channels.intel_alerts,
             f"⏰ **Timer{where}** is due{note} (set by <@{ping.created_by}>)",
         )
+        # A structure timer eaten by a 403 is exactly the loss the corp set
+        # the timer to avoid — degrade loudly (GDD §13 / §11.3).
+        if self.alarms is not None:
+            if not delivered:
+                await self.alarms.raise_alarm(
+                    AlarmCode.TIMER_UNDELIVERED,
+                    AlarmSeverity.CRITICAL,
+                    f"A timer ping{where or ''} fired but could not be posted to #intel-alerts.",
+                    "check CORTANA's permissions on #intel-alerts; the timer "
+                    "details are in the journal",
+                )
+            else:
+                await self.alarms.clear(AlarmCode.TIMER_UNDELIVERED)
         if self.speaker is not None and ping.system_name:
             await self.speaker.say(ping.guild_id, f"Timer {ping.system_name} due.", PRIORITY_NORMAL)
 
@@ -599,7 +665,10 @@ class App:
 
     async def _send_channel(
         self, channel_id: int, content: str, embed: dict[str, Any] | None = None
-    ) -> None:
+    ) -> bool:
+        """Send to a channel; True when the message landed. Failures raise
+        the CHANNEL_UNWRITABLE alarm (keyed by channel id) and successes
+        clear it — a broken channel id is visible without journal access."""
         assert self.bot
         import discord  # composition root: text-side discord.py only (constraint 2)
 
@@ -609,7 +678,8 @@ class App:
                 channel = await self.bot.fetch_channel(channel_id)
             except discord.DiscordException as exc:
                 log.error("channel_unavailable", channel_id=channel_id, error=str(exc))
-                return
+                await self._channel_alarm(channel_id, str(exc))
+                return False
         kwargs: dict[str, Any] = {}
         if embed is not None:
             kwargs["embed"] = discord.Embed.from_dict(embed)
@@ -617,9 +687,92 @@ class App:
             await channel.send(content or None, **kwargs)  # type: ignore[union-attr]
         except discord.DiscordException as exc:
             log.error("channel_send_failed", channel_id=channel_id, error=str(exc))
+            await self._channel_alarm(channel_id, str(exc))
+            return False
+        if self.alarms is not None:
+            await self.alarms.clear(AlarmCode.CHANNEL_UNWRITABLE, key=str(channel_id))
+        return True
+
+    async def _channel_alarm(self, channel_id: int, error: str) -> None:
+        if self.alarms is None:
+            return
+        await self.alarms.raise_alarm(
+            AlarmCode.CHANNEL_UNWRITABLE,
+            AlarmSeverity.CRITICAL,
+            f"Cannot post to channel {channel_id}: {error}",
+            "check the channel id in cortana.yaml and CORTANA's permissions "
+            "there (View Channel, Send Messages, Embed Links)",
+            key=str(channel_id),
+        )
 
     async def _post_health(self, content: str, embed: dict[str, Any] | None) -> None:
         await self._send_channel(self.holder.current.discord.channels.health, content, embed)
+
+    # ── AlarmBus plumbing (GDD §11.3) ────────────────────────────────────────
+
+    async def _alarm_send(
+        self, content: str, embed: dict[str, Any] | None
+    ) -> tuple[int, int] | None:
+        """AlarmBus send: post a card to #bot-health, returning its ids.
+
+        Deliberately NOT via ``_send_channel``: a failure here must only make
+        the card retry later (dirty + flush), never raise further alarms."""
+        bot = self.bot
+        if bot is None or not bot.is_ready():
+            return None
+        import discord
+
+        channel_id = self.holder.current.discord.channels.health
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            message = await channel.send(  # type: ignore[union-attr]
+                content or None,
+                embed=discord.Embed.from_dict(embed) if embed is not None else None,
+            )
+        except Exception as exc:  # noqa: BLE001 — the bus retries; never crash it
+            log.warning("alarm_card_post_failed", channel_id=channel_id, error=str(exc))
+            return None
+        return channel_id, message.id
+
+    async def _alarm_edit(
+        self, channel_id: int, message_id: int, content: str, embed: dict[str, Any] | None
+    ) -> bool | None:
+        """AlarmBus edit: True = landed, None = transient (retry the edit),
+        False = message deleted (the bus re-posts a fresh card)."""
+        bot = self.bot
+        if bot is None or not bot.is_ready():
+            return None
+        import discord
+
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            await channel.get_partial_message(message_id).edit(  # type: ignore[union-attr]
+                content=content or None,
+                embed=discord.Embed.from_dict(embed) if embed is not None else None,
+            )
+        except discord.NotFound:
+            return False
+        except Exception as exc:  # noqa: BLE001 — the bus retries; never crash it
+            log.warning(
+                "alarm_card_edit_failed",
+                channel_id=channel_id,
+                message_id=message_id,
+                error=str(exc),
+            )
+            return None
+        return True
+
+    def _ipc_status(self) -> tuple[bool, float | None]:
+        """Ears liveness for /botstatus: (alive, heartbeat age in seconds)."""
+        import time
+
+        from cortana.health import HEARTBEAT_TIMEOUT_S
+
+        if self.ipc is None:
+            return False, None
+        last = self.ipc.last_heartbeat
+        age = None if last is None else max(0.0, time.monotonic() - last)
+        return self.ipc.is_alive(HEARTBEAT_TIMEOUT_S), age
 
 
 def parsed_intent_severity(intent: Any) -> Severity:

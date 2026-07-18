@@ -20,14 +20,22 @@ for exactly the failure signatures the §20 table names and raises the
 The wake/STT probes arrive via :meth:`set_wake_probe` / :meth:`set_stt_probe`
 (injected callables — this module imports neither audio component). The wake
 stage counters (frames_seen → vad_speech → inferences → hits/near_misses)
-ride the periodic report and are exposed for the ``/status`` cog, so a silent
-wake death is a visible zero instead of a green status.
+ride the periodic report and are exposed for the ``/botstatus`` cog, so a
+silent wake death is a visible zero instead of a green status.
 
-Reporting goes through an injected async ``post_fn(content, embed)`` — this
-module never imports discord; the embed is a plain ``discord.Embed.from_dict``
-payload dict assembled here. All time is injected: a monotonic ``clock``
-callable for intervals, and ``datetime`` timestamps enter only through
-:meth:`build_report_embed`'s caller-supplied ``now``.
+This module DETECTS; the :class:`cortana.alarms.AlarmBus` (GDD §11.3)
+ANNOUNCES. Every degradation transition raises/clears its alarm code
+(EARS_DOWN, VOICE_ABSENT, WAKE_FAULTED, STT_DEGRADED) through the bus wired
+by :meth:`set_alarm_bus` — one edited-in-place #bot-health card per episode
+instead of the old one-shot posts. Without a bus (tests, partial wiring) the
+transition is journald-only.
+
+The hourly report still goes through an injected async
+``post_fn(content, embed)`` — this module never imports discord; the embed is
+a plain ``discord.Embed.from_dict`` payload dict assembled here. All time is
+injected: a monotonic ``clock`` callable for intervals, and ``datetime``
+timestamps enter only through :meth:`build_report_embed`'s caller-supplied
+``now``.
 
 Hot-path discipline: :meth:`note_audio` runs for every 20 ms frame and does
 one attribute store — no allocation, no logging, no locks.
@@ -43,6 +51,7 @@ from typing import Any
 
 import structlog
 
+from cortana.alarms import AlarmBus, AlarmCode, AlarmSeverity
 from cortana.config import ConfigHolder
 from cortana.types import Tier
 
@@ -111,11 +120,9 @@ class HealthReporter:
         self._wake_hits = 0
         self._commands_rejected = 0
         # Discord post/edit failures (channel 403s etc.): counted per report
-        # window, announced to #bot-health once per window (not per failure —
-        # a broken channel would otherwise spam an alert on every sweep).
+        # window. The per-failure POST_FAILURE alarm is raised by the Poster
+        # itself (bot.py) — this is just the report-window tally.
         self._post_failures = 0
-        self._post_failure_announced = False
-        self._announce_post_failure = False
 
         # STT quality: rolling confidence ring + consecutive-LOW streak.
         self._confidences: deque[float] = deque(maxlen=_CONFIDENCE_RING)
@@ -131,6 +138,10 @@ class HealthReporter:
         # for the ops surface: a voice session dying under Ears must never be
         # invisible to whoever reads the health report.
         self._last_driver_event: dict[str, Any] | None = None
+        self._stt_conf_alarmed = False
+
+        # The operator alarm surface (GDD §11.3); None = journald only.
+        self._alarms: AlarmBus | None = None
 
     # ── signals ──────────────────────────────────────────────────────────────
 
@@ -167,6 +178,10 @@ class HealthReporter:
         """The most recent Ears driver_disconnected event, verbatim."""
         return self._last_driver_event
 
+    def set_alarm_bus(self, alarms: AlarmBus) -> None:
+        """Wire the AlarmBus every degradation transition reports through."""
+        self._alarms = alarms
+
     # ── counters ─────────────────────────────────────────────────────────────
 
     def record_incident_posted(self) -> None:
@@ -187,12 +202,9 @@ class HealthReporter:
     def record_post_failure(self) -> None:
         """A Discord card post/edit failed (403, deleted channel, REST error).
 
-        Counted into the hourly report and announced ONCE per window — a
-        channel-permission problem used to be invisible outside journald."""
+        Counted into the hourly report; the POST_FAILURE alarm card is
+        raised by the Poster itself (bot.py), which has the context."""
         self._post_failures += 1
-        if not self._post_failure_announced:
-            self._post_failure_announced = True
-            self._announce_post_failure = True
 
     def record_stt(self, confidence: float, tier: Tier) -> None:
         """One STT+resolution result: confidence ring + LOW-tier streak (§20)."""
@@ -255,54 +267,63 @@ class HealthReporter:
         await self._check_stt()
         await self._check_stt_watchdog()
         await self._check_wake_fault()
-        await self._check_posting()
         await self._maybe_report(now)
 
+    async def _raise(
+        self,
+        code: AlarmCode,
+        severity: AlarmSeverity,
+        summary: str,
+        fix_hint: str,
+        key: str | None = None,
+    ) -> None:
+        if self._alarms is None:
+            log.warning("alarm_bus_unwired", code=code.value, summary=summary)
+            return
+        await self._alarms.raise_alarm(code, severity, summary, fix_hint, key=key)
+
+    async def _clear(self, code: AlarmCode, key: str | None = None) -> None:
+        if self._alarms is not None:
+            await self._alarms.clear(code, key=key)
+
     async def _check_stt_watchdog(self) -> None:
-        """The transcriber latched degraded (respawn cap) — announce once."""
+        """The transcriber latched degraded (respawn cap) — one alarm card."""
         latched = self.stt_watchdog_degraded
         if latched and not self._stt_watchdog_announced:
             self._stt_watchdog_announced = True
             log.warning("stt_watchdog_latch_announced")
-            await self._post(
-                "⚠️ **STT watchdog respawn cap reached** — transcription is latched "
-                "off until a reload or restart. Voice commands will be rejected; "
-                "slash commands and the incident engine are unaffected.",
-                None,
+            await self._raise(
+                AlarmCode.STT_DEGRADED,
+                AlarmSeverity.CRITICAL,
+                "STT watchdog respawn cap reached — transcription is latched off. "
+                "Voice commands are rejected; slash commands and the incident "
+                "engine are unaffected.",
+                "run `/reload` (or restart cortana-brain) to clear the latch",
+                key="watchdog",
             )
         elif not latched and self._stt_watchdog_announced:
             self._stt_watchdog_announced = False
             log.info("stt_watchdog_latch_cleared")
-            await self._post("✅ STT watchdog latch cleared — transcription restored.", None)
+            await self._clear(AlarmCode.STT_DEGRADED, key="watchdog")
 
     async def _check_wake_fault(self) -> None:
-        """The wake model pool latched faulted (build failure) — announce once."""
+        """The wake model pool latched faulted (build failure) — one card."""
         faulted = self.wake_faulted
         if faulted and not self._wake_fault_announced:
             self._wake_fault_announced = True
             log.warning("wake_fault_announced")
-            await self._post(
-                "⚠️ **Wake-word model failed to build** — wake detection is offline "
-                "(audio still flows, nothing is scored). Check `wake.model` and the "
-                "openwakeword install, then reload the config or restart. "
-                "Slash commands are unaffected.",
-                None,
+            await self._raise(
+                AlarmCode.WAKE_FAULTED,
+                AlarmSeverity.CRITICAL,
+                "Wake-word model failed to build — wake detection is offline "
+                "(audio still flows, nothing is scored). Slash commands are "
+                "unaffected.",
+                "check `wake.model` and the openwakeword install, then `/reload` or restart",
             )
         elif not faulted and self._wake_fault_announced:
             self._wake_fault_announced = False
             log.info("wake_fault_recovered")
-            await self._post("✅ Wake-word model restored.", None)
-
-    async def _check_posting(self) -> None:
-        if self._announce_post_failure:
-            self._announce_post_failure = False
-            log.warning("post_failures_announced", count=self._post_failures)
-            await self._post(
-                "⚠️ **Discord post failed** — a card could not be posted or "
-                "edited (check CORTANA's channel permissions: View Channel, Send "
-                "Messages, Embed Links). Details are in the journal.",
-                None,
-            )
+            await self._clear(AlarmCode.WAKE_FAULTED)
 
     async def _check_ears(self, now: float) -> None:
         seen = self._last_heartbeat_at
@@ -315,25 +336,29 @@ class HealthReporter:
         if never_connected and not self._ears_down:
             self._ears_down = True
             log.warning("ears_never_connected", waited_s=round(now - self._started_at, 1))
-            await self._post(
-                "⚠️ **Ears has not connected since startup** — voice is down. "
-                "Check `systemctl status cortana-ears`. Slash commands and the "
-                "incident engine are unaffected.",
-                None,
+            await self._raise(
+                AlarmCode.EARS_DOWN,
+                AlarmSeverity.CRITICAL,
+                "Ears has not connected since startup — voice is down. Slash "
+                "commands and the incident engine are unaffected.",
+                "check `systemctl status cortana-ears` and its journal",
             )
             return
         if not alive and seen is not None and not self._ears_down:
             self._ears_down = True
             log.warning("ears_heartbeat_missed", last_seen_s_ago=round(now - seen, 1))
-            await self._post(
-                "⚠️ **Ears heartbeat missed** — voice path degraded. "
-                "Slash commands and the incident engine are unaffected.",
-                None,
+            await self._raise(
+                AlarmCode.EARS_DOWN,
+                AlarmSeverity.CRITICAL,
+                "Ears heartbeat missed — voice path degraded. Slash commands "
+                "and the incident engine are unaffected.",
+                "check `systemctl status cortana-ears`; Brain re-adopts it on "
+                "reconnect automatically",
             )
         elif alive and self._ears_down:
             self._ears_down = False
             log.info("ears_heartbeat_recovered")
-            await self._post("✅ Ears heartbeat recovered — voice path restored.", None)
+            await self._clear(AlarmCode.EARS_DOWN)
 
     async def _check_voice(self, now: float) -> None:
         """§20 row 1: no audio for the alarm window while Ears is connected
@@ -354,28 +379,40 @@ class HealthReporter:
                 silence_s=round(now - (last if last is not None else self._started_at), 1),
                 humans_present=self._humans_present,
             )
-            await self._post(
-                "⚠️ **Voice offline — use `/under-attack`, `/help-me` and `/hostiles`.** "
-                "No audio received for "
-                f"{alarm_s}s with pilots in channel; retrying. "
-                "Every slash command and the incident engine keep working.",
-                None,
+            await self._raise(
+                AlarmCode.VOICE_ABSENT,
+                AlarmSeverity.CRITICAL,
+                f"No audio received for {alarm_s}s with pilots in channel — "
+                "voice receive is dead. Pilots should use `/under-attack`, "
+                "`/help-me` and `/hostiles`; every slash command keeps working.",
+                "check cortana-ears and the Discord voice connection; this "
+                "clears itself when audio flows again",
             )
         elif self._voice_offline and last is not None and (now - last) < alarm_s:
             self._voice_offline = False
             log.info("voice_receive_recovered")
-            await self._post("✅ Voice receive recovered.", None)
+            await self._clear(AlarmCode.VOICE_ABSENT)
 
     async def _check_stt(self) -> None:
         if self._low_streak >= LOW_TIER_ALERT_STREAK and not self._stt_degraded:
             self._stt_degraded = True
             log.warning("stt_sustained_low_confidence", streak=self._low_streak)
-            await self._post(
-                f"⚠️ **{self._low_streak} consecutive low-confidence resolutions** — "
-                "something is wrong with the audio path (mic mix, model, or capture). "
-                "Voice commands are being rejected; slash commands are unaffected.",
-                None,
+        if self._stt_degraded and not self._stt_conf_alarmed:
+            self._stt_conf_alarmed = True
+            await self._raise(
+                AlarmCode.STT_DEGRADED,
+                AlarmSeverity.WARNING,
+                f"{max(self._low_streak, LOW_TIER_ALERT_STREAK)} consecutive "
+                "low-confidence resolutions — something is wrong with the audio "
+                "path (mic mix, model, or capture). Voice commands are being "
+                "rejected; slash commands are unaffected.",
+                "listen to comms quality and check the journal's confidence "
+                "scores; clears itself on the next confident resolution",
+                key="confidence",
             )
+        elif not self._stt_degraded and self._stt_conf_alarmed:
+            self._stt_conf_alarmed = False
+            await self._clear(AlarmCode.STT_DEGRADED, key="confidence")
 
     async def _maybe_report(self, now: float) -> None:
         interval_s = self._holder.current.health.report_interval_min * 60
@@ -471,4 +508,3 @@ class HealthReporter:
         self._wake_hits = 0
         self._commands_rejected = 0
         self._post_failures = 0
-        self._post_failure_announced = False

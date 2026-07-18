@@ -29,13 +29,14 @@ from cortana.dsc.cogs.help import (
 )
 from cortana.dsc.cogs.intel import IntelCog
 from cortana.dsc.cogs.ops import OpsCog
+from cortana.dsc.cogs.status import StatusCog
 from cortana.dsc.cogs.subs import SubsCog
 from cortana.dsc.cogs.utility import UtilityCog
 from cortana.nlu import grammar
 from cortana.types import IncidentOutcome, Intent, Outcome, ParsedCommand
 from tests.test_incidents import FakeGazetteer, FakePoster, StubHolder, make_config
 
-ALL_COGS = (IntelCog, SubsCog, OpsCog, UtilityCog, AdminCog, HelpCog)
+ALL_COGS = (IntelCog, SubsCog, OpsCog, UtilityCog, AdminCog, HelpCog, StatusCog)
 
 
 # ── coverage: every registered app command appears in the help content ───────
