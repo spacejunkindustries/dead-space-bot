@@ -12,7 +12,7 @@ notebooks/automatic_model_training.ipynb), which produces
 
 Validation is this script's own contribution: it scores the trained model
 against the held-out synthetic splits (positive_test and the adversarial
-negative_test — "aura", "commander", "concord", ... per GDD §5.2) and against
+negative_test — "hey katana", "concord", "capsuleer", ... per GDD §5.2) and against
 the ~11 h real-speech validation feature stream, then prints false-reject and
 false-accept rates across a threshold sweep so the operator can pick
 wake.threshold for cortana.yaml from data.
@@ -31,7 +31,7 @@ from typing import Any
 
 from generate_samples import load_config, oww_train_entry, render_oww_config, run_cmd
 
-log = logging.getLogger("aura.wake.train")
+log = logging.getLogger("cortana.wake.train")
 
 
 # ------------------------------------------------------------------------- training
@@ -111,7 +111,7 @@ def sweep(cfg: dict[str, Any], model_path: Path) -> None:
     clip_root = Path(cfg["paths"]["output_dir"]) / cfg["phrase"]["model_name"]
     max_clips = int(val["max_clips"])
 
-    log.info("scoring held-out positive clips (synthetic 'aura command')")
+    log.info("scoring held-out positive clips (synthetic 'hey cortana')")
     pos = np.asarray(score_clips(model_path, clip_root / "positive_test", max_clips))
     log.info("scoring held-out adversarial negatives (GDD §5.2 collision phrases)")
     neg = np.asarray(score_clips(model_path, clip_root / "negative_test", max_clips))
