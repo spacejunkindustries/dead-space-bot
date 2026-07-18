@@ -142,17 +142,6 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
     (Intent.ASSIST_REQUEST, re.compile(r"\bneed\s+(?:help|backup|back\s*up)\b", re.I)),
     (Intent.HOSTILE_SPOTTED, re.compile(r"\bhostiles?\b|\breds?\b|\bneuts?\b", re.I)),
     (Intent.GATE_CAMP, re.compile(r"\bgate\s*camp(?:ed|ers)?\b", re.I)),
-    # Chase mode (GDD §13.1): "update chase Kisogo" / "chase Kisogo"
-    # retargets the pilot's live incident card as the target moves. Below the
-    # distress intents so "tackled … giving chase" is never claimed. A BARE
-    # "chase" only counts in leading position (the utterance is wake-gated,
-    # so a command starts with it) — mid-sentence chatter like "let's chase
-    # them down" must never silently retarget a live card; the explicit forms
-    # "update chase" / "chase mode" work anywhere.
-    (
-        Intent.CHASE_UPDATE,
-        re.compile(r"\bupdate\s+chase\b(?:\s+mode)?|\bchase\s+mode\b|^\W*chase\b", re.I),
-    ),
     (Intent.RESOLVE, re.compile(r"\bclear(?:ed)?\b", re.I)),
     (Intent.TIMER, re.compile(r"\btimer\b", re.I)),
     (Intent.FORMUP, re.compile(r"\bform(?:\s|-)?up\b", re.I)),
@@ -160,7 +149,22 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
     # HELP sits below ASSIST_REQUEST so "need help" is always a distress call;
     # a bare "help" (nothing else claimed it) is a request for the manual.
     (Intent.HELP, re.compile(r"\bhelp\b", re.I)),
-    (Intent.CANCEL, re.compile(r"\bcancel\b", re.I)),
+    # "cancelled"/"canceled" too: "chase cancelled" must land here, not on
+    # the chase pattern below.
+    (Intent.CANCEL, re.compile(r"\bcancel(?:led|ed)?\b", re.I)),
+    # Chase mode (GDD §13.1): "update chase Kisogo" / "chase Kisogo"
+    # retargets the pilot's live incident card as the target moves. Sits
+    # BELOW the distress intents, RESOLVE and CANCEL — "tackled … giving
+    # chase" is a distress call, "chase done, clear Kisogo" is a clear, and
+    # "chase cancelled" is a cancel. Both the bare word and "chase mode"
+    # count only in LEADING position (the utterance is wake-gated, so a
+    # command starts with it) — mid-sentence chatter like "we're in chase
+    # mode after the vexor" must never silently retarget a live card;
+    # explicit "update chase" works anywhere.
+    (
+        Intent.CHASE_UPDATE,
+        re.compile(r"\bupdate\s+chase\b(?:\s+mode)?|^\W*chase\b(?:\s+mode)?", re.I),
+    ),
     # Callsign registry (GDD §6.1). UNREGISTER before REGISTER so the longer
     # word can never be claimed by the shorter pattern.
     (
@@ -328,7 +332,10 @@ def clean_callsign(text: str) -> str | None:
     """Voice-path callsign cleaning: filler stripped, then sanitised and
     title-cased (STT emits lowercase; a callsign is a proper name)."""
     tokens = [t for t in re.split(r"[\s,.;:!?]+", text) if t]
-    while tokens and tokens[0].lower() in (_CALLSIGN_FILLER | _FILLER):
+    # "system"/"systems" are report-window noise words, NOT callsign filler —
+    # "register System Junkie" must keep its name intact.
+    callsign_filler = _CALLSIGN_FILLER | (_FILLER - {"system", "systems"})
+    while tokens and tokens[0].lower() in callsign_filler:
         tokens.pop(0)
     cleaned = sanitize_callsign(" ".join(tokens))
     return cleaned.title() if cleaned else None
@@ -402,10 +409,17 @@ def system_reply(transcript: str) -> str | None:
 # ("hey jarvis", "aura command", "hey overseer"). Matches nothing when absent,
 # so a message that happens not to start with the wake word is left intact.
 _BROADCAST_WAKE_RE = re.compile(
-    r"^\W*(?:(?:hey|ok(?:ay)?|hi)\s+)?(?:jarvis|aura|overseer|alexa)(?:\s+command)?[\s,.:;!?-]*",
+    r"^\W*(?:(?:hey|ok(?:ay)?|hi)\s+)?"
+    r"(?:jarvis|aura|cortana|cortina|katana|overseer|alexa)(?:\s+command)?[\s,.:;!?-]*",
     re.I,
 )
 _ALL_HANDS_RE = re.compile(r"\ball\s+hands\b|\bat\s+here\b|\bping\s+everyone\b", re.I)
+
+#: Words that END a chase rather than name a system ("chase mode off",
+#: "chase is done"). "over" never appears here — the signoff strip owns it.
+_CHASE_TERMINATORS = frozenset(
+    ("is", "off", "done", "end", "ended", "ending", "stop", "stopped", "complete", "finished")
+)
 
 
 # Whisper hallucinating on near-silence produces a word stuttered three or
@@ -584,6 +598,17 @@ def parse(transcript: str) -> ParsedCommand | None:
         system_text, detail = _split_timer(remainder)
     else:
         system_text, detail = _split_system_detail(remainder)
+
+    # "chase mode off" / "chase is over" / "chase done" — the pilot is
+    # CLOSING the chase, not naming a system called "off". A terminator
+    # window means no system; the engine answers with the chase hint
+    # instead of writing junk onto the live card verbatim.
+    if (
+        intent is Intent.CHASE_UPDATE
+        and system_text is not None
+        and system_text.lower() in _CHASE_TERMINATORS
+    ):
+        system_text = None
 
     return ParsedCommand(
         intent=intent,

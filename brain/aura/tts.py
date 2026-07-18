@@ -177,9 +177,9 @@ def chase_no_incident() -> str:
 
 
 def chase_hint() -> str:
-    """*"Report first, then say update chase and the system."* — a bare
-    "chase mode" with no system and nothing to retarget."""
-    return "Report first, then say update chase and the system."
+    """*"Say update chase and a system, or clear to finish."* — a bare
+    "chase mode", or a chase terminator ("chase mode off") with no system."""
+    return "Say update chase and a system, or clear to finish."
 
 
 def post_failed() -> str:

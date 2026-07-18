@@ -696,3 +696,32 @@ def test_mid_sentence_chase_chatter_never_claims_the_intent() -> None:
     # The explicit forms work anywhere; bare "chase" only leads.
     p = parse("okay update chase Alenia")
     assert p is not None and p.intent is Intent.CHASE_UPDATE
+
+
+def test_chase_terminators_never_become_system_names() -> None:
+    from aura.nlu.grammar import parse
+
+    for heard in ("chase mode off", "chase is over", "chase done", "chase stopped"):
+        p = parse(heard)
+        assert p is not None and p.intent is Intent.CHASE_UPDATE, heard
+        assert p.system_text is None, heard
+    # "chase cancelled" is a CANCEL; "chase done, clear Kisogo" is a clear.
+    p = parse("chase cancelled")
+    assert p is not None and p.intent is Intent.CANCEL
+    p = parse("chase done, clear Kisogo")
+    assert p is not None and p.intent is Intent.RESOLVE and p.system_text == "Kisogo"
+
+
+def test_chase_mode_mid_sentence_never_claims() -> None:
+    from aura.nlu.grammar import parse
+
+    p = parse("we're in chase mode after the vexor")
+    assert p is None or p.intent is not Intent.CHASE_UPDATE
+
+
+def test_callsign_starting_with_system_survives() -> None:
+    from aura.nlu.grammar import parse
+
+    p = parse("register system junkie")
+    assert p is not None and p.intent is Intent.REGISTER
+    assert p.detail == "System Junkie"

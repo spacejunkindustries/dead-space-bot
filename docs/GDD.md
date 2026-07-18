@@ -12,7 +12,7 @@ Version 1.0 · July 2026
 
 CORTANA sits in your corp's Discord voice channel and listens for spoken reports. A player under attack says:
 
-> **"Aura Command, hostiles Otanuomi, three battleships"**
+> **"Hey Cortana, hostiles Otanuomi, three battleships"**
 
 Roughly a second and a half later, CORTANA posts a live incident card in `#intel-alerts`, mentions the roles that subscribe to that system, and speaks back into voice:
 
@@ -249,7 +249,7 @@ Songbird VoiceTick (20ms, per-user decoded PCM 48kHz)
        │
        ├─► webrtcvad ──── speech present?
        │        │ yes
-       ├─► openWakeWord ──── "Aura Command"?
+       ├─► openWakeWord ──── "Hey Cortana"?
        │        │ hit
        │        ▼
        │   capture window opens
@@ -285,7 +285,7 @@ Two constraints govern the choice:
 | Phrase | Verdict |
 |---|---|
 | "Aura" | ❌ ~3 phonemes. Fires on *hour*, *or a*, *aura*. |
-| **"Aura Command"** | ✅ ~9 phonemes, distinctive, never said naturally. **Default.** |
+| **"Hey Cortana"** | ✅ ~9 phonemes, distinctive, never said naturally. **Default.** |
 | "Hey Overseer" | ✅ Good phonetics, low collision. Supported alternative. |
 
 The phrase is configurable. The 6-phoneme / no-collision rule is not optional — it is the difference between a tool and a nuisance.
@@ -361,17 +361,17 @@ Mapping: red → high, orange → medium, yellow → none/info. A leading *"repo
 ### 6.5 Examples
 
 ```
-"Aura Command, hostiles Otanuomi, three battleships"
-"Aura Command, tackled in Kisogo, need help"
-"Aura Command, gate camp Otanuomi, miners only"
-"Aura Command, clear Otanuomi"
-"Aura Command, timer Kisogo four hours"
-"Aura Command, form up Otanuomi fifteen minutes"
-"Aura Command, status"
-"Aura Command, help"
-"Aura Command, cancel"
-"Aura Command, register Space Junkie"
-"Aura Command, ping me for gate camps in Otanuomi"
+"Hey Cortana, hostiles Otanuomi, three battleships"
+"Hey Cortana, tackled in Kisogo, need help"
+"Hey Cortana, gate camp Otanuomi, miners only"
+"Hey Cortana, clear Otanuomi"
+"Hey Cortana, timer Kisogo four hours"
+"Hey Cortana, form up Otanuomi fifteen minutes"
+"Hey Cortana, status"
+"Hey Cortana, help"
+"Hey Cortana, cancel"
+"Hey Cortana, register Space Junkie"
+"Hey Cortana, ping me for gate camps in Otanuomi"
 ```
 
 Fifteen commands. Short enough that pilots remember them under fire, which is the only time they matter.
@@ -589,7 +589,7 @@ Incident
 **The Discord message is edited in place.** It is not an append-only stream of pings. This is the core architectural choice of the engine:
 
 - Five pilots reporting the same gate camp produce **one** card reading *"reported by 5"* — not five pings.
-- *"Aura Command, clear Otanuomi"* edits that card to ✅ **RESOLVED** and greys it out.
+- *"Hey Cortana, clear Otanuomi"* edits that card to ✅ **RESOLVED** and greys it out.
 - Someone scrolling back reads **state**, not archaeology.
 - No updates for 20 minutes → auto-marked **STALE**, silently.
 
@@ -650,7 +650,7 @@ Routing = evaluate every rule against the incident → union the matching roles 
 
 ### 10.3 Personal pings
 
-*"Aura Command, ping me for gate camps in Otanuomi."* A personal ping is a **user mention, not a role** — the role model above is unchanged; personal pings are additive.
+*"Hey Cortana, ping me for gate camps in Otanuomi."* A personal ping is a **user mention, not a role** — the role model above is unchanged; personal pings are additive.
 
 - Stored in `personal_pings` (§14): incident types + an optional system (`NULL` = all systems). Capped per user by `discipline.personal_pings_max` (default 10); at the cap CORTANA answers *"Ping limit reached."*
 - Matching = incident type ∈ the subscription's types ∧ (no system, or the incident's system). Matching subscribers' mentions are **appended to the mention line** of the incident card in `#intel-alerts` — never a separate message.
@@ -718,7 +718,7 @@ Short. Always short. CORTANA is talking over a fight.
 | Card post failed (channel perms/REST) | *"Discord post failed."* — the report is rolled back, not recorded |
 | Chase updated (§13.1) | *"Chase updated, Kisogo."* |
 | Chase, nothing to retarget | *"No active incident to chase."* |
-| Chase, no system heard | *"Report first, then say update chase and the system."* |
+| Chase, no system heard | *"Say update chase and a system, or clear to finish."* |
 | Responders | *"Space Junkie responding to Otanuomi."* (callsign/display name; count as fallback) |
 | Resolved | *"Otanuomi clear."* |
 | Timer set | *"Timer Kisogo, four hours."* |
@@ -765,10 +765,10 @@ Beyond intel, CORTANA carries the utilities a corp actually asks for. Each is vo
 
 | Feature | Voice | Value |
 |---|---|---|
-| **Structure timers** | *"Aura Command, timer Kisogo four hours"* | Schedules a mention ahead of a structure coming out. Enormous value in EVE, and a natural voice command — you're looking at the timer in-game right now. |
-| **Form-ups** | *"Aura Command, form up Otanuomi fifteen minutes"* | Posts an op card with RSVP buttons and a countdown. |
+| **Structure timers** | *"Hey Cortana, timer Kisogo four hours"* | Schedules a mention ahead of a structure coming out. Enormous value in EVE, and a natural voice command — you're looking at the timer in-game right now. |
+| **Form-ups** | *"Hey Cortana, form up Otanuomi fifteen minutes"* | Posts an op card with RSVP buttons and a countdown. |
 | **Roll call** | `/rollcall` | Who's in voice, who's subscribed, who's responding. |
-| **Jump distance** | *"Aura Command, jumps to Jita"* | Spoken reply, no post. BFS over the adjacency graph. |
+| **Jump distance** | *"Hey Cortana, jumps to Jita"* | Spoken reply, no post. BFS over the adjacency graph. |
 | **Chase mode** | *"update chase Kisogo"* → `/chase` | Retargets your live incident card as the target moves — one card, edited in place, with a movement trail. |
 
 ### 13.1 Chase mode
@@ -777,7 +777,7 @@ A tackled target that jumps out is not a new incident — it is the same inciden
 
 - The card is **edited in place** (constraint 9) — never a second post — and each hop is appended to the card's updates as a movement trail (*chase → Kisogo → Alenia*).
 - System matching is **flexible**: a confident gazetteer match binds the real system (routing and the proximity prior keep working); anything else — a misheard name, a system outside the gazetteer's scope — goes on the card **verbatim**. A chase never stops to ask *"say again the system"* mid-pursuit.
-- Confirmation is spoken: *"Chase updated, Kisogo."* With no active incident of yours to retarget: *"No active incident to chase."*; a bare *"chase mode"* with no system: *"Report first, then say update chase and the system."*
+- Confirmation is spoken: *"Chase updated, Kisogo."* With no active incident of yours to retarget: *"No active incident to chase."*; a bare *"chase mode"* with no system: *"Say update chase and a system, or clear to finish."*
 
 ---
 
@@ -1019,7 +1019,7 @@ discord:
   auto_join: true                       # join when a pilot enters, leave when empty
 
 wake:
-  model:  /opt/aura/models/wake/aura_command.onnx   # the phrase is baked into the model
+  model:  /opt/aura/models/wake/hey_cortana.onnx   # the phrase is baked into the model
   threshold: 0.55
   refractory_ms: 2000
   ack: beep                             # voice = speak "Go ahead." | beep = tone | none

@@ -36,9 +36,9 @@ discord:
                                        #           by /optout + pinned docs)
 
 wake:
-  # The phrase itself ("aura command", GDD §5.2) is baked into the trained
+  # The phrase itself ("hey cortana", GDD §5.2) is baked into the trained
   # model below — changing it means training a new model, not editing config.
-  model:  /opt/aura/models/wake/aura_command.onnx  # trained openWakeWord ONNX chain
+  model:  /opt/aura/models/wake/hey_cortana.onnx  # trained openWakeWord ONNX chain
   threshold: 0.55                      # wake score needed to open a capture window.
                                        # The trigger is single-frame (no debounce): below
                                        # ~0.45 ambient chatter false-fires constantly, and
@@ -91,7 +91,7 @@ matching:
 incidents:
   dedupe_window_s: 90                  # same system + type within this window → fold (GDD §9.2)
   stale_after_min: 20                  # no updates for this long → auto-STALE, silently
-  cancel_window_s: 30                  # "aura command, cancel" kills the user's last incident
+  cancel_window_s: 30                  # "hey cortana, cancel" kills the user's last incident
 
 discipline:
   user_cooldown_s: 30                  # min seconds between mentions from the same pilot

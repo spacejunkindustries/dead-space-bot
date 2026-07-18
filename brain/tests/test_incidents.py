@@ -1434,7 +1434,7 @@ async def test_chase_without_system_speaks_hint(make_env: Callable[..., Env]) ->
     )
     out = await env.engine.report(GUILD, 42, chase, None)
     assert out.outcome is Outcome.REJECTED
-    assert out.utterance == "Report first, then say update chase and the system."
+    assert out.utterance == "Say update chase and a system, or clear to finish."
 
 
 async def test_spoken_code_is_read_back_on_post(make_env: Callable[..., Env]) -> None:
@@ -1451,3 +1451,51 @@ async def test_spoken_code_is_read_back_on_post(make_env: Callable[..., Env]) ->
     out = await env.engine.report(GUILD, 42, spoken, high(1, "Otanuomi"))
     assert out.outcome is Outcome.POSTED
     assert out.utterance == "Under attack Otanuomi, code red, posted."
+
+
+async def test_chase_never_touches_a_formup_card(make_env: Callable[..., Env]) -> None:
+    # Form-ups share the incidents table; an unfiltered "latest ACTIVE" once
+    # rewrote a fleet's rally card to the chase system.
+    env = make_env()
+    tackle = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    formup = ParsedCommand(
+        intent=Intent.FORMUP,
+        system_text="Kisogo",
+        group_alias=None,
+        detail="twenty minutes",
+        raw="form up Kisogo twenty minutes",
+    )
+    await env.engine.report(GUILD, 42, formup, high(2, "Kisogo"))
+
+    chase = ParsedCommand(
+        intent=Intent.CHASE_UPDATE,
+        system_text="Alenia",
+        group_alias=None,
+        detail=None,
+        raw="update chase Alenia",
+    )
+    out = await env.engine.report(GUILD, 42, chase, high(3, "Alenia"))
+    assert out.outcome is Outcome.POSTED
+    assert out.incident_id == tackle.incident_id  # the TACKLE moved, not the rally
+    row = db.query_one(
+        env.conn, "SELECT system_id FROM incidents WHERE id = ?", (tackle.incident_id,)
+    )
+    assert row["system_id"] == 3
+
+
+async def test_folded_co_reporter_may_drive_the_chase(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    first = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    folded = await env.engine.report(GUILD, 43, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    assert folded.outcome is Outcome.FOLDED
+
+    chase = ParsedCommand(
+        intent=Intent.CHASE_UPDATE,
+        system_text="Kisogo",
+        group_alias=None,
+        detail=None,
+        raw="update chase Kisogo",
+    )
+    out = await env.engine.report(GUILD, 43, chase, high(2, "Kisogo"))  # the SECOND pilot
+    assert out.outcome is Outcome.POSTED
+    assert out.incident_id == first.incident_id

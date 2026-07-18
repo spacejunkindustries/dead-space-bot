@@ -1057,12 +1057,22 @@ class IncidentEngine:
             return IncidentOutcome(Outcome.REJECTED, tts.chase_hint(), None, None)
         async with self._lock:
             now = self._clock()
+            # Only REPORT cards are chaseable — form-ups and timers share the
+            # incidents table and an unfiltered "latest ACTIVE" once rewrote a
+            # fleet's rally card to the chase system. A pilot whose duplicate
+            # report was dedupe-folded into someone else's card is on that
+            # card's reporter set (incident_updates), so they may chase too.
+            report_types = tuple(str(i) for i in sorted(_REPORT_INTENTS))
+            placeholders = ", ".join("?" for _ in report_types)
             row = await asyncio.to_thread(
                 db.query_one,
                 self._conn,
-                "SELECT id FROM incidents WHERE guild_id = ? AND reporter_id = ?"
-                " AND status = 'ACTIVE' ORDER BY id DESC LIMIT 1",
-                (guild_id, reporter_id),
+                "SELECT id FROM incidents WHERE guild_id = ? AND status = 'ACTIVE'"
+                f" AND type IN ({placeholders})"
+                " AND (reporter_id = ? OR id IN"
+                "      (SELECT incident_id FROM incident_updates WHERE user_id = ?))"
+                " ORDER BY id DESC LIMIT 1",
+                (guild_id, *report_types, reporter_id, reporter_id),
             )
             if row is None:
                 return IncidentOutcome(Outcome.REJECTED, tts.chase_no_incident(), None, None)

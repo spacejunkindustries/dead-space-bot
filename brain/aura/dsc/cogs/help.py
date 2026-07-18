@@ -173,7 +173,7 @@ HELP_TOPICS: dict[str, HelpTopic] = {
             ),
             (
                 "Personal pings — just you",
-                "*“Aura Command, ping me for gate camps in Otanuomi”* or "
+                "*“Hey Cortana, ping me for gate camps in Otanuomi”* or "
                 "`/pingme type [system]` — a direct @mention when a matching incident "
                 "posts. Use it for a specific interest (your mining hole, your route) "
                 "without joining a role. No system = everywhere; max 10.\n"
@@ -219,9 +219,9 @@ HELP_TOPICS: dict[str, HelpTopic] = {
             (
                 "Scheduling",
                 "• `/timer Kisogo 4 hours armor timer` — mention ahead of a structure "
-                "timer (*“Aura Command, timer Kisogo four hours”*)\n"
+                "timer (*“Hey Cortana, timer Kisogo four hours”*)\n"
                 "• `/formup Otanuomi 15 minutes kitchen sink` — op card with RSVP "
-                "buttons (*“Aura Command, form up Otanuomi fifteen minutes”*)\n"
+                "buttons (*“Hey Cortana, form up Otanuomi fifteen minutes”*)\n"
                 "• `/remindme 45 minutes check the pos` — personal DM reminder",
             ),
             (
@@ -326,7 +326,7 @@ _MAIN_DESCRIPTION = (
     "live incident card, role pings, and a spoken confirmation — in about a "
     "second and a half. Every voice command has a slash twin, so everything "
     "keeps working from chat alone.\n\n"
-    "**Say:** *“Aura Command, hostiles Otanuomi, three battleships”*\n"
+    "**Say:** *“Hey Cortana, hostiles Otanuomi, three battleships”*\n"
     "**CORTANA answers in voice:** *“Hostiles Otanuomi, pinged.”* — and the card "
     "is already posted.\n\n"
     "Pick a topic below, or jump straight there with `/help topic:…`."

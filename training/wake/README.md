@@ -1,4 +1,4 @@
-# Wake-word training — "Aura Command"
+# Wake-word training — "Hey Cortana"
 
 Offline pipeline that trains the custom [openWakeWord](https://github.com/dscripka/openWakeWord)
 model CORTANA listens for. It is completely separate from `brain/` and `ears/`:
@@ -22,7 +22,7 @@ pipeline's sweep output:
 
 ```yaml
 wake:
-  model:  /opt/aura/models/wake/aura_command.onnx
+  model:  /opt/aura/models/wake/hey_cortana.onnx
   threshold: 0.55        # replace with the value picked from the sweep table
 ```
 
@@ -143,7 +143,7 @@ true false-accept rate is only measurable against real comms
 false-accept estimate once deployed — watch it for the first week.
 
 Also sanity-check by ear: play a few `positive_test` clips and confirm the
-TTS actually says "aura command" the way pilots will.
+TTS actually says "hey cortana" the way pilots will.
 
 ## Deploying
 

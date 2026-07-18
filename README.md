@@ -1,13 +1,13 @@
-# AURA
+# CORTANA
 
 Voice-activated fleet intel bot for the DEAD corp's EVE Echoes Discord. A pilot
 in fleet comms says *"Aura command — hostiles in Otanuomi, five tacklers"* and
 about a second and a half later an incident card is in the intel channel, the
-right subscribers are pinged, and AURA confirms over voice — against 20–40
+right subscribers are pinged, and CORTANA confirms over voice — against 20–40
 seconds for alt-tabbing out of the client to type it. No cloud services: wake
 word, speech recognition, and TTS all run on one self-hosted droplet.
 
-AURA is two processes joined by a Unix domain socket. **Ears** (Rust, Songbird
+CORTANA is two processes joined by a Unix domain socket. **Ears** (Rust, Songbird
 ≥0.6) is a deliberately thin audio pump: it holds the Discord voice connection
 (including the now-mandatory DAVE end-to-end encryption), decodes per-user PCM,
 and plays TTS. **Brain** (Python, discord.py) is everything requiring
@@ -15,7 +15,7 @@ judgement: wake-word gating, Whisper STT, a fixed regex grammar (no LLM in the
 command path), phonetic system-name matching against a small region-scoped
 gazetteer, the incident engine, routing, and notification discipline. Every
 voice command has a slash-command twin hitting the same engine, so if Discord
-ever breaks voice receive, AURA degrades to a fast text bot instead of dying.
+ever breaks voice receive, CORTANA degrades to a fast text bot instead of dying.
 
 The full specification is [`docs/GDD.md`](docs/GDD.md) — it is the source of
 truth. Contributors: read [`CLAUDE.md`](CLAUDE.md) before touching anything;
@@ -89,19 +89,19 @@ restart. Ears stays connected across Brain restarts.
 
 ## Privacy
 
-AURA puts a microphone-reading robot into a corp's social space. From GDD §19,
-the governing decision: **AURA does not record anything.**
+CORTANA puts a microphone-reading robot into a corp's social space. From GDD §19,
+the governing decision: **CORTANA does not record anything.**
 
 > - Audio lives in a **RAM ring buffer only**. Never written to disk.
 >   Overwritten every 1.5 seconds.
 > - The capture buffer is freed the instant STT returns.
-> - AURA stores the **transcript of triggered commands**, never audio.
+> - CORTANA stores the **transcript of triggered commands**, never audio.
 > - Non-command speech is **never transcribed at all** — the wake-word gate
 >   means it never reaches the recogniser.
 
-AURA announces itself every time it joins a voice channel, and `/optout` drops
+CORTANA announces itself every time it joins a voice channel, and `/optout` drops
 a user's audio inside Ears, before any processing — an actual drop, not a
-downstream filter. Introduce AURA to your corp with GDD §19, not with the
+downstream filter. Introduce CORTANA to your corp with GDD §19, not with the
 feature list.
 
 ## Documentation
