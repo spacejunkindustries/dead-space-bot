@@ -14,6 +14,7 @@ from aura.config import (
     AuraConfig,
     CaptureConfig,
     ChannelsConfig,
+    ChatConfig,
     CircuitBreakerConfig,
     DatabaseConfig,
     DisciplineConfig,
@@ -93,6 +94,7 @@ def make_config(
     personal_pings_max: int = 10,
     mentions_enabled: bool = True,
     wake_ack: str = "beep",
+    chat_enabled: bool = False,
 ) -> AuraConfig:
     return AuraConfig(
         discord=DiscordConfig(
@@ -149,6 +151,7 @@ def make_config(
         ipc=IpcConfig(socket="/run/aura/aura.sock"),
         health=HealthConfig(report_interval_min=60, voice_silence_alarm_s=60),
         database=DatabaseConfig(path=":memory:"),
+        chat=ChatConfig(enabled=chat_enabled, user_cooldown_s=1),
     )
 
 

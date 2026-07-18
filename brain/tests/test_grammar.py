@@ -575,3 +575,26 @@ def test_jarvis_and_cortana_wake_residue_stripped() -> None:
 def test_stuttered_hallucination_collapses_in_relay() -> None:
     assert broadcast_text("Rens, Rens, Rens") == "Rens"
     assert broadcast_text("Rens Rens") == "Rens Rens"  # 2x = emphasis, kept
+
+
+# ── command override (GDD §6.6) ──────────────────────────────────────────────
+
+
+def test_override_query_extracts_question() -> None:
+    from aura.nlu.grammar import override_query
+
+    q = override_query("hey cortana command override please tell me the weather in Chicago")
+    assert q == "please tell me the weather in Chicago"
+    assert override_query("override, what's the capital of France, over") == (
+        "what's the capital of France"
+    )
+
+
+def test_override_never_diverts_reports() -> None:
+    from aura.nlu.grammar import override_query
+
+    # "override" mid-sentence is a report word, not the doorway.
+    assert override_query("hostiles are trying to override the gate in Kisogo") is None
+    assert override_query("hostiles in Otanuomi") is None
+    # A bare "command override" with no question is not a query either.
+    assert override_query("command override") is None

@@ -491,3 +491,61 @@ async def test_confident_relay_posts_and_acks() -> None:
     await app._on_utterance(USER, GUILD, b"\x00\x00")
     assert len(engine.broadcasts) == 1
     assert (GUILD, "Relayed.") in speaker.said
+
+
+# ── command override wiring (GDD §6.6) ───────────────────────────────────────
+
+
+class _Chat:
+    def __init__(self, reply: str | None = "Sunny, 21 degrees.", error: Exception | None = None):
+        self.reply = reply
+        self.error = error
+        self.asked: list[tuple[int, str]] = []
+
+    async def ask(self, user_id: int, query: str) -> str:
+        self.asked.append((user_id, query))
+        if self.error is not None:
+            raise self.error
+        assert self.reply is not None
+        return self.reply
+
+
+async def test_override_routes_to_chat_and_speaks_reply() -> None:
+    app, engine, _, speaker, _ = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey jarvis command override what's the weather in Chicago"]),
+    )
+    app.holder = StubHolder(make_config(chat_enabled=True))  # type: ignore[assignment]
+    app.discipline = Discipline(app.holder)  # type: ignore[arg-type]
+    chat = _Chat()
+    app.chat = chat  # type: ignore[assignment]
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert chat.asked == [(USER, "what's the weather in Chicago")]
+    assert speaker.said == [(GUILD, "Sunny, 21 degrees.")]
+    assert engine.reports == [] and engine.broadcasts == []  # never touches intel
+
+
+async def test_override_failure_speaks_fixed_line() -> None:
+    from aura.chat import ChatError
+
+    app, engine, _, speaker, _ = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["command override tell me a story"]),
+    )
+    app.holder = StubHolder(make_config(chat_enabled=True))  # type: ignore[assignment]
+    app.discipline = Discipline(app.holder)  # type: ignore[arg-type]
+    app.chat = _Chat(error=ChatError("boom"))  # type: ignore[assignment]
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert speaker.said == [(GUILD, "Override channel unavailable.")]
+    assert engine.broadcasts == []
+
+
+async def test_override_disabled_falls_through_to_relay() -> None:
+    # chat.enabled false (default): the same words flow to the normal path.
+    app, engine, _, _, _ = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["command override what's the weather in Chicago"]),
+    )
+    app.chat = None  # type: ignore[assignment]
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert len(engine.broadcasts) == 1  # relayed, not asked

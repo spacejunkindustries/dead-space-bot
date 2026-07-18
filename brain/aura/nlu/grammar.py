@@ -35,6 +35,7 @@ __all__ = [
     "broadcast_severity",
     "clean_callsign",
     "encode_ping_types",
+    "override_query",
     "parse",
     "sanitize_callsign",
     "system_reply",
@@ -398,6 +399,30 @@ def broadcast_severity(transcript: str) -> Severity | None:
     """The spoken colour code of a freeform relay, if any (GDD §6.4)."""
     severity, _ = _extract_code(transcript)
     return severity
+
+
+# "Command override" — the explicit doorway to the out-of-band assistant
+# (GDD §6.6). Leading position only (after wake residue), so a report that
+# happens to contain the word "override" mid-sentence can never be diverted.
+_OVERRIDE_RE = re.compile(r"^\W*(?:command\s+|com+a?nd\s+)?override\b[\s,.:;-]*", re.I)
+
+
+def override_query(transcript: str) -> str | None:
+    """Extract the question from a "command override …" utterance.
+
+    Returns the query text, or ``None`` when the utterance is not an
+    override (then it flows to the normal grammar untouched — constraint 6).
+    A bare "command override" with no question also returns ``None``.
+    """
+    if not transcript or not transcript.strip():
+        return None
+    work = _BROADCAST_WAKE_RE.sub("", transcript, count=1)
+    work = _WAKE_RE.sub("", work, count=1)
+    m = _OVERRIDE_RE.match(work)
+    if m is None:
+        return None
+    rest = _SIGNOFF_RE.sub("", work[m.end() :]).strip(" ,.;:!?-")
+    return rest or None
 
 
 def bare_code(transcript: str) -> Severity | None:

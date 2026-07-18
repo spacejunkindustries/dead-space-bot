@@ -390,3 +390,25 @@ def test_holographic_effect_preserves_format() -> None:
     assert len(out) == len(pcm)  # same length, same s16le format
     assert len(out) % 2 == 0
     assert holographic(b"", rate) == b""  # empty passes through
+
+
+# ── personality pack (GDD §12.4) ─────────────────────────────────────────────
+
+
+def test_standard_personality_keeps_exact_catalogue() -> None:
+    tts.set_personality("standard")
+    assert tts.go_ahead() == "Go ahead."
+    assert tts.relayed() == "Relayed."
+
+
+def test_cortana_personality_rotates_ack_lines_only() -> None:
+    tts.set_personality("cortana")
+    try:
+        seen = {tts.go_ahead() for _ in range(50)}
+        assert len(seen) > 1  # it actually varies
+        assert all(len(line) < 40 for line in seen)  # stays under the spoken cap
+        # Info-carrying lines never vary.
+        assert tts.ping_sent("Otanuomi") == "Hostiles Otanuomi, pinged."
+        assert tts.responders(2, "Otanuomi") == "Two responding to Otanuomi."
+    finally:
+        tts.set_personality("standard")

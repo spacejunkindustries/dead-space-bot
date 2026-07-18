@@ -41,6 +41,7 @@ from aura.audio.capture import CaptureManager
 from aura.audio.stt import SttError, SttTimeoutError, Transcriber, make_transcriber
 from aura.audio.vad import VadGate
 from aura.audio.wake import OpenWakeWordDetector
+from aura.chat import ChatClient, ChatCooldownError, read_api_key
 from aura.config import ConfigError, ConfigHolder
 from aura.core import db
 from aura.core.discipline import Discipline
@@ -153,6 +154,7 @@ class App:
         self.health: HealthReporter | None = None
         self.gateway: VoiceGateway | None = None
         self.reminders: ReminderService | None = None
+        self.chat: ChatClient | None = None
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         # Fire-and-forget spoken cues (the "go ahead" ack); kept referenced so
@@ -186,8 +188,17 @@ class App:
 
         self.discipline = Discipline(self.holder)
         self.ipc = IpcServer(self.holder, self._on_audio, self._on_control)
+        tts_mod.set_personality(cfg.tts.personality)
         self.speaker = Speaker(self.holder, self.ipc)
         await self.speaker.warm()  # prime Piper's model into cache off the hot path
+
+        if cfg.chat.enabled:
+            key = read_api_key(cfg.chat.api_key_file)
+            if key:
+                self.chat = ChatClient(self.holder, key)
+                log.info("override_channel_ready", model=cfg.chat.model)
+            else:
+                log.warning("override_channel_no_key", api_key_file=cfg.chat.api_key_file)
 
         self.transcriber = await asyncio.to_thread(make_transcriber, cfg.stt)
         # Load the Whisper weights now, off the request path: the first real
@@ -223,6 +234,7 @@ class App:
             self.holder, self.engine, self.gazetteer, self.discipline, self.speaker, self.conn
         )
         late_poster.bind(self.bot)
+        self.bot.chat = self.chat  # /ask slash twin (GDD §6.6, constraint 10)
         self.reminders = ReminderService(self.conn, self.bot)
 
         self.gateway = VoiceGateway(self.holder, self.ipc, self.conn, self.bot.announce_join)
@@ -299,6 +311,8 @@ class App:
             self.holder.reload()
         except ConfigError as exc:
             log.error("config_reload_failed", error=str(exc))
+        else:
+            tts_mod.set_personality(self.holder.current.tts.personality)
 
     async def _graceful_shutdown(self) -> None:
         log.info("shutting_down")
@@ -464,6 +478,16 @@ class App:
         if pend_sev is not None and loop.time() <= pend_sev[1]:
             inherited = pend_sev[0]
 
+        # "Command override" — the explicitly-invoked out-of-band assistant
+        # (GDD §6.6). Checked before the grammar so a question containing
+        # command words ("what's the status of the war?") is never misread as
+        # a report; a non-override utterance passes through untouched.
+        if self.chat is not None and cfg.chat.enabled:
+            query = grammar.override_query(result.text)
+            if query is not None:
+                await self._command_override(guild_id, user_id, query)
+                return
+
         parsed = grammar.parse(result.text)
         if parsed is None:
             # Spoken-colour dialogue (GDD §6.4): a standalone "code orange"
@@ -619,6 +643,32 @@ class App:
             await self._send_channel(
                 self.holder.current.discord.channels.intel_live, f"🔊 {utterance}"
             )
+
+    async def _command_override(self, guild_id: int, user_id: int, query: str) -> None:
+        """One §6.6 override question: throttle → ask → speak or post.
+
+        The reply is spoken when it fits the §12.2 cap; longer answers post to
+        the intel channel and the pilot hears "Answer posted to Discord."
+        Failures never surface raw errors on comms — a fixed line only.
+        """
+        assert self.chat and self.speaker
+        cfg = self.holder.current
+        log.info("override_query", user_id=user_id, query=query)
+        try:
+            reply = await asyncio.wait_for(
+                self.chat.ask(user_id, query), timeout=cfg.chat.timeout_s
+            )
+        except ChatCooldownError:
+            await self._speak_or_post(guild_id, user_id, tts_mod.override_cooldown())
+            return
+        except Exception as exc:  # ChatError, TimeoutError — comms stay clean
+            log.warning("override_failed", user_id=user_id, error=str(exc))
+            await self._speak_or_post(guild_id, user_id, tts_mod.override_unavailable())
+            return
+        spoken = await self.speaker.say(guild_id, reply, PRIORITY_NORMAL, user_id=user_id)
+        if not spoken:
+            await self._send_channel(cfg.discord.channels.intel_live, f"💬 **Override** · {reply}")
+            await self._speak_or_post(guild_id, user_id, tts_mod.override_posted())
 
     async def _speak_or_post(self, guild_id: int, user_id: int, utterance: str) -> None:
         """Speak a short rejection/reply; fall back to channel text when muted."""

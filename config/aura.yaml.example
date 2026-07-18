@@ -86,8 +86,26 @@ tts:
   binary: /usr/local/bin/piper         # Piper invoked as a subprocess (GDD §12 license note)
   max_utterance_s: 3                   # hard cap; longer text goes to the channel instead
   effect: none                         # none | holographic (chorus+reverb "ship AI" sheen)
+  personality: standard                # standard = exact GDD §12.1 lines;
+                                       # cortana = acknowledgement lines rotate
+                                       # ("Go ahead." / "Listening." / "Send it.")
+                                       # so AURA feels alive; info lines never vary.
   # Ducking (60%) and talk-over suppression are fixed playback mechanics in
   # Ears (ears/src/playback.rs, GDD §12.2) — not tunables.
+
+chat:                                  # "command override" assistant (GDD §6.6) — OFF by default
+  enabled: false                       # true = pilots can say "command override, <question>"
+                                       # (slash twin: /ask). Costs real money per question.
+  model: claude-haiku-4-5              # cheapest tier (~$0.002/question);
+                                       # claude-opus-4-8 = smarter, ~10x the price
+  api_key_file: /etc/aura/anthropic    # dev fallback ONLY (0600). Production reads
+                                       # $CREDENTIALS_DIRECTORY/anthropic via systemd
+                                       # LoadCredential= — the key is never in this file.
+  max_tokens: 300                      # hard cap per answer
+  user_cooldown_s: 10                  # per-pilot throttle — the cost control
+  timeout_s: 25                        # wall-clock cap incl. web search
+  web_search: true                     # allow 1 live web search per question
+                                       # (weather etc.; each search bills ~1¢)
 
 gazetteer:
   file: /etc/aura/gazetteer.yaml       # scope rules: regions/within_jumps_of/include_all (GDD §8.1)
