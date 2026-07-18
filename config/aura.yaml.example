@@ -145,6 +145,10 @@ chat:                                  # "command override" assistant (GDD §6.6
   timeout_s: 25                        # wall-clock cap incl. web search
   web_search: true                     # allow 1 live web search per question
                                        # (weather etc.; each search bills ~1¢)
+  answer_channel: 000000000000000000   # where answers too long to speak post.
+                                       # 0 = intel_live — but chit-chat in an
+                                       # intel channel annoys; point this at a
+                                       # general/bot channel.
 
 gazetteer:
   file: /etc/aura/gazetteer.yaml       # scope rules: regions/within_jumps_of/include_all (GDD §8.1)

@@ -191,23 +191,21 @@ def not_understood() -> str:
 
 
 _STANDING_DOWN_BRATTY = (
-    "Nope. Standing down. Wake me when you're ready.",
+    "Nope. Standing down. Wake me later.",
     "I give up. Holler when it's words.",
     "Can't parse that shit. Standing down.",
-    "I'm out. Say the magic words to retry.",
-    "Done guessing. Wake me and try again.",
+    "I'm out. Wake me to retry.",
+    "Done guessing. Wake me and retry.",
 )
 
 
 def standing_down() -> str:
-    """*"Couldn't parse that. Standing down. Wake me to retry."* — the second
-    consecutive unintelligible utterance ends the dialogue: the pilot now
-    KNOWS the window is closed and a fresh wake word is needed (no dead air,
-    and — because this path never reopens — no feedback loop either)."""
-    return _pick(
-        "Couldn't parse that. Standing down. Wake me to retry.",
-        bratty=_STANDING_DOWN_BRATTY,
-    )
+    """*"Standing down. Wake me to retry."* — the second consecutive
+    unintelligible utterance ends the dialogue: the pilot now KNOWS the
+    window is closed and a fresh wake word is needed. Every variant must fit
+    the §12.2 3-second cap — the first cut of this line was longer, got
+    dropped by the cap, and fell back into the intel channel as text spam."""
+    return _pick("Standing down. Wake me to retry.", bratty=_STANDING_DOWN_BRATTY)
 
 
 def chase_updated(system: str) -> str:
@@ -443,7 +441,7 @@ def hot_lines() -> tuple[str, ...]:
     lines: list[str] = [
         "Go ahead.",
         "Say again?",
-        "Couldn't parse that. Standing down. Wake me to retry.",
+        "Standing down. Wake me to retry.",
         "Say again the system.",
         "Say again the callsign.",
         "Relayed.",
