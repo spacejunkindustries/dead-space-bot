@@ -18,6 +18,7 @@ discord:
     fc:    000000000000000000          # gate: only this role may voice-trigger under fleetmode
   watch_voice_channels: [000000000000000000]  # voice channels AURA watches / auto-joins
   auto_join: true                      # join when a pilot enters, leave when empty
+  mentions_enabled: true               # false = silent mode: post cards, ping nobody
 
 wake:
   # The phrase itself ("aura command", GDD §5.2) is baked into the trained

@@ -59,6 +59,11 @@ class DiscordConfig:
     roles: RolesConfig
     watch_voice_channels: tuple[int, ...]
     auto_join: bool
+    #: Master switch for role/@here pings. False = "silent mode": incidents and
+    #: relays still post to the channel, but AURA mentions nobody and the
+    #: @Pilot trigger gate is lifted (there is nothing to protect). Turn on once
+    #: real roles are wired into routing.yaml.
+    mentions_enabled: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +267,7 @@ def _build_discord(data: dict[str, Any]) -> DiscordConfig:
         ),
         watch_voice_channels=_int_list(s, "discord.watch_voice_channels"),
         auto_join=_get(s, "discord.auto_join", bool, default=True),
+        mentions_enabled=_get(s, "discord.mentions_enabled", bool, default=True),
     )
 
 

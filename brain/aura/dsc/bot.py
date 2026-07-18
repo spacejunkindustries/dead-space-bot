@@ -315,11 +315,17 @@ class AuraBot(commands.Bot):
         from aura.dsc.views import view_from_card
 
         target = await self._alert_channel(channel)
+        # Silent mode hard-stop: even if a stray "@here" reached the content,
+        # Discord suppresses the actual notification when mentions are disabled.
+        if self.holder.current.discord.mentions_enabled:
+            allowed = discord.AllowedMentions(everyone=True, roles=True, users=False)
+        else:
+            allowed = discord.AllowedMentions.none()
         message = await target.send(
             content=content or None,
             embed=discord.Embed.from_dict(card.embed),
             view=view_from_card(card),
-            allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=False),
+            allowed_mentions=allowed,
         )
         return target.id, message.id
 
