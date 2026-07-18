@@ -86,6 +86,10 @@ class WakeConfig:
     #: "voice" = speak "Go ahead." (Cortana talks back), "beep" = an instant
     #: tone (fast, no synthesis latency), "none" = silent. Default "beep".
     ack: str = "beep"
+    #: openWakeWord's built-in Silero VAD gate: a wake trigger only counts
+    #: when the VAD simultaneously scores speech above this. Cuts false
+    #: fires from music/game audio/keyboard noise on busy comms. 0.0 = off.
+    vad_threshold: float = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +363,12 @@ def _build_wake(data: dict[str, Any]) -> WakeConfig:
         threshold=_in_range(_get(s, "wake.threshold", float), "wake.threshold", 0.0, 1.0),
         refractory_ms=_positive(_get(s, "wake.refractory_ms", int), "wake.refractory_ms"),
         ack=ack,
+        vad_threshold=_in_range(
+            float(_get(s, "wake.vad_threshold", float, default=0.5)),
+            "wake.vad_threshold",
+            0.0,
+            1.0,
+        ),
     )
 
 
