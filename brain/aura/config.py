@@ -88,8 +88,12 @@ class WakeConfig:
     ack: str = "beep"
     #: openWakeWord's built-in Silero VAD gate: a wake trigger only counts
     #: when the VAD simultaneously scores speech above this. Cuts false
-    #: fires from music/game audio/keyboard noise on busy comms. 0.0 = off.
-    vad_threshold: float = 0.5
+    #: fires from music/game audio/keyboard noise — but it gates the wake
+    #: model hard, and it shipped ON by default once and silently killed the
+    #: wake word on a live deployment. OPT-IN only (0.0 = off, the default);
+    #: enable at ~0.3-0.5 and verify wake still fires before trusting it.
+    #: Applied at model build — needs a restart, not just SIGHUP.
+    vad_threshold: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,7 +370,7 @@ def _build_wake(data: dict[str, Any]) -> WakeConfig:
         refractory_ms=_positive(_get(s, "wake.refractory_ms", int), "wake.refractory_ms"),
         ack=ack,
         vad_threshold=_in_range(
-            float(_get(s, "wake.vad_threshold", float, default=0.5)),
+            float(_get(s, "wake.vad_threshold", float, default=0.0)),
             "wake.vad_threshold",
             0.0,
             1.0,

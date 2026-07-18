@@ -58,8 +58,8 @@ def test_relay_mode_rejects_unknown() -> None:
 
 
 def test_wake_vad_threshold_default_and_bounds() -> None:
-    assert _build_wake(_wake({})).vad_threshold == 0.5
-    assert _build_wake(_wake({"vad_threshold": 0.0})).vad_threshold == 0.0
+    assert _build_wake(_wake({})).vad_threshold == 0.0  # OPT-IN: on-by-default once killed wake
+    assert _build_wake(_wake({"vad_threshold": 0.4})).vad_threshold == 0.4
     with pytest.raises(ConfigError, match="wake.vad_threshold"):
         _build_wake(_wake({"vad_threshold": 1.5}))
 
