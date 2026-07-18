@@ -28,6 +28,12 @@ discord:
   auto_join: true                      # join when a pilot enters, leave when empty
   mentions_enabled: true               # false = silent mode: post cards, ping nobody
   here_on_severity: [high]             # ping @here by threat colour: high=RED, medium=ORANGE
+  join_announcement: daily             # §19 consent notice on voice join:
+                                       #   every = post on every join
+                                       #   daily = at most once per 24h (survives
+                                       #           restarts — stops rejoin spam)
+                                       #   off   = never (consent posture carried
+                                       #           by /optout + pinned docs)
 
 wake:
   # The phrase itself ("aura command", GDD §5.2) is baked into the trained

@@ -68,6 +68,13 @@ class DiscordConfig:
     #: "high" = CODE RED, "medium" = CODE ORANGE, "none" = CODE YELLOW. Default
     #: RED only — the safe choice; add "medium" to also ping on CODE ORANGE.
     here_on_severity: tuple[str, ...] = ("high",)
+    #: §19 consent-announcement cadence on voice join:
+    #:   every = post on every join (the original behaviour)
+    #:   daily = at most once per 24h, persisted across restarts (default —
+    #:           restart churn used to spam the channel with the notice)
+    #:   off   = never post it (the corp accepts the consent posture is
+    #:           carried by /optout + the pinned docs instead)
+    join_announcement: str = "daily"
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,7 +336,15 @@ def _build_discord(data: dict[str, Any]) -> DiscordConfig:
         here_on_severity=tuple(
             str(x).lower() for x in (_get(s, "discord.here_on_severity", list, default=["high"]))
         ),
+        join_announcement=_join_announcement(s),
     )
+
+
+def _join_announcement(s: dict[str, Any]) -> str:
+    mode = str(_get(s, "discord.join_announcement", str, default="daily")).lower()
+    if mode not in ("every", "daily", "off"):
+        raise ConfigError(f"discord.join_announcement: must be one of every|daily|off, got {mode!r}")
+    return mode
 
 
 def _build_wake(data: dict[str, Any]) -> WakeConfig:
