@@ -100,3 +100,47 @@ def test_unquoted_yaml_off_is_accepted_for_offable_keys() -> None:
         }
     }
     assert build_stt(stt).relay_mode == "off"
+
+
+def _discord_base() -> dict[str, object]:
+    return {
+        "token_file": "/dev/null",
+        "guild_id": 1,
+        "channels": {"intel_alerts": 1, "intel_live": 2, "health": 3},
+        "watch_voice_channels": [9],
+    }
+
+
+def test_roles_section_is_optional() -> None:
+    # An empty `roles:` header (every key commented out) parses as None and
+    # once crash-looped a deployment with "expected a mapping, got NoneType".
+    from cortana.config import _build_discord
+
+    for roles in ({}, None, "absent"):
+        d = _discord_base()
+        if roles != "absent":
+            d["roles"] = roles
+        cfg = _build_discord({"discord": d})
+        assert cfg.roles.pilot == 0
+        assert cfg.roles.fc == 0
+
+
+def test_partial_roles_section_keeps_the_configured_gate() -> None:
+    from cortana.config import _build_discord
+
+    d = _discord_base()
+    d["roles"] = {"pilot": 42}
+    cfg = _build_discord({"discord": d})
+    assert cfg.roles.pilot == 42
+    assert cfg.roles.fc == 0
+
+
+def test_empty_required_section_names_the_missing_key() -> None:
+    # `channels:` with nothing under it must say which KEY is missing, not
+    # "expected a mapping, got NoneType".
+    from cortana.config import _build_discord
+
+    d = _discord_base()
+    d["channels"] = None
+    with pytest.raises(ConfigError, match="discord.channels.intel_alerts: missing required key"):
+        _build_discord({"discord": d})

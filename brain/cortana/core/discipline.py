@@ -110,15 +110,29 @@ class Discipline:
     # ── role gates ────────────────────────────────────────────────────────────
 
     def may_mention(self, member_role_ids: Iterable[int]) -> bool:
-        """Pilot-role gate (GDD §11.1 layer 4): only ``@Pilot`` triggers mentions."""
+        """Pilot-role gate (GDD §11.1 layer 4): only ``@Pilot`` triggers mentions.
+
+        An unconfigured pilot role (0) means the gate is off — anyone may
+        trigger mentions. The circuit breaker and cooldowns still bound the
+        blast radius (§11.2/§11.3).
+        """
         pilot = self._holder.current.discord.roles.pilot
+        if pilot == 0:
+            return True
         return pilot in set(member_role_ids)
 
     def may_voice_trigger(self, member_role_ids: Iterable[int]) -> bool:
-        """Fleet-ops gate (GDD §11.4): under fleetmode only the FC may voice-trigger."""
+        """Fleet-ops gate (GDD §11.4): under fleetmode only the FC may voice-trigger.
+
+        An unconfigured FC role (0) means fleetmode cannot restrict anyone —
+        the alternative (fleetmode silently blocking every voice command) is
+        a trap for corps that never wired roles up.
+        """
         if not self._fleetmode:
             return True
         fc = self._holder.current.discord.roles.fc
+        if fc == 0:
+            return True
         return fc in set(member_role_ids)
 
     def check(self, member_role_ids: Iterable[int], source: Source) -> bool:

@@ -194,3 +194,27 @@ def test_fleetmode_never_gates_slash() -> None:
     assert d.check([PILOT_ROLE], "slash")
     d.set_fleetmode(False)
     assert d.check([PILOT_ROLE], "voice")
+
+
+# ── unconfigured role gates (roles: section is optional) ─────────────────────
+
+
+def _ungated() -> Discipline:
+    import dataclasses
+
+    cfg = make_config()
+    cfg = dataclasses.replace(cfg, discord=dataclasses.replace(cfg.discord, roles=RolesConfig()))
+    return Discipline(StubHolder(cfg))  # type: ignore[arg-type]
+
+
+def test_unconfigured_pilot_role_lifts_mention_gate() -> None:
+    d = _ungated()
+    assert d.may_mention([])
+    assert d.may_mention([555])
+
+
+def test_unconfigured_fc_role_means_fleetmode_restricts_nobody() -> None:
+    d = _ungated()
+    d.set_fleetmode(True)
+    assert d.may_voice_trigger([])
+    assert d.check([555], "voice")
