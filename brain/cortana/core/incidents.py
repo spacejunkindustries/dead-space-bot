@@ -29,7 +29,7 @@ import asyncio
 import re
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -42,9 +42,8 @@ from cortana.core import db
 from cortana.core.callsigns import CallsignRegistry
 from cortana.core.discipline import Discipline
 from cortana.core.personal_pings import PersonalPingRegistry, types_from_detail
-from cortana.core.routing import RoutingRule, apply_group_alias, evaluate, load_group_aliases
+from cortana.core.routing import MentionDecision, RoutingRule, decide_mentions, load_group_aliases
 from cortana.core.routing import load_rules as load_routing_rules_file
-from cortana.core.routing import suppress as suppress_decision
 from cortana.types import (
     INTENT_SEVERITY,
     MENTION_INTENTS,
@@ -63,7 +62,6 @@ from cortana.types import (
     PriorContext,
     Resolution,
     ResponderState,
-    RoutingDecision,
     Severity,
     Tier,
 )
@@ -112,6 +110,9 @@ _COLOR_BY_SEVERITY: dict[Severity, int] = {
     Severity.MEDIUM: 0xE67E22,  # orange
     Severity.NONE: 0xF1C40F,  # yellow
 }
+#: Severity ordering for the fold raises-never-lowers rule (GDD §9.2).
+_SEVERITY_RANK: dict[Severity, int] = {Severity.NONE: 0, Severity.MEDIUM: 1, Severity.HIGH: 2}
+
 _COLOR_RESOLVED = 0x95A5A6  # grey
 _COLOR_STALE = 0x607D8B  # dim slate
 _COLOR_BROADCAST = 0xF1C40F  # yellow — freeform intel relay is CODE YELLOW (GDD §8.6)
@@ -151,9 +152,21 @@ class Poster(Protocol):
     """Injected Discord side — implemented by ``aura.dsc.bot`` (INTERFACES.md)."""
 
     async def post(
-        self, guild_id: int, channel: AlertChannel, content: str, card: CardRender
+        self,
+        guild_id: int,
+        channel: AlertChannel,
+        content: str,
+        card: CardRender,
+        *,
+        mentions: MentionDecision | None = None,
     ) -> tuple[int, int]:
-        """Post a card; returns ``(channel_id, message_id)``."""
+        """Post a card; returns ``(channel_id, message_id)``.
+
+        ``mentions`` is the escalation authority's grant: the implementation
+        builds its ``AllowedMentions`` allowlist from it verbatim (explicit
+        user ids, explicit role ids, ``everyone`` only when ``here``).
+        ``None`` means nothing in the content may ping.
+        """
         ...
 
     async def edit(self, channel_id: int, message_id: int, content: str, card: CardRender) -> None:
@@ -314,7 +327,7 @@ def _format_duration(delta: timedelta) -> str:
     return " ".join(parts)
 
 
-def _mention_content(decision: RoutingDecision) -> str:
+def _mention_content(decision: MentionDecision) -> str:
     parts: list[str] = []
     if decision.here:
         parts.append("@here")
@@ -573,8 +586,16 @@ class IncidentEngine:
         reporter_id: int,
         parsed: ParsedCommand,
         resolution: Resolution | None,
+        *,
+        caller_may_mention: bool = True,
     ) -> IncidentOutcome:
-        """Handle one parsed command from either path; always logs to command_log."""
+        """Handle one parsed command from either path; always logs to command_log.
+
+        ``caller_may_mention`` is the @Pilot gate result (GDD §11.1 layer 4),
+        threaded through to :func:`decide_mentions` so a caller who may not
+        trigger mentions can never earn one — defence in depth behind the
+        surface-level rejection both paths already do.
+        """
         intent = parsed.intent
 
         if intent is Intent.CANCEL:
@@ -643,7 +664,9 @@ class IncidentEngine:
         # possible failure. The gazetteer match, when it lands, still drives
         # routing and proximity; when it doesn't, the report survives anyway.
         if intent in _REPORT_INTENTS:
-            outcome = await self._report_incident(guild_id, reporter_id, parsed, resolution)
+            outcome = await self._report_incident(
+                guild_id, reporter_id, parsed, resolution, caller_may_mention
+            )
             tier = resolution.tier if resolution is not None else None
             await self._log_command(reporter_id, parsed, resolution, tier, outcome.outcome)
             return outcome
@@ -670,6 +693,21 @@ class IncidentEngine:
             return outcome
 
         best = resolution.best
+        # MEDIUM ("borderline") never drives a destructive/scheduling action:
+        # resolving or timing against a guessed system has no undo, so CORTANA
+        # asks to confirm instead of acting — the same ASKED outcome the
+        # uncertain-report flow already speaks (GDD §8.3: never silently
+        # guess). The pilot repeats the command; a confirmed retry lands HIGH.
+        if resolution.tier is not Tier.HIGH:
+            name = self._system_name(best.system_id, best.name)
+            outcome = IncidentOutcome(
+                outcome=Outcome.ASKED,
+                utterance=f"Heard {name} — say again to confirm.",
+                card=None,
+                incident_id=None,
+            )
+            await self._log_command(reporter_id, parsed, resolution, None, Outcome.ASKED)
+            return outcome
         if intent is Intent.RESOLVE:
             outcome = await self.resolve_system(guild_id, reporter_id, best.system_id)
             await self._log_command(reporter_id, parsed, resolution, None, outcome.outcome)
@@ -703,25 +741,32 @@ class IncidentEngine:
         here: bool = False,
         severity: Severity | None = None,
         confidence: float | None = None,
+        group_alias: str | None = None,
+        caller_may_mention: bool = True,
     ) -> IncidentOutcome:
-        """Post any spoken message to the intel channel verbatim.
+        """Post any spoken/typed message to the intel channel verbatim.
 
         The fallback when nothing matched the fixed grammar: fleet movements
-        ("blop fleet moving to Moe 8 gate"), region callsigns, freeform sitreps
-        — a nullsec corp's comms are lively and unstructured, and dropping a
-        call because it wasn't a recognised keyword is the wrong default. The
-        reporter's callsign labels the relay; ``here`` (an "all hands" phrase)
-        pings, gated by the same cooldown/circuit-breaker as any mention.
+        ("blop fleet moving to Moe 8 gate"), region callsigns, freeform
+        sitreps — a nullsec corp's comms are lively and unstructured, and
+        dropping a call because it wasn't a recognised keyword is the wrong
+        default. Slash twin: ``/relay`` (constraint 10).
 
-        A spoken colour code (GDD §6.4) colours the relay card and, via
-        ``here_on_severity``, can escalate it to an @here on its own — "code
-        red, blop fleet inbound" pings like any CODE RED. ``confidence`` is
-        the STT avg_logprob, recorded in ``command_log`` so the relay gate
-        threshold can be tuned from real data."""
+        Mentions go through :func:`decide_mentions` like every other path:
+        a relay is not an escalatable incident type, so **a relay can never
+        @here** (constraint 11) — a spoken colour code colours the card only,
+        and an "all hands" phrase (``group_alias="all_hands"``; ``here=True``
+        is the deprecated voice-path spelling of the same request) mentions
+        every subscribed role, gated by the caller's @Pilot standing and the
+        same cooldown/circuit-breaker as any mention. A mention-free relay
+        posts to ``#intel-live`` (GDD §11.2). ``confidence`` is the STT
+        avg_logprob, recorded in ``command_log`` so the relay gate threshold
+        can be tuned from real data."""
         text = text.strip()
         if not text:
             return IncidentOutcome(Outcome.REJECTED, None, None, None)
         card_severity = severity if severity is not None else Severity.NONE
+        alias = group_alias if group_alias is not None else ("all_hands" if here else None)
         async with self._lock:
             now = self._clock()
             # Dedupe: the same relay text again within the incident dedupe
@@ -737,16 +782,21 @@ class IncidentEngine:
                 return IncidentOutcome(Outcome.FOLDED, tts.relayed(), None, None)
             self._recent_relays[relay_key] = now
             who = self._callsigns.lookup(reporter_id) or f"<@{reporter_id}>"
-            content = ""
             cfg = self._holder.current.discord
-            if severity is not None and str(severity) in cfg.here_on_severity:
-                here = True  # ping-by-colour (GDD §11.3), same as incident cards
-            here = here and cfg.mentions_enabled
-            if here and self._discipline.allow_mention(reporter_id, now):
-                self._discipline.record_mention(reporter_id, now)
-                if self._on_mention is not None:
-                    self._on_mention()
-                content = "@here"
+            decision = decide_mentions(
+                intent=None,  # a freeform relay: structurally never @here
+                severity=card_severity,
+                now=now,
+                rules=self._rules,
+                group_alias=alias,
+                alias_roles=self._alias_roles,
+                here_on_severity=cfg.here_on_severity,
+                mentions_enabled=cfg.mentions_enabled,
+                caller_may_mention=caller_may_mention,
+            )
+            if decision.wants_mentions and not self._discipline.allow_mention(reporter_id, now):
+                decision = decision.suppressed()
+            content = _mention_content(decision)
             emoji = _SEVERITY_EMOJI[card_severity]
             code = _SEVERITY_CODE[card_severity]
             card = CardRender(
@@ -760,11 +810,19 @@ class IncidentEngine:
                 }
             )
             try:
-                await self._poster.post(guild_id, AlertChannel.ALERTS, content, card)
+                await self._poster.post(
+                    guild_id, decision.channel, content, card, mentions=decision
+                )
             except PostError as exc:
                 del self._recent_relays[relay_key]  # a failed relay is not "seen"
                 log.warning("relay_post_failed", reporter_id=reporter_id, error=str(exc))
                 return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
+            # Discipline is charged only after the post actually went out —
+            # a phantom mention from a failed post must never open the breaker.
+            if decision.wants_mentions:
+                self._discipline.record_mention(reporter_id, now)
+                if self._on_mention is not None:
+                    self._on_mention()
         await asyncio.to_thread(
             db.execute,
             self._conn,
@@ -776,7 +834,7 @@ class IncidentEngine:
         log.info(
             "intel_broadcast",
             reporter_id=reporter_id,
-            here=content == "@here",
+            roles=len(decision.role_ids),
             severity=str(card_severity),
         )
         return IncidentOutcome(Outcome.POSTED, tts.relayed(), card, None)
@@ -820,6 +878,7 @@ class IncidentEngine:
         reporter_id: int,
         parsed: ParsedCommand,
         resolution: Resolution,
+        caller_may_mention: bool,
     ) -> IncidentOutcome:
         async with self._lock:
             now = self._clock()
@@ -852,7 +911,14 @@ class IncidentEngine:
             if existing_id is not None:
                 return await self._fold(int(existing_id), reporter_id, parsed, now, system_name)
             return await self._open_incident(
-                guild_id, reporter_id, parsed, resolution, now, system_name, resolved
+                guild_id,
+                reporter_id,
+                parsed,
+                resolution,
+                now,
+                system_name,
+                resolved,
+                caller_may_mention,
             )
 
     async def _fold(
@@ -863,7 +929,14 @@ class IncidentEngine:
         now: datetime,
         system_name: str,
     ) -> IncidentOutcome:
-        """Fold a duplicate report into the live incident: edit, never re-mention."""
+        """Fold a duplicate report into the live incident: edit, never re-mention.
+
+        Severity raises but never lowers: a pilot escalating with a spoken
+        colour ("code red, hostiles UMI" folding into a plain sighting) turns
+        the card red on the re-render instead of being silently dropped. The
+        no-re-mention rule is untouched — severity display and mention policy
+        are separable (GDD §9.2).
+        """
 
         def _write() -> Incident | None:
             db.execute(
@@ -876,6 +949,19 @@ class IncidentEngine:
                 "UPDATE incidents SET updated_at = ? WHERE id = ?",
                 (_iso(now), incident_id),
             )
+            if parsed.severity is not None:
+                stored = db.query_value(
+                    self._conn, "SELECT severity FROM incidents WHERE id = ?", (incident_id,)
+                )
+                if (
+                    stored is not None
+                    and _SEVERITY_RANK[parsed.severity] > _SEVERITY_RANK[Severity(stored)]
+                ):
+                    db.execute(
+                        self._conn,
+                        "UPDATE incidents SET severity = ? WHERE id = ?",
+                        (str(parsed.severity), incident_id),
+                    )
             return _load_incident(self._conn, incident_id)
 
         incident = await asyncio.to_thread(_write)
@@ -902,6 +988,7 @@ class IncidentEngine:
         now: datetime,
         system_name: str,
         resolved: bool,
+        caller_may_mention: bool,
     ) -> IncidentOutcome:
         best = resolution.best if resolution is not None else None
         # A spoken colour code (GDD §6.4) overrides the intent's default:
@@ -939,34 +1026,31 @@ class IncidentEngine:
         incident = await asyncio.to_thread(_load_incident, self._conn, incident_id)
         assert incident is not None
 
-        # Routing → group alias → discipline. Personal subscribers (GDD §10.3)
-        # ride the same decision, so cooldown/breaker suppression and the
-        # dedupe fold's no-re-mention rule apply to them identically.
-        decision = evaluate(
-            incident,
-            self._rules,
-            now,
+        # ONE escalation decision (GDD §6.4/§10/§11): rule evaluation, group
+        # alias, ping-by-colour, the @Pilot gate, silent mode, and the channel
+        # all resolve inside decide_mentions — the engine adds nothing on top.
+        # Personal subscribers (GDD §10.3) ride the same decision, so
+        # cooldown/breaker suppression and the dedupe fold's no-re-mention
+        # rule apply to them identically.
+        cfg_discord = self._holder.current.discord
+        decision = decide_mentions(
+            intent=parsed.intent,
+            severity=severity,
+            now=now,
+            rules=self._rules,
+            incident=incident,
             gazetteer=self._gazetteer,
             personal=self._personal_pings.rules_for(guild_id),
+            group_alias=parsed.group_alias,
+            alias_roles=self._alias_roles,
+            here_on_severity=cfg_discord.here_on_severity,
+            mentions_enabled=cfg_discord.mentions_enabled,
+            caller_may_mention=caller_may_mention,
         )
-        decision = apply_group_alias(decision, parsed.group_alias, self._rules, self._alias_roles)
-        # Ping-by-colour (GDD §11.3): a threat level in here_on_severity fires
-        # an @here on its own, so a corp gets CODE RED alerts without wiring up
-        # a single routing rule. Silent mode still wins below.
-        if str(severity) in self._holder.current.discord.here_on_severity:
-            decision = replace(decision, here=True)
-        if not self._holder.current.discord.mentions_enabled:
-            decision = suppress_decision(decision)  # silent mode: post, ping nobody
         flood_announced = False
-        mentions_wanted = bool(decision.role_ids or decision.here or decision.user_ids)
-        if mentions_wanted:
-            if self._discipline.allow_mention(reporter_id, now):
-                self._discipline.record_mention(reporter_id, now)
-                if self._on_mention is not None:
-                    self._on_mention()
-            else:
-                decision = suppress_decision(decision)
-                flood_announced = self._discipline.should_announce_flood(now)
+        if decision.wants_mentions and not self._discipline.allow_mention(reporter_id, now):
+            decision = decision.suppressed()
+            flood_announced = self._discipline.should_announce_flood(now)
 
         if uncertain:
             self._pending_candidates[incident_id] = resolution.candidates
@@ -979,19 +1063,26 @@ class IncidentEngine:
         )
         try:
             channel_id, message_id = await self._poster.post(
-                guild_id, decision.channel, content, card
+                guild_id, decision.channel, content, card, mentions=decision
             )
         except PostError as exc:
             # Roll the incident back: an ACTIVE row with no message would
             # silently fold every duplicate report into a card that exists
             # nowhere — pilots would hear confirmations for an alert nobody
-            # can see. The pilot is told the post failed instead.
+            # can see. The pilot is told the post failed instead. Discipline
+            # was never charged — a phantom mention must not run a cooldown
+            # or open the breaker.
             self._pending_candidates.pop(incident_id, None)
             await asyncio.to_thread(
                 db.execute, self._conn, "DELETE FROM incidents WHERE id = ?", (incident_id,)
             )
             log.warning("incident_rolled_back_post_failed", incident_id=incident_id, error=str(exc))
             return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
+        # Discipline is charged only after the post actually went out.
+        if decision.wants_mentions:
+            self._discipline.record_mention(reporter_id, now)
+            if self._on_mention is not None:
+                self._on_mention()
         await asyncio.to_thread(
             db.execute,
             self._conn,
@@ -1335,7 +1426,12 @@ class IncidentEngine:
     # ── staleness sweep (GDD §9.1) ───────────────────────────────────────────
 
     async def sweep_stale(self) -> list[int]:
-        """Mark incidents with no updates for ``stale_after_min`` STALE, silently."""
+        """Mark incidents with no updates for ``stale_after_min`` STALE, silently.
+
+        FORMUP is excluded: a rally card legitimately sits quiet until its
+        ``fires_at`` — staleness is anchored by the countdown timer, not by
+        update chatter (GDD §13).
+        """
         async with self._lock:
             now = self._clock()
             cutoff = now - timedelta(minutes=self._holder.current.incidents.stale_after_min)
@@ -1343,7 +1439,8 @@ class IncidentEngine:
             def _sweep() -> list[Incident]:
                 rows = db.query(
                     self._conn,
-                    "SELECT id FROM incidents WHERE status = 'ACTIVE' AND updated_at < ?",
+                    "SELECT id FROM incidents WHERE status = 'ACTIVE' AND updated_at < ?"
+                    " AND type != 'FORMUP'",
                     (_iso(cutoff),),
                 )
                 stale: list[Incident] = []
@@ -1434,7 +1531,21 @@ class IncidentEngine:
             incident = await asyncio.to_thread(_load_incident, self._conn, incident_id)
             assert incident is not None
             card = self._render(incident, system_name, formup_at=_iso(fires_at))
-            channel_id, message_id = await self._poster.post(guild_id, AlertChannel.LIVE, "", card)
+            try:
+                channel_id, message_id = await self._poster.post(
+                    guild_id, AlertChannel.LIVE, "", card
+                )
+            except PostError as exc:
+                # Same rollback guard as _open_incident: an ACTIVE FORMUP row
+                # with no message (and no countdown timer yet) is invisible —
+                # delete it and tell the pilot the post failed.
+                await asyncio.to_thread(
+                    db.execute, self._conn, "DELETE FROM incidents WHERE id = ?", (incident_id,)
+                )
+                log.warning(
+                    "formup_rolled_back_post_failed", incident_id=incident_id, error=str(exc)
+                )
+                return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
             await asyncio.to_thread(
                 db.execute,
                 self._conn,

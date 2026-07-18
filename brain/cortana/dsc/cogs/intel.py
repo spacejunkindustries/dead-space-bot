@@ -1,16 +1,21 @@
-"""Intel slash commands: /hostiles /under-attack /help-me /camp /clear /status /cancel (GDD §7).
+"""Intel slash commands: /hostiles /under-attack /help-me /camp /clear /relay
+/status /cancel (GDD §7).
 
 Every command here is the slash twin of a voice command and calls the SAME
-``IncidentEngine.report`` entry point (CLAUDE.md constraint 10) — the cog only
-builds ``ParsedCommand`` + a HIGH-tier ``Resolution`` from the typed,
-autocompleted system name and renders the outcome back to the pilot.
+``IncidentEngine`` entry point (CLAUDE.md constraint 10) — the cog only builds
+``ParsedCommand`` + a HIGH-tier ``Resolution`` from the typed, autocompleted
+system name and renders the outcome back to the pilot. The optional ``code:``
+and ``audience:`` parameters map onto exactly the parsed fields the voice
+path produces (spoken colour codes → ``ParsedCommand.severity``, "miners
+only"/"all hands" → ``ParsedCommand.group_alias``), so severity and group
+targeting survive a voice outage too.
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import discord
 import structlog
@@ -19,7 +24,7 @@ from discord.ext import commands
 
 from cortana.core import db
 from cortana.dsc.bot import resolve_typed_system
-from cortana.types import MENTION_INTENTS, Intent, Outcome, ParsedCommand
+from cortana.types import MENTION_INTENTS, Intent, Outcome, ParsedCommand, Severity
 
 if TYPE_CHECKING:  # pragma: no cover
     from cortana.dsc.bot import AuraBot
@@ -39,6 +44,24 @@ _TYPE_BADGES: dict[str, str] = {
     str(Intent.ASSIST_REQUEST): "🔴 Assist request",
     str(Intent.GATE_CAMP): "🟠 Gate camp",
     str(Intent.FORMUP): "🔵 Form-up",
+}
+
+#: Typed twins of the spoken threat colours (GDD §6.4) and group aliases
+#: (GDD §6.2) — mapped onto the exact ParsedCommand fields the voice grammar
+#: fills, so both paths hand the engine identical inputs (constraint 10).
+_ThreatCode = Literal["red", "orange", "yellow"]
+_Audience = Literal["miners", "defense", "all-hands"]
+
+_CODE_SEVERITY: dict[str, Severity] = {
+    "red": Severity.HIGH,
+    "orange": Severity.MEDIUM,
+    "yellow": Severity.NONE,
+}
+
+_AUDIENCE_ALIAS: dict[str, str] = {
+    "miners": "miners",
+    "defense": "defense",
+    "all-hands": "all_hands",
 }
 
 
@@ -84,18 +107,22 @@ class IntelCog(commands.Cog):
         system: str,
         detail: str | None,
         command_name: str,
+        *,
+        code: _ThreatCode | None = None,
+        audience: _Audience | None = None,
     ) -> None:
         if interaction.guild_id is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Guild only.", ephemeral=True)
             return
         member = interaction.user
+        may_mention = self.bot.discipline.may_mention(r.id for r in member.roles)
         # Constraint 10 parity with the voice path: silent mode lifts the
         # Pilot gate — with pings off there is no mention to protect, so
         # anyone may post (and no roles need wiring up first).
         if (
             self.bot.holder.current.discord.mentions_enabled
             and intent in _MENTION_INTENTS
-            and not self.bot.discipline.may_mention(r.id for r in member.roles)
+            and not may_mention
         ):
             await interaction.response.send_message(
                 "Reporting requires the Pilot role (GDD §11.1).", ephemeral=True
@@ -113,10 +140,21 @@ class IntelCog(commands.Cog):
             return
 
         raw = f"/{command_name} {system}" + (f" {detail}" if detail else "")
+        if code:
+            raw += f" code:{code}"
+        if audience:
+            raw += f" audience:{audience}"
         parsed = ParsedCommand(
-            intent=intent, system_text=system, group_alias=None, detail=detail, raw=raw
+            intent=intent,
+            system_text=system,
+            group_alias=_AUDIENCE_ALIAS[audience] if audience else None,
+            detail=detail,
+            raw=raw,
+            severity=_CODE_SEVERITY[code] if code else None,
         )
-        outcome = await self.bot.engine.report(interaction.guild_id, member.id, parsed, resolution)
+        outcome = await self.bot.engine.report(
+            interaction.guild_id, member.id, parsed, resolution, caller_may_mention=may_mention
+        )
         await interaction.followup.send(
             outcome_text(outcome.outcome, outcome.utterance), ephemeral=True
         )
@@ -124,40 +162,145 @@ class IntelCog(commands.Cog):
     # ── commands ─────────────────────────────────────────────────────────────
 
     @app_commands.command(name="hostiles", description="Report hostiles in a system")
-    @app_commands.describe(system="System name", detail="Free-text note, e.g. 'three battleships'")
+    @app_commands.describe(
+        system="System name",
+        detail="Free-text note, e.g. 'three battleships'",
+        code="Threat colour override — twin of the spoken 'code red/orange/yellow'",
+        audience="Who to ping — twin of 'miners only' / 'defense only' / 'all hands'",
+    )
     @app_commands.autocomplete(system=system_autocomplete)
     async def hostiles(
-        self, interaction: discord.Interaction, system: str, detail: str | None = None
+        self,
+        interaction: discord.Interaction,
+        system: str,
+        detail: str | None = None,
+        code: _ThreatCode | None = None,
+        audience: _Audience | None = None,
     ) -> None:
-        await self._report(interaction, Intent.HOSTILE_SPOTTED, system, detail, "hostiles")
+        await self._report(
+            interaction,
+            Intent.HOSTILE_SPOTTED,
+            system,
+            detail,
+            "hostiles",
+            code=code,
+            audience=audience,
+        )
 
     @app_commands.command(
         name="help-me", description="High-severity assist request — you are in trouble"
     )
-    @app_commands.describe(system="System name", detail="Free-text note, e.g. 'tackled on gate'")
+    @app_commands.describe(
+        system="System name",
+        detail="Free-text note, e.g. 'tackled on gate'",
+        code="Threat colour override — twin of the spoken 'code red/orange/yellow'",
+        audience="Who to ping — twin of 'miners only' / 'defense only' / 'all hands'",
+    )
     @app_commands.autocomplete(system=system_autocomplete)
     async def help_me(
-        self, interaction: discord.Interaction, system: str, detail: str | None = None
+        self,
+        interaction: discord.Interaction,
+        system: str,
+        detail: str | None = None,
+        code: _ThreatCode | None = None,
+        audience: _Audience | None = None,
     ) -> None:
-        await self._report(interaction, Intent.ASSIST_REQUEST, system, detail, "help-me")
+        await self._report(
+            interaction,
+            Intent.ASSIST_REQUEST,
+            system,
+            detail,
+            "help-me",
+            code=code,
+            audience=audience,
+        )
 
     @app_commands.command(
         name="under-attack", description="You are under attack — tackled or taking damage"
     )
-    @app_commands.describe(system="System name", detail="Free-text note, e.g. 'pointed on gate'")
+    @app_commands.describe(
+        system="System name",
+        detail="Free-text note, e.g. 'pointed on gate'",
+        code="Threat colour override — twin of the spoken 'code red/orange/yellow'",
+        audience="Who to ping — twin of 'miners only' / 'defense only' / 'all hands'",
+    )
     @app_commands.autocomplete(system=system_autocomplete)
     async def under_attack(
-        self, interaction: discord.Interaction, system: str, detail: str | None = None
+        self,
+        interaction: discord.Interaction,
+        system: str,
+        detail: str | None = None,
+        code: _ThreatCode | None = None,
+        audience: _Audience | None = None,
     ) -> None:
-        await self._report(interaction, Intent.UNDER_ATTACK, system, detail, "under-attack")
+        await self._report(
+            interaction,
+            Intent.UNDER_ATTACK,
+            system,
+            detail,
+            "under-attack",
+            code=code,
+            audience=audience,
+        )
 
     @app_commands.command(name="camp", description="Report a gate camp")
-    @app_commands.describe(system="System name", detail="Free-text note, e.g. 'camping the gate'")
+    @app_commands.describe(
+        system="System name",
+        detail="Free-text note, e.g. 'camping the gate'",
+        code="Threat colour override — twin of the spoken 'code red/orange/yellow'",
+        audience="Who to ping — twin of 'miners only' / 'defense only' / 'all hands'",
+    )
     @app_commands.autocomplete(system=system_autocomplete)
     async def camp(
-        self, interaction: discord.Interaction, system: str, detail: str | None = None
+        self,
+        interaction: discord.Interaction,
+        system: str,
+        detail: str | None = None,
+        code: _ThreatCode | None = None,
+        audience: _Audience | None = None,
     ) -> None:
-        await self._report(interaction, Intent.GATE_CAMP, system, detail, "camp")
+        await self._report(
+            interaction, Intent.GATE_CAMP, system, detail, "camp", code=code, audience=audience
+        )
+
+    @app_commands.command(
+        name="relay",
+        description="Relay freeform intel verbatim — twin of the voice relay (GDD §8.6)",
+    )
+    @app_commands.describe(
+        message="Posted onto an intel-relay card exactly as typed",
+        code="Threat colour for the relay card — twin of the spoken colour code",
+        audience="Who to ping (requires the Pilot role); relays never @here",
+    )
+    async def relay(
+        self,
+        interaction: discord.Interaction,
+        message: str,
+        code: _ThreatCode | None = None,
+        audience: _Audience | None = None,
+    ) -> None:
+        # Slash twin of the freeform voice relay (constraint 10): the exact
+        # engine.broadcast path, with the same decide_mentions authority —
+        # a relay can never @here, and mentions require the Pilot role
+        # (threaded through as caller_may_mention, exactly like the voice
+        # path gates its all-hands flag; the relay itself posts regardless).
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        member = interaction.user
+        roles = getattr(member, "roles", ())
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        outcome = await self.bot.engine.broadcast(
+            interaction.guild_id,
+            member.id,
+            message,
+            severity=_CODE_SEVERITY[code] if code else None,
+            group_alias=_AUDIENCE_ALIAS[audience] if audience else None,
+            caller_may_mention=self.bot.discipline.may_mention(r.id for r in roles),
+        )
+        await interaction.followup.send(
+            outcome_text(outcome.outcome, outcome.utterance), ephemeral=True
+        )
 
     @app_commands.command(name="clear", description="Resolve the incidents in a system")
     @app_commands.describe(system="System name")

@@ -91,7 +91,9 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "• *“update chase <system>”* → `/chase` — chase mode: retargets "
                 "your live card as the target moves, no new post\n"
                 "• *“status”* → `/status` — active incidents, spoken/ephemeral reply\n"
-                "• *“cancel”* → `/cancel` — retracts your last report (30s window)",
+                "• *“cancel”* → `/cancel` — retracts your last report (30s window)\n"
+                "• anything else you say (freeform intel) → `/relay` — posts it "
+                "verbatim as an intel-relay card; relays never `@here`",
             ),
             (
                 "Colour codes stack inline",

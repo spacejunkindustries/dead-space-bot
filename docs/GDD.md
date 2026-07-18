@@ -340,7 +340,7 @@ The callsign commands are a **name registry keyed on the Discord user id** Ears 
 |---|---|
 | "miners only" | Routes to `@Miners` alone |
 | "defense only" | Routes to `@Home-Defense` alone |
-| "all hands" | `@here` + every subscribed role, regardless of severity |
+| "all hands" | Every subscribed role, regardless of severity — and it *requests* `@here`, granted only when the report is `UNDER_ATTACK` or `ASSIST_REQUEST` (constraint 11; the request passes the same `decide_mentions()` clamp as everything else, §11.1) |
 
 Group aliases are configurable but deliberately few. Every alias added is another token the recogniser can confuse with a system name. Four is the recommended ceiling.
 
@@ -352,9 +352,12 @@ Anything after the system and group is captured verbatim into the incident body:
 
 The card labels (CODE RED / CODE ORANGE / CODE YELLOW, §9.1) are also **input**: a pilot can speak the colour to set or override severity.
 
-- **Inline** — *"code red, hostiles in UMI"*: the report parses normally and carries `severity=high`; the card renders CODE RED and, when `high` is in `here_on_severity`, fires the colour-based `@here` (§11.3). The colour phrase is stripped before intent matching, so *"code red"* can never be misread as a "reds" sighting.
+A colour code changes what the card **says** — its severity, colour, and readback. Whether anything gets **pinged** is decided separately, by exactly one function: `decide_mentions()` (`brain/cortana/core/routing.py`), the single escalation authority every mention flows through (§11.1). Constraint 11 always wins there: `@here` fires **only** for `UNDER_ATTACK` and `ASSIST_REQUEST`. A colour code can *request* an `@here` (via `discord.here_on_severity`, §16), but the request is clamped to those two types — a severity code on a sighting, and a freeform relay of any colour, can never `@here`.
+
+- **Inline** — *"code red, hostiles in UMI"*: the report parses normally and carries `severity=high`; the card renders CODE RED and subscribed roles are mentioned per the routing rules — but a sighting is not an escalatable type, so no `@here`. On an under-attack or help-me report, `high ∈ here_on_severity` fires the colour-based `@here` even with zero routing rules wired up, and it always lands in `#intel-alerts` (the channel is recomputed after every escalation decision — `@here` can never fire into `#intel-live`). The colour phrase is stripped before intent matching, so *"code red"* can never be misread as a "reds" sighting.
 - **Standalone (dialogue)** — *"code orange"* alone: CORTANA replies *"Code orange. Go ahead."*, reopens a wake-free capture window (the §8.3 mechanism), and the pilot's next utterance — report or freeform relay — inherits the severity. An inline colour on the follow-up wins over the opener.
-- **Relays** — a colour on a freeform relay colours the relay card and rides the same `here_on_severity` escalation: *"code red, blop fleet inbound"* pings like any CODE RED.
+- **Relays** — a colour on a freeform relay colours the relay card **only**: *"code red, blop fleet inbound"* posts a red relay card but never pings by colour (constraint 11 — a relay is not an incident type). An *"all hands"* phrase mentions every subscribed role (gated on the speaker's @Pilot standing), never `@here`. A mention-free relay posts to `#intel-live`, the quiet feed (§11.2).
+- **Folds** — a colour spoken on a duplicate report **raises (never lowers)** the live card's severity on the fold re-render, so a spoken escalation is never silently dropped; the fold's no-re-mention rule (§9.2) is untouched — severity display and mention policy are separable.
 
 Mapping: red → high, orange → medium, yellow → none/info. A leading *"report"* and a trailing *"end report"* / *"end of report"* / *"end transmission"* are radio-procedure framing and are stripped (*"report, I've been tackled in UMI, end report"*).
 
@@ -396,10 +399,11 @@ Full parity. Every voice command routes to the same engine.
 
 | Command | Purpose |
 |---|---|
-| `/hostiles system detail` | Report a sighting |
-| `/under-attack system detail` | You are under attack — tackled or taking damage |
-| `/help-me system detail` | High-severity assist request |
-| `/camp system detail` | Report a gate camp |
+| `/hostiles system detail [code] [audience]` | Report a sighting |
+| `/under-attack system detail [code] [audience]` | You are under attack — tackled or taking damage |
+| `/help-me system detail [code] [audience]` | High-severity assist request |
+| `/camp system detail [code] [audience]` | Report a gate camp |
+| `/relay message [code] [audience]` | Freeform intel relay, posted verbatim — twin of the voice relay (§8.6); never `@here` |
 | `/clear system` | Resolve an incident |
 | `/status` | Active incidents summary |
 | `/help [topic]` | Interactive help: main page + topic pages (reporting, responding, subscriptions, identity, ops, privacy, admin) via a select menu; twin of voice "help" |
@@ -424,10 +428,12 @@ Full parity. Every voice command routes to the same engine.
 | `/register callsign` | Register my pilot callsign, exactly as typed (fixes STT misspellings) |
 | `/unregister` | Delete my registered callsign |
 | `/whoami` | Show my registered callsign |
-| `/routing` | *(admin)* Manage subscription rules |
+| `/routing` | *(admin)* Manage subscription rules | `code: red\|orange\|yellow` and `audience: miners\|defense\|all-hands` parameters on the report commands and `/relay` are the typed twins of the spoken colour codes (§6.4) and group aliases (§6.2) — they map onto the exact `ParsedCommand.severity` / `ParsedCommand.group_alias` fields the voice grammar fills, so severity and group targeting survive a voice outage too (constraint 10).
 | `/gazetteer` | *(admin)* Reload / inspect / prune systems |
 | `/fleetmode` | *(admin)* Restrict voice triggering to FC role |
 | `/health` | *(admin)* Pipeline status, STT confidence, incident counts |
+
+The optional `code: red|orange|yellow` and `audience: miners|defense|all-hands` parameters on the four report commands and `/relay` are the typed twins of the spoken colour codes (§6.4) and group aliases (§6.2) — they map onto the exact `ParsedCommand.severity` / `ParsedCommand.group_alias` fields the voice grammar fills, so severity and group targeting survive a voice outage too (constraint 10).
 
 ---
 
@@ -527,6 +533,8 @@ Levenshtein on raw text alone is the wrong tool: STT errors are **phonetic, not 
 | **Medium** | `top1 ≥ 0.55` | **Post anyway**, flagged uncertain, with buttons `[Otanuomi] [Kisogo] [Wrong — fix]`. Speak *"Hostiles Otanuomi — say again to confirm."* Speed beats certainty when a pilot is in structure; get the ping out and let humans correct it. |
 | **Low** | below | Do not post. Speak *"Say again the system."* Reopen the capture window for 4s. A bare system name spoken into the reopened window is re-bound to the rejected command's intent and resolved as its system. |
 
+**Destructive and scheduling commands need HIGH.** The tier table above governs *reports*, which post-anyway because speed beats certainty. `clear`, `timer`, and `form up` act irreversibly on a *specific* system — resolving the wrong system's incidents or scheduling a rally in the wrong place has no undo — so they act only on a High-tier match. A Medium match answers *"Heard Otanuomi — say again to confirm."* (the same ASKED outcome as an uncertain report) and does nothing; the pilot repeats the command, and a confirmed hearing resolves High. Low still gets *"Say again the system."*
+
 **Spoken readback.** When the pilot spoke a colour code, the confirmation reads the report back — *"Under attack UMI, code red, posted."* — so they hear exactly what the card says without looking at Discord. Combined with the catch-all posture (§8.6) this is the contract for misheard systems: **the action always continues**; the card carries the heard name verbatim, the readback surfaces it, and *"cancel"* (30s) or **[Wrong — fix]** repairs it.
 
 ### 8.4 Context priors
@@ -591,13 +599,15 @@ Incident
 - Five pilots reporting the same gate camp produce **one** card reading *"reported by 5"* — not five pings.
 - *"Hey Cortana, clear Otanuomi"* edits that card to ✅ **RESOLVED** and greys it out.
 - Someone scrolling back reads **state**, not archaeology.
-- No updates for 20 minutes → auto-marked **STALE**, silently.
+- No updates for 20 minutes → auto-marked **STALE**, silently. Form-ups are exempt: a rally card legitimately sits quiet until it fires — its staleness is anchored by its countdown timer (§13), not by update chatter.
 
 ### 9.2 Dedupe rule
 
 > Same system + same type + within 90 seconds → **fold into the existing incident**, increment the reporter count, **do not re-mention**.
 
 This one rule is the primary defence against notification fatigue.
+
+A fold **raises but never lowers** severity: a spoken colour on the duplicate (*"code red, hostiles UMI"* folding into a plain sighting) turns the card red on the re-render instead of being silently discarded. Severity display and mention policy are separable — the escalated fold still re-mentions nobody.
 
 ### 9.3 Response loop
 
@@ -666,18 +676,20 @@ If CORTANA is annoying for one week, the corp mutes `#intel-alerts` and the proj
 ### 11.1 Layered defences
 
 1. **Dedupe window** (§9.2) — one incident, one mention.
-2. **Per-user cooldown** — 30s between mentions from the same pilot. A panicking player cannot ping six times.
-3. **Escalation discipline** — `@here` is reserved for `UNDER_ATTACK` and `ASSIST_REQUEST`. Sightings never `@here`. Ever.
-4. **Permission gate** — only members holding `@Pilot` can trigger a mention. The new guy cannot experiment at 03:00.
+2. **Per-user cooldown** — 30s between mentions from the same pilot. A panicking player cannot ping six times. Charged only after a post actually succeeds — a failed post never runs a cooldown or feeds the breaker.
+3. **Escalation discipline** — `@here` is reserved for `UNDER_ATTACK` and `ASSIST_REQUEST`. Sightings never `@here`. Severity codes never earn it for any other type (§6.4). Freeform relays never `@here`. Ever.
+4. **Permission gate** — only members holding `@Pilot` can trigger a mention. The new guy cannot experiment at 03:00. The gate result is threaded all the way into the escalation decision, so no engine path (relay escalation included) can mint a mention the caller wasn't entitled to.
 5. **Global circuit breaker** — more than *N* mentions in *M* minutes → CORTANA stops mentioning, posts **flood control active**, and keeps logging incidents silently. Something is wrong; do not amplify it.
 6. **Quiet hours** per role.
+
+**One authority.** Layers 3, 4, and 6 — plus group aliases, `here_on_severity`, silent mode (`mentions_enabled`), the personal-ping user list, and the channel choice — are computed in exactly one pure function: `decide_mentions()` in `brain/cortana/core/routing.py`. Every card post and every relay flows through it; the discipline layer (2, 5) may only *suppress* its decision, never widen it. The Poster then sends `AllowedMentions` as an explicit allowlist built verbatim from the decision — the listed role ids, the listed user ids (never `users=True`), and `everyone` only when the decision granted `@here`. Two properties are therefore structural, not guarded per-path: `@here` cannot occur outside the two escalatable types, and `@here` (or any mention) cannot occur in `#intel-live` — the channel is recomputed from the final mention set.
 
 ### 11.2 Two channels
 
 | Channel | Contents |
 |---|---|
-| `#intel-live` | Every incident that mentions nobody. The quiet feed, for people who want it. |
-| `#intel-alerts` | Only incidents that mention a role. |
+| `#intel-live` | Everything that mentions nobody — incidents and freeform relays alike. The quiet feed, for people who want it. |
+| `#intel-alerts` | Only cards that mention someone (a role, `@here`, or a personal-ping subscriber). |
 
 Let people choose their own volume. An incident card lives in exactly one of
 the two channels — one incident is one message, edited in place (§9.1), never
@@ -1248,7 +1260,7 @@ Because voice receive is undocumented and can break without warning (§2.2), COR
 | Ears down | Brain heartbeat miss | Post the degraded notice; text path unaffected |
 | Droplet down | External uptime check | `Restart=always` + a page |
 
-**The load-bearing invariant: every voice command has a slash-command twin hitting the same engine.** The voice path is a fast front-end to a system that is complete without it. This is what makes CORTANA survivable on a platform that never promised to support half of it.
+**The load-bearing invariant: every voice command has a slash-command twin hitting the same engine.** The voice path is a fast front-end to a system that is complete without it. This is what makes CORTANA survivable on a platform that never promised to support half of it. The parity surface is total: the freeform intel relay's slash twin is `/relay` (→ `IncidentEngine.broadcast`, the same `decide_mentions` authority), and spoken colour codes / group targeting ride the `code:` / `audience:` parameters on the report commands (§7) — severity and audience survive a voice outage along with the commands themselves.
 
 ---
 
