@@ -184,6 +184,11 @@ class App:
         # grace reads this so the "Go ahead." gap can't endpoint a capture
         # before the pilot has spoken a word.
         self._capture_opened_at: dict[int, float] = {}
+        # Loop guard for the say-again reopen: a wake gets ONE wake-free
+        # retry; a second consecutive unintelligible utterance drops silently
+        # instead of re-reopening (ambient noise + Whisper hallucination
+        # otherwise turns the retry into an endless say-again loop).
+        self._say_again_reopen: dict[int, float] = {}
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -492,6 +497,7 @@ class App:
                 self._pending_severity.pop(uid, None)
                 self._pending_override.pop(uid, None)
                 self._capture_opened_at.pop(uid, None)
+                self._say_again_reopen.pop(uid, None)
         elif t == "speaking":
             pass  # informational; talk-over suppression happens in Ears
         else:
@@ -544,6 +550,7 @@ class App:
         pending = self._pending_retry.pop(user_id, None)
         pend_sev = self._pending_severity.pop(user_id, None)
         pend_override = self._pending_override.pop(user_id, None)
+        say_again_armed = self._say_again_reopen.pop(user_id, None)
         inherited: Severity | None = None
         if pend_sev is not None and loop.time() <= pend_sev[1]:
             inherited = pend_sev[0]
@@ -624,10 +631,18 @@ class App:
                         text=result.text,
                     )
                     # "Say again?" must be TRUE: reopen a wake-free window so
-                    # the repeat is actually heard (it used to be ignored
-                    # until the pilot re-woke).
+                    # the repeat is actually heard. ONE retry per wake — the
+                    # reopened window swallows ambient mic noise, Whisper
+                    # hallucinates words from it, and an unguarded reopen
+                    # turned that into an infinite say-again loop with nobody
+                    # talking (live incident). Second failure drops silently;
+                    # the pilot re-wakes when they actually want to talk.
+                    if say_again_armed is not None and loop.time() <= say_again_armed:
+                        log.info("say_again_loop_guard", user_id=user_id, text=result.text)
+                        return
                     if self.capture is not None:
                         self.capture.reopen(user_id, guild_id)
+                        self._say_again_reopen[user_id] = loop.time() + _RETRY_TTL_S
                     await self._speak_or_post(guild_id, user_id, tts_mod.not_understood())
                     return
                 # Gate on STT confidence: a hallucinated transcript
@@ -642,8 +657,12 @@ class App:
                         avg_logprob=round(result.avg_logprob, 3),
                         text=result.text,
                     )
+                    if say_again_armed is not None and loop.time() <= say_again_armed:
+                        log.info("say_again_loop_guard", user_id=user_id, text=result.text)
+                        return
                     if self.capture is not None:
                         self.capture.reopen(user_id, guild_id)
+                        self._say_again_reopen[user_id] = loop.time() + _RETRY_TTL_S
                     await self._speak_or_post(guild_id, user_id, tts_mod.say_again())
                     return
                 text = grammar.broadcast_text(result.text)

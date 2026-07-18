@@ -677,3 +677,26 @@ async def test_bare_override_while_disabled_speaks_unavailable() -> None:
     await app._on_utterance(USER, GUILD, b"\x00\x00")
     assert speaker.said == [(GUILD, "Override channel unavailable.")]
     assert capture.reopened == []
+
+
+async def test_say_again_reopens_once_then_goes_silent() -> None:
+    # One wake gets ONE wake-free retry; a second unintelligible utterance
+    # drops silently — an unguarded reopen once turned ambient-noise
+    # hallucinations into an endless bratty "say again" loop (live incident).
+    app, engine, _, speaker, capture = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["mumble static", "thank you thank you", "clear Otanuomi"]),
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert speaker.said == [(GUILD, "Say again?")]
+    assert capture.reopened == [(USER, GUILD)]
+
+    # The retry is ALSO noise: silent drop, no second reopen, no speech.
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert speaker.said == [(GUILD, "Say again?")]
+    assert capture.reopened == [(USER, GUILD)]
+    assert engine.broadcasts == []
+
+    # A fresh wake with a real command still works normally.
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert len(engine.reports) == 1
