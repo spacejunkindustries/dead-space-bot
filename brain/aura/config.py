@@ -64,6 +64,10 @@ class DiscordConfig:
     #: @Pilot trigger gate is lifted (there is nothing to protect). Turn on once
     #: real roles are wired into routing.yaml.
     mentions_enabled: bool = True
+    #: Threat levels that fire an @here (ping by colour), when mentions are on.
+    #: "high" = CODE RED, "medium" = CODE ORANGE, "none" = CODE YELLOW. Default
+    #: RED only — the safe choice; add "medium" to also ping on CODE ORANGE.
+    here_on_severity: tuple[str, ...] = ("high",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +272,9 @@ def _build_discord(data: dict[str, Any]) -> DiscordConfig:
         watch_voice_channels=_int_list(s, "discord.watch_voice_channels"),
         auto_join=_get(s, "discord.auto_join", bool, default=True),
         mentions_enabled=_get(s, "discord.mentions_enabled", bool, default=True),
+        here_on_severity=tuple(
+            str(x).lower() for x in (_get(s, "discord.here_on_severity", list, default=["high"]))
+        ),
     )
 
 
