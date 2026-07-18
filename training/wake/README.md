@@ -78,9 +78,11 @@ the openWakeWord repo:
 ```bash
 cd training/wake
 
-# 3.10 environment, host-independent (works on 3.12 Kaggle/Colab too)
+# 3.10 environment, host-independent (works on 3.12 Kaggle/Colab too).
+# --clear makes the step re-runnable: it replaces any half-built venv from a
+# previous attempt instead of stopping on an interactive "replace? [y/n]".
 pip install -q uv
-uv venv --python 3.10 .venv
+uv venv --clear --python 3.10 .venv
 uv pip install --python .venv/bin/python -r requirements-train.txt
 PY=.venv/bin/python          # use this for every step below
 
