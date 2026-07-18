@@ -185,6 +185,12 @@ class App:
 
         # Health before the engine: the engine reports mentions into it.
         self.health = HealthReporter(self.holder, self._post_health)
+        # Audio-pipeline probes: the wake stage counters/fault latch and the
+        # STT watchdog latch become #bot-health alerts + report lines instead
+        # of silent deaths behind a green status.
+        self.health.set_wake_probe(wake.counters, lambda: wake.faulted)
+        transcriber = self.transcriber
+        self.health.set_stt_probe(lambda: bool(getattr(transcriber, "degraded", False)))
 
         late_poster = _LatePoster()
         rules_path = self.holder.path.parent / "routing.yaml"

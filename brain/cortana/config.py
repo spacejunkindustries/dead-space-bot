@@ -176,6 +176,11 @@ class SttConfig:
     cpu_threads: int
     bias_with_gazetteer: bool
     whisper_cpp_url: str
+    #: STT watchdog deadline (GDD §20): seconds one decode may run once it
+    #: reaches the head of the serialized STT queue before the worker is
+    #: respawned. Queue WAIT time never counts — overload is not a hang.
+    #: After 2 consecutive respawns STT latches degraded until reload/restart.
+    watchdog_s: float = 15.0
     #: Minimum Whisper avg_logprob for a transcript that matched NO grammar
     #: intent to be posted as a freeform relay (GDD §8.6). Below this the
     #: transcript is treated as unintelligible — CORTANA says "Say again" instead
@@ -493,6 +498,9 @@ def _build_stt(data: dict[str, Any]) -> SttConfig:
         cpu_threads=_positive(_get(s, "stt.cpu_threads", int), "stt.cpu_threads"),
         bias_with_gazetteer=_get(s, "stt.bias_with_gazetteer", bool, default=True),
         whisper_cpp_url=_get(s, "stt.whisper_cpp_url", str),
+        watchdog_s=_positive(
+            float(_get(s, "stt.watchdog_s", float, default=15.0)), "stt.watchdog_s"
+        ),
         relay_min_logprob=float(_get(s, "stt.relay_min_logprob", float, default=-0.9)),
         relay_mode=relay_mode,
     )

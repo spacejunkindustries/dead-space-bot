@@ -97,6 +97,11 @@ stt:
   cpu_threads: 2                       # inference threads (droplet has 2 dedicated vCPUs)
   bias_with_gazetteer: true            # pass system names as Whisper initial_prompt
   whisper_cpp_url: http://127.0.0.1:8080/inference  # used only when backend: whisper-cpp
+  watchdog_s: 15                       # hang watchdog (GDD §20): seconds one decode may run
+                                       # once it reaches the head of the STT queue before the
+                                       # worker is respawned. Queue WAIT never counts (overload
+                                       # is not a hang). After 2 consecutive respawns STT
+                                       # latches degraded until reload/restart. Restart-only.
   relay_min_logprob: -0.9              # freeform relays below this Whisper confidence are
                                        # dropped with "Say again" instead of posted (GDD §8.6);
                                        # recognised commands are never gated by this.

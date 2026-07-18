@@ -12,6 +12,16 @@ for exactly the failure signatures the §20 table names and raises the
 - **Ears down** — heartbeat miss. The text path is unaffected and says so.
 - **STT rot** — 10 consecutive LOW-tier resolutions means something upstream
   (audio path, model, mic mix) is broken, not that ten pilots mumbled.
+- **STT watchdog latch** — the transcriber's respawn cap fired
+  (``TimeoutTranscriber.degraded``): decodes are refused until a reload.
+- **Wake fault** — the wake model pool latched after a build failure
+  (``OpenWakeWordDetector.faulted``): frames flow but nothing is scored.
+
+The wake/STT probes arrive via :meth:`set_wake_probe` / :meth:`set_stt_probe`
+(injected callables — this module imports neither audio component). The wake
+stage counters (frames_seen → vad_speech → inferences → hits/near_misses)
+ride the periodic report and are exposed for the ``/status`` cog, so a silent
+wake death is a visible zero instead of a green status.
 
 Reporting goes through an injected async ``post_fn(content, embed)`` — this
 module never imports discord; the embed is a plain ``discord.Embed.from_dict``
@@ -111,6 +121,13 @@ class HealthReporter:
         self._confidences: deque[float] = deque(maxlen=_CONFIDENCE_RING)
         self._low_streak = 0
 
+        # Injected audio-pipeline probes (None until wired — never alarm).
+        self._wake_counters_fn: Callable[[], dict[str, int]] | None = None
+        self._wake_faulted_fn: Callable[[], bool] | None = None
+        self._stt_watchdog_fn: Callable[[], bool] | None = None
+        self._wake_fault_announced = False
+        self._stt_watchdog_announced = False
+
     # ── signals ──────────────────────────────────────────────────────────────
 
     def note_audio(self) -> None:
@@ -125,6 +142,17 @@ class HealthReporter:
     def set_humans_present(self, count: int) -> None:
         """Unmuted human count in the watched voice channel (voice gateway)."""
         self._humans_present = count
+
+    def set_wake_probe(
+        self, counters: Callable[[], dict[str, int]], faulted: Callable[[], bool]
+    ) -> None:
+        """Wire the wake detector's stage counters + fault flag (``__main__``)."""
+        self._wake_counters_fn = counters
+        self._wake_faulted_fn = faulted
+
+    def set_stt_probe(self, watchdog_degraded: Callable[[], bool]) -> None:
+        """Wire the transcriber's watchdog-latch flag (``__main__``)."""
+        self._stt_watchdog_fn = watchdog_degraded
 
     # ── counters ─────────────────────────────────────────────────────────────
 
@@ -188,6 +216,22 @@ class HealthReporter:
     def low_streak(self) -> int:
         return self._low_streak
 
+    @property
+    def wake_counters(self) -> dict[str, int]:
+        """Snapshot of the wake pipeline stage counters ({} until wired) —
+        for the periodic report and the future ``/status`` cog."""
+        return dict(self._wake_counters_fn()) if self._wake_counters_fn is not None else {}
+
+    @property
+    def wake_faulted(self) -> bool:
+        """True while the wake model pool is latched faulted (build failure)."""
+        return bool(self._wake_faulted_fn()) if self._wake_faulted_fn is not None else False
+
+    @property
+    def stt_watchdog_degraded(self) -> bool:
+        """True while the STT watchdog respawn cap is latched."""
+        return bool(self._stt_watchdog_fn()) if self._stt_watchdog_fn is not None else False
+
     # ── detection + reporting (call every few seconds) ───────────────────────
 
     async def check(self) -> None:
@@ -196,8 +240,45 @@ class HealthReporter:
         await self._check_ears(now)
         await self._check_voice(now)
         await self._check_stt()
+        await self._check_stt_watchdog()
+        await self._check_wake_fault()
         await self._check_posting()
         await self._maybe_report(now)
+
+    async def _check_stt_watchdog(self) -> None:
+        """The transcriber latched degraded (respawn cap) — announce once."""
+        latched = self.stt_watchdog_degraded
+        if latched and not self._stt_watchdog_announced:
+            self._stt_watchdog_announced = True
+            log.warning("stt_watchdog_latch_announced")
+            await self._post(
+                "⚠️ **STT watchdog respawn cap reached** — transcription is latched "
+                "off until a reload or restart. Voice commands will be rejected; "
+                "slash commands and the incident engine are unaffected.",
+                None,
+            )
+        elif not latched and self._stt_watchdog_announced:
+            self._stt_watchdog_announced = False
+            log.info("stt_watchdog_latch_cleared")
+            await self._post("✅ STT watchdog latch cleared — transcription restored.", None)
+
+    async def _check_wake_fault(self) -> None:
+        """The wake model pool latched faulted (build failure) — announce once."""
+        faulted = self.wake_faulted
+        if faulted and not self._wake_fault_announced:
+            self._wake_fault_announced = True
+            log.warning("wake_fault_announced")
+            await self._post(
+                "⚠️ **Wake-word model failed to build** — wake detection is offline "
+                "(audio still flows, nothing is scored). Check `wake.model` and the "
+                "openwakeword install, then reload the config or restart. "
+                "Slash commands are unaffected.",
+                None,
+            )
+        elif not faulted and self._wake_fault_announced:
+            self._wake_fault_announced = False
+            log.info("wake_fault_recovered")
+            await self._post("✅ Wake-word model restored.", None)
 
     async def _check_posting(self) -> None:
         if self._announce_post_failure:
@@ -299,7 +380,11 @@ class HealthReporter:
         avg_conf = (
             round(sum(self._confidences) / len(self._confidences), 3) if self._confidences else None
         )
-        status = "degraded" if self.degraded else "nominal"
+        # The report's status word also covers the audio-pipeline latches; the
+        # `degraded` property itself (what the engine keys spoken fallbacks
+        # off) is unchanged — the latches speak through their own alerts.
+        report_degraded = self.degraded or self.stt_watchdog_degraded or self.wake_faulted
+        status = "degraded" if report_degraded else "nominal"
         parts = []
         if self._voice_offline:
             parts.append("voice receive offline")
@@ -307,6 +392,22 @@ class HealthReporter:
             parts.append("Ears heartbeat missed")
         if self._stt_degraded:
             parts.append("sustained low STT confidence")
+        if self.stt_watchdog_degraded:
+            parts.append("STT watchdog latched")
+        if self.wake_faulted:
+            parts.append("wake model faulted")
+        wake = self.wake_counters
+        wake_value = (
+            "n/a"
+            if not wake
+            else (
+                f"frames {wake.get('frames_seen', 0)} · "
+                f"scored {wake.get('vad_speech', 0)} · "
+                f"inferences {wake.get('inferences', 0)} · "
+                f"hits {wake.get('hits', 0)} · "
+                f"near {wake.get('near_misses', 0)}"
+            )
+        )
         fields = [
             {
                 "name": "Status",
@@ -325,6 +426,16 @@ class HealthReporter:
                 "inline": True,
             },
             {
+                "name": "STT watchdog",
+                "value": "latched (degraded)" if self.stt_watchdog_degraded else "ok",
+                "inline": True,
+            },
+            {
+                "name": "Wake pipeline",
+                "value": ("FAULTED · " if self.wake_faulted else "") + wake_value,
+                "inline": False,
+            },
+            {
                 "name": "Ears",
                 "value": "connected"
                 if self._ears_reports_connected and not self._ears_down
@@ -335,7 +446,7 @@ class HealthReporter:
         ]
         return {
             "title": "CORTANA health report",
-            "color": 0xE74C3C if self.degraded else 0x2ECC71,
+            "color": 0xE74C3C if report_degraded else 0x2ECC71,
             "timestamp": now.isoformat(),
             "fields": fields,
         }

@@ -451,6 +451,11 @@ async def test_single_refractory_window_with_real_detector() -> None:
     recorder = Recorder()
     holder = StubHolder(make_config())
     detector = OpenWakeWordDetector(holder)  # type: ignore[arg-type]
+    # openwakeword isn't installed here: give the model pool a build seam and
+    # the spare __init__ would have built, so the first speaker scores
+    # immediately (the pool replenishes in the background off-loop).
+    detector._build_model = object  # type: ignore[method-assign]
+    detector._spares.append(object())
     detector._predict_chunk = lambda state, chunk: 0.9  # type: ignore[method-assign]
     manager = CaptureManager(
         holder,  # type: ignore[arg-type]

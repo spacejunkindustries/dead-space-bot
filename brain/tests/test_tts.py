@@ -395,6 +395,48 @@ async def test_per_guild_ordering(tmp_path, monkeypatch) -> None:
     await speaker.close()
 
 
+async def test_alert_jumps_ahead_of_queued_normals(tmp_path, monkeypatch) -> None:
+    """The per-guild queue is priority-ordered: an ALERT enqueued behind
+    NORMAL jobs plays before them (the in-flight synthesis is never
+    preempted), so a voice ack can't sit behind an uncached synthesis past
+    the dialog grace window. Equal priorities keep FIFO order, and every
+    job's completion future still resolves True."""
+    order: list[str] = []
+    first_started = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        class _P(_FakeProc):
+            async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+                text = (input or b"").decode().strip()
+                if text == "first":
+                    first_started.set()
+                    await gate.wait()  # hold the worker: the rest must queue
+                order.append(text)
+                return self._stdout, self._stderr
+
+        return _P(b"\x01\x00" * 100)
+
+    monkeypatch.setattr(tts.asyncio, "create_subprocess_exec", fake_exec)
+    ipc = _FakeIpc()
+    speaker = Speaker(_holder(tmp_path), ipc)  # type: ignore[arg-type]
+
+    t_first = asyncio.create_task(speaker.say(1, "first"))
+    await first_started.wait()  # in-flight NORMAL holds the worker
+    t_normal_a = asyncio.create_task(speaker.say(1, "normal a"))
+    t_normal_b = asyncio.create_task(speaker.say(1, "normal b"))
+    await asyncio.sleep(0)  # both NORMALs are queued...
+    t_alert = asyncio.create_task(speaker.say(1, "alert", PRIORITY_ALERT))
+    await asyncio.sleep(0)  # ...before the ALERT even arrives
+    gate.set()
+
+    results = await asyncio.gather(t_first, t_normal_a, t_normal_b, t_alert)
+    assert results == [True, True, True, True]
+    assert order == ["first", "alert", "normal a", "normal b"]
+    assert len(ipc.sent) == 4
+    await speaker.close()
+
+
 async def test_voice_swap_on_reload_refreshes_sample_rate(tmp_path, monkeypatch) -> None:
     """A SIGHUP that swaps tts.voice must rebuild WAV headers (and the
     duration check) with the NEW voice's native rate, not the boot-time one."""

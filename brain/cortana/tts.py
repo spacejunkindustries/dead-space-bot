@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import math
 import random
@@ -596,13 +597,23 @@ class _SayJob:
     done: asyncio.Future[bool]
 
 
+#: Priority-queue entry: (rank, seq, job). Rank is the NEGATED wire priority
+#: (ipc.PRIORITY_ALERT=2 > NORMAL=1 > LOW=0, and PriorityQueue pops the
+#: smallest), seq keeps FIFO order within one priority class and breaks ties
+#: before the unorderable job ever gets compared.
+_QueueEntry = tuple[int, int, _SayJob]
+
+
 class Speaker:
     """Synthesises §12.1 utterances and ships them to Ears for playback.
 
-    One :class:`Speaker` serves all guilds. Each guild gets its own FIFO queue
-    and worker task so utterances within a guild play in order; the Piper
-    subprocess itself is serialised globally (one synthesis at a time — the
-    droplet's cores belong to Whisper).
+    One :class:`Speaker` serves all guilds. Each guild gets its own
+    priority-ordered queue and worker task: ALERT jobs jump ahead of QUEUED
+    NORMAL jobs (the in-flight synthesis is never preempted), so a wake ack
+    or a CODE RED confirmation can't sit behind an uncached NORMAL synthesis
+    past the dialog grace window; jobs of equal priority play in FIFO order.
+    The Piper subprocess itself is serialised globally (one synthesis at a
+    time — the droplet's cores belong to Whisper).
 
     :meth:`say` returns ``True`` when the utterance was synthesised and handed
     to IPC, ``False`` when it was suppressed (TTS disabled, muted trigger
@@ -618,7 +629,8 @@ class Speaker:
         self._voice_path = holder.current.tts.voice
         self._sample_rate = read_voice_sample_rate(self._voice_path)
         self._synth_lock = asyncio.Lock()
-        self._queues: dict[int, asyncio.Queue[_SayJob]] = {}
+        self._queues: dict[int, asyncio.PriorityQueue[_QueueEntry]] = {}
+        self._seq = itertools.count()  # FIFO within a priority class
         self._workers: dict[int, asyncio.Task[None]] = {}
         self._closed = False
         self._voice_mutes: set[int] = set()
@@ -691,7 +703,9 @@ class Speaker:
             log.debug("tts_suppressed_muted_user", user_id=user_id, guild_id=guild_id)
             return False
         job = _SayJob(text=text, priority=priority, done=asyncio.get_running_loop().create_future())
-        self._queue_for(guild_id).put_nowait(job)
+        # ALERT (higher wire priority) sorts ahead of queued NORMAL jobs; the
+        # seq counter keeps arrival order within a class.
+        self._queue_for(guild_id).put_nowait((-priority, next(self._seq), job))
         return await job.done
 
     async def synthesize(self, text: str) -> bytes:
@@ -790,26 +804,26 @@ class Speaker:
         self._workers.clear()
         for queue in self._queues.values():
             while not queue.empty():
-                job = queue.get_nowait()
+                _, _, job = queue.get_nowait()
                 if not job.done.done():
                     job.done.set_result(False)
         self._queues.clear()
 
     # ── internals ────────────────────────────────────────────────────────────
 
-    def _queue_for(self, guild_id: int) -> asyncio.Queue[_SayJob]:
+    def _queue_for(self, guild_id: int) -> asyncio.PriorityQueue[_QueueEntry]:
         queue = self._queues.get(guild_id)
         if queue is None:
-            queue = asyncio.Queue()
+            queue = asyncio.PriorityQueue()
             self._queues[guild_id] = queue
             self._workers[guild_id] = asyncio.create_task(
                 self._worker(guild_id, queue), name=f"tts-worker-{guild_id}"
             )
         return queue
 
-    async def _worker(self, guild_id: int, queue: asyncio.Queue[_SayJob]) -> None:
+    async def _worker(self, guild_id: int, queue: asyncio.PriorityQueue[_QueueEntry]) -> None:
         while True:
-            job = await queue.get()
+            _, _, job = await queue.get()
             try:
                 spoken = await self._speak(guild_id, job)
             except asyncio.CancelledError:
