@@ -34,6 +34,7 @@ from cortana.dialog.types import (
     Action,
     ArmWindow,
     Classified,
+    ConfirmPending,
     DialogEvent,
     DialogSession,
     DialogState,
@@ -41,6 +42,7 @@ from cortana.dialog.types import (
     Ev,
     Line,
     NoteRejected,
+    PendingConfirm,
     Relay,
     Report,
     RunOverride,
@@ -49,7 +51,15 @@ from cortana.dialog.types import (
 )
 from cortana.ipc import PRIORITY_ALERT, PRIORITY_NORMAL
 from cortana.nlu import grammar, phonetics
-from cortana.types import INTENT_SEVERITY, MENTION_INTENTS, Intent, Outcome, Severity, Tier
+from cortana.types import (
+    INTENT_SEVERITY,
+    MENTION_INTENTS,
+    Intent,
+    Outcome,
+    Resolution,
+    Severity,
+    Tier,
+)
 
 if TYPE_CHECKING:
     import sqlite3
@@ -270,6 +280,7 @@ class DialogEngine:
             relay_text=grammar.broadcast_text(text),
             relay_mode=cfg.stt.relay_mode,
             chat_available=chat is not None and cfg.chat.enabled,
+            confirm_reply=grammar.confirm_reply(text),
         )
 
     # ── machine application ──────────────────────────────────────────────────
@@ -324,6 +335,8 @@ class DialogEngine:
             await self._relay(s, action)
         elif isinstance(action, RunOverride):
             await self._override(s, action.query)
+        elif isinstance(action, ConfirmPending):
+            await self._confirm(s, action.confirm)
         elif isinstance(action, NoteRejected):
             self._health.record_rejected()
             log.info("utterance_no_intent", user_id=s.user_id, reason=action.reason)
@@ -416,8 +429,10 @@ class DialogEngine:
             await self._speak_or_post(s, _PILOT_REQUIRED_UTTERANCE)
             return
 
-        resolution = None
-        if parsed.system_text:
+        # A confirmed §8.3 candidate arrives pre-resolved at HIGH tier — the
+        # pilot vouched for exactly that system; re-resolving could demote it.
+        resolution = action.forced_resolution
+        if resolution is None and parsed.system_text:
             priors = await asyncio.to_thread(
                 self._incidents.build_prior_context, s.guild_id, s.user_id
             )
@@ -475,6 +490,54 @@ class DialogEngine:
                 self._session(s.user_id, s.guild_id),
                 DialogEvent(Ev.ENGINE_REJECTED_LOW, parsed=parsed),
             )
+
+        # MEDIUM tier (GDD §8.3): the engine answered "say again to confirm".
+        # Arm a wake-free confirm window carrying the command + candidate so
+        # "yes" — or an exact repeat — completes it by voice; the machine's
+        # budget bounds how often this can recur.
+        if (
+            outcome.outcome is Outcome.ASKED
+            and resolution is not None
+            and resolution.best is not None
+        ):
+            await self._apply(
+                self._session(s.user_id, s.guild_id),
+                DialogEvent(
+                    Ev.ENGINE_ASKED,
+                    confirm=PendingConfirm(
+                        parsed=parsed,
+                        candidate=resolution.best,
+                        incident_id=outcome.incident_id,
+                    ),
+                ),
+            )
+
+    async def _confirm(self, s: DialogSession, confirm: PendingConfirm) -> None:
+        """Complete a pending §8.3 confirm — the voice twin of the card's
+        pick/confirm button (constraint 10: same engine path, both ways in).
+
+        An uncertain report already posted its card: confirming pins the
+        heard candidate through the same ``confirm_system`` path the pick
+        button uses — alias learning (§8.5) included. A destructive or
+        scheduling command (clear/timer/form up) posted nothing: the stored
+        candidate re-reports as a HIGH-tier resolution, exactly as if the
+        repeat had been heard cleanly.
+        """
+        if confirm.incident_id is not None:
+            outcome = await self._incidents.confirm_system(
+                confirm.incident_id, s.user_id, confirm.candidate.system_id
+            )
+            self._count_outcome(outcome.outcome)
+            parsed = confirm.parsed
+            effective = (
+                parsed.severity
+                if parsed.severity is not None
+                else INTENT_SEVERITY.get(parsed.intent, Severity.NONE)
+            )
+            await self._reply(s, effective, outcome)
+            return
+        forced = Resolution(tier=Tier.HIGH, candidates=(confirm.candidate,))
+        await self._report(s, Report(confirm.parsed, forced_resolution=forced))
 
     async def _relay(self, s: DialogSession, action: Relay) -> None:
         """Freeform intel relay (GDD §8.6) through the broadcast path.

@@ -33,6 +33,7 @@ from cortana.types import (
     PriorContext,
     Severity,
     SystemEntry,
+    Tier,
     TranscriptResult,
 )
 from tests.test_incidents import PILOT_ROLE, FakeGazetteer, StubHolder, make_config
@@ -73,6 +74,7 @@ class _Engine:
         self.reports: list[tuple[int, int, Any, Any]] = []
         self.broadcasts: list[tuple[int, int, str, bool]] = []
         self.broadcast_severities: list[Any] = []
+        self.confirms: list[tuple[int, int, int]] = []
         self.fired: list[datetime] = []
 
     async def report(
@@ -88,6 +90,10 @@ class _Engine:
         self.report_gates = getattr(self, "report_gates", [])
         self.report_gates.append(caller_may_mention)
         return self.outcome
+
+    async def confirm_system(self, incident_id: int, user_id: int, system_id: int) -> Any:
+        self.confirms.append((incident_id, user_id, system_id))
+        return IncidentOutcome(Outcome.POSTED, "Confirmed Otanuomi.", None, incident_id)
 
     async def broadcast(
         self,
@@ -467,6 +473,109 @@ async def test_failed_rebind_does_not_rearm_forever() -> None:
     armed_after_first = len(rig.capture.armed)
     await utter_window(rig)
     assert len(rig.capture.armed) == armed_after_first  # no re-arm from the rebind
+
+
+# ── MEDIUM-tier voice confirm (GDD §8.3 AWAIT_CONFIRM) ───────────────────────
+
+_ASKED_CLEAR = IncidentOutcome(Outcome.ASKED, "Heard Otanuomi — say again to confirm.", None, None)
+
+
+async def test_asked_outcome_arms_a_confirm_window() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["aura command clear Otanuomi"]),
+        outcome=_ASKED_CLEAR,
+    )
+    await utter_wake(rig)
+    assert len(rig.engine.reports) == 1
+    assert (GUILD, "Heard Otanuomi — say again to confirm.") in rig.speaker.said
+    assert len(rig.capture.armed) == 1  # the confirm window
+    assert rig.dialog.session_state(USER) is DialogState.AWAIT_CONFIRM
+
+
+async def test_voice_yes_completes_a_destructive_confirm_as_high_tier() -> None:
+    # "clear Otanuomi" → MEDIUM → ASKED; "yes" in the window re-reports the
+    # STORED candidate as a HIGH-tier resolution — no re-resolution, same
+    # engine entry point (constraint 10).
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["aura command clear Otanuomi", "yes"]),
+        outcome=_ASKED_CLEAR,
+    )
+    await utter_wake(rig)
+    first_resolution = rig.engine.reports[0][3]
+    assert first_resolution.best is not None
+
+    await utter_window(rig)
+    assert len(rig.engine.reports) == 2
+    _, _, parsed2, resolution2 = rig.engine.reports[1]
+    assert parsed2.intent is Intent.RESOLVE
+    assert resolution2.tier is Tier.HIGH
+    assert resolution2.best.system_id == first_resolution.best.system_id
+    assert rig.engine.confirms == []  # no card to pin — nothing was posted
+
+
+async def test_voice_yes_confirms_an_uncertain_card_via_the_button_path() -> None:
+    # An uncertain report posted a card (incident_id set): "yes" completes
+    # through the SAME confirm_system path the card's pick button hits.
+    asked = IncidentOutcome(Outcome.ASKED, "Hostiles Otanuomi — say again to confirm.", None, 7)
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["aura command hostiles Otanuomi", "yes"]),
+        outcome=asked,
+    )
+    await utter_wake(rig)
+    assert rig.dialog.session_state(USER) is DialogState.AWAIT_CONFIRM
+    best = rig.engine.reports[0][3].best
+
+    await utter_window(rig)
+    assert rig.engine.confirms == [(7, USER, best.system_id)]
+    assert len(rig.engine.reports) == 1  # the posted card is pinned, not re-reported
+    assert (GUILD, "Confirmed Otanuomi.") in rig.speaker.said
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
+
+
+async def test_exact_repeat_completes_the_confirm_by_voice() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["aura command clear Otanuomi", "clear Otanuomi"]),
+        outcome=_ASKED_CLEAR,
+    )
+    await utter_wake(rig)
+    await utter_window(rig)
+    assert len(rig.engine.reports) == 2
+    assert rig.engine.reports[1][3].tier is Tier.HIGH
+
+
+async def test_voice_no_closes_the_confirm_silently() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["aura command clear Otanuomi", "no"]),
+        outcome=_ASKED_CLEAR,
+    )
+    await utter_wake(rig)
+    said_before = list(rig.speaker.said)
+    armed_before = len(rig.capture.armed)
+
+    await utter_window(rig)
+    assert len(rig.engine.reports) == 1  # nothing confirmed, nothing re-reported
+    assert rig.engine.confirms == []
+    assert rig.speaker.said == said_before  # standing-down semantics, silent
+    assert len(rig.capture.armed) == armed_before  # no re-arm
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
+
+
+async def test_unrelated_speech_in_the_confirm_window_closes_silently() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["aura command clear Otanuomi", "How's everybody doing"]),
+        outcome=_ASKED_CLEAR,
+    )
+    await utter_wake(rig)
+    await utter_window(rig)
+    assert len(rig.engine.reports) == 1
+    assert rig.engine.broadcasts == []  # never leaks into the relay path
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
 
 
 async def test_bare_no_intent_utterance_is_relayed_in_open_mode() -> None:

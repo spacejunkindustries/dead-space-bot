@@ -35,6 +35,7 @@ __all__ = [
     "bare_override",
     "broadcast_severity",
     "clean_callsign",
+    "confirm_reply",
     "encode_ping_types",
     "override_query",
     "parse",
@@ -410,6 +411,85 @@ def system_reply(transcript: str) -> str | None:
     work = _SIGNOFF_RE.sub("", work)
     cleaned = _strip_filler(work.strip(" ,.;:!?-"))
     return cleaned or None
+
+
+# ── confirm-window replies (GDD §8.3 AWAIT_CONFIRM) ──────────────────────────
+
+# Standalone yes/no vocabulary for the §8.3 confirm window. A small fixed
+# table (constraint 6) of the words pilots actually answer with, plus the
+# radio-procedure acknowledgements ("roger", "copy") that the sign-off strip
+# would otherwise swallow — which is why this runs on the raw wake-stripped
+# text, before any sign-off handling.
+_CONFIRM_YES = frozenset(
+    (
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "ya",
+        "yah",
+        "aye",
+        "affirmative",
+        "affirm",
+        "confirm",
+        "confirmed",
+        "correct",
+        "roger",
+        "copy",
+        "right",
+        "positive",
+    )
+)
+_CONFIRM_NO = frozenset(
+    (
+        "no",
+        "nope",
+        "nah",
+        "negative",
+        "cancel",
+        "canceled",
+        "cancelled",
+        "wrong",
+        "incorrect",
+        "belay",
+        "disregard",
+        "abort",
+        "stop",
+    )
+)
+# Words allowed to ride along without breaking standalone-ness ("yes please",
+# "yeah do it", "confirm it, over").
+_CONFIRM_FILLER = frozenset(
+    ("do", "it", "that", "thats", "is", "the", "please", "over", "out", "um", "uh", "er", "and")
+)
+_CONFIRM_YES_ALLOWED = _CONFIRM_YES | _CONFIRM_FILLER
+_DO_IT_RE = re.compile(r"\bdo\s+it\b", re.I)
+
+
+def confirm_reply(transcript: str) -> str | None:
+    """Classify a standalone confirm-window reply: ``"yes"``, ``"no"``, or
+    ``None`` when the utterance carries other content (GDD §8.3).
+
+    Any negative word anywhere vetoes ("no, wrong", "yes— no, cancel"): a
+    destructive confirm must fail closed. An affirmative counts only when the
+    whole utterance is affirmation ("yes", "yeah do it", "confirm, over") —
+    "yes, hostiles Kisogo" is a command, not a reply, and returns ``None``
+    so the grammar can claim it.
+    """
+    if not transcript or not transcript.strip():
+        return None
+    work = _BROADCAST_WAKE_RE.sub("", transcript, count=1)
+    work = _WAKE_RE.sub("", work, count=1)
+    work = work.replace("'", "")
+    tokens = [t for t in re.split(r"[\s,.;:!?-]+", work.lower()) if t]
+    if not tokens:
+        return None
+    if any(t in _CONFIRM_NO for t in tokens):
+        return "no"
+    has_yes = any(t in _CONFIRM_YES for t in tokens) or _DO_IT_RE.search(work) is not None
+    if has_yes and all(t in _CONFIRM_YES_ALLOWED for t in tokens):
+        return "yes"
+    return None
 
 
 # Freeform relay (GDD §8.6): leading wake residue, tolerant of any wake phrase
