@@ -318,7 +318,7 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 | "timer \<system\> \<duration\>" | `TIMER` | none | schedules a future ping |
 | "form up \<system\> \<duration\>" | `FORMUP` | none | posts op with RSVP |
 | "status" | `QUERY` | none | spoken reply only |
-| "help" | `HELP` | none | spoken reply only — *"Check help in Discord."*; the manual is `/help` |
+| "help" | `HELP` | none | speaks *"Command list posted to Discord."* and posts the `/help` front page to the intel channel |
 | "cancel" | `CANCEL` | none | kills this user's last incident (30s window) |
 | "register \<callsign\>" / "call me \<callsign\>" | `REGISTER` | none | spoken reply only |
 | "unregister" / "unregister me" / "forget me" | `UNREGISTER` | none | spoken reply only |
@@ -346,7 +346,17 @@ Group aliases are configurable but deliberately few. Every alias added is anothe
 
 Anything after the system and group is captured verbatim into the incident body: *"three battleships"*, *"camping the gate"*, *"I'm in structure"*. It does not parse. It is a human note for humans.
 
-### 6.4 Examples
+### 6.4 Spoken threat colours
+
+The card labels (CODE RED / CODE ORANGE / CODE YELLOW, §9.1) are also **input**: a pilot can speak the colour to set or override severity.
+
+- **Inline** — *"code red, hostiles in UMI"*: the report parses normally and carries `severity=high`; the card renders CODE RED and, when `high` is in `here_on_severity`, fires the colour-based `@here` (§11.3). The colour phrase is stripped before intent matching, so *"code red"* can never be misread as a "reds" sighting.
+- **Standalone (dialogue)** — *"code orange"* alone: AURA replies *"Code orange. Go ahead."*, reopens a wake-free capture window (the §8.3 mechanism), and the pilot's next utterance — report or freeform relay — inherits the severity. An inline colour on the follow-up wins over the opener.
+- **Relays** — a colour on a freeform relay colours the relay card and rides the same `here_on_severity` escalation: *"code red, blop fleet inbound"* pings like any CODE RED.
+
+Mapping: red → high, orange → medium, yellow → none/info. A leading *"report"* and a trailing *"end report"* / *"end of report"* / *"end transmission"* are radio-procedure framing and are stripped (*"report, I've been tackled in UMI, end report"*).
+
+### 6.5 Examples
 
 ```
 "Aura Command, hostiles Otanuomi, three battleships"
@@ -526,6 +536,8 @@ Within a month of real use, your corp's specific accents, specific mics, and spe
 
 Pilots use phone mics, in noisy rooms, with a game running, stressed and talking fast. AURA is engineered on the assumption that **the transcript is sometimes wrong** — not as a limitation to apologise for, but as a fact the design absorbs. The confirmation loop, the correction buttons, the confidence tiers, and the alias table are not garnish; they are the mechanism by which an imperfect signal produces a reliable tool.
 
+**The freeform relay is confidence-gated.** A transcript that matched no intent posts to the intel channel verbatim (the catch-all) — but only when Whisper's `avg_logprob` clears `stt.relay_min_logprob`. Below that, the transcript is treated as decoded noise ("Rens, Rens, Rens" hallucinated from silence) and AURA says *"Say again the system."* instead of posting garbage. Recognised commands are **never** gated — a distress call always posts. Stuttered three-plus word repeats in relay text collapse to one word, and every relay logs its confidence to `command_log` so the threshold is tuned from data. A successful relay is acknowledged with a spoken *"Relayed."* — without the ack, pilots repeat themselves, and every repeat is another card and another STT decode.
+
 ---
 
 ## 9. Incident engine
@@ -569,7 +581,7 @@ Every card carries:
 
 `[🚀 On my way]` `[👀 Watching]` `[❌ Can't respond]`
 
-On the first **On my way**, AURA speaks into voice: *"Two responding to Otanuomi."*
+On the first **On my way**, AURA speaks into voice — naming the responder when it can: the registered callsign wins, then the clicker's guild display name (*"Space Junkie responding to Otanuomi."*), and only when neither is known does it fall back to the count (*"Two responding to Otanuomi."*).
 
 That closes the loop. A pilot in structure gets an audible answer without touching their phone. It is the cheapest feature in the document and the one the corp will actually love.
 
@@ -678,12 +690,14 @@ Short. Always short. AURA is talking over a fight.
 | Ping sent, scoped | *"Hostiles Otanuomi, pinged home defense."* |
 | Ambiguous system | *"Hostiles Otanuomi — say again to confirm."* |
 | Unresolved system | *"Say again the system."* |
-| Responders | *"Two responding to Otanuomi."* |
+| Responders | *"Space Junkie responding to Otanuomi."* (callsign/display name; count as fallback) |
 | Resolved | *"Otanuomi clear."* |
 | Timer set | *"Timer Kisogo, four hours."* |
 | Flood control | *"Flood control active."* |
 | Degraded | *"Voice offline, use slash commands."* |
-| Help | *"Check help in Discord."* |
+| Help | *"Command list posted to Discord."* (the /help page posts alongside) |
+| Relay posted | *"Relayed."* |
+| Colour code opener | *"Code orange. Go ahead."* |
 | Registered | *"Registered you as Space Junkie."* |
 | Unregistered | *"Unregistered."* |
 | Not registered | *"You are not registered."* |
@@ -972,6 +986,7 @@ stt:
   cpu_threads: 2
   bias_with_gazetteer: true
   whisper_cpp_url: http://127.0.0.1:8080/inference
+  relay_min_logprob: -0.9               # freeform-relay confidence gate (§8.6)
 
 matching:
   phonetic_weight: 0.6

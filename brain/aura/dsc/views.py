@@ -252,7 +252,14 @@ async def dispatch_incident_action(
     await interaction.response.defer()
     if action.kind == "respond":
         assert action.state is not None
-        outcome = await bot.engine.respond(action.incident_id, interaction.user.id, action.state)
+        outcome = await bot.engine.respond(
+            action.incident_id,
+            interaction.user.id,
+            action.state,
+            # GDD §9.3: voice hears WHO is coming — the guild display name,
+            # unless a registered callsign wins inside the engine.
+            display_name=interaction.user.display_name,
+        )
         if outcome.outcome is Outcome.REJECTED:
             await interaction.followup.send("That incident is already resolved.", ephemeral=True)
             return

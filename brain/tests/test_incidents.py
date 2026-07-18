@@ -44,6 +44,7 @@ from aura.types import (
     PriorContext,
     Resolution,
     ResponderState,
+    Severity,
     SystemEntry,
     Tier,
 )
@@ -274,8 +275,16 @@ def cmd(
     detail: str | None = None,
     alias: str | None = None,
     raw: str = "synthetic transcript",
+    severity: Severity | None = None,
 ) -> ParsedCommand:
-    return ParsedCommand(intent=intent, system_text=None, group_alias=alias, detail=detail, raw=raw)
+    return ParsedCommand(
+        intent=intent,
+        system_text=None,
+        group_alias=alias,
+        detail=detail,
+        raw=raw,
+        severity=severity,
+    )
 
 
 def high(system_id: int, name: str, score: float = 0.92) -> Resolution:
@@ -1164,3 +1173,91 @@ async def test_here_on_severity_pings_red_without_rules(make_env: Callable[..., 
     await env.engine.report(GUILD, 43, cmd(Intent.HOSTILE_SPOTTED), high(2, "Kisogo"))
     _, _, content2, _ = env.poster.posts[-1]
     assert "@here" not in content2
+
+
+# ── spoken colour codes (GDD §6.4) ───────────────────────────────────────────
+
+
+async def test_spoken_code_red_overrides_intent_severity(make_env: Callable[..., Env]) -> None:
+    # "code red, hostiles in Otanuomi" — a sighting is MEDIUM by default, but
+    # the spoken colour makes it CODE RED: red card, and @here via the default
+    # here_on_severity=("high",).
+    env = make_env()
+    out = await env.engine.report(
+        GUILD, 42, cmd(Intent.HOSTILE_SPOTTED, severity=Severity.HIGH), high(1, "Otanuomi")
+    )
+    assert out.outcome is Outcome.POSTED
+    _, _, content, card = env.poster.posts[-1]
+    assert "CODE RED" in card.embed["title"]
+    assert "@here" in content
+
+
+async def test_spoken_code_yellow_downgrades_the_card_colour(
+    make_env: Callable[..., Env],
+) -> None:
+    # The spoken colour drives the card and the colour-based @here; explicit
+    # routing rules (escalate_at) still make their own mention decisions.
+    env = make_env()
+    out = await env.engine.report(
+        GUILD, 42, cmd(Intent.HOSTILE_SPOTTED, severity=Severity.NONE), high(1, "Otanuomi")
+    )
+    assert out.outcome is Outcome.POSTED
+    _, _, content, card = env.poster.posts[-1]
+    assert "CODE YELLOW" in card.embed["title"]
+    assert "@here" not in content  # NONE is not in here_on_severity
+
+
+async def test_broadcast_severity_colours_the_relay_and_pings(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    out = await env.engine.broadcast(
+        GUILD, 42, "blop fleet inbound", severity=Severity.HIGH, confidence=-0.2
+    )
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "Relayed."
+    _, _, content, card = env.poster.posts[-1]
+    assert "CODE RED" in card.embed["title"]
+    assert "@here" in content  # ping-by-colour applies to relays too
+    row = db.query_one(
+        env.conn, "SELECT confidence FROM command_log WHERE parsed_intent = 'BROADCAST'"
+    )
+    assert row is not None and abs(row["confidence"] - (-0.2)) < 1e-9
+
+
+async def test_broadcast_without_code_stays_yellow_and_silent(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    await env.engine.broadcast(GUILD, 42, "moving to Kisogo gate")
+    _, _, content, card = env.poster.posts[-1]
+    assert "CODE YELLOW" in card.embed["title"]
+    assert "@here" not in content
+
+
+# ── named responder callouts (GDD §9.3) ──────────────────────────────────────
+
+
+async def test_responder_callout_prefers_callsign_over_count(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    await env.engine.report(GUILD, 42, cmd(Intent.REGISTER, detail="Space Junkie"), None)
+    posted = await env.engine.report(GUILD, 7, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    out = await env.engine.respond(
+        posted.incident_id, 42, ResponderState.OTW, display_name="IgnoredNick"
+    )
+    assert out.utterance == "Space Junkie responding to Otanuomi."
+
+
+async def test_responder_callout_falls_back_to_display_name_then_count(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    posted = await env.engine.report(GUILD, 7, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    out = await env.engine.respond(
+        posted.incident_id, 43, ResponderState.OTW, display_name="SiMpLeNoOB"
+    )
+    assert out.utterance == "SiMpLeNoOB responding to Otanuomi."
+    out2 = await env.engine.respond(posted.incident_id, 44, ResponderState.OTW)
+    assert out2.utterance == "Two responding to Otanuomi."

@@ -672,7 +672,14 @@ class IncidentEngine:
     # ── freeform intel relay (GDD §8.6 catch-all) ────────────────────────────
 
     async def broadcast(
-        self, guild_id: int, reporter_id: int, text: str, *, here: bool = False
+        self,
+        guild_id: int,
+        reporter_id: int,
+        text: str,
+        *,
+        here: bool = False,
+        severity: Severity | None = None,
+        confidence: float | None = None,
     ) -> IncidentOutcome:
         """Post any spoken message to the intel channel verbatim.
 
@@ -681,25 +688,37 @@ class IncidentEngine:
         — a nullsec corp's comms are lively and unstructured, and dropping a
         call because it wasn't a recognised keyword is the wrong default. The
         reporter's callsign labels the relay; ``here`` (an "all hands" phrase)
-        pings, gated by the same cooldown/circuit-breaker as any mention."""
+        pings, gated by the same cooldown/circuit-breaker as any mention.
+
+        A spoken colour code (GDD §6.4) colours the relay card and, via
+        ``here_on_severity``, can escalate it to an @here on its own — "code
+        red, blop fleet inbound" pings like any CODE RED. ``confidence`` is
+        the STT avg_logprob, recorded in ``command_log`` so the relay gate
+        threshold can be tuned from real data."""
         text = text.strip()
         if not text:
             return IncidentOutcome(Outcome.REJECTED, None, None, None)
+        card_severity = severity if severity is not None else Severity.NONE
         async with self._lock:
             now = self._clock()
             who = self._callsigns.lookup(reporter_id) or f"<@{reporter_id}>"
             content = ""
-            here = here and self._holder.current.discord.mentions_enabled
+            cfg = self._holder.current.discord
+            if severity is not None and str(severity) in cfg.here_on_severity:
+                here = True  # ping-by-colour (GDD §11.3), same as incident cards
+            here = here and cfg.mentions_enabled
             if here and self._discipline.allow_mention(reporter_id, now):
                 self._discipline.record_mention(reporter_id, now)
                 if self._on_mention is not None:
                     self._on_mention()
                 content = "@here"
+            emoji = _SEVERITY_EMOJI[card_severity]
+            code = _SEVERITY_CODE[card_severity]
             card = CardRender(
                 embed={
-                    "title": "🟡 CODE YELLOW · Intel relay",
+                    "title": f"{emoji} {code} · Intel relay",
                     "description": text,
-                    "color": _COLOR_BROADCAST,
+                    "color": _COLOR_BY_SEVERITY[card_severity],
                     "timestamp": _iso(now),
                     "fields": [{"name": "From", "value": who, "inline": True}],
                     "footer": {"text": "AURA voice relay"},
@@ -711,11 +730,16 @@ class IncidentEngine:
             self._conn,
             "INSERT INTO command_log (user_id, raw_transcript, parsed_intent,"
             " matched_system_id, confidence, tier, outcome, at)"
-            " VALUES (?, ?, 'BROADCAST', NULL, NULL, NULL, 'POSTED', ?)",
-            (reporter_id, text, _iso(now)),
+            " VALUES (?, ?, 'BROADCAST', NULL, ?, NULL, 'POSTED', ?)",
+            (reporter_id, text, confidence, _iso(now)),
         )
-        log.info("intel_broadcast", reporter_id=reporter_id, here=content == "@here")
-        return IncidentOutcome(Outcome.POSTED, None, card, None)
+        log.info(
+            "intel_broadcast",
+            reporter_id=reporter_id,
+            here=content == "@here",
+            severity=str(card_severity),
+        )
+        return IncidentOutcome(Outcome.POSTED, tts.relayed(), card, None)
 
     # ── personal pings (GDD §10.3) ───────────────────────────────────────────
 
@@ -840,7 +864,11 @@ class IncidentEngine:
         resolved: bool,
     ) -> IncidentOutcome:
         best = resolution.best if resolution is not None else None
-        severity = INTENT_SEVERITY[parsed.intent]
+        # A spoken colour code (GDD §6.4) overrides the intent's default:
+        # "code red, hostiles in UMI" is a HIGH-severity sighting.
+        severity = (
+            parsed.severity if parsed.severity is not None else INTENT_SEVERITY[parsed.intent]
+        )
         # Only a resolved-but-borderline (MEDIUM) match offers the confirm
         # buttons; an unmatched location has nothing to confirm against.
         uncertain = resolved and resolution is not None and resolution.tier is Tier.MEDIUM
@@ -1029,9 +1057,19 @@ class IncidentEngine:
     # ── response loop (GDD §9.3) ─────────────────────────────────────────────
 
     async def respond(
-        self, incident_id: int, user_id: int, state: ResponderState
+        self,
+        incident_id: int,
+        user_id: int,
+        state: ResponderState,
+        *,
+        display_name: str | None = None,
     ) -> IncidentOutcome:
-        """Button press: upsert the responder row and edit the card in place."""
+        """Button press: upsert the responder row and edit the card in place.
+
+        ``display_name`` is the clicker's guild display name; the registered
+        callsign wins over it, and either makes the spoken callout name WHO is
+        coming — "Space Junkie responding to Otanuomi." — instead of a bare
+        count (the count remains the fallback when no name is known)."""
         async with self._lock:
             now = self._clock()
 
@@ -1064,8 +1102,13 @@ class IncidentEngine:
                 await self._poster.edit(incident.channel_id, incident.message_id, "", card)
             utterance: str | None = None
             if state is ResponderState.OTW and previous is not ResponderState.OTW:
-                otw = sum(1 for s in incident.responders.values() if s is ResponderState.OTW)
-                utterance = f"{_number_word(otw)} responding to {system_name}."
+                name = self._callsigns.lookup(user_id) or display_name
+                if name:
+                    spoken_system = system_name if system_name != "unknown" else None
+                    utterance = tts.responder_named(name, spoken_system)
+                else:
+                    otw = sum(1 for s in incident.responders.values() if s is ResponderState.OTW)
+                    utterance = f"{_number_word(otw)} responding to {system_name}."
             log.info(
                 "responder_updated",
                 incident_id=incident_id,

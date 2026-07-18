@@ -152,7 +152,7 @@ async def test_engine_help_speaks_hint_and_logs(tmp_path: Any) -> None:
     outcome = await engine.report(1, 42, parsed, None)
 
     assert outcome.outcome is Outcome.POSTED
-    assert outcome.utterance == "Check help in Discord."
+    assert outcome.utterance == "Command list posted to Discord."
     assert outcome.card is None  # posts nothing
     assert outcome.incident_id is None
     row = db.query_one(conn, "SELECT * FROM command_log")
@@ -163,7 +163,7 @@ async def test_engine_help_speaks_hint_and_logs(tmp_path: Any) -> None:
 
 
 def test_help_utterance_catalogue() -> None:
-    assert tts.help_hint() == "Check help in Discord."
+    assert tts.help_hint() == "Command list posted to Discord."
 
 
 # ── the /help slash twin (thin-adapter wiring, test_subs_cog pattern) ────────

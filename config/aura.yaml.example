@@ -25,7 +25,10 @@ wake:
   # The phrase itself ("aura command", GDD §5.2) is baked into the trained
   # model below — changing it means training a new model, not editing config.
   model:  /opt/aura/models/wake/aura_command.onnx  # trained openWakeWord ONNX chain
-  threshold: 0.55                      # wake score needed to open a capture window
+  threshold: 0.55                      # wake score needed to open a capture window.
+                                       # The trigger is single-frame (no debounce): below
+                                       # ~0.45 ambient chatter false-fires constantly, and
+                                       # every false wake is an STT decode + a junk relay.
   refractory_ms: 2000                  # per-user dead time after a wake hit
   ack: beep                            # how AURA acknowledges the wake word:
                                        #   voice = speak "Go ahead." (talks back)
@@ -46,6 +49,9 @@ stt:
   cpu_threads: 2                       # inference threads (droplet has 2 dedicated vCPUs)
   bias_with_gazetteer: true            # pass system names as Whisper initial_prompt
   whisper_cpp_url: http://127.0.0.1:8080/inference  # used only when backend: whisper-cpp
+  relay_min_logprob: -0.9              # freeform relays below this Whisper confidence are
+                                       # dropped with "Say again" instead of posted (GDD §8.6);
+                                       # recognised commands are never gated by this.
 
 matching:
   phonetic_weight: 0.6                 # weight of metaphone similarity (constraint 7)
