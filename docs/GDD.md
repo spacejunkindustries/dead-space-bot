@@ -961,6 +961,13 @@ type 0x03  TTS            Brain→Ears
 { "t": "optouts", "user_ids": ["…", "…"] }   // enforced in Ears, pre-IPC
 ```
 
+Brain replays the current `join` (and the opt-out set) the moment Ears
+(re)connects. A freshly started Ears process reaches the socket before its
+own Discord gateway is READY, so Ears **holds join/leave commands until
+READY** and executes them then — the Songbird manager cannot create calls
+before serenity initialises it, and acting early would crash the voice
+control task.
+
 ---
 
 ## 16. Configuration reference

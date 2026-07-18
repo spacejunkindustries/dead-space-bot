@@ -20,15 +20,22 @@ use serenity::client::{Client, Context, EventHandler};
 use serenity::model::gateway::{GatewayIntents, Ready};
 use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::{SerenityInit, Songbird};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-struct GatewayHandler;
+struct GatewayHandler {
+    /// Flipped true on the first READY. Songbird's manager panics on
+    /// `get_or_insert` until serenity has initialised it with shard/user
+    /// data, which happens at READY — voice.rs holds Brain's join/leave
+    /// commands behind this flag so an early IPC replay cannot race it.
+    ready_tx: watch::Sender<bool>,
+}
 
 #[async_trait]
 impl EventHandler for GatewayHandler {
     async fn ready(&self, _ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, guilds = ready.guilds.len(), "discord gateway ready");
+        let _ = self.ready_tx.send(true);
     }
 }
 
@@ -59,9 +66,11 @@ async fn main() -> Result<()> {
         .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
     let manager = Songbird::serenity_from_config(songbird_config);
 
+    let (ready_tx, ready_rx) = watch::channel(false);
+
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
     let mut client = Client::builder(&token, intents)
-        .event_handler(GatewayHandler)
+        .event_handler(GatewayHandler { ready_tx })
         .register_songbird_with(Arc::clone(&manager))
         .await
         .context("building serenity client")?;
@@ -79,6 +88,7 @@ async fn main() -> Result<()> {
         Arc::clone(&shared),
         out_tx.clone(),
         voice_cmd_rx,
+        ready_rx,
     ));
     let playback_task = tokio::spawn(playback::run_playback(
         Arc::clone(&manager),

@@ -226,13 +226,30 @@ impl EventHandler for Receiver {
 /// Execute join/leave commands from Brain against the Songbird manager.
 ///
 /// Runs until the command channel closes.
+///
+/// Commands are held until `ready_rx` reports the gateway READY: Brain
+/// replays the current join the instant the IPC socket connects, which on a
+/// fresh Ears process is ~half a second *before* serenity initialises the
+/// Songbird manager — and `Songbird::get_or_insert` panics until then,
+/// killing this task and silently dropping every subsequent join. The mpsc
+/// channel buffers whatever arrives while we wait, so nothing is lost.
 pub async fn run_voice_control(
     manager: Arc<Songbird>,
     shared: Arc<Shared>,
     out_tx: mpsc::UnboundedSender<Outbound>,
     mut rx: mpsc::UnboundedReceiver<VoiceCmd>,
+    mut ready_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     while let Some(cmd) = rx.recv().await {
+        if !*ready_rx.borrow() {
+            info!(?cmd, "gateway not ready; holding voice command");
+            if ready_rx.wait_for(|ready| *ready).await.is_err() {
+                // Sender dropped => the serenity client is gone; we are
+                // shutting down and the command can never be executed.
+                warn!("gateway ready signal closed; stopping voice control");
+                return;
+            }
+        }
         match cmd {
             VoiceCmd::Join {
                 guild_id,
