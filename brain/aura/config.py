@@ -1,4 +1,4 @@
-"""Configuration loading, validation, and hot-reload for AURA Brain.
+"""Configuration loading, validation, and hot-reload for CORTANA Brain.
 
 Mirrors ``config/aura.yaml.example`` / GDD §16 one dataclass per section.
 ``load_config`` validates types and ranges and raises :class:`ConfigError`
@@ -60,7 +60,7 @@ class DiscordConfig:
     watch_voice_channels: tuple[int, ...]
     auto_join: bool
     #: Master switch for role/@here pings. False = "silent mode": incidents and
-    #: relays still post to the channel, but AURA mentions nobody and the
+    #: relays still post to the channel, but CORTANA mentions nobody and the
     #: @Pilot trigger gate is lifted (there is nothing to protect). Turn on once
     #: real roles are wired into routing.yaml.
     mentions_enabled: bool = True
@@ -82,7 +82,7 @@ class WakeConfig:
     model: str
     threshold: float
     refractory_ms: int
-    #: How AURA acknowledges the wake word to the pilot:
+    #: How CORTANA acknowledges the wake word to the pilot:
     #: "voice" = speak "Go ahead." (Cortana talks back), "beep" = an instant
     #: tone (fast, no synthesis latency), "none" = silent. Default "beep".
     ack: str = "beep"
@@ -135,7 +135,7 @@ class SttConfig:
     whisper_cpp_url: str
     #: Minimum Whisper avg_logprob for a transcript that matched NO grammar
     #: intent to be posted as a freeform relay (GDD §8.6). Below this the
-    #: transcript is treated as unintelligible — AURA says "Say again" instead
+    #: transcript is treated as unintelligible — CORTANA says "Say again" instead
     #: of posting hallucinated noise to the intel channel. Recognised commands
     #: are never gated by this (a distress call always posts).
     relay_min_logprob: float = -0.9
@@ -204,7 +204,7 @@ class TtsConfig:
     effect: str = "none"
     #: Spoken-line flavour: "standard" keeps the exact GDD §12.1 catalogue;
     #: "cortana" rotates acknowledgement lines ("Go ahead." / "Listening." /
-    #: "Send it.") so AURA feels alive. Info-carrying lines never vary.
+    #: "Send it.") so CORTANA feels alive. Info-carrying lines never vary.
     personality: str = "standard"
     # Ducking level and talk-over suppression are fixed playback mechanics in
     # Ears (ears/src/playback.rs) — deliberately not tunables here.

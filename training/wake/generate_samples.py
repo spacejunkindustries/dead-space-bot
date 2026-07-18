@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic sample generation for the AURA wake phrase.
+"""Synthetic sample generation for the CORTANA wake phrase.
 
 OFFLINE pipeline — runs on a GPU box or Colab, never on the droplet, and is
 never imported by brain/. Install deps from training/wake/requirements-train.txt
@@ -420,7 +420,7 @@ def stage_augment(cfg: dict[str, Any], overwrite: bool = False) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "AURA wake-word synthetic sample generation (offline; GPU box or Colab). "
+            "CORTANA wake-word synthetic sample generation (offline; GPU box or Colab). "
             "Runs the asset-fetch and clip-generation stages of the official "
             "openWakeWord training flow."
         )

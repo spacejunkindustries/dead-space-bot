@@ -3,7 +3,7 @@ name = "aura-ears"
 version = "1.0.0"
 edition = "2021"
 rust-version = "1.83"
-description = "AURA voice socket: DAVE-capable Discord audio pump (Songbird 0.6)"
+description = "CORTANA voice socket: DAVE-capable Discord audio pump (Songbird 0.6)"
 license = "MIT"
 publish = false
 

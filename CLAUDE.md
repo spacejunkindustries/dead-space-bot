@@ -1,4 +1,4 @@
-# AURA — project guide for Claude Code
+# CORTANA (codename AURA) — project guide for Claude Code
 
 Voice-activated fleet intel bot for an EVE Echoes corp Discord. Self-hosted on a DigitalOcean droplet.
 
@@ -49,7 +49,7 @@ A self-deafened bot receives no audio and raises no error. Silent, total failure
 
 **5. Audio never touches disk. Not once.**
 Not for debugging. Not in tests. Not behind a feature flag. Not in a temp file. RAM ring buffer only, overwritten every 1.5s.
-This is the privacy guarantee the corp is asked to trust (GDD §19) and it is the reason AURA sidesteps recording-consent law entirely. Breaking it once breaks it permanently.
+This is the privacy guarantee the corp is asked to trust (GDD §19) and it is the reason CORTANA sidesteps recording-consent law entirely. Breaking it once breaks it permanently.
 Need to debug the audio path? Log the **transcript** and the confidence score. `command_log` exists for this.
 
 **6. No LLM in the command path.**
@@ -66,7 +66,7 @@ There is one supported exception: **`include_all` mode** (`gazetteer.yaml`). Som
 One incident = one message, updated. Never post a second message for the same incident. Five pilots reporting one gate camp produce one card reading "reported by 5". GDD §9.1.
 
 **10. Every voice command has a slash-command twin hitting the same engine.**
-Non-negotiable invariant. Voice receive is undocumented and can break without notice; the slash path is what keeps AURA alive when it does. If you add a voice command without its twin, the PR is incomplete. GDD §20.
+Non-negotiable invariant. Voice receive is undocumented and can break without notice; the slash path is what keeps CORTANA alive when it does. If you add a voice command without its twin, the PR is incomplete. GDD §20.
 
 **11. `@here` only for `UNDER_ATTACK` and `ASSIST_REQUEST`.**
 Never for sightings. Ever. Notification fatigue kills this bot faster than any bug. GDD §11.

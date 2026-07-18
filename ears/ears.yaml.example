@@ -1,4 +1,4 @@
-# AURA Ears configuration — /etc/aura/ears.yaml
+# CORTANA Ears configuration — /etc/aura/ears.yaml
 #
 # Ears is a dumb audio pump: this file carries plumbing only. Every knob
 # about *meaning* (thresholds, matching, routing) lives in Brain's aura.yaml.

@@ -1,4 +1,4 @@
-# AURA Brain — phase-1 interface contract
+# CORTANA Brain — phase-1 interface contract
 
 This document is the contract the Brain modules are built against. Signatures
 here are normative; if an implementation must diverge, update this file in the

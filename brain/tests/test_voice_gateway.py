@@ -1,7 +1,7 @@
 """Voice gateway census → join/leave steering.
 
 Regression coverage for the muted-pilot bug: a pilot sitting in voice muted
-until they need to shout a report is *present*, so AURA must stay with them
+until they need to shout a report is *present*, so CORTANA must stay with them
 (GDD §1.2). Only the §20 silence alarm cares about the unmuted count.
 """
 
@@ -62,7 +62,7 @@ def test_census_counts_present_and_unmuted_separately() -> None:
             _member(),  # unmuted human
             _member(self_mute=True),  # muted human — present, not unmuted
             _member(mute=True),  # server-muted human — present, not unmuted
-            _member(bot=True),  # AURA itself — never counted
+            _member(bot=True),  # CORTANA itself — never counted
         ]
     )
     present, unmuted = AuraBot._human_census(channel)
@@ -72,7 +72,7 @@ def test_census_counts_present_and_unmuted_separately() -> None:
 
 def test_census_member_without_voice_state_counts_as_present() -> None:
     # Transient cache: member is in the channel list but .voice is momentarily
-    # None. They are present (keep AURA) but not countable as unmuted.
+    # None. They are present (keep CORTANA) but not countable as unmuted.
     channel = SimpleNamespace(members=[SimpleNamespace(bot=False, voice=None)])
     present, unmuted = AuraBot._human_census(channel)
     assert present == 1
@@ -86,7 +86,7 @@ def test_census_member_without_voice_state_counts_as_present() -> None:
 async def test_muted_present_pilot_does_not_trigger_leave() -> None:
     ipc = _FakeIpc()
     gw = _gateway(_StubHolder(), ipc)
-    gw._joined_channel_id = CHANNEL  # AURA is already in the channel
+    gw._joined_channel_id = CHANNEL  # CORTANA is already in the channel
 
     # One pilot present but fully muted: present=1, unmuted=0.
     await gw.on_voice_update(CHANNEL, 1, 0)
@@ -112,7 +112,7 @@ async def test_muted_present_pilot_schedules_join() -> None:
     ipc = _FakeIpc()
     gw = _gateway(_StubHolder(), ipc)
 
-    # Not joined yet; a present-but-muted pilot must still pull AURA in.
+    # Not joined yet; a present-but-muted pilot must still pull CORTANA in.
     await gw.on_voice_update(CHANNEL, 1, 0)
 
     assert gw._pending_channel_id == CHANNEL

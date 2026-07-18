@@ -1,6 +1,6 @@
 """Personal ping subscriptions — GDD §10.3 "ping me for gate camps in Otanuomi".
 
-A **user mention, not a role**: each subscription asks AURA to append this
+A **user mention, not a role**: each subscription asks CORTANA to append this
 user's mention to the mention line of matching incident cards. The role model
 of GDD §10 is unchanged — personal pings are additive, capped per user
 (``discipline.personal_pings_max``), and ride the exact same discipline path

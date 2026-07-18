@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aura"
 version = "1.0.0"
-description = "AURA Brain — voice-activated fleet intel bot for an EVE Echoes corp Discord"
+description = "CORTANA Brain — voice-activated fleet intel bot for an EVE Echoes corp Discord"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 dependencies = [

@@ -639,3 +639,60 @@ def test_relay_framed_rejects_unframed_speech() -> None:
     assert not relay_framed("Rens, Rens, Rens")
     assert not relay_framed("hey jarvis Kisogo")
     assert not relay_framed("")
+
+
+# ── chase mode + "system" noise word (GDD §13 / §6.3) ────────────────────────
+
+
+def test_system_noise_word_is_stripped_from_the_window() -> None:
+    from aura.nlu.grammar import parse
+
+    p = parse("I'm tackled code red in system UMI over")
+    assert p is not None
+    assert p.intent is Intent.UNDER_ATTACK
+    assert p.system_text == "UMI"
+    assert p.severity is Severity.HIGH
+
+    p2 = parse("hostiles code orange system Otanuomi, three battleships over")
+    assert p2 is not None
+    assert p2.system_text == "Otanuomi"
+    assert p2.detail == "three battleships"
+
+
+def test_chase_update_parses_with_and_without_update_prefix() -> None:
+    from aura.nlu.grammar import parse
+
+    for heard in ("update chase Kisogo", "chase Kisogo", "hey cortana update chase mode UMI over"):
+        p = parse(heard)
+        assert p is not None, heard
+        assert p.intent is Intent.CHASE_UPDATE, heard
+        assert p.system_text in ("Kisogo", "UMI")
+
+
+def test_bare_chase_mode_parses_without_system() -> None:
+    from aura.nlu.grammar import parse
+
+    p = parse("hey cortana chase mode")
+    assert p is not None
+    assert p.intent is Intent.CHASE_UPDATE
+    assert p.system_text is None
+
+
+def test_distress_words_always_beat_chase() -> None:
+    from aura.nlu.grammar import parse
+
+    # "tackled ... chase" is a distress call, never a chase command.
+    p = parse("I'm tackled in Kisogo they're giving chase")
+    assert p is not None
+    assert p.intent is Intent.UNDER_ATTACK
+
+
+def test_mid_sentence_chase_chatter_never_claims_the_intent() -> None:
+    from aura.nlu.grammar import parse
+
+    # A live card must never be silently retargeted by chatter.
+    assert parse("let's chase them down") is None
+    assert parse("we should chase him") is None
+    # The explicit forms work anywhere; bare "chase" only leads.
+    p = parse("okay update chase Alenia")
+    assert p is not None and p.intent is Intent.CHASE_UPDATE

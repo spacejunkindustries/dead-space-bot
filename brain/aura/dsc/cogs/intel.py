@@ -165,6 +165,34 @@ class IntelCog(commands.Cog):
     async def clear(self, interaction: discord.Interaction, system: str) -> None:
         await self._report(interaction, Intent.RESOLVE, system, None, "clear")
 
+    @app_commands.command(
+        name="chase", description="Chase mode: retarget your live incident as the target moves"
+    )
+    @app_commands.describe(system="System the target moved to (any name — no exact match needed)")
+    @app_commands.autocomplete(system=system_autocomplete)
+    async def chase(self, interaction: discord.Interaction, system: str) -> None:
+        # Voice twin: "update chase <system>" (constraint 10). Deliberately
+        # NOT routed through _report: chase is flexible — an unknown or
+        # misheard system rides the card verbatim instead of rejecting.
+        if interaction.guild_id is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        resolution = resolve_typed_system(self.bot.gazetteer, system)  # None is fine here
+        parsed = ParsedCommand(
+            intent=Intent.CHASE_UPDATE,
+            system_text=system,
+            group_alias=None,
+            detail=None,
+            raw=f"/chase {system}",
+        )
+        outcome = await self.bot.engine.report(
+            interaction.guild_id, interaction.user.id, parsed, resolution
+        )
+        await interaction.followup.send(
+            outcome_text(outcome.outcome, outcome.utterance), ephemeral=True
+        )
+
     @app_commands.command(name="status", description="Active incidents summary")
     async def status(self, interaction: discord.Interaction) -> None:
         if interaction.guild_id is None:

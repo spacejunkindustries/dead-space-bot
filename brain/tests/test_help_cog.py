@@ -211,7 +211,7 @@ async def test_slash_help_dispatches_through_engine_and_sends_menu() -> None:
     ((content, kwargs),) = interaction.response.messages
     assert content is None
     assert kwargs["ephemeral"] is True
-    assert kwargs["embed"].title == "AURA — voice-activated fleet intel"
+    assert kwargs["embed"].title == "CORTANA — voice-activated fleet intel"
     # Non-admin menu: one select, admin topic absent from its options.
     select = kwargs["view"].children[0]
     assert select.custom_id == "aura:help:menu"

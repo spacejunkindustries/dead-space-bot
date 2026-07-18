@@ -142,6 +142,17 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
     (Intent.ASSIST_REQUEST, re.compile(r"\bneed\s+(?:help|backup|back\s*up)\b", re.I)),
     (Intent.HOSTILE_SPOTTED, re.compile(r"\bhostiles?\b|\breds?\b|\bneuts?\b", re.I)),
     (Intent.GATE_CAMP, re.compile(r"\bgate\s*camp(?:ed|ers)?\b", re.I)),
+    # Chase mode (GDD §13.1): "update chase Kisogo" / "chase Kisogo"
+    # retargets the pilot's live incident card as the target moves. Below the
+    # distress intents so "tackled … giving chase" is never claimed. A BARE
+    # "chase" only counts in leading position (the utterance is wake-gated,
+    # so a command starts with it) — mid-sentence chatter like "let's chase
+    # them down" must never silently retarget a live card; the explicit forms
+    # "update chase" / "chase mode" work anywhere.
+    (
+        Intent.CHASE_UPDATE,
+        re.compile(r"\bupdate\s+chase\b(?:\s+mode)?|\bchase\s+mode\b|^\W*chase\b", re.I),
+    ),
     (Intent.RESOLVE, re.compile(r"\bclear(?:ed)?\b", re.I)),
     (Intent.TIMER, re.compile(r"\btimer\b", re.I)),
     (Intent.FORMUP, re.compile(r"\bform(?:\s|-)?up\b", re.I)),
@@ -177,7 +188,26 @@ _GROUP_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # ("tackled *in* Kisogo"). Stripped from the system window only; detail stays
 # verbatim.
 _FILLER = frozenset(
-    ("in", "at", "on", "near", "the", "a", "an", "um", "uh", "er", "im", "i'm", "we're", "were")
+    (
+        "in",
+        "at",
+        "on",
+        "near",
+        "the",
+        "a",
+        "an",
+        "um",
+        "uh",
+        "er",
+        "im",
+        "i'm",
+        "we're",
+        "were",
+        # "in system UMI" — "system" is a noise word before the name, never
+        # part of it; pilots say it constantly and it wrecked resolution.
+        "system",
+        "systems",
+    )
 )
 
 # Where a spoken duration starts, for splitting "timer Kisogo four hours".
@@ -439,7 +469,7 @@ def bare_code(transcript: str) -> Severity | None:
 
     "Code orange." with nothing else after wake/sign-off stripping means the
     pilot is announcing severity first and will give the report in the next
-    breath: AURA acknowledges and reopens a wake-free capture window. Returns
+    breath: CORTANA acknowledges and reopens a wake-free capture window. Returns
     the severity, or ``None`` when the utterance carries other content (then
     the code rides along inline instead).
     """

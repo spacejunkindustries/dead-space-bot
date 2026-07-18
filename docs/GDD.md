@@ -1,4 +1,6 @@
-# AURA — Voice-Activated Fleet Intel Bot
+# CORTANA — Voice-Activated Fleet Intel Bot
+
+> **Naming.** The bot presents as **CORTANA** everywhere a user sees or hears it. The internal codename remains **aura**: the Python package, repository layout, systemd units (`aura-brain`/`aura-ears`), and filesystem paths (`/opt/aura`, `/etc/aura`, `/run/aura`) keep the old name deliberately — renaming live infrastructure buys no user-visible change and risks the running deployment.
 
 **Game Design Document**
 EVE Echoes corp utility bot · self-hosted on DigitalOcean
@@ -8,15 +10,15 @@ Version 1.0 · July 2026
 
 ## 1. Product definition
 
-AURA sits in your corp's Discord voice channel and listens for spoken reports. A player under attack says:
+CORTANA sits in your corp's Discord voice channel and listens for spoken reports. A player under attack says:
 
 > **"Aura Command, hostiles Otanuomi, three battleships"**
 
-Roughly a second and a half later, AURA posts a live incident card in `#intel-alerts`, mentions the roles that subscribe to that system, and speaks back into voice:
+Roughly a second and a half later, CORTANA posts a live incident card in `#intel-alerts`, mentions the roles that subscribe to that system, and speaks back into voice:
 
 > *"Hostiles Otanuomi, pinged home defense."*
 
-Corpmates tap **🚀 On my way**. AURA speaks again:
+Corpmates tap **🚀 On my way**. CORTANA speaks again:
 
 > *"Two responding to Otanuomi."*
 
@@ -34,17 +36,17 @@ EVE Echoes is a mobile game. Calling for help currently means putting the game d
 | Ping the right role | 2–5s |
 | **Total** | **20–40s — you are already in a pod** |
 
-AURA's path: **~1–2 seconds from the moment you stop talking.** That gap is the entire product.
+CORTANA's path: **~1–2 seconds from the moment you stop talking.** That gap is the entire product.
 
 ### 1.2 Operating envelope
 
-AURA is built for the **solo and small-gang player** — ratting, mining, or roaming, jumped without warning, hands full, no time to type.
+CORTANA is built for the **solo and small-gang player** — ratting, mining, or roaming, jumped without warning, hands full, no time to type.
 
-It is explicitly **not** built to run during structured fleet ops with an FC on comms. People shouting at a bot would step all over fleet command. AURA ships with a **fleet-ops mode** (§11.4) that restricts voice triggering to the FC role, and corps are expected to use it. Design for the lonely ratter.
+It is explicitly **not** built to run during structured fleet ops with an FC on comms. People shouting at a bot would step all over fleet command. CORTANA ships with a **fleet-ops mode** (§11.4) that restricts voice triggering to the FC role, and corps are expected to use it. Design for the lonely ratter.
 
 ### 1.3 Scope
 
-AURA is a complete corp utility bot. It ships with:
+CORTANA is a complete corp utility bot. It ships with:
 
 - Voice-triggered incident reporting
 - Live incident tracking with response coordination
@@ -63,13 +65,13 @@ This section is normative. It dictates the tech stack, and much of the public gu
 
 ### 2.1 Speaking is easy and fully supported
 
-Playing audio into a voice channel is a documented, first-class Discord feature supported by every voice library. AURA's spoken back-channel carries no platform risk.
+Playing audio into a voice channel is a documented, first-class Discord feature supported by every voice library. CORTANA's spoken back-channel carries no platform risk.
 
 ### 2.2 Listening is undocumented and always has been
 
 Voice **receive** is not documented by Discord. Every library that implements it did so by reverse engineering, and Discord has stated it is unlikely to ever officially support or document the feature. It works, it is not guaranteed, and it can break on a Discord-side change with no notice.
 
-This is a permanent structural property of the platform, not a defect in AURA. §20 specifies how AURA absorbs it: **every voice capability has a slash-command twin backed by the same engine**, so a broken receive path costs AURA its speed advantage and nothing else.
+This is a permanent structural property of the platform, not a defect in CORTANA. §20 specifies how CORTANA absorbs it: **every voice capability has a slash-command twin backed by the same engine**, so a broken receive path costs CORTANA its speed advantage and nothing else.
 
 ### 2.3 DAVE: end-to-end encryption is mandatory
 
@@ -77,7 +79,7 @@ Discord completed its rollout of the **DAVE protocol** (Discord Audio & Video En
 
 Consequences that shape this design:
 
-- AURA must join the MLS group and negotiate DAVE simply to enter a voice channel.
+- CORTANA must join the MLS group and negotiate DAVE simply to enter a voice channel.
 - Any bot, tutorial, or library last touched before 2026 is dead on arrival.
 - **Library support is now the binding constraint on the stack.** Most options are non-viable.
 
@@ -94,22 +96,22 @@ Consequences that shape this design:
 It is also, fortunately, an excellent fit:
 
 - **`VoiceTick` fires every 20ms** carrying **per-user, reordered, jitter-buffered, decoded PCM** — synchronised across speakers, ready to consume.
-- Per-user streams keyed by SSRC, mapped to user IDs via speaking-state events. AURA always knows *who* said something.
+- Per-user streams keyed by SSRC, mapped to user IDs via speaking-state events. CORTANA always knows *who* said something.
 - Symphonia in-process; ffmpeg removed entirely. Light footprint.
-- Deadline-aware scheduler — ~660 concurrent Opus-passthrough calls on a single thread on a Ryzen 5700X. AURA needs one.
+- Deadline-aware scheduler — ~660 concurrent Opus-passthrough calls on a single thread on a Ryzen 5700X. CORTANA needs one.
 
-### 2.5 Other platform facts AURA depends on
+### 2.5 Other platform facts CORTANA depends on
 
 - **Self-deaf must be off.** A self-deafened bot receives nothing and raises no error. This is the single most common cause of a silent voice bot.
 - Bots respect the voice channel user limit unless granted `MOVE_MEMBERS`.
-- Discord exposes an `allow_voice_recording` voice flag per member — whether that user has consented to being clipped. AURA reads it as a consent signal (§19).
-- Stage channels are excluded from DAVE and remain unencrypted. Not used by AURA.
+- Discord exposes an `allow_voice_recording` voice flag per member — whether that user has consented to being clipped. CORTANA reads it as a consent signal (§19).
+- Stage channels are excluded from DAVE and remain unencrypted. Not used by CORTANA.
 - The `GUILD_VOICE_STATES` intent is required.
-- Discord's client-side voice activity gating means AURA receives packets **only from users actively transmitting**. Idle listeners cost nothing.
+- Discord's client-side voice activity gating means CORTANA receives packets **only from users actively transmitting**. Idle listeners cost nothing.
 
 ### 2.6 Python is not excluded — only Python *voice* is
 
-discord.py's gateway, slash commands, components, roles, and REST are unaffected by the DAVE change. Only `VoiceClient` is broken. AURA therefore uses Rust exclusively for the audio socket and Python for everything else — which is where the speech and phonetics ecosystem lives.
+discord.py's gateway, slash commands, components, roles, and REST are unaffected by the DAVE change. Only `VoiceClient` is broken. CORTANA therefore uses Rust exclusively for the audio socket and Python for everything else — which is where the speech and phonetics ecosystem lives.
 
 ---
 
@@ -265,13 +267,13 @@ Songbird VoiceTick (20ms, per-user decoded PCM 48kHz)
        └─► refractory period: 2s per user after a hit
 ```
 
-**Wake acknowledgement.** The instant the capture window opens, AURA tells the pilot it is listening — so they know to start talking, not repeat the wake word. The form is `wake.ack`: `voice` speaks *"Go ahead."*, `beep` plays an instant tone, `none` is silent. `beep` is the default because the tone is instant, while a spoken cue costs one Piper synthesis; corps that want AURA to talk back set `voice`. The cue plays at ALERT priority (jumping the queue) and, since AURA never captures its own playback, never bleeds into the utterance being recorded.
+**Wake acknowledgement.** The instant the capture window opens, CORTANA tells the pilot it is listening — so they know to start talking, not repeat the wake word. The form is `wake.ack`: `voice` speaks *"Go ahead."*, `beep` plays an instant tone, `none` is silent. `beep` is the default because the tone is instant, while a spoken cue costs one Piper synthesis; corps that want CORTANA to talk back set `voice`. The cue plays at ALERT priority (jumping the queue) and, since CORTANA never captures its own playback, never bleeds into the utterance being recorded.
 
 ### 5.1 Wake word
 
 **Engine: openWakeWord** (Apache 2.0). Free, self-hosted, no per-seat licensing, and it benchmarks competitively against the leading commercial engine. Custom phrases are trained from a synthetic TTS pipeline; the trained ONNX chain ships in `/opt/aura/models/wake/`.
 
-*Porcupine is the mature commercial alternative — type-to-train, instant custom words — but its free tier is scoped to personal use and commercial licensing starts around $6k/yr. A 50-pilot corp bot is not a comfortable fit for the free tier. AURA does not require it.*
+*Porcupine is the mature commercial alternative — type-to-train, instant custom words — but its free tier is scoped to personal use and commercial licensing starts around $6k/yr. A 50-pilot corp bot is not a comfortable fit for the free tier. CORTANA does not require it.*
 
 ### 5.2 The wake phrase
 
@@ -290,7 +292,7 @@ The phrase is configurable. The 6-phoneme / no-collision rule is not optional �
 
 ### 5.3 Speech recognition
 
-**Default backend: faster-whisper, `small`, int8, CPU.** ~3.4% WER on clean English, ~2GB RAM, and sub-second on the 2–4s clips AURA actually feeds it. CTranslate2 releases the GIL during inference, so it runs in a thread pool without blocking the event loop.
+**Default backend: faster-whisper, `small`, int8, CPU.** ~3.4% WER on clean English, ~2GB RAM, and sub-second on the 2–4s clips CORTANA actually feeds it. CTranslate2 releases the GIL during inference, so it runs in a thread pool without blocking the event loop.
 
 **Alternative backend: whisper.cpp HTTP server.** Selectable via `stt.backend`. Its native quantized kernels are more predictable on CPU-only hosts; the tradeoff is an extra process. Both implement the same `Transcriber` protocol.
 
@@ -328,7 +330,7 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 
 Higher-severity patterns are matched first, so *"tackled, need help in Kisogo"* resolves to `UNDER_ATTACK`, not a sighting. The personal-ping intents are the one exception: their utterances *contain* type words ("ping me for gate camps"), so `PING_ME`/`PING_ME_CLEAR` are matched before the type words can claim the utterance — a genuine distress call never contains "ping me".
 
-`PING_ME` (§10.3) reuses the type vocabulary above: *hostiles/reds/neuts* → `HOSTILE_SPOTTED`, *gate camp(s)* → `GATE_CAMP`, *under attack/attacks/tackled* → `UNDER_ATTACK`, *need help/need backup/assist request(s)* → `ASSIST_REQUEST`, and *"anything"/"everything"/"all"* (or no type word at all) → all four. The optional system window resolves through the same phonetic pipeline as reports (§8.2); anything below HIGH tier is treated as unresolved — a subscription silently scoped to the wrong system would never fire, so AURA answers *"Say again the system."* instead of guessing. No system means the subscription covers all systems. The recognised types travel to the engine encoded in `detail` (comma-separated `Intent` values), shared by the `/pingme` twin.
+`PING_ME` (§10.3) reuses the type vocabulary above: *hostiles/reds/neuts* → `HOSTILE_SPOTTED`, *gate camp(s)* → `GATE_CAMP`, *under attack/attacks/tackled* → `UNDER_ATTACK`, *need help/need backup/assist request(s)* → `ASSIST_REQUEST`, and *"anything"/"everything"/"all"* (or no type word at all) → all four. The optional system window resolves through the same phonetic pipeline as reports (§8.2); anything below HIGH tier is treated as unresolved — a subscription silently scoped to the wrong system would never fire, so CORTANA answers *"Say again the system."* instead of guessing. No system means the subscription covers all systems. The recognised types travel to the engine encoded in `detail` (comma-separated `Intent` values), shared by the `/pingme` twin.
 
 The callsign commands are a **name registry keyed on the Discord user id** Ears already attaches to every utterance (the SSRC→user map, §15). There are no voice biometrics and nothing derived from the audio — identity comes from Discord, the callsign is just a display name (§19 posture unchanged). The spoken callsign is the cleaned post-intent remainder: filler stripped, title-cased, markdown/mention characters removed, capped at 32 characters. `/register` (the typed twin) stores the callsign exactly as typed, which is also how a pilot fixes an STT misspelling.
 
@@ -351,7 +353,7 @@ Anything after the system and group is captured verbatim into the incident body:
 The card labels (CODE RED / CODE ORANGE / CODE YELLOW, §9.1) are also **input**: a pilot can speak the colour to set or override severity.
 
 - **Inline** — *"code red, hostiles in UMI"*: the report parses normally and carries `severity=high`; the card renders CODE RED and, when `high` is in `here_on_severity`, fires the colour-based `@here` (§11.3). The colour phrase is stripped before intent matching, so *"code red"* can never be misread as a "reds" sighting.
-- **Standalone (dialogue)** — *"code orange"* alone: AURA replies *"Code orange. Go ahead."*, reopens a wake-free capture window (the §8.3 mechanism), and the pilot's next utterance — report or freeform relay — inherits the severity. An inline colour on the follow-up wins over the opener.
+- **Standalone (dialogue)** — *"code orange"* alone: CORTANA replies *"Code orange. Go ahead."*, reopens a wake-free capture window (the §8.3 mechanism), and the pilot's next utterance — report or freeform relay — inherits the severity. An inline colour on the follow-up wins over the opener.
 - **Relays** — a colour on a freeform relay colours the relay card and rides the same `here_on_severity` escalation: *"code red, blop fleet inbound"* pings like any CODE RED.
 
 Mapping: red → high, orange → medium, yellow → none/info. A leading *"report"* and a trailing *"end report"* / *"end of report"* / *"end transmission"* are radio-procedure framing and are stripped (*"report, I've been tackled in UMI, end report"*).
@@ -380,7 +382,7 @@ Fifteen commands. Short enough that pilots remember them under fire, which is th
 
 An **explicitly-invoked** chat channel, off by default (`chat.enabled`). When a pilot opens an utterance with *"command override"* (after the wake word), everything that follows goes to a cloud Claude model — general questions, banter, live facts via one web search — and the answer is spoken back (or posted to the intel channel when it exceeds the §12.2 cap, with *"Answer posted to Discord."* spoken instead). Slash twin: `/ask` (constraint 10), sharing the same client and the same per-pilot cooldown.
 
-**Constraint 6 is untouched.** The incident grammar never sees an LLM: the override prefix is matched *first* and only in leading position, so a report containing the word "override" mid-sentence can never be diverted, and a non-override utterance never reaches the model. The model is instructed to never invent in-game intel — hostiles, timers, and system status come only from AURA's own reports.
+**Constraint 6 is untouched.** The incident grammar never sees an LLM: the override prefix is matched *first* and only in leading position, so a report containing the word "override" mid-sentence can never be diverted, and a non-override utterance never reaches the model. The model is instructed to never invent in-game intel — hostiles, timers, and system status come only from CORTANA's own reports.
 
 **Cost posture.** Default model is the cheapest Claude tier (fractions of a cent per question); replies are capped at `chat.max_tokens`, web search at one per question, and `chat.user_cooldown_s` throttles each pilot. The cooldown arms only on a successful answer — a failed request must not turn the pilot's retry into a throttle message. The API key rides systemd `LoadCredential=` (`anthropic:` credential; constraint 12), with `chat.api_key_file` as the 0600 dev fallback.
 
@@ -417,8 +419,8 @@ Full parity. Every voice command routes to the same engine.
 | `/pingme type [system]` | Personal ping: mention me on matching incidents (§10.3) |
 | `/mypings` | List my personal pings, ephemeral |
 | `/pingme-clear [index]` | Remove my personal pings — all, or one by `/mypings` index |
-| `/optout` | Exclude my audio from AURA entirely |
-| `/mute-voice` | Stop AURA speaking to me |
+| `/optout` | Exclude my audio from CORTANA entirely |
+| `/mute-voice` | Stop CORTANA speaking to me |
 | `/register callsign` | Register my pilot callsign, exactly as typed (fixes STT misspellings) |
 | `/unregister` | Delete my registered callsign |
 | `/whoami` | Show my registered callsign |
@@ -431,7 +433,7 @@ Full parity. Every voice command routes to the same engine.
 
 ## 8. System name resolution
 
-This subsystem decides whether AURA succeeds or fails. It is specified in the most detail because it deserves it.
+This subsystem decides whether CORTANA succeeds or fails. It is specified in the most detail because it deserves it.
 
 EVE system names are phonetically hostile — *Otanuomi*, *Kisogo*, *Alenia*, *Hulmate*, *Tannolen*. Generic English STT shreds them. And **naming the wrong system is worse than silence**: it sends the response fleet twelve jumps the wrong way while the reporter dies.
 
@@ -440,7 +442,7 @@ EVE system names are phonetically hostile — *Otanuomi*, *Kisogo*, *Alenia*, *H
 Two layers. The **seed** fills the `systems` + `system_adjacency` tables from
 the EVE static data export (Echoes uses New Eden names); the **scope rules** in
 `gazetteer.yaml` pick, at runtime, which of those systems are *active* — the
-set AURA will match a transcript against. The seed is wide on purpose so the
+set CORTANA will match a transcript against. The seed is wide on purpose so the
 scope can point anywhere without re-seeding; accuracy comes from the scope, not
 the seed.
 
@@ -474,10 +476,10 @@ code, because corps move.**
 
   **The tradeoff is real and stated honestly.** A 5,000-entry candidate set has
   more near-homophones than a 300-entry one, so raw first-pass accuracy is
-  lower than a tight scoped gazetteer. AURA leans on the rest of §8 to close the
+  lower than a tight scoped gazetteer. CORTANA leans on the rest of §8 to close the
   gap rather than on a narrow set:
 
-  - the **confidence tiers and confirm-flow** (§8.3) — AURA never silently
+  - the **confidence tiers and confirm-flow** (§8.3) — CORTANA never silently
     guesses; a MEDIUM match posts flagged with `[Wrong — fix]` and a spoken
     "say again to confirm",
   - the **context priors** (§8.4) — recency, proximity, and reporter-history
@@ -517,7 +519,7 @@ raw transcript
 
 Levenshtein on raw text alone is the wrong tool: STT errors are **phonetic, not typographic**. Whisper writes *"oh tan you oh me"* — character-distance-far from *Otanuomi*, phonetically adjacent. Metaphone collapses that gap.
 
-### 8.3 Confidence tiers — AURA never silently guesses
+### 8.3 Confidence tiers — CORTANA never silently guesses
 
 | Tier | Rule | Behaviour |
 |---|---|---|
@@ -525,9 +527,11 @@ Levenshtein on raw text alone is the wrong tool: STT errors are **phonetic, not 
 | **Medium** | `top1 ≥ 0.55` | **Post anyway**, flagged uncertain, with buttons `[Otanuomi] [Kisogo] [Wrong — fix]`. Speak *"Hostiles Otanuomi — say again to confirm."* Speed beats certainty when a pilot is in structure; get the ping out and let humans correct it. |
 | **Low** | below | Do not post. Speak *"Say again the system."* Reopen the capture window for 4s. A bare system name spoken into the reopened window is re-bound to the rejected command's intent and resolved as its system. |
 
+**Spoken readback.** When the pilot spoke a colour code, the confirmation reads the report back — *"Under attack UMI, code red, posted."* — so they hear exactly what the card says without looking at Discord. Combined with the catch-all posture (§8.6) this is the contract for misheard systems: **the action always continues**; the card carries the heard name verbatim, the readback surfaces it, and *"cancel"* (30s) or **[Wrong — fix]** repairs it.
+
 ### 8.4 Context priors
 
-Candidates are reweighted by what is plausible *right now*. A fleet fight is spatially and temporally clustered — AURA exploits that.
+Candidates are reweighted by what is plausible *right now*. A fleet fight is spatially and temporally clustered — CORTANA exploits that.
 
 | Prior | Rule |
 |---|---|
@@ -540,13 +544,13 @@ Applied as a cheap multiplicative reweighting over the top-8 base-score candidat
 
 ### 8.5 Alias learning
 
-Every time a pilot taps `[Wrong — fix]` and picks the correct system, AURA writes `(raw transcript) → (system_id)` into the alias table, which is consulted **before** phonetic matching on every subsequent utterance.
+Every time a pilot taps `[Wrong — fix]` and picks the correct system, CORTANA writes `(raw transcript) → (system_id)` into the alias table, which is consulted **before** phonetic matching on every subsequent utterance.
 
 Within a month of real use, your corp's specific accents, specific mics, and specific noisy rooms are baked in. **This is the highest-leverage component in the entire system and it is roughly forty lines of code.**
 
 ### 8.6 Recognition error is a normal operating condition
 
-Pilots use phone mics, in noisy rooms, with a game running, stressed and talking fast. AURA is engineered on the assumption that **the transcript is sometimes wrong** — not as a limitation to apologise for, but as a fact the design absorbs. The confirmation loop, the correction buttons, the confidence tiers, and the alias table are not garnish; they are the mechanism by which an imperfect signal produces a reliable tool.
+Pilots use phone mics, in noisy rooms, with a game running, stressed and talking fast. CORTANA is engineered on the assumption that **the transcript is sometimes wrong** — not as a limitation to apologise for, but as a fact the design absorbs. The confirmation loop, the correction buttons, the confidence tiers, and the alias table are not garnish; they are the mechanism by which an imperfect signal produces a reliable tool.
 
 **The freeform relay is framed by default.** `stt.relay_mode` decides what unmatched speech may become a relay card:
 
@@ -554,7 +558,7 @@ Pilots use phone mics, in noisy rooms, with a game running, stressed and talking
 - **`open`** — the old catch-all: any unmatched transcript relays.
 - **`off`** — the freeform relay never posts; recognised commands only.
 
-**The relay is also confidence-gated.** Whatever the mode, a relay posts only when Whisper's `avg_logprob` clears `stt.relay_min_logprob`. Below that, the transcript is treated as decoded noise ("Rens, Rens, Rens" hallucinated from silence) and AURA says *"Say again the system."* instead of posting garbage. Recognised commands are **never** gated — a distress call always posts. Stuttered three-plus word repeats in relay text collapse to one word, and every relay logs its confidence to `command_log` so the threshold is tuned from data.
+**The relay is also confidence-gated.** Whatever the mode, a relay posts only when Whisper's `avg_logprob` clears `stt.relay_min_logprob`. Below that, the transcript is treated as decoded noise ("Rens, Rens, Rens" hallucinated from silence) and CORTANA says *"Say again the system."* instead of posting garbage. Recognised commands are **never** gated — a distress call always posts. Stuttered three-plus word repeats in relay text collapse to one word, and every relay logs its confidence to `command_log` so the threshold is tuned from data.
 
 **Relays dedupe like incidents.** Identical relay text (case-insensitive) within `incidents.dedupe_window_s` folds — the pilot hears *"Relayed."* again, but no second card posts. Pilots repeat when they miss the ack; a repeat is not fresh intel. A successful relay is acknowledged with a spoken *"Relayed."* — without the ack, pilots repeat themselves, and every repeat is another card and another STT decode.
 
@@ -562,7 +566,7 @@ Pilots use phone mics, in noisy rooms, with a game running, stressed and talking
 
 ## 9. Incident engine
 
-AURA is not a ping bot. It is an **incident tracker that happens to be voice-driven**. This is the difference between a toy and something a corp runs for years.
+CORTANA is not a ping bot. It is an **incident tracker that happens to be voice-driven**. This is the difference between a toy and something a corp runs for years.
 
 ```
 Incident
@@ -601,7 +605,7 @@ Every card carries:
 
 `[🚀 On my way]` `[👀 Watching]` `[❌ Can't respond]`
 
-On the first **On my way**, AURA speaks into voice — naming the responder when it can: the registered callsign wins, then the clicker's guild display name (*"Space Junkie responding to Otanuomi."*), and only when neither is known does it fall back to the count (*"Two responding to Otanuomi."*).
+On the first **On my way**, CORTANA speaks into voice — naming the responder when it can: the registered callsign wins, then the clicker's guild display name (*"Space Junkie responding to Otanuomi."*), and only when neither is known does it fall back to the count (*"Two responding to Otanuomi."*).
 
 That closes the loop. A pilot in structure gets an audible answer without touching their phone. It is the cheapest feature in the document and the one the corp will actually love.
 
@@ -611,7 +615,7 @@ Buttons use persistent views with the incident ID encoded in `custom_id`, so the
 
 ## 10. Routing and subscriptions
 
-Subscriptions are built on **Discord roles**. Roles are native, respect per-user notification settings, are already understood by every member, and mean AURA does not reinvent a permission system.
+Subscriptions are built on **Discord roles**. Roles are native, respect per-user notification settings, are already understood by every member, and mean CORTANA does not reinvent a permission system.
 
 ### 10.1 Rule model
 
@@ -648,7 +652,7 @@ Routing = evaluate every rule against the incident → union the matching roles 
 
 *"Aura Command, ping me for gate camps in Otanuomi."* A personal ping is a **user mention, not a role** — the role model above is unchanged; personal pings are additive.
 
-- Stored in `personal_pings` (§14): incident types + an optional system (`NULL` = all systems). Capped per user by `discipline.personal_pings_max` (default 10); at the cap AURA answers *"Ping limit reached."*
+- Stored in `personal_pings` (§14): incident types + an optional system (`NULL` = all systems). Capped per user by `discipline.personal_pings_max` (default 10); at the cap CORTANA answers *"Ping limit reached."*
 - Matching = incident type ∈ the subscription's types ∧ (no system, or the incident's system). Matching subscribers' mentions are **appended to the mention line** of the incident card in `#intel-alerts` — never a separate message.
 - **Same discipline, no exceptions.** Personal pings ride the exact mention path of §11: the reporter's per-user cooldown, the circuit breaker, and quiet-hour role logic all suppress them together with the roles; a dedupe fold (§9.2) never re-pings personal subscribers; the incident's own reporter is never personally pinged for their own report; and they can **never** cause `@here` (constraint 11 untouched).
 - Managed by voice (`PING_ME` / `PING_ME_CLEAR`, §6.1) and the slash twins `/pingme`, `/mypings`, `/pingme-clear` — all through the same engine entry point (constraint 10).
@@ -657,7 +661,7 @@ Routing = evaluate every rule against the incident → union the matching roles 
 
 ## 11. Notification discipline
 
-If AURA is annoying for one week, the corp mutes `#intel-alerts` and the project is dead — no matter how good the speech recognition is. This subsystem gets as much engineering weight as the recogniser.
+If CORTANA is annoying for one week, the corp mutes `#intel-alerts` and the project is dead — no matter how good the speech recognition is. This subsystem gets as much engineering weight as the recogniser.
 
 ### 11.1 Layered defences
 
@@ -665,7 +669,7 @@ If AURA is annoying for one week, the corp mutes `#intel-alerts` and the project
 2. **Per-user cooldown** — 30s between mentions from the same pilot. A panicking player cannot ping six times.
 3. **Escalation discipline** — `@here` is reserved for `UNDER_ATTACK` and `ASSIST_REQUEST`. Sightings never `@here`. Ever.
 4. **Permission gate** — only members holding `@Pilot` can trigger a mention. The new guy cannot experiment at 03:00.
-5. **Global circuit breaker** — more than *N* mentions in *M* minutes → AURA stops mentioning, posts **flood control active**, and keeps logging incidents silently. Something is wrong; do not amplify it.
+5. **Global circuit breaker** — more than *N* mentions in *M* minutes → CORTANA stops mentioning, posts **flood control active**, and keeps logging incidents silently. Something is wrong; do not amplify it.
 6. **Quiet hours** per role.
 
 ### 11.2 Two channels
@@ -691,17 +695,17 @@ mirrored or reposted.
 
 ## 12. Voice back-channel
 
-AURA speaking back is not decoration — it is what lets a pilot keep their eyes on the game. It is also the *easy* half of the voice problem, since the send path is fully supported (§2.1).
+CORTANA speaking back is not decoration — it is what lets a pilot keep their eyes on the game. It is also the *easy* half of the voice problem, since the send path is fully supported (§2.1).
 
 **Engine: Piper.** Local neural TTS, VITS models exported to ONNX. Real-time on a Raspberry Pi 5 with no GPU, roughly an order of magnitude faster than real time on a normal CPU. Voices are tens of megabytes. No API, no bill, no dependency.
 
 Current release v1.4.2 (April 2026), maintained by the Open Home Foundation at `OHF-Voice/piper1-gpl`.
 
-> **License note:** the original Rhasspy repo was MIT and is archived. The maintained fork is **GPL-3.0**. For a self-hosted corp bot this is immaterial — nothing is distributed. AURA invokes Piper as a separate binary over a subprocess boundary rather than linking it, which keeps the question closed even if the bot is later shared with other corps.
+> **License note:** the original Rhasspy repo was MIT and is archived. The maintained fork is **GPL-3.0**. For a self-hosted corp bot this is immaterial — nothing is distributed. CORTANA invokes Piper as a separate binary over a subprocess boundary rather than linking it, which keeps the question closed even if the bot is later shared with other corps.
 
 ### 12.1 Utterance catalogue
 
-Short. Always short. AURA is talking over a fight.
+Short. Always short. CORTANA is talking over a fight.
 
 | Event | Utterance |
 |---|---|
@@ -712,6 +716,9 @@ Short. Always short. AURA is talking over a fight.
 | Unresolved system | *"Say again the system."* |
 | No command, no relay frame (§8.6) | *"Say again?"* |
 | Card post failed (channel perms/REST) | *"Discord post failed."* — the report is rolled back, not recorded |
+| Chase updated (§13.1) | *"Chase updated, Kisogo."* |
+| Chase, nothing to retarget | *"No active incident to chase."* |
+| Chase, no system heard | *"Report first, then say update chase and the system."* |
 | Responders | *"Space Junkie responding to Otanuomi."* (callsign/display name; count as fallback) |
 | Resolved | *"Otanuomi clear."* |
 | Timer set | *"Timer Kisogo, four hours."* |
@@ -736,7 +743,7 @@ Personal-ping type words pluralize naturally: *hostiles*, *attacks*, *assist req
 ### 12.2 Speaking rules
 
 - **Never speak over a high-severity report in progress.** If VAD reports active speech, queue.
-- Duck to 60% volume. AURA is not the FC. The duck level and talk-over suppression are fixed playback mechanics in Ears (`ears/src/playback.rs`), not config knobs.
+- Duck to 60% volume. CORTANA is not the FC. The duck level and talk-over suppression are fixed playback mechanics in Ears (`ears/src/playback.rs`), not config knobs.
 - Hard cap **3 seconds** per utterance. If it does not fit, it goes to the channel instead.
 - `/mute-voice` per user. Some pilots will hate this. They can silence it without leaving.
 
@@ -748,13 +755,13 @@ Piper reloads its voice model on every subprocess spawn (~1s on the droplet), so
 
 ### 12.4 Personality
 
-`tts.personality` selects the spoken-line flavour. `standard` keeps the exact §12.1 catalogue. `cortana` rotates **acknowledgement lines only** through short variants — *"Go ahead." / "Listening." / "Send it." / "Copy code orange. Send it." / "On the wire."* — so AURA feels alive rather than canned. Information-carrying lines (system names, counts, timers, callsigns) never vary: a pilot mid-fight must never parse a surprise phrasing for facts. This is scripted variation, not generation — no model is involved (constraint 6), and no real person's voice is imitated.
+`tts.personality` selects the spoken-line flavour. `standard` keeps the exact §12.1 catalogue. `cortana` rotates **acknowledgement lines only** through short variants — *"Go ahead." / "Listening." / "Send it." / "Copy code orange. Send it." / "On the wire."* — so CORTANA feels alive rather than canned. Information-carrying lines (system names, counts, timers, callsigns) never vary: a pilot mid-fight must never parse a surprise phrasing for facts. This is scripted variation, not generation — no model is involved (constraint 6), and no real person's voice is imitated.
 
 ---
 
 ## 13. Fleet ops features
 
-Beyond intel, AURA carries the utilities a corp actually asks for. Each is voice-shaped and slash-backed.
+Beyond intel, CORTANA carries the utilities a corp actually asks for. Each is voice-shaped and slash-backed.
 
 | Feature | Voice | Value |
 |---|---|---|
@@ -762,6 +769,15 @@ Beyond intel, AURA carries the utilities a corp actually asks for. Each is voice
 | **Form-ups** | *"Aura Command, form up Otanuomi fifteen minutes"* | Posts an op card with RSVP buttons and a countdown. |
 | **Roll call** | `/rollcall` | Who's in voice, who's subscribed, who's responding. |
 | **Jump distance** | *"Aura Command, jumps to Jita"* | Spoken reply, no post. BFS over the adjacency graph. |
+| **Chase mode** | *"update chase Kisogo"* → `/chase` | Retargets your live incident card as the target moves — one card, edited in place, with a movement trail. |
+
+### 13.1 Chase mode
+
+A tackled target that jumps out is not a new incident — it is the same incident moving. *"update chase <system>"* (slash twin `/chase`) retargets the pilot's most recent ACTIVE incident:
+
+- The card is **edited in place** (constraint 9) — never a second post — and each hop is appended to the card's updates as a movement trail (*chase → Kisogo → Alenia*).
+- System matching is **flexible**: a confident gazetteer match binds the real system (routing and the proximity prior keep working); anything else — a misheard name, a system outside the gazetteer's scope — goes on the card **verbatim**. A chase never stops to ask *"say again the system"* mid-pursuit.
+- Confirmation is spoken: *"Chase updated, Kisogo."* With no active incident of yours to retarget: *"No active incident to chase."*; a bare *"chase mode"* with no system: *"Report first, then say update chase and the system."*
 
 ---
 
@@ -1128,7 +1144,7 @@ Real-time audio is latency-sensitive, and **shared vCPU means CPU steal, which m
 
 DigitalOcean moved to **per-second billing (60s minimum) on January 1, 2026**. List prices move a few times a year — confirm against the live pricing page before provisioning.
 
-**Region:** choose the datacenter nearest the **Discord voice region your corp actually lands in**, not nearest your players. AURA's RTT to Discord's voice server is what sits in the audio path; your pilots' RTT to AURA is irrelevant because they never talk to it directly.
+**Region:** choose the datacenter nearest the **Discord voice region your corp actually lands in**, not nearest your players. CORTANA's RTT to Discord's voice server is what sits in the audio path; your pilots' RTT to CORTANA is irrelevant because they never talk to it directly.
 
 ### 17.2 Host layout
 
@@ -1145,7 +1161,7 @@ Ubuntu 24.04 LTS
 ├── /var/lib/aura/aura.db
 ├── /run/aura/aura.sock        (tmpfiles.d, mode 0660, root:aura)
 ├── user: aura  (nologin, owns runtime dirs)
-└── ufw: deny incoming, allow SSH only — AURA opens no listening ports
+└── ufw: deny incoming, allow SSH only — CORTANA opens no listening ports
 ```
 
 ### 17.3 Build and system dependencies
@@ -1159,7 +1175,7 @@ piper                  # /usr/local/bin/piper
 
 - **No ffmpeg.** Songbird ≥0.4 removed it entirely in favour of Symphonia.
 - Compile the Rust binary in CI or on a larger machine. A 4 GB droplet will thrash building Songbird with LTO. Ship the binary, not the toolchain. CI publishes each main-branch build to the `ears-bin` branch (binary + sha256), which `install.sh` fetches with the droplet's existing clone credentials — no GitHub API token on the host.
-- `openwakeword` is installed `--no-deps`: its Linux dependency pin `tflite-runtime` has no wheels for Python ≥3.12, and AURA uses only the ONNX inference path. Its true runtime dependencies are listed explicitly in `requirements.txt`.
+- `openwakeword` is installed `--no-deps`: its Linux dependency pin `tflite-runtime` has no wheels for Python ≥3.12, and CORTANA uses only the ONNX inference path. Its true runtime dependencies are listed explicitly in `requirements.txt`.
 
 ### 17.4 Bot permissions and intents
 
@@ -1193,32 +1209,32 @@ piper                  # /usr/local/bin/piper
 
 ## 19. Privacy and consent
 
-AURA puts a microphone-reading robot into a corp's social space. Getting this wrong destroys trust permanently, and no feature recovers it.
+CORTANA puts a microphone-reading robot into a corp's social space. Getting this wrong destroys trust permanently, and no feature recovers it.
 
-**The governing decision: AURA does not record anything.**
+**The governing decision: CORTANA does not record anything.**
 
 - Audio lives in a **RAM ring buffer only**. Never written to disk. Overwritten every 1.5 seconds.
 - The capture buffer is freed the instant STT returns.
-- AURA stores the **transcript of triggered commands**, never audio.
+- CORTANA stores the **transcript of triggered commands**, never audio.
 - Non-command speech is **never transcribed at all** — the wake-word gate means it never reaches the recogniser.
 
-This is not only good manners. Laws on recording conversations vary by country and by state and may require notice to, or consent from, **every** participant. By never recording, AURA sidesteps the entire category rather than trying to comply with all of it.
+This is not only good manners. Laws on recording conversations vary by country and by state and may require notice to, or consent from, **every** participant. By never recording, CORTANA sidesteps the entire category rather than trying to comply with all of it.
 
 Additionally:
 
-- **Announcement on join.** AURA posts: *"🎙️ AURA is listening for commands. Audio is not recorded. `/optout` to exclude yourself."* Cadence is `discord.join_announcement`: `every` join, at most once per 24h (`daily`, the default — persisted in `app_state` so restart/rejoin churn cannot spam the channel), or `off` (the corp accepts that the consent posture is carried by `/optout` and the pinned docs instead).
+- **Announcement on join.** CORTANA posts: *"🎙️ CORTANA is listening for commands. Audio is not recorded. `/optout` to exclude yourself."* Cadence is `discord.join_announcement`: `every` join, at most once per 24h (`daily`, the default — persisted in `app_state` so restart/rejoin churn cannot spam the channel), or `off` (the corp accepts that the consent posture is carried by `/optout` and the pinned docs instead).
 - **`/optout`** drops that user's stream **inside Ears, before any processing and before it crosses the IPC boundary**. An actual drop, not a downstream filter.
-- AURA reads Discord's `allow_voice_recording` voice flag as an additional consent signal.
+- CORTANA reads Discord's `allow_voice_recording` voice flag as an additional consent signal.
 - Callsign registration (§6.1) is keyed on the Discord user id attached to each utterance — it stores a chosen display name, never a voiceprint or anything derived from audio.
 - A plain-language privacy note is pinned in the channel. Discord's Developer Policy expects a privacy policy regardless, and an honest one here is four sentences.
 
-**Introduce AURA to the corp with this section, not with the feature list.** If half the corp is uncomfortable, that conversation is cheaper before the droplet is provisioned than after.
+**Introduce CORTANA to the corp with this section, not with the feature list.** If half the corp is uncomfortable, that conversation is cheaper before the droplet is provisioned than after.
 
 ---
 
 ## 20. Resilience and degradation
 
-Because voice receive is undocumented and can break without warning (§2.2), AURA is engineered to **survive the loss of its own headline feature**.
+Because voice receive is undocumented and can break without warning (§2.2), CORTANA is engineered to **survive the loss of its own headline feature**.
 
 | Failure | Detection | Response |
 |---|---|---|
@@ -1231,7 +1247,7 @@ Because voice receive is undocumented and can break without warning (§2.2), AUR
 | Ears down | Brain heartbeat miss | Post the degraded notice; text path unaffected |
 | Droplet down | External uptime check | `Restart=always` + a page |
 
-**The load-bearing invariant: every voice command has a slash-command twin hitting the same engine.** The voice path is a fast front-end to a system that is complete without it. This is what makes AURA survivable on a platform that never promised to support half of it.
+**The load-bearing invariant: every voice command has a slash-command twin hitting the same engine.** The voice path is a fast front-end to a system that is complete without it. This is what makes CORTANA survivable on a platform that never promised to support half of it.
 
 ---
 
@@ -1257,7 +1273,7 @@ Against 20–40 seconds for the manual path. That is the whole thesis, restated 
 
 ## 22. Security
 
-- No inbound ports. AURA dials out only; `ufw` denies all incoming except SSH.
+- No inbound ports. CORTANA dials out only; `ufw` denies all incoming except SSH.
 - IPC socket is `0660 root:aura` on a `tmpfs` — not reachable off-box.
 - Token via `LoadCredential=`, never in config, environment, or repo.
 - Least-privilege bot permissions (§17.4). No Administrator.

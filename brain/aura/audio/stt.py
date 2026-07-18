@@ -131,10 +131,26 @@ class FasterWhisperTranscriber:
             # segments only propagates a hallucination into the next one.
             "condition_on_previous_text": False,
             "without_timestamps": True,
+            # Chatter defence (GDD §5.3): Silero VAD inside faster-whisper
+            # trims non-speech from the clip before decoding. Fleet comms are
+            # full of keyboard noise, breath, and game audio bleed — decoding
+            # those spans is where "Rens, Rens, Rens" hallucinations grow.
+            "vad_filter": True,
         }
         if self._cfg.bias_with_gazetteer and bias:
             kwargs["initial_prompt"] = bias  # gazetteer biasing, GDD §5.3
-        segments, _info = model.transcribe(audio, **kwargs)
+            # hotwords bias the decoder toward these tokens on EVERY window
+            # (initial_prompt only prefixes the first) — helps short system
+            # names survive noisy audio. Harmless no-op on backends/versions
+            # without the parameter; guarded below.
+            kwargs["hotwords"] = bias
+        try:
+            segments, _info = model.transcribe(audio, **kwargs)
+        except TypeError:
+            # Older faster-whisper without hotwords/vad_filter kwargs.
+            kwargs.pop("hotwords", None)
+            kwargs.pop("vad_filter", None)
+            segments, _info = model.transcribe(audio, **kwargs)
 
         texts: list[str] = []
         logprobs: list[float] = []

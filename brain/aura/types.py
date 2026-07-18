@@ -1,4 +1,4 @@
-"""Shared enums and dataclasses used across AURA Brain modules.
+"""Shared enums and dataclasses used across CORTANA Brain modules.
 
 This module is the vocabulary of the system: every cross-module boundary in
 docs/INTERFACES.md speaks in these types. It has no dependencies beyond the
@@ -57,6 +57,7 @@ class Intent(StrEnum):
     ASSIST_REQUEST = "ASSIST_REQUEST"
     GATE_CAMP = "GATE_CAMP"
     RESOLVE = "RESOLVE"
+    CHASE_UPDATE = "CHASE_UPDATE"
     TIMER = "TIMER"
     FORMUP = "FORMUP"
     QUERY = "QUERY"
@@ -86,6 +87,7 @@ INTENT_SEVERITY: Mapping[Intent, Severity] = MappingProxyType(
         Intent.ASSIST_REQUEST: Severity.HIGH,
         Intent.GATE_CAMP: Severity.MEDIUM,
         Intent.RESOLVE: Severity.NONE,
+        Intent.CHASE_UPDATE: Severity.NONE,
         Intent.TIMER: Severity.NONE,
         Intent.FORMUP: Severity.NONE,
         Intent.QUERY: Severity.NONE,
@@ -293,7 +295,7 @@ class Incident:
 
 @dataclass(frozen=True, slots=True)
 class IncidentOutcome:
-    """Result of an incident-engine call: what happened, what AURA should say
+    """Result of an incident-engine call: what happened, what CORTANA should say
 
     into voice (None = say nothing), and the rendered card (None when nothing
     was posted or edited). ``incident_id`` is None for REJECTED outcomes.

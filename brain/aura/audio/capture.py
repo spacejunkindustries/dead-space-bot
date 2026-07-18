@@ -92,7 +92,7 @@ class CaptureManager:
         self._on_utterance = on_utterance
         # Fired (sync, on the hot path) the instant a capture opens — the
         # composition root uses it to speak the "go ahead" cue so the pilot
-        # knows AURA is listening (GDD §5). Must not block; it schedules.
+        # knows CORTANA is listening (GDD §5). Must not block; it schedules.
         self._on_capture_start = on_capture_start
         self._states: dict[int, _UserState] = {}
         self._tasks: set[asyncio.Task[None]] = set()

@@ -1,7 +1,7 @@
 # Wake-word training — "Aura Command"
 
 Offline pipeline that trains the custom [openWakeWord](https://github.com/dscripka/openWakeWord)
-model AURA listens for. It is completely separate from `brain/` and `ears/`:
+model CORTANA listens for. It is completely separate from `brain/` and `ears/`:
 nothing here is imported at runtime, and none of these dependencies belong in
 `brain/requirements.txt`. Per `CLAUDE.md`, the scripts are the automatable
 part — **the run itself needs a human**, a GPU, and several hours.
@@ -173,7 +173,7 @@ whichever `.onnx` the corp settles on.
   noise/music collection into the configured directories and skip that stage.
 - **Python version.** Upstream's notebook targets 3.10. The ONNX-only path
   generally works on newer interpreters, but the optional `--tflite` export
-  pins ancient TensorFlow and genuinely needs 3.10. AURA deploys ONNX only.
+  pins ancient TensorFlow and genuinely needs 3.10. CORTANA deploys ONNX only.
 - **Synthetic ≠ real.** Every number in the sweep table is measured on
   synthetic speech plus a generic real-speech stream — not on your pilots,
   your accents, or your comms compression. It picks a starting threshold;

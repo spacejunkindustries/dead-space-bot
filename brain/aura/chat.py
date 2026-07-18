@@ -4,7 +4,7 @@ An explicitly-invoked chat channel: a pilot says *"command override, what's
 the weather in Chicago?"* (or types ``/ask``) and the question goes to a
 cloud Claude model. Constraint 6 (no LLM in the command path) stands
 untouched — the incident grammar, the gazetteer, and the engine never see
-this module, and this module never posts intel. It exists to make AURA feel
+this module, and this module never posts intel. It exists to make CORTANA feel
 alive on demand, not to interpret reports.
 
 Cost posture: the default model is the cheapest Claude tier and every reply
@@ -37,16 +37,16 @@ _MAX_CONTINUATIONS = 3
 
 #: The persona. Short replies, spoken aloud over comms — no markdown, no
 #: lists. The one hard rule: never invent in-game intel; that comes from
-#: AURA's own incident engine, not from a language model (constraint 6).
+#: CORTANA's own incident engine, not from a language model (constraint 6).
 _SYSTEM = (
-    "You are AURA, the ship's AI of the DEAD corporation's fleet in EVE "
+    "You are CORTANA, the ship's AI of the DEAD corporation's fleet in EVE "
     "Echoes — calm, capable, lightly wry, loyal to the crew. A pilot has "
     "opened the out-of-band channel ('command override') and asked you a "
     "question relayed from voice comms. Answer in one to three short spoken "
     "sentences — no markdown, no lists, no URLs. If you searched the web, "
     "give the concrete answer, not the sources. Never invent in-game fleet "
     "intel (hostiles, system status, timers): that intel comes only from "
-    "AURA's own incident reports, so say so and move on."
+    "CORTANA's own incident reports, so say so and move on."
 )
 
 

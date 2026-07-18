@@ -4,7 +4,7 @@ GDD §7 / §9.1 / §11.2 / §17.4 / §19. This module is the only place discord.
 meets the rest of the system:
 
 - **Intents** (GDD §17.4): guilds, members (role gating), voice_states
-  (census for auto-join). ``message_content`` stays off — AURA reads no chat.
+  (census for auto-join). ``message_content`` stays off — CORTANA reads no chat.
 - **Token** (constraint 12): ``$CREDENTIALS_DIRECTORY/token`` (systemd
   ``LoadCredential=``) first, ``discord.token_file`` as the dev fallback.
   Never an env var value, never a config value, never logged.
@@ -118,7 +118,7 @@ class AuraBot(commands.Bot):
         intents.guilds = True
         intents.members = True  # role gating (GDD §17.4)
         intents.voice_states = True  # census + auto-join (GDD §17.4)
-        # No message_content: AURA never reads chat, and the prefix path is
+        # No message_content: CORTANA never reads chat, and the prefix path is
         # inert — every command is a slash command on the app-command tree.
         super().__init__(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
         self.holder = holder
@@ -221,7 +221,7 @@ class AuraBot(commands.Bot):
         ``present`` counts every non-bot member physically in the channel,
         regardless of mute state — this drives auto-join/leave, because a pilot
         sitting muted until they need to shout a report is still present and
-        AURA must stay with them (GDD §1.2, the lonely ratter).
+        CORTANA must stay with them (GDD §1.2, the lonely ratter).
 
         ``unmuted`` additionally excludes self/server-muted members — this
         feeds the §20 "voice receive is dead" alarm, which must not fire when

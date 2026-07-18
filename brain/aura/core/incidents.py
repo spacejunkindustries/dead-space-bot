@@ -100,6 +100,13 @@ _SEVERITY_CODE: dict[Severity, str] = {
     Severity.NONE: "CODE YELLOW",
 }
 
+#: Spoken colour words for the §8.3 readback ("…, code red, posted.").
+_SEVERITY_SPOKEN_WORD: dict[Severity, str] = {
+    Severity.HIGH: "red",
+    Severity.MEDIUM: "orange",
+    Severity.NONE: "yellow",
+}
+
 _COLOR_BY_SEVERITY: dict[Severity, int] = {
     Severity.HIGH: 0xED4245,  # red
     Severity.MEDIUM: 0xE67E22,  # orange
@@ -399,7 +406,7 @@ def render_card(
                 "inline": True,
             },
         ],
-        "footer": {"text": f"{footer} · AURA"},
+        "footer": {"text": f"{footer} · CORTANA"},
     }
     if desc_lines:
         embed["description"] = "\n".join(desc_lines)
@@ -641,6 +648,15 @@ class IncidentEngine:
             await self._log_command(reporter_id, parsed, resolution, tier, outcome.outcome)
             return outcome
 
+        # Chase mode (GDD §13): retargets the pilot's live incident. Flexible
+        # like the report intents — a chase must never stop to ask "say
+        # again" while the pilot is mid-pursuit.
+        if intent is Intent.CHASE_UPDATE:
+            outcome = await self.chase_update(guild_id, reporter_id, parsed, resolution)
+            tier = resolution.tier if resolution is not None else None
+            await self._log_command(reporter_id, parsed, resolution, tier, outcome.outcome)
+            return outcome
+
         # The remaining intents (clear / timer / form up) act on a *specific*
         # real system, so they still require a confident match.
         if resolution is None or resolution.tier is Tier.LOW or resolution.best is None:
@@ -740,7 +756,7 @@ class IncidentEngine:
                     "color": _COLOR_BY_SEVERITY[card_severity],
                     "timestamp": _iso(now),
                     "fields": [{"name": "From", "value": who, "inline": True}],
-                    "footer": {"text": "AURA voice relay"},
+                    "footer": {"text": "CORTANA voice relay"},
                 }
             )
             try:
@@ -779,7 +795,7 @@ class IncidentEngine:
         The system window resolves through the same phonetic pipeline as
         reports; anything below HIGH tier is treated as unresolved — a stored
         subscription silently scoped to the wrong system would never fire, so
-        AURA asks again instead of guessing (GDD §8.3 posture).
+        CORTANA asks again instead of guessing (GDD §8.3 posture).
         """
         types = types_from_detail(parsed.detail)
         system_id: int | None = None
@@ -984,6 +1000,12 @@ class IncidentEngine:
         )
 
         label = _TYPE_LABELS[parsed.intent]
+        # Readback (GDD §8.3): when the pilot SPOKE a colour code, it comes
+        # back in the confirmation — "Tackled UMI, code red, posted." — so
+        # they hear exactly what the card says without looking at Discord.
+        spoken_code = (
+            f", code {_SEVERITY_SPOKEN_WORD[severity]}" if parsed.severity is not None else ""
+        )
         if flood_announced:
             utterance = "Flood control active."
         elif uncertain:
@@ -991,12 +1013,12 @@ class IncidentEngine:
         elif decision.role_ids or decision.here or decision.user_ids:
             scoped = _GROUP_ALIAS_SPOKEN.get(parsed.group_alias or "")
             utterance = (
-                f"{label} {system_name}, pinged {scoped}."
+                f"{label} {system_name}{spoken_code}, pinged {scoped}."
                 if scoped
-                else f"{label} {system_name}, pinged."
+                else f"{label} {system_name}{spoken_code}, pinged."
             )
         else:
-            utterance = f"{label} {system_name}, posted."
+            utterance = f"{label} {system_name}{spoken_code}, posted."
 
         log.info(
             "incident_opened",
@@ -1013,6 +1035,87 @@ class IncidentEngine:
         return IncidentOutcome(outcome, utterance, card, incident_id)
 
     # ── resolve / cancel (GDD §9.1, §6.1) ────────────────────────────────────
+
+    async def chase_update(
+        self,
+        guild_id: int,
+        reporter_id: int,
+        parsed: ParsedCommand,
+        resolution: Resolution | None,
+    ) -> IncidentOutcome:
+        """ "update chase <system>" / ``/chase`` — retarget the pilot's live
+        incident card as the target moves (GDD §13).
+
+        The card is edited in place (constraint 9) and keeps a movement trail
+        in its updates. System matching is flexible: a confident gazetteer
+        match binds the real system (routing/proximity keep working); anything
+        else goes on the card verbatim — a chase never stops to ask
+        "say again the system" mid-pursuit.
+        """
+        system_text = (parsed.system_text or "").strip()
+        if not system_text:
+            return IncidentOutcome(Outcome.REJECTED, tts.chase_hint(), None, None)
+        async with self._lock:
+            now = self._clock()
+            row = await asyncio.to_thread(
+                db.query_one,
+                self._conn,
+                "SELECT id FROM incidents WHERE guild_id = ? AND reporter_id = ?"
+                " AND status = 'ACTIVE' ORDER BY id DESC LIMIT 1",
+                (guild_id, reporter_id),
+            )
+            if row is None:
+                return IncidentOutcome(Outcome.REJECTED, tts.chase_no_incident(), None, None)
+            incident_id = int(row["id"])
+
+            confident = (
+                resolution is not None
+                and resolution.best is not None
+                and resolution.tier is not Tier.LOW
+            )
+            if confident:
+                assert resolution is not None and resolution.best is not None
+                system_id: int | None = resolution.best.system_id
+                system_name = self._system_name(system_id, resolution.best.name)
+                confidence: float | None = resolution.best.score
+            else:
+                system_id = None
+                system_name = system_text
+                confidence = None
+
+            def _write() -> Incident | None:
+                db.execute(
+                    self._conn,
+                    "UPDATE incidents SET system_id = ?, system_confidence = ?,"
+                    " raw_system_text = ?, updated_at = ? WHERE id = ?",
+                    (system_id, confidence, system_text, _iso(now), incident_id),
+                )
+                db.execute(
+                    self._conn,
+                    "INSERT INTO incident_updates (incident_id, user_id, text, at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (incident_id, reporter_id, f"chase → {system_name}", _iso(now)),
+                )
+                return _load_incident(self._conn, incident_id)
+
+            incident = await asyncio.to_thread(_write)
+            if incident is None:  # pragma: no cover — row deleted mid-flight
+                return IncidentOutcome(Outcome.REJECTED, None, None, None)
+            # The card's location changed: any pending confirm-candidates
+            # pointed at the OLD heard name.
+            self._pending_candidates.pop(incident_id, None)
+            card = self._render(incident, system_name)
+            if incident.channel_id is not None and incident.message_id is not None:
+                await self._poster.edit(incident.channel_id, incident.message_id, "", card)
+            log.info(
+                "chase_updated",
+                incident_id=incident_id,
+                system=system_name,
+                resolved=system_id is not None,
+            )
+            return IncidentOutcome(
+                Outcome.POSTED, tts.chase_updated(system_name), card, incident_id
+            )
 
     async def resolve_system(self, guild_id: int, user_id: int, system_id: int) -> IncidentOutcome:
         """ "clear <system>" / ``/clear`` — resolve every open incident there."""

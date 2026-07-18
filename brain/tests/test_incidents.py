@@ -1233,7 +1233,7 @@ async def test_broadcast_all_hands_pings_here(make_env: Callable[..., Env]) -> N
 
 
 async def test_silent_mode_posts_without_pinging(make_env: Callable[..., Env]) -> None:
-    # mentions_enabled=False: incidents still post, but AURA mentions nobody.
+    # mentions_enabled=False: incidents still post, but CORTANA mentions nobody.
     env = make_env(mentions_enabled=False)
     out = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
     assert out.outcome is Outcome.POSTED
@@ -1354,3 +1354,100 @@ async def test_responder_callout_falls_back_to_display_name_then_count(
     assert out.utterance == "SiMpLeNoOB responding to Otanuomi."
     out2 = await env.engine.respond(posted.incident_id, 44, ResponderState.OTW)
     assert out2.utterance == "Two responding to Otanuomi."
+
+
+# ── chase mode (GDD §13) ─────────────────────────────────────────────────────
+
+
+async def test_chase_updates_the_live_card_in_place(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    opened = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    assert opened.outcome is Outcome.POSTED
+    posts_before = len(env.poster.posts)
+
+    chase = ParsedCommand(
+        intent=Intent.CHASE_UPDATE,
+        system_text="Kisogo",
+        group_alias=None,
+        detail=None,
+        raw="update chase Kisogo",
+    )
+    out = await env.engine.report(GUILD, 42, chase, high(2, "Kisogo"))
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "Chase updated, Kisogo."
+    assert len(env.poster.posts) == posts_before  # edited in place, never re-posted
+    assert env.poster.edits, "the live card must be edited"
+    row = db.query_one(
+        env.conn, "SELECT system_id FROM incidents WHERE id = ?", (opened.incident_id,)
+    )
+    assert row["system_id"] == 2
+    # Movement trail lands in the updates.
+    upd = db.query(
+        env.conn, "SELECT text FROM incident_updates WHERE incident_id = ?", (opened.incident_id,)
+    )
+    assert any("chase" in (u["text"] or "") for u in upd)
+
+
+async def test_chase_with_unmatched_system_rides_verbatim(make_env: Callable[..., Env]) -> None:
+    # Flexible naming: a misheard/unknown system must never stall the chase.
+    env = make_env()
+    await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    chase = ParsedCommand(
+        intent=Intent.CHASE_UPDATE,
+        system_text="Zarzakh Prime",
+        group_alias=None,
+        detail=None,
+        raw="update chase Zarzakh Prime",
+    )
+    out = await env.engine.report(GUILD, 42, chase, None)  # no resolution at all
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "Chase updated, Zarzakh Prime."
+    row = db.query_one(
+        env.conn, "SELECT system_id, raw_system_text FROM incidents ORDER BY id DESC LIMIT 1"
+    )
+    assert row["system_id"] is None
+    assert row["raw_system_text"] == "Zarzakh Prime"
+
+
+async def test_chase_without_active_incident_rejects(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    chase = ParsedCommand(
+        intent=Intent.CHASE_UPDATE,
+        system_text="Kisogo",
+        group_alias=None,
+        detail=None,
+        raw="update chase Kisogo",
+    )
+    out = await env.engine.report(GUILD, 42, chase, high(2, "Kisogo"))
+    assert out.outcome is Outcome.REJECTED
+    assert out.utterance == "No active incident to chase."
+
+
+async def test_chase_without_system_speaks_hint(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    chase = ParsedCommand(
+        intent=Intent.CHASE_UPDATE,
+        system_text=None,
+        group_alias=None,
+        detail=None,
+        raw="chase mode",
+    )
+    out = await env.engine.report(GUILD, 42, chase, None)
+    assert out.outcome is Outcome.REJECTED
+    assert out.utterance == "Report first, then say update chase and the system."
+
+
+async def test_spoken_code_is_read_back_on_post(make_env: Callable[..., Env]) -> None:
+    # §8.3 readback: the pilot hears the colour they spoke come back.
+    env = make_env(mentions_enabled=False)
+    spoken = ParsedCommand(
+        intent=Intent.UNDER_ATTACK,
+        system_text="Otanuomi",
+        group_alias=None,
+        detail=None,
+        raw="I'm tackled code red in system Otanuomi",
+        severity=Severity.HIGH,
+    )
+    out = await env.engine.report(GUILD, 42, spoken, high(1, "Otanuomi"))
+    assert out.outcome is Outcome.POSTED
+    assert out.utterance == "Under attack Otanuomi, code red, posted."
