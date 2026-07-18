@@ -23,8 +23,13 @@ like lurking.
 
 Opt-outs are enforced in Ears, before frames cross the IPC boundary
 (CLAUDE.md constraint); this module's job is only to push the current
-``optouts`` table across right after every join and whenever the set
-changes (the ``/optout`` cog calls :meth:`push_optouts`).
+``optouts`` table across — FIRST on every Ears hello (Ears fails closed
+until it arrives), right after every join, and whenever the set changes
+(the ``/optout`` cog calls :meth:`push_optouts`).
+
+Join results come back as ``join_ok`` / ``join_failed`` control events
+(GDD §15); the retry/rejoin judgement lives here in Brain — Ears only
+reports what happened.
 """
 
 from __future__ import annotations
@@ -150,17 +155,45 @@ class VoiceGateway:
                     await self._leave()
 
     async def on_ears_hello(self) -> None:
-        """Ears (re)connected: replay the join and the opt-out set.
+        """Ears (re)connected: push the opt-out set FIRST, then replay the join.
 
         Ears restarts lose all session state; without this replay a Brain
-        that thinks it is joined would sit deaf forever.
+        that thinks it is joined would sit deaf forever. The opt-out push is
+        unconditional and precedes everything else because a fresh Ears
+        process fails CLOSED — it drops all audio until its first ``optouts``
+        frame of the process lifetime arrives (GDD §19, §15).
         """
         async with self._lock:
+            await self.push_optouts()
             if self._joined_channel_id is not None:
-                # _send_join replays the opt-out set itself, right after the join.
                 await self._send_join(self._joined_channel_id, announce=False)
-            else:
-                await self.push_optouts()
+
+    async def on_join_ok(self, channel_id: int) -> None:
+        """Ears confirmed a voice join (GDD §15 ``join_ok``)."""
+        log.info("voice_join_confirmed", channel_id=channel_id)
+
+    async def on_join_failed(self, channel_id: int, reason: str) -> None:
+        """Ears reported a failed voice join (GDD §15 ``join_failed``).
+
+        Rejoin policy is judgement and therefore lives HERE, not in Ears:
+        clear the joined state so Brain's view matches reality, then — if the
+        channel still has pilots — schedule another debounced join. Each
+        retry is loudly logged; a persistently failing join repeats at the
+        debounce cadence rather than silently giving up.
+        """
+        async with self._lock:
+            log.error("voice_join_failed", channel_id=channel_id, reason=reason)
+            if self._joined_channel_id == channel_id:
+                self._joined_channel_id = None
+                if self._on_census is not None:
+                    self._on_census(0)
+            if (
+                self._holder.current.discord.auto_join
+                and self._counts.get(channel_id, 0) > 0
+                and self._pending_channel_id != channel_id
+            ):
+                log.info("voice_join_retry_scheduled", channel_id=channel_id)
+                self._schedule_join(channel_id)
 
     # ── opt-outs ─────────────────────────────────────────────────────────────
 

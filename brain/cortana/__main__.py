@@ -446,24 +446,81 @@ class App:
         assert self.dialog is not None
         return self.dialog.on_capture_start(user_id, guild_id, origin, armed_gen)
 
+    def _purge_user(self, uid: int) -> None:
+        """Drop every piece of per-user voice/dialog state Brain holds.
+
+        Called from the IPC ``left`` event and from snapshot reconciliation
+        (§19 posture). The dialog engine owns all per-user state (§5.4) —
+        session, armed windows, capture, timing — so this is one call."""
+        if self.dialog is not None:
+            self.dialog.reset_user(uid)
+
+    def _reconcile_snapshot(self, msg: dict[str, Any]) -> None:
+        """Reconcile Brain's per-user view against Ears' state snapshot.
+
+        Ears sends a full snapshot (per-guild connected state + SSRC↔user
+        roster) right after every hello (GDD §15), replacing the lossy event
+        deltas an IPC outage would have eaten. Users Brain is still tracking
+        that Ears no longer sees (left during the outage) are purged exactly
+        as if their ``left`` event had arrived. State is reset only where the
+        views actually differ — the hello replay already handled the rest.
+        """
+        roster: set[int] = set()
+        for guild in msg.get("guilds", []) or []:
+            for entry in guild.get("users", []) or []:
+                user_id = entry.get("user_id")
+                if user_id is not None:
+                    with contextlib.suppress(ValueError, TypeError):
+                        roster.add(int(user_id))
+        tracked: set[int] = self.dialog.tracked_users() if self.dialog is not None else set()
+        stale = tracked - roster
+        for uid in stale:
+            self._purge_user(uid)
+        if stale:
+            log.info("ears_snapshot_reconciled", purged_users=len(stale))
+
     async def _on_control(self, msg: dict[str, Any]) -> None:
         t = msg.get("t")
         if t == "heartbeat":
             if self.health is not None:
                 self.health.note_heartbeat(msg)
         elif t == "hello":
-            log.info("ears_connected", version=msg.get("version"))
+            log.info("ears_connected", version=msg.get("version"), proto=msg.get("proto"))
             # Every armed window / SSRC mapping the previous Ears process knew
             # is gone — dialog state must not outlive the audio path (§5.4).
+            # The snapshot that follows re-purges anything Ears still sees
+            # differently.
             if self.dialog is not None:
                 self.dialog.reset_all()
             if self.gateway is not None:
                 await self.gateway.on_ears_hello()
+        elif t == "snapshot":
+            self._reconcile_snapshot(msg)
+        elif t == "join_ok":
+            if self.gateway is not None:
+                await self.gateway.on_join_ok(int(msg.get("channel_id") or 0))
+        elif t == "join_failed":
+            if self.gateway is not None:
+                await self.gateway.on_join_failed(
+                    int(msg.get("channel_id") or 0), str(msg.get("reason", ""))
+                )
+        elif t == "driver_disconnected":
+            # Voice session died under Ears (DAVE crash, 4014, channel gone).
+            # Ears reports; the rejoin judgement stays here. Loud log + health
+            # note so a silent voice absence becomes visible (GDD §20).
+            log.warning(
+                "ears_driver_disconnected",
+                guild_id=msg.get("guild_id"),
+                kind=msg.get("kind"),
+                reason=msg.get("reason"),
+            )
+            if self.health is not None:
+                self.health.note_driver_event(msg)
         elif t == "left":
             user_id = msg.get("user_id")
-            if user_id is not None and self.dialog is not None:
+            if user_id is not None:
                 # Purges capture state, armed windows, and the session (§19).
-                self.dialog.reset_user(int(user_id))
+                self._purge_user(int(user_id))
         elif t == "speaking":
             pass  # informational; talk-over suppression happens in Ears
         else:

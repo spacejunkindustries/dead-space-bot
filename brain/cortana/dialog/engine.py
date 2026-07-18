@@ -150,6 +150,13 @@ class DialogEngine:
         for user_id in list(self._sessions):
             self.reset_user(user_id)
 
+    def tracked_users(self) -> set[int]:
+        """Every user the engine holds ANY state for — sessions or timing.
+
+        Snapshot reconciliation (GDD §15) purges members of this set that
+        Ears no longer sees."""
+        return set(self._sessions) | set(self._last_audio_at)
+
     # ── hot path ─────────────────────────────────────────────────────────────
 
     def on_audio(self, user_id: int, guild_id: int, pcm: bytes) -> None:

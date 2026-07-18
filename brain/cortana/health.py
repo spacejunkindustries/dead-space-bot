@@ -127,6 +127,10 @@ class HealthReporter:
         self._stt_watchdog_fn: Callable[[], bool] | None = None
         self._wake_fault_announced = False
         self._stt_watchdog_announced = False
+        # Most recent Ears driver_disconnected control event (IPC v2), kept
+        # for the ops surface: a voice session dying under Ears must never be
+        # invisible to whoever reads the health report.
+        self._last_driver_event: dict[str, Any] | None = None
 
     # ── signals ──────────────────────────────────────────────────────────────
 
@@ -153,6 +157,15 @@ class HealthReporter:
     def set_stt_probe(self, watchdog_degraded: Callable[[], bool]) -> None:
         """Wire the transcriber's watchdog-latch flag (``__main__``)."""
         self._stt_watchdog_fn = watchdog_degraded
+
+    def note_driver_event(self, msg: dict[str, Any]) -> None:
+        """An Ears ``driver_disconnected`` control event arrived (GDD §15)."""
+        self._last_driver_event = dict(msg)
+
+    @property
+    def last_driver_event(self) -> dict[str, Any] | None:
+        """The most recent Ears driver_disconnected event, verbatim."""
+        return self._last_driver_event
 
     # ── counters ─────────────────────────────────────────────────────────────
 

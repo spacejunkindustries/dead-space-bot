@@ -178,11 +178,19 @@ class _FakeProc:
 
 
 class _FakeIpc:
-    def __init__(self) -> None:
-        self.sent: list[tuple[int, int, bytes]] = []
+    """send_tts mirrors IpcServer's v2 contract: True while a client is
+    attached, False when Ears is disconnected (Speaker must then report the
+    utterance as unspoken so the channel-text fallback engages)."""
 
-    async def send_tts(self, guild_id: int, priority: int, wav_bytes: bytes) -> None:
+    def __init__(self, *, connected: bool = True) -> None:
+        self.sent: list[tuple[int, int, bytes]] = []
+        self.connected = connected
+
+    async def send_tts(self, guild_id: int, priority: int, wav_bytes: bytes) -> bool:
+        if not self.connected:
+            return False
         self.sent.append((guild_id, priority, wav_bytes))
+        return True
 
 
 def _holder(tmp_path, *, enabled: bool = True, max_utterance_s: float = 3.0) -> Any:
@@ -540,3 +548,26 @@ def test_bratty_personality_rotates_with_attitude() -> None:
         assert set(tts._GO_AHEAD_BRATTY) <= set(lines)
     finally:
         tts.set_personality("standard")
+
+
+async def test_say_returns_false_when_ears_disconnected(tmp_path, monkeypatch) -> None:
+    """IPC v2: send_tts is False with no Ears attached — the utterance was
+    never played, so say() must report unspoken (channel-text fallback)."""
+    pcm = b"\x01\x00" * 22050
+    _patch_piper(monkeypatch, pcm)
+    ipc = _FakeIpc(connected=False)
+    speaker = Speaker(_holder(tmp_path), ipc)  # type: ignore[arg-type]
+
+    assert await speaker.say(42, "Hostiles Otanuomi, pinged.", PRIORITY_ALERT) is False
+    assert ipc.sent == []
+    await speaker.close()
+
+
+async def test_chirp_returns_false_when_ears_disconnected(tmp_path) -> None:
+    ipc = _FakeIpc(connected=False)
+    speaker = Speaker(_holder(tmp_path), ipc)  # type: ignore[arg-type]
+    assert await speaker.chirp(42) is False
+    ipc.connected = True
+    assert await speaker.chirp(42) is True
+    assert len(ipc.sent) == 1
+    await speaker.close()

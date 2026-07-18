@@ -39,13 +39,101 @@ impl EventHandler for GatewayHandler {
     }
 }
 
+/// `sysexits.h` EX_CONFIG: configuration error. The deploy units set
+/// `RestartPreventExitStatus=78` so a bad config edit stops the service
+/// cleanly instead of crash-looping it.
+const EXIT_CONFIG: i32 = 78;
+
+/// Parsed command line: `cortana-ears [--version|--check] [CONFIG]`.
+struct Cli {
+    version: bool,
+    check: bool,
+    config_path: String,
+}
+
+fn parse_cli(args: impl Iterator<Item = String>) -> Cli {
+    let mut cli = Cli {
+        version: false,
+        check: false,
+        config_path: config::DEFAULT_CONFIG_PATH.to_owned(),
+    };
+    for arg in args {
+        match arg.as_str() {
+            "--version" => cli.version = true,
+            "--check" => cli.check = true,
+            other => cli.config_path = other.to_owned(),
+        }
+    }
+    cli
+}
+
+/// Offline preflight for `ExecStartPre=` and operators: parse the config
+/// (deny_unknown_fields stays on), confirm the credential is readable, the
+/// socket directory is usable, and the statically linked Opus decoder
+/// actually constructs. Returns the process exit code and prints one human
+/// line per problem — this is an interactive CLI mode, deliberately stdout,
+/// not tracing.
+fn run_check(config_path: &str) -> i32 {
+    let cfg = match config::load(std::path::Path::new(config_path)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            println!("cortana-ears --check: FAIL: config: {e:#}");
+            return EXIT_CONFIG;
+        },
+    };
+    if let Err(e) = config::read_token(&cfg) {
+        println!("cortana-ears --check: FAIL: token: {e:#}");
+        return EXIT_CONFIG;
+    }
+    let socket_dir = cfg
+        .socket_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    if !socket_dir.is_dir() {
+        println!(
+            "cortana-ears --check: FAIL: socket directory {} does not exist \
+             (tmpfiles.d should create it)",
+            socket_dir.display()
+        );
+        return EXIT_CONFIG;
+    }
+    // Opus decode is the whole job (DecodeMode::Decode); prove the statically
+    // linked decoder constructs at 48 kHz stereo, Songbird's receive shape.
+    if let Err(e) = songbird::driver::opus::Decoder::new(48_000, songbird::driver::opus::Channels::Stereo)
+    {
+        println!("cortana-ears --check: FAIL: opus decoder: {e}");
+        return 1;
+    }
+    println!(
+        "cortana-ears --check: OK (config {}, socket {}, ipc protocol v{})",
+        config_path,
+        cfg.socket_path.display(),
+        ipc::IPC_PROTOCOL_VERSION
+    );
+    0
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = parse_cli(std::env::args().skip(1));
+    if cli.version {
+        // Human/CLI output on purpose (matches --check): the protocol version
+        // is how an operator confirms a matched Ears/Brain pair (GDD §15).
+        println!(
+            "cortana-ears {} (ipc protocol v{})",
+            env!("CARGO_PKG_VERSION"),
+            ipc::IPC_PROTOCOL_VERSION
+        );
+        return Ok(());
+    }
+    if cli.check {
+        std::process::exit(run_check(&cli.config_path));
+    }
+
     init_tracing();
 
-    let cfg_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| config::DEFAULT_CONFIG_PATH.to_owned());
+    let cfg_path = cli.config_path;
     let cfg = config::load(std::path::Path::new(&cfg_path))?;
     let token = config::read_token(&cfg)?;
     info!(
@@ -148,4 +236,36 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_current_span(false)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        parse_cli(args.iter().map(|s| (*s).to_owned()))
+    }
+
+    #[test]
+    fn cli_defaults() {
+        let c = cli(&[]);
+        assert!(!c.version);
+        assert!(!c.check);
+        assert_eq!(c.config_path, config::DEFAULT_CONFIG_PATH);
+    }
+
+    #[test]
+    fn cli_flags_and_config_path_in_any_order() {
+        let c = cli(&["--check", "/tmp/ears.yaml"]);
+        assert!(c.check);
+        assert_eq!(c.config_path, "/tmp/ears.yaml");
+        let c = cli(&["/tmp/ears.yaml", "--version"]);
+        assert!(c.version);
+        assert_eq!(c.config_path, "/tmp/ears.yaml");
+    }
+
+    #[test]
+    fn check_fails_config_exit_code_on_missing_file() {
+        assert_eq!(run_check("/nonexistent/ears.yaml"), EXIT_CONFIG);
+    }
 }

@@ -656,8 +656,9 @@ class Speaker:
             return False
         if user_id is not None and user_id in self._voice_mutes:
             return False
-        await self._ipc.send_tts(guild_id, PRIORITY_ALERT, self._chirp_wav)
-        return True
+        # send_tts is False when Ears is not connected: the chirp was NOT
+        # played — report that honestly so callers never assume an ack landed.
+        return await self._ipc.send_tts(guild_id, PRIORITY_ALERT, self._chirp_wav)
 
     @property
     def sample_rate(self) -> int:
@@ -885,7 +886,13 @@ class Speaker:
                 cap_s=cfg.max_utterance_s,
             )
             return False
-        await self._ipc.send_tts(guild_id, job.priority, build_wav(pcm, self._sample_rate))
+        sent = await self._ipc.send_tts(guild_id, job.priority, build_wav(pcm, self._sample_rate))
+        if not sent:
+            # Ears is disconnected (or the write failed): the utterance was
+            # never played. Returning False engages the caller's channel-text
+            # fallback instead of the prompt silently vanishing (GDD §20).
+            log.warning("tts_dropped_no_ears", guild_id=guild_id, text=job.text)
+            return False
         log.debug(
             "tts_sent",
             guild_id=guild_id,
