@@ -43,16 +43,21 @@ __all__ = ["Gazetteer", "GazetteerError"]
 log = structlog.get_logger(__name__)
 
 #: Character budget for the Whisper ``initial_prompt`` bias text. Whisper
-#: keeps roughly the last 224 tokens of the prompt, so the text is ordered by
-#: salience and truncated on a name boundary.
-PROMPT_BIAS_MAX_CHARS = 900
+#: keeps only the LAST ~224 tokens of an over-long prompt — EVE names tokenize
+#: poorly (~2-4 BPE tokens each), so a 900-char prompt overflowed the window
+#: and Whisper silently dropped the *front* of it: exactly the home/hub/alias
+#: names the ordering puts first, keeping the alphabetical tail instead. The
+#: budget must keep the whole prompt inside the window; ~380 chars ≈ 120-160
+#: tokens leaves headroom. A smaller prompt also cuts per-call decode cost and
+#: hallucination priming (the bias names leaking into noise transcripts).
+PROMPT_BIAS_MAX_CHARS = 380
 
 #: Hard cap on the number of names in the bias prompt. At a 5000-system
 #: nomadic gazetteer the whole active set cannot be listed, so the prompt is
 #: bounded and preference-ordered (home → hubs → alias targets → the rest);
 #: the character budget above is usually the binding limit, this is the
 #: backstop that keeps the prompt cheap regardless of gazetteer size.
-PROMPT_BIAS_MAX_NAMES = 200
+PROMPT_BIAS_MAX_NAMES = 60
 
 
 class GazetteerError(Exception):

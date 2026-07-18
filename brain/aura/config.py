@@ -97,6 +97,12 @@ class SttConfig:
     cpu_threads: int
     bias_with_gazetteer: bool
     whisper_cpp_url: str
+    #: Minimum Whisper avg_logprob for a transcript that matched NO grammar
+    #: intent to be posted as a freeform relay (GDD §8.6). Below this the
+    #: transcript is treated as unintelligible — AURA says "Say again" instead
+    #: of posting hallucinated noise to the intel channel. Recognised commands
+    #: are never gated by this (a distress call always posts).
+    relay_min_logprob: float = -0.9
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +334,7 @@ def _build_stt(data: dict[str, Any]) -> SttConfig:
         cpu_threads=_positive(_get(s, "stt.cpu_threads", int), "stt.cpu_threads"),
         bias_with_gazetteer=_get(s, "stt.bias_with_gazetteer", bool, default=True),
         whisper_cpp_url=_get(s, "stt.whisper_cpp_url", str),
+        relay_min_logprob=float(_get(s, "stt.relay_min_logprob", float, default=-0.9)),
     )
 
 

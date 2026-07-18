@@ -115,7 +115,23 @@ class FasterWhisperTranscriber:
 
         model = self._get_model()
         audio = np.frombuffer(pcm16k, dtype=np.int16).astype(np.float32) / _INT16_FULL_SCALE
-        kwargs: dict[str, Any] = {"language": "en"}
+        kwargs: dict[str, Any] = {
+            "language": "en",
+            # Latency-critical decode settings for a 2-vCPU box (GDD §5.3):
+            # the library defaults are beam_size=5 plus a six-step temperature
+            # fallback ladder that re-decodes the whole clip whenever quality
+            # thresholds fail — on noisy fleet audio that is 5-10x the wall
+            # clock of one greedy pass, and it was the bulk of a measured
+            # 20-30s voice→card latency. Greedy + no fallback keeps a 6s
+            # utterance in low single-digit seconds; greedy decoding also
+            # curbs the repeated-token hallucinations that fallback amplifies.
+            "beam_size": 1,
+            "temperature": 0.0,
+            # Each utterance is independent — carrying decoder context across
+            # segments only propagates a hallucination into the next one.
+            "condition_on_previous_text": False,
+            "without_timestamps": True,
+        }
         if self._cfg.bias_with_gazetteer and bias:
             kwargs["initial_prompt"] = bias  # gazetteer biasing, GDD §5.3
         segments, _info = model.transcribe(audio, **kwargs)
@@ -298,6 +314,14 @@ class TimeoutTranscriber:
                 close()
             self._inner = self._factory()
             self._generation += 1
+            fresh = self._inner
+        # Re-warm the respawned backend OFF the request path: without this,
+        # the very next utterance pays the multi-second model reload inside
+        # its own watchdog window — the reload→timeout→reload spiral the
+        # startup warm() exists to prevent (GDD §20).
+        warm = getattr(fresh, "warm", None)
+        if callable(warm):
+            threading.Thread(target=warm, name="aura-stt-rewarm", daemon=True).start()
 
 
 def make_transcriber(cfg: SttConfig) -> Transcriber:

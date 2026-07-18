@@ -154,6 +154,10 @@ class ParsedCommand:
     group_alias: str | None
     detail: str | None
     raw: str
+    #: Spoken threat-colour override (GDD §6.4): "code red" → HIGH,
+    #: "code orange" → MEDIUM, "code yellow" → NONE. ``None`` = not spoken;
+    #: the intent's default severity applies.
+    severity: Severity | None = None
 
 
 @dataclass(frozen=True, slots=True)

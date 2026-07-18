@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import pytest
 
-from aura.nlu.grammar import clean_callsign, parse, sanitize_callsign, system_reply
-from aura.types import Intent
+from aura.nlu.grammar import (
+    bare_code,
+    broadcast_severity,
+    broadcast_text,
+    clean_callsign,
+    parse,
+    sanitize_callsign,
+    system_reply,
+)
+from aura.types import Intent, Severity
 
-# ── the GDD §6.4 examples ────────────────────────────────────────────────────
+# ── the GDD §6.5 examples ────────────────────────────────────────────────────
 
 
 def test_hostiles_with_detail() -> None:
@@ -478,3 +486,92 @@ def test_over_variants_stripped(signoff: str) -> None:
     assert p is not None
     assert p.intent is Intent.HOSTILE_SPOTTED
     assert p.system_text == "Jita"
+
+
+# ── spoken colour codes (GDD §6.4) ───────────────────────────────────────────
+
+
+def test_inline_code_sets_severity_and_never_claims_red() -> None:
+    cmd = parse("code red hostiles in umi")
+    assert cmd is not None
+    # "red" belongs to the colour code, not the HOSTILE_SPOTTED \breds?\b —
+    # the intent must come from "hostiles" and the code must carry HIGH.
+    assert cmd.intent is Intent.HOSTILE_SPOTTED
+    assert cmd.severity is Severity.HIGH
+    assert cmd.system_text == "umi"
+
+
+def test_inline_code_orange_on_a_report() -> None:
+    cmd = parse("code orange, hostiles in Otanuomi, three battleships")
+    assert cmd is not None
+    assert cmd.intent is Intent.HOSTILE_SPOTTED
+    assert cmd.severity is Severity.MEDIUM
+    assert cmd.system_text == "Otanuomi"
+
+
+def test_no_code_leaves_severity_none() -> None:
+    cmd = parse("hostiles in Otanuomi")
+    assert cmd is not None
+    assert cmd.severity is None
+
+
+@pytest.mark.parametrize(
+    ("phrase", "severity"),
+    [
+        ("code red", Severity.HIGH),
+        ("hey jarvis, code orange", Severity.MEDIUM),
+        ("Code yellow.", Severity.NONE),
+        ("hey cortana code red over", Severity.HIGH),
+    ],
+)
+def test_bare_code_detected(phrase: str, severity: Severity) -> None:
+    assert bare_code(phrase) is severity
+
+
+def test_bare_code_rejects_utterances_with_content() -> None:
+    assert bare_code("code orange hostiles in umi") is None
+    assert bare_code("no code here") is None
+
+
+def test_broadcast_severity_and_code_stripped_from_text() -> None:
+    assert broadcast_severity("code red blop fleet inbound") is Severity.HIGH
+    assert broadcast_text("code red blop fleet inbound") == "blop fleet inbound"
+    assert broadcast_severity("blop fleet inbound") is None
+
+
+# ── report envelope and STT-drift fixes ──────────────────────────────────────
+
+
+def test_report_envelope_stripped() -> None:
+    cmd = parse("report, I been tackled in umi, end report")
+    assert cmd is not None
+    assert cmd.intent is Intent.UNDER_ATTACK
+    assert cmd.system_text == "umi"
+
+
+def test_end_of_report_signoff_variants() -> None:
+    for tail in ("end report", "end of report", "report ends", "end transmission"):
+        cmd = parse(f"hostiles in Otanuomi {tail}")
+        assert cmd is not None, tail
+        assert cmd.system_text == "Otanuomi", tail
+
+
+def test_regester_misspelling_registers() -> None:
+    # A real fleet said "Register Space Junkie"; Whisper wrote "Regester" and
+    # the command fell through to the relay. Never again.
+    cmd = parse("Regester Space Junkie")
+    assert cmd is not None
+    assert cmd.intent is Intent.REGISTER
+    assert cmd.detail == "Space Junkie"
+
+
+def test_jarvis_and_cortana_wake_residue_stripped() -> None:
+    for wake in ("hey jarvis", "hey cortana", "cortana"):
+        cmd = parse(f"{wake} hostiles in Otanuomi")
+        assert cmd is not None, wake
+        assert cmd.system_text == "Otanuomi", wake
+
+
+def test_stuttered_hallucination_collapses_in_relay() -> None:
+    assert broadcast_text("Rens, Rens, Rens") == "Rens"
+    assert broadcast_text("Rens Rens") == "Rens Rens"  # 2x = emphasis, kept

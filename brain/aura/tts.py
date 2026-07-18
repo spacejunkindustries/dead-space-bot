@@ -35,7 +35,7 @@ import structlog
 
 from aura.config import ConfigHolder
 from aura.ipc import PRIORITY_ALERT, PRIORITY_NORMAL, IpcServer
-from aura.types import Intent
+from aura.types import Intent, Severity
 
 __all__ = [
     "DEFAULT_SAMPLE_RATE",
@@ -157,8 +157,39 @@ def degraded() -> str:
 
 
 def help_hint() -> str:
-    """*"Check help in Discord."* — the HELP intent; the real manual is /help."""
-    return "Check help in Discord."
+    """*"Command list posted to Discord."* — the HELP intent; the App posts the
+    /help front page to the intel channel alongside this (the real manual is
+    /help — a spoken catalogue would blow the §12.2 3-second cap)."""
+    return "Command list posted to Discord."
+
+
+_SEVERITY_SPOKEN: dict[Severity, str] = {
+    Severity.HIGH: "red",
+    Severity.MEDIUM: "orange",
+    Severity.NONE: "yellow",
+}
+
+
+def relayed() -> str:
+    """*"Relayed."* — spoken after a freeform relay posts, so the pilot knows
+    it landed and stops repeating themselves (each repeat is another card and
+    another STT decode)."""
+    return "Relayed."
+
+
+def code_ack(severity: Severity) -> str:
+    """*"Code orange. Go ahead."* — a standalone spoken colour code opens a
+    dialogue: AURA acknowledges and the report follows in a wake-free window
+    (GDD §6.4)."""
+    return f"Code {_SEVERITY_SPOKEN[severity]}. Go ahead."
+
+
+def responder_named(name: str, system: str | None) -> str:
+    """*"Space Junkie responding to Otanuomi."* — spoken when a pilot presses
+    "On my way", so the reporter hears WHO is coming, not just a count."""
+    if system:
+        return f"{name} responding to {system}."
+    return f"{name} is on the way."
 
 
 def registered(callsign: str) -> str:

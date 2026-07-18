@@ -64,6 +64,18 @@ the openWakeWord repo:
 `generate_samples.py` wraps steps 1–3 (plus all asset downloads);
 `train.py` wraps step 4 and adds the validation sweep.
 
+## Running it on Kaggle (phone-friendly)
+
+`kaggle_hey_cortana.ipynb` in this directory is a ready-to-import notebook:
+kaggle.com → Create → Notebook → File → Import Notebook → upload it, set
+**Accelerator: GPU T4 x2** and **Internet: ON**, then run the cells in order.
+It puts the entire ~40 GB job on `/kaggle/tmp` (the ~60 GiB ephemeral disk —
+`/kaggle/working` is capped at ~20 GB and WILL fill up), and copies only the
+three final `.onnx` files back to `/kaggle/working` as downloadable output.
+For a run that survives the phone's browser sleeping, use *Save Version →
+Save & Run All (Commit)* after the interactive cells check out — it executes
+headless for up to ~12 h.
+
 ## Running it
 
 > **Python version matters.** The pin set targets **3.10** — `piper-phonemize`

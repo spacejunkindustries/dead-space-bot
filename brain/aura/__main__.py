@@ -56,6 +56,7 @@ from aura.types import (
     INTENT_SEVERITY,
     MENTION_INTENTS,
     CardRender,
+    Intent,
     Outcome,
     ParsedCommand,
     Severity,
@@ -163,6 +164,10 @@ class App:
         # command, wall-clock deadline). The next utterance from that user may
         # be a bare system name that re-binds to the rejected intent.
         self._pending_retry: dict[int, tuple[ParsedCommand, float]] = {}
+        # Spoken-colour dialogue state (GDD §6.4): a standalone "code orange"
+        # acknowledges, reopens a wake-free window, and the next utterance from
+        # that user inherits the severity. Same shape and TTL as the retry.
+        self._pending_severity: dict[int, tuple[Severity, float]] = {}
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -450,13 +455,28 @@ class App:
             avg_logprob=round(result.avg_logprob, 3),
         )
 
-        # The pending-retry context applies only to this user's very next
-        # utterance — pop unconditionally (a full command discards it).
+        # The pending contexts apply only to this user's very next utterance —
+        # pop unconditionally (a full command discards them).
         loop = asyncio.get_running_loop()
         pending = self._pending_retry.pop(user_id, None)
+        pend_sev = self._pending_severity.pop(user_id, None)
+        inherited: Severity | None = None
+        if pend_sev is not None and loop.time() <= pend_sev[1]:
+            inherited = pend_sev[0]
 
         parsed = grammar.parse(result.text)
         if parsed is None:
+            # Spoken-colour dialogue (GDD §6.4): a standalone "code orange"
+            # opens a two-step report — acknowledge, reopen a wake-free
+            # window, and let the next utterance inherit the severity.
+            code = grammar.bare_code(result.text)
+            if code is not None:
+                self._pending_severity[user_id] = (code, loop.time() + _RETRY_TTL_S)
+                if self.capture is not None:
+                    self.capture.reopen(user_id, guild_id)
+                log.info("code_dialogue_opened", user_id=user_id, severity=str(code))
+                await self._speak_or_post(guild_id, user_id, tts_mod.code_ack(code))
+                return
             # §8.3 retry: a bare system name in the reopened window re-binds
             # to the LOW-rejected command's intent.
             if pending is not None and loop.time() <= pending[1]:
@@ -469,6 +489,20 @@ class App:
                 # (GDD §8.6): post whatever was said to the intel channel rather
                 # than drop it. A nullsec corp's comms are lively and
                 # unstructured — fleet movements, region callsigns, sitreps.
+                # Gate on STT confidence first: a hallucinated transcript
+                # ("Rens, Rens, Rens" decoded from noise) must not become a
+                # card. Recognised commands are never gated — this protects
+                # the relay path only.
+                if result.avg_logprob < cfg.stt.relay_min_logprob:
+                    self.health.record_rejected()
+                    log.info(
+                        "relay_low_confidence",
+                        user_id=user_id,
+                        avg_logprob=round(result.avg_logprob, 3),
+                        text=result.text,
+                    )
+                    await self._speak_or_post(guild_id, user_id, tts_mod.say_again())
+                    return
                 text = grammar.broadcast_text(result.text)
                 if len(text) < 3:
                     self.health.record_rejected()
@@ -477,9 +511,28 @@ class App:
                 here = grammar.wants_all_hands(result.text) and self.discipline.may_mention(
                     self._member_role_ids(user_id)
                 )
-                outcome = await self.engine.broadcast(guild_id, user_id, text, here=here)
+                relay_sev = (
+                    inherited if inherited is not None else grammar.broadcast_severity(result.text)
+                )
+                outcome = await self.engine.broadcast(
+                    guild_id,
+                    user_id,
+                    text,
+                    here=here,
+                    severity=relay_sev,
+                    confidence=result.avg_logprob,
+                )
                 self._count_outcome(outcome.outcome)
+                # "Relayed." — without an audible ack pilots repeat themselves,
+                # and every repeat is another card and another STT decode.
+                await self._reply(guild_id, user_id, relay_sev or Severity.NONE, outcome)
                 return
+
+        # A severity spoken in the opener ("code orange" → "go ahead" → the
+        # report) attaches to the report itself; an inline code on the report
+        # wins over the opener.
+        if inherited is not None and parsed.severity is None:
+            parsed = dataclasses.replace(parsed, severity=inherited)
 
         # GDD §11.1 layer 4: only @Pilot may trigger mentions — reject the
         # command outright, exactly like the slash twin (constraint 10). Lifted
@@ -513,6 +566,16 @@ class App:
         outcome = await self.engine.report(guild_id, user_id, parsed, resolution)
         self._count_outcome(outcome.outcome)
 
+        # Voice "help" (GDD §6.1): the spoken line stays under the §12.2 cap,
+        # so the actual command list — the /help front page — is posted to the
+        # intel channel alongside it.
+        if parsed.intent is Intent.HELP and outcome.outcome is Outcome.POSTED:
+            from aura.dsc.cogs.help import main_embed  # text-side import, lazy
+
+            await self._send_channel(
+                self.holder.current.discord.channels.intel_live, "", embed=main_embed()
+            )
+
         # LOW tier: "say again" — reopen capture so the retry needs no wake
         # word, and remember the rejected command so a bare system-name reply
         # re-binds to its intent (GDD §8.3).
@@ -525,7 +588,12 @@ class App:
             self.capture.reopen(user_id, guild_id)
             self._pending_retry[user_id] = (parsed, loop.time() + _RETRY_TTL_S)
 
-        await self._reply(guild_id, user_id, parsed_intent_severity(parsed.intent), outcome)
+        effective = (
+            parsed.severity
+            if parsed.severity is not None
+            else parsed_intent_severity(parsed.intent)
+        )
+        await self._reply(guild_id, user_id, effective, outcome)
 
     def _count_outcome(self, outcome: Outcome) -> None:
         assert self.health

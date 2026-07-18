@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import re
 
-from aura.types import Intent, ParsedCommand
+from aura.types import Intent, ParsedCommand, Severity
 
 __all__ = [
     "PING_TYPE_ORDER",
+    "bare_code",
+    "broadcast_severity",
     "clean_callsign",
     "encode_ping_types",
     "parse",
@@ -42,7 +44,11 @@ __all__ = [
 # capture window starts 300ms of pre-roll before the trigger, so the phrase
 # (or Whisper's rendering of it) usually survives into the transcript.
 _WAKE_RE = re.compile(
-    r"^\W*(?:hey\s+|ok(?:ay)?\s+)?(?:aura|ora|or\s+a|aura's|laura|oracle)[\s,]*"
+    r"^\W*(?:hey\s+|ok(?:ay)?\s+)?"
+    r"(?:aura|ora|or\s+a|aura's|laura|oracle"
+    # the pretrained interim wake word and the trained replacement, with
+    # Whisper's routine renderings of each
+    r"|jarvis|jarvus|jervis|cortana|cortana's|cortina|katana|montana)[\s,]*"
     r"(?:command(?:er)?)?\b[\s,.:;-]*",
     re.IGNORECASE,
 )
@@ -66,6 +72,13 @@ _JARGON_NORMALIZE: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:newts?|nutes?|noots?|neutes?|knutes?)\b", re.I), "neuts"),
     (re.compile(r"\b(?:tickled|tackle)\b", re.I), "tackled"),
     (re.compile(r"\b(?:gatecamp|gate\s*champ|gate\s*camps?)\b", re.I), "gate camp"),
+    # Whisper's spellings of "register" — a real fleet said "Register Space
+    # Junkie", got "Regester Space Junkie", and the command fell through to
+    # the freeform relay instead of registering the callsign.
+    (
+        re.compile(r"\b(?:regester|registar|redgister|rejister|regiser|regista)\b", re.I),
+        "register",
+    ),
 )
 
 # Radio sign-off at the tail of an utterance ("...three battleships, over").
@@ -75,11 +88,38 @@ _JARGON_NORMALIZE: tuple[tuple[re.Pattern[str], str], ...] = (
 _SIGNOFF_RE = re.compile(
     r"[\s,.;:!?-]*\b(?:"
     r"over\s+and\s+out|over\s+out|overandout|over|out|copy|roger|clear\s+skies"
+    # radio-procedure closers for the "report … end report" envelope
+    r"|end\s+(?:of\s+)?report|report\s+ends?|end\s+transmission"
     # common STT renderings of "over" at the tail of a transmission
     r"|rover|ova|oveur|ovah"
     r")\b[\s,.;:!?-]*$",
     re.I,
 )
+
+# Radio-procedure opener: "report, I've been tackled in UMI, end report".
+# A leading "report(ing)" frames the message; it is not part of it.
+_REPORT_OPENER_RE = re.compile(r"^\W*report(?:ing)?\b[\s,.:;-]*", re.I)
+
+# ── spoken threat colours (GDD §6.4) ─────────────────────────────────────────
+
+# "code red / orange / yellow" — spoken severity, mirroring the card labels
+# (CODE RED = high, CODE ORANGE = medium, CODE YELLOW = none/info). Matched
+# anywhere in the utterance and stripped before intent matching — "code red"
+# must never be claimed by the HOSTILE_SPOTTED "\breds?\b" pattern.
+_CODE_RE = re.compile(r"\bcode\s+(red|orange|yellow)\b[\s,.:;-]*", re.I)
+_CODE_SEVERITY: dict[str, Severity] = {
+    "red": Severity.HIGH,
+    "orange": Severity.MEDIUM,
+    "yellow": Severity.NONE,
+}
+
+
+def _extract_code(text: str) -> tuple[Severity | None, str]:
+    """Pull the first spoken colour code out of ``text``; strip all of them."""
+    m = _CODE_RE.search(text)
+    if m is None:
+        return None, text
+    return _CODE_SEVERITY[m.group(1).lower()], _CODE_RE.sub(" ", text)
 
 
 def _normalize_jargon(text: str) -> str:
@@ -336,12 +376,48 @@ _BROADCAST_WAKE_RE = re.compile(
 _ALL_HANDS_RE = re.compile(r"\ball\s+hands\b|\bat\s+here\b|\bping\s+everyone\b", re.I)
 
 
+# Whisper hallucinating on near-silence produces a word stuttered three or
+# more times ("Rens, Rens, Rens"). Real speech repeats for emphasis at most
+# twice; three-plus identical words in a row collapse to one.
+_REPEAT_RE = re.compile(r"\b(\w[\w'-]*)(?:[\s,.;:!?-]+\1\b){2,}", re.I)
+
+
 def broadcast_text(transcript: str) -> str:
-    """Clean a freeform relay message: strip a leading wake phrase and a
-    trailing radio sign-off, leaving the intel itself (GDD §8.6)."""
+    """Clean a freeform relay message: strip a leading wake phrase, a spoken
+    colour code, and a trailing radio sign-off, leaving the intel itself
+    (GDD §8.6). Stuttered hallucinations collapse to a single word."""
     work = _BROADCAST_WAKE_RE.sub("", transcript, count=1)
     work = _SIGNOFF_RE.sub("", work)
+    work = _REPORT_OPENER_RE.sub("", work, count=1)
+    _, work = _extract_code(work)
+    work = _REPEAT_RE.sub(r"\1", work)
     return work.strip(" ,.;:!?-")
+
+
+def broadcast_severity(transcript: str) -> Severity | None:
+    """The spoken colour code of a freeform relay, if any (GDD §6.4)."""
+    severity, _ = _extract_code(transcript)
+    return severity
+
+
+def bare_code(transcript: str) -> Severity | None:
+    """Detect a *standalone* colour code — the dialogue opener (GDD §6.4).
+
+    "Code orange." with nothing else after wake/sign-off stripping means the
+    pilot is announcing severity first and will give the report in the next
+    breath: AURA acknowledges and reopens a wake-free capture window. Returns
+    the severity, or ``None`` when the utterance carries other content (then
+    the code rides along inline instead).
+    """
+    if not transcript or not transcript.strip():
+        return None
+    work = _BROADCAST_WAKE_RE.sub("", transcript, count=1)
+    work = _WAKE_RE.sub("", work, count=1)
+    work = _SIGNOFF_RE.sub("", work)
+    severity, work = _extract_code(work)
+    if severity is None:
+        return None
+    return severity if len(work.strip(" ,.;:!?-")) < 3 else None
 
 
 def wants_all_hands(transcript: str) -> bool:
@@ -356,7 +432,11 @@ def parse(transcript: str) -> ParsedCommand | None:
         return None
     work = _WAKE_RE.sub("", transcript, count=1)
     work = _SIGNOFF_RE.sub("", work)
+    work = _REPORT_OPENER_RE.sub("", work, count=1)
     work = _normalize_jargon(work)
+    # Spoken colour first: "code red" carries severity, and its "red" must be
+    # gone before the HOSTILE_SPOTTED pattern can misread it as a sighting.
+    severity, work = _extract_code(work)
 
     intent: Intent | None = None
     match: re.Match[str] | None = None
@@ -381,7 +461,12 @@ def parse(transcript: str) -> ParsedCommand | None:
 
     if intent in _SYSTEMLESS_INTENTS:
         return ParsedCommand(
-            intent=intent, system_text=None, group_alias=group_alias, detail=None, raw=transcript
+            intent=intent,
+            system_text=None,
+            group_alias=group_alias,
+            detail=None,
+            raw=transcript,
+            severity=severity,
         )
 
     if intent is Intent.PING_ME:
@@ -395,6 +480,7 @@ def parse(transcript: str) -> ParsedCommand | None:
             group_alias=group_alias,
             detail=encoded,
             raw=transcript,
+            severity=severity,
         )
 
     if intent is Intent.REGISTER:
@@ -406,6 +492,7 @@ def parse(transcript: str) -> ParsedCommand | None:
             group_alias=group_alias,
             detail=clean_callsign(remainder),
             raw=transcript,
+            severity=severity,
         )
 
     if intent in (Intent.TIMER, Intent.FORMUP):
@@ -419,4 +506,5 @@ def parse(transcript: str) -> ParsedCommand | None:
         group_alias=group_alias,
         detail=detail,
         raw=transcript,
+        severity=severity,
     )

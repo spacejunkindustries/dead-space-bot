@@ -28,6 +28,7 @@ from aura.types import (
     Outcome,
     ParsedCommand,
     PriorContext,
+    Severity,
     SystemEntry,
     TranscriptResult,
 )
@@ -47,14 +48,20 @@ class _Gazetteer(FakeGazetteer):
 
 
 class _Transcriber:
-    def __init__(self, texts: list[str] | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        texts: list[str] | None = None,
+        error: Exception | None = None,
+        avg_logprob: float = -0.1,
+    ) -> None:
         self.texts = list(texts or [])
         self.error = error
+        self.avg_logprob = avg_logprob
 
     def transcribe(self, pcm: bytes, bias: str) -> TranscriptResult:
         if self.error is not None:
             raise self.error
-        return TranscriptResult(text=self.texts.pop(0), avg_logprob=-0.1)
+        return TranscriptResult(text=self.texts.pop(0), avg_logprob=self.avg_logprob)
 
 
 class _Engine:
@@ -68,8 +75,19 @@ class _Engine:
         self.reports.append((guild_id, user_id, parsed, resolution))
         return self.outcome
 
-    async def broadcast(self, guild_id: int, user_id: int, text: str, *, here: bool = False) -> Any:
+    async def broadcast(
+        self,
+        guild_id: int,
+        user_id: int,
+        text: str,
+        *,
+        here: bool = False,
+        severity: Any = None,
+        confidence: Any = None,
+    ) -> Any:
         self.broadcasts.append((guild_id, user_id, text, here))
+        self.broadcast_severities = getattr(self, "broadcast_severities", [])
+        self.broadcast_severities.append(severity)
         return self.outcome
 
     def build_prior_context(self, guild_id: int, user_id: int) -> PriorContext:
@@ -406,3 +424,70 @@ async def test_graceful_shutdown_is_bounded(monkeypatch) -> None:
     # A wedged close must not hang the process: the wait_for bound returns
     # control promptly instead of blocking until systemd's SIGKILL.
     await asyncio.wait_for(app._graceful_shutdown(), timeout=2)
+
+
+# ── spoken colour codes: dialogue + inline (GDD §6.4) ────────────────────────
+
+
+async def test_bare_code_opens_dialogue_and_next_report_inherits_severity() -> None:
+    app, engine, _, speaker, capture = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey jarvis code orange", "hostiles Otanuomi"]),
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    # Step 1: acknowledged, window reopened, nothing posted yet.
+    assert speaker.said == [(GUILD, "Code orange. Go ahead.")]
+    assert capture.reopened == [(USER, GUILD)]
+    assert engine.reports == [] and engine.broadcasts == []
+
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    # Step 2: the report inherits the pending severity.
+    assert len(engine.reports) == 1
+    parsed = engine.reports[0][2]
+    assert parsed.intent is Intent.HOSTILE_SPOTTED
+    assert parsed.severity is Severity.MEDIUM
+
+
+async def test_inline_code_red_rides_the_report() -> None:
+    app, engine, _, _, _ = make_app(
+        roles=[PILOT_ROLE], transcriber=_Transcriber(["code red hostiles Otanuomi"])
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert len(engine.reports) == 1
+    assert engine.reports[0][2].severity is Severity.HIGH
+
+
+async def test_pending_severity_colours_a_freeform_relay() -> None:
+    app, engine, _, _, _ = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["code red", "blop fleet moving to Kisogo gate whatever"]),
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert len(engine.broadcasts) == 1
+    assert engine.broadcast_severities == [Severity.HIGH]
+
+
+# ── freeform relay confidence gate (GDD §8.6) ────────────────────────────────
+
+
+async def test_low_confidence_gibberish_is_not_relayed() -> None:
+    app, engine, health, speaker, _ = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["Rens, Rens, Rens"], avg_logprob=-2.4),
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert engine.broadcasts == []  # hallucinated noise never becomes a card
+    assert health.rejected == 1
+    assert speaker.said == [(GUILD, "Say again the system.")]
+
+
+async def test_confident_relay_posts_and_acks() -> None:
+    app, engine, _, speaker, _ = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["blop fleet moving to Kisogo gate whatever"]),
+        outcome=IncidentOutcome(Outcome.POSTED, "Relayed.", None, None),
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert len(engine.broadcasts) == 1
+    assert (GUILD, "Relayed.") in speaker.said
