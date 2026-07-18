@@ -284,6 +284,11 @@ class Incident:
     status: IncidentStatus
     message_id: int | None
     channel_id: int | None
+    #: The heard system name VERBATIM (GDD §8.6 flexible resolution) — what
+    #: the card shows whenever ``system_id`` is NULL. Loaded from the
+    #: ``raw_system_text`` column so re-renders (responder buttons, folds,
+    #: stale sweeps) can never degrade a card to "unknown" (live incident).
+    raw_system_text: str | None = None
     updates: list[IncidentUpdate] = field(default_factory=list)
     responders: dict[int, ResponderState] = field(default_factory=dict)
 
