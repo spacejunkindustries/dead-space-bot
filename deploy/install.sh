@@ -16,15 +16,21 @@
 #   GATE     Preflight the NEW release against the LIVE /etc/cortana:
 #            the token file must exist before anything is enabled, and the
 #            release's own doctor (python -m cortana.doctor) runs offline as
-#            the service user via setpriv.
+#            the service user via setpriv, with the credentials handed over
+#            through CREDENTIALS_DIRECTORY exactly the way systemd does.
+#            On a FIRST install (no live release) missing human-installed
+#            assets degrade to warnings and the run ends enable-only after
+#            printing the setup checklist — a fresh droplet must be able to
+#            reach the instructions it needs.
 #   FLIP     Atomically swap the /opt/cortana/current symlink.
-#   RESTART  Brain always; Ears only when its binary hash changed (hash is
-#            recorded per release), so a protocol-desynced brain/ears pair
-#            cannot exist after a deploy.
+#   RESTART  Brain always; Ears when its binary hash OR its unit file
+#            changed (hash is recorded per release), so a protocol-desynced
+#            or stale-sandboxed brain/ears pair cannot exist after a deploy.
 #   VERIFY   PASS/FAIL table: doctor, is-active after settle, ears<->brain
 #            IPC handshake in the journal, DB migration version. On FAIL:
-#            journal tail, automatic rollback to the previous release,
-#            nonzero exit.
+#            journal tail, automatic rollback to the previous release, a
+#            .verify_failed marker on the bad release (--rollback will never
+#            pick it), nonzero exit.
 #
 # Idempotent: re-running from the same commit that is already live is a
 # fast-path no-op ending in VERIFY. The last 3 releases are kept so
@@ -100,15 +106,56 @@ live_release() { readlink -f "${CURRENT}" 2>/dev/null || true; }
 # Recorded ears binary hash of a release dir ("" when none).
 ears_hash_of() { awk '{print $1}' "$1/ears.sha256" 2>/dev/null || true; }
 
-install_if_changed() {  # src dst mode — sets UNITS_CHANGED=1 on change
-    local src="$1" dst="$2" mode="$3"
+install_if_changed() {  # src dst mode [flagvar] — sets UNITS_CHANGED=1 (and flagvar=1) on change
+    local src="$1" dst="$2" mode="$3" flagvar="${4:-}"
     if [[ -f "${dst}" ]] && cmp -s "${src}" "${dst}"; then
         note "${dst} unchanged"
     else
         run install -m "${mode}" "${src}" "${dst}"
         note "${dst} installed"
         UNITS_CHANGED=1
+        if [[ -n "${flagvar}" ]]; then
+            printf -v "${flagvar}" 1
+        fi
     fi
+}
+
+# First-time-setup checklist. Printed after a verified deploy AND on the
+# first-install enable-only path — a fresh droplet must reach these
+# instructions through the script itself, not by already knowing them.
+print_checklist() {
+    cat <<'CHECKLIST'
+
+==> First-time setup that still needs a human (skip what's done):
+
+  1. Piper TTS binary at /usr/local/bin/piper
+     (https://github.com/OHF-Voice/piper1-gpl — not in Ubuntu's archive).
+
+  2. Model files (GDD §4 Assets):
+       /opt/cortana/models/wake/     openWakeWord ONNX chain (melspec, embedding,
+                                     and the trained "hey cortana" model)
+       /opt/cortana/models/piper/    Piper voice .onnx + .onnx.json
+     Whisper weights need NO manual step for the shipped config: install.sh
+     prefetches stt.model "small" into /var/lib/cortana/hf, the same HF cache
+     the service reads. Only a path-based stt.model is hand-installed.
+
+  3. Edit /etc/cortana/{cortana,routing,gazetteer,ears}.yaml — installed
+     copies are examples with placeholder IDs.
+
+  4. Seed the gazetteer AS THE SERVICE USER so the database stays writable:
+       sudo -u aura /opt/cortana/current/venv/bin/python -m cortana.nlu.seed \
+           --db /var/lib/cortana/cortana.db ...
+
+  5. Failure alerts to Discord: put a webhook URL in /etc/cortana/alert_webhook
+     (mode 0600). Without it, alerts only land in /var/lib/cortana/alerts.log.
+
+  6. Firewall: ufw deny incoming except SSH. CORTANA opens no listening ports.
+
+  Useful afterwards:
+       journalctl -u cortana-brain -u cortana-ears -f
+       sudo deploy/install.sh --rollback     # flip back to the previous release
+
+CHECKLIST
 }
 
 show_journal_tail() {
@@ -163,7 +210,12 @@ verify_release() {
     if (( ears_expected )) && systemctl is-active --quiet cortana-brain.service; then
         local since ok=0 _try
         since="$(systemctl show -p ActiveEnterTimestamp --value cortana-brain.service)"
-        for _try in 1 2 3 4 5 6; do   # ears reconnects with backoff — allow ~30s
+        # Budget ~120s: ears reconnects with backoff, and the brain binds the
+        # IPC socket only AFTER setup() — whose STT warm is bounded at 120s
+        # (_STT_WARM_TIMEOUT_S in cortana/__main__.py). A shorter window used
+        # to fail perfectly good first deploys mid-model-load. A passing
+        # deploy exits this loop on the first hit; only broken ones wait.
+        for _try in {1..24}; do
             if journalctl -u cortana-brain.service --since "${since}" --no-pager 2>/dev/null \
                     | grep -q ipc_client_connected; then
                 ok=1
@@ -215,10 +267,14 @@ do_rollback() {
     for d in "${RELEASES}"/*/; do
         d="${d%/}"
         [[ -f "${d}/.complete" ]] || continue
+        # Never roll back INTO a release that failed VERIFY: after an
+        # automatic rollback the failed release is kept on disk (newest,
+        # .complete) and used to be exactly what this loop picked.
+        [[ -f "${d}/.verify_failed" ]] && continue
         [[ "$(readlink -f "${d}")" == "${cur}" ]] && continue
         prev="${d}"   # ascending name sort == date order; ends on newest other
     done
-    [[ -n "${prev}" ]] || die "--rollback: no other complete release under ${RELEASES}"
+    [[ -n "${prev}" ]] || die "--rollback: no other complete, verify-clean release under ${RELEASES}"
 
     say "ROLLBACK: $(basename "${cur}") -> $(basename "${prev}")"
     local old_hash new_hash
@@ -235,7 +291,17 @@ do_rollback() {
         say "rollback verified — now running $(basename "${prev}")"
     else
         show_journal_tail
-        die "rollback to $(basename "${prev}") did not verify — manual intervention needed"
+        # Leaving current pointed at a release that just failed VERIFY would
+        # make --rollback strictly worse than doing nothing: mark the target
+        # bad, restore the release that was live when we started, and say so.
+        run touch "${prev}/.verify_failed"
+        say "rollback target failed verification — restoring $(basename "${cur}")"
+        run flip_current "${cur}"
+        sysctl_run restart cortana-brain.service
+        if [[ -n "${new_hash}" && "${new_hash}" != "${old_hash}" ]]; then
+            sysctl_run restart cortana-ears.service
+        fi
+        die "rollback to $(basename "${prev}") did not verify — flipped back to $(basename "${cur}") (which is still running its pre-rollback state); manual intervention needed"
     fi
 }
 
@@ -318,9 +384,19 @@ PYEOF
 }
 
 prefetch_whisper_weights() {
-    "${REL}/venv/bin/python" - <<'PYEOF'
+    # Into the SAME Hugging Face cache the service reads: cortana-brain.service
+    # sets HF_HOME=${VARLIB}/hf, and a size-name stt.model ("small") resolves
+    # through that cache. A prefetch with output_dir= used to land somewhere
+    # the brain never looks, re-downloading ~460 MB as aura at the first
+    # utterance — at fleet time. Run as aura so every cache file is owned by
+    # the service user. (A path-based stt.model bypasses this cache entirely;
+    # those weights are hand-installed per the checklist.)
+    setpriv --reuid aura --regid aura --clear-groups \
+        env HOME="${VARLIB}" HF_HOME="${VARLIB}/hf" \
+        "${REL}/venv/bin/python" - <<'PYEOF'
 from faster_whisper import download_model
-download_model("small", output_dir="/opt/cortana/models/whisper/small")
+
+download_model("small")  # -> Systran/faster-whisper-small in the HF cache
 PYEOF
 }
 
@@ -363,13 +439,15 @@ stage_release() {
     # --- model prefetch (best-effort — a warning beats a runtime failure)
     if [[ "${DRYRUN}" == 1 ]]; then
         note "dry-run: would prefetch openWakeWord feature models into the release venv"
-        note "dry-run: would prefetch faster-whisper 'small' weights if absent"
+        note "dry-run: would prefetch faster-whisper 'small' weights into ${VARLIB}/hf if absent"
     else
         note "prefetching openWakeWord feature models (melspec + embedding)"
         prefetch_wake_models \
             || warn "openWakeWord model download failed — voice will not start until it succeeds (re-run install.sh with network access)"
-        if [[ ! -d "${OPT}/models/whisper/small" ]]; then
-            note "prefetching faster-whisper 'small' weights"
+        # HF hub cache layout: <HF_HOME>/hub/models--<org>--<repo>. "small"
+        # maps to Systran/faster-whisper-small (faster_whisper.utils).
+        if [[ ! -d "${VARLIB}/hf/hub/models--Systran--faster-whisper-small" ]]; then
+            note "prefetching faster-whisper 'small' weights into ${VARLIB}/hf (shared with the service)"
             prefetch_whisper_weights \
                 || warn "whisper download failed — stt.model: small will fetch from HuggingFace at first start instead"
         fi
@@ -490,6 +568,9 @@ run install -d -m 0755 "${OPT}" "${RELEASES}"
 run install -d -m 0755 "${OPT}/models/wake" "${OPT}/models/whisper" "${OPT}/models/piper"
 run install -d -m 0750 -o root -g aura "${ETC}"
 run install -d -m 0750 -o aura -g aura "${VARLIB}"
+# Shared Hugging Face cache: the whisper prefetch (STAGE, runs as aura) and
+# cortana-brain.service (Environment=HF_HOME) both resolve stt.model names here.
+run install -d -m 0750 -o aura -g aura "${VARLIB}/hf"
 # Pre-create the database with the right owner: the natural way to run the
 # gazetteer seeder is plain `sudo python -m cortana.nlu.seed ...`, which would
 # otherwise create cortana.db as root:root and crash cortana-brain (User=aura)
@@ -560,6 +641,16 @@ fi
 # -------------------------------------------------------------------- GATE
 say "GATE: preflight against live ${ETC}"
 
+# First install = nothing live yet. Missing human-installed assets (wake
+# model, piper binary + voice, gazetteer seed) must not brick the very first
+# deploy before the checklist that explains them has ever been printed: the
+# doctor runs with --first-install (exactly those FAILs degrade to WARN) and,
+# when any such asset is actually missing, this run ends enable-only with the
+# checklist and exit 0 instead of flipping/starting services that cannot run.
+FIRST_INSTALL=0
+[[ -z "$(live_release)" ]] && FIRST_INSTALL=1
+DEGRADED_FIRST_INSTALL=0
+
 # Both units LoadCredential= the token; enabling them without it guarantees a
 # cryptic credential failure on first start. Abort loudly instead — nothing
 # has been enabled or flipped yet.
@@ -598,20 +689,47 @@ fi
 DOCTOR_RESULT="SKIP (no doctor module in release)"
 if [[ "${DRYRUN}" == 1 ]]; then
     note "dry-run: would run 'python -m cortana.doctor --config ${ETC}/cortana.yaml'"
-    note "dry-run: offline, as aura via setpriv, aborting the deploy on failure"
+    note "dry-run: offline, as aura via setpriv with a staged CREDENTIALS_DIRECTORY,"
+    note "dry-run: aborting the deploy on failure (--first-install on a fresh host)"
     DOCTOR_RESULT="SKIP (dry-run)"
 elif "${REL}/venv/bin/python" -c \
         'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("cortana.doctor") else 1)' \
         2>/dev/null; then
     note "running release doctor (offline) as aura"
+    # The credentials are root:root 0600 — the CORRECT posture for
+    # LoadCredential= (the checklist itself demands it), which means the
+    # doctor running as aura cannot read them in place and would FAIL a
+    # perfectly healthy droplet. Hand them over the same way systemd does at
+    # runtime: private copies, owned by aura, via CREDENTIALS_DIRECTORY.
+    DOCTOR_CREDS="$(mktemp -d)"
+    install -m 0600 -o aura -g aura "${ETC}/token" "${DOCTOR_CREDS}/token"
+    if [[ -f "${ETC}/anthropic" ]]; then
+        install -m 0600 -o aura -g aura "${ETC}/anthropic" "${DOCTOR_CREDS}/anthropic"
+    fi
+    chown aura:aura "${DOCTOR_CREDS}"
+    chmod 0700 "${DOCTOR_CREDS}"
+    doctor_args=(--config "${ETC}/cortana.yaml")
+    if (( FIRST_INSTALL )); then
+        doctor_args+=(--first-install)
+    fi
+    DOCTOR_OUT="$(mktemp)"
     doctor_rc=0
     setpriv --reuid aura --regid aura --clear-groups \
-        env HOME="${VARLIB}" \
-        "${REL}/venv/bin/python" -m cortana.doctor --config "${ETC}/cortana.yaml" \
-        || doctor_rc=$?
+        env HOME="${VARLIB}" CREDENTIALS_DIRECTORY="${DOCTOR_CREDS}" \
+        "${REL}/venv/bin/python" -m cortana.doctor "${doctor_args[@]}" \
+        | tee "${DOCTOR_OUT}" || doctor_rc=$?
+    rm -rf "${DOCTOR_CREDS}"
     if (( doctor_rc == 0 )); then
         DOCTOR_RESULT=PASS
+        # [first-install] rows = the doctor downgraded missing assets. With
+        # everything present a fresh host takes the normal full deploy path.
+        if (( FIRST_INSTALL )) && grep -qF '[first-install]' "${DOCTOR_OUT}"; then
+            DEGRADED_FIRST_INSTALL=1
+            DOCTOR_RESULT="WARN (first install — assets missing)"
+        fi
+        rm -f "${DOCTOR_OUT}"
     else
+        rm -f "${DOCTOR_OUT}"
         DOCTOR_RESULT="FAIL (exit ${doctor_rc})"
         die "doctor rejected the new release against the live config (exit ${doctor_rc}). Nothing live was changed — fix the reported problem and re-run install.sh."
     fi
@@ -622,8 +740,9 @@ fi
 # ----------------------------------------------------------------- systemd
 say "Installing systemd units, alert hook and tmpfiles"
 UNITS_CHANGED=0
+EARS_UNIT_CHANGED=0
 install_if_changed "${SCRIPT_DIR}/cortana-brain.service" /etc/systemd/system/cortana-brain.service 0644
-install_if_changed "${SCRIPT_DIR}/cortana-ears.service" /etc/systemd/system/cortana-ears.service 0644
+install_if_changed "${SCRIPT_DIR}/cortana-ears.service" /etc/systemd/system/cortana-ears.service 0644 EARS_UNIT_CHANGED
 install_if_changed "${SCRIPT_DIR}/cortana-alert@.service" /etc/systemd/system/cortana-alert@.service 0644
 # alert.sh lives at a fixed path, NOT under current/: OnFailure fires exactly
 # when a deploy may have left current/ broken, and the alerter must survive that.
@@ -634,6 +753,29 @@ if (( UNITS_CHANGED )); then
     sysctl_run daemon-reload
 fi
 sysctl_run enable --quiet cortana-brain.service cortana-ears.service
+
+# --------------------------------------------------- first install, degraded
+# Assets only a human can supply are still missing (doctor rows marked
+# [first-install] above). Stop here, enable-only: nothing is flipped or
+# started — services that cannot run would only crash-loop into OnFailure
+# alerts — and the checklist the operator has been missing finally prints.
+# The staged release is kept; the re-run after the checklist reuses it and
+# takes the normal GATE/FLIP/RESTART/VERIFY path.
+if (( DEGRADED_FIRST_INSTALL )); then
+    say "FIRST INSTALL: human-installed assets are missing — stopping enable-only"
+    note "units are installed and enabled, but nothing was flipped or started"
+    print_checklist
+    cat <<'FIRSTEOF'
+  FIRST INSTALL: after finishing the checklist, re-run
+
+       sudo deploy/install.sh
+
+  It will reuse the staged release, re-run the doctor against the now-complete
+  host, then flip, start and verify as a normal deploy.
+
+FIRSTEOF
+    exit 0
+fi
 
 # -------------------------------------------------------------------- FLIP
 # Captured BEFORE the flip: the rollback target and the live ears hash.
@@ -675,12 +817,20 @@ elif [[ "${NEW_EARS_HASH}" != "${OLD_EARS_HASH}" ]]; then
     note "ears binary hash changed — restarting cortana-ears"
     sysctl_run restart cortana-ears.service
     EARS_RESTARTED=1
+elif (( EARS_UNIT_CHANGED )); then
+    # Unit-file edits (sandboxing, restart policy, OnFailure alerting) never
+    # reach the running process through daemon-reload alone — without this
+    # restart the old process keeps the old policy indefinitely while the
+    # operator believes the new one is live.
+    note "cortana-ears.service unit changed — restarting cortana-ears"
+    sysctl_run restart cortana-ears.service
+    EARS_RESTARTED=1
 elif [[ "${DRYRUN}" != 1 ]] && ! systemctl is-active --quiet cortana-ears.service; then
     note "cortana-ears not running — starting it"
     sysctl_run restart cortana-ears.service
     EARS_RESTARTED=1
 else
-    note "ears binary unchanged — cortana-ears left running (buffers through the brain restart)"
+    note "ears binary and unit unchanged — cortana-ears left running (buffers through the brain restart)"
 fi
 
 # ------------------------------------------------------------------ VERIFY
@@ -689,10 +839,17 @@ if verify_release "${REL}"; then
         say "DRY RUN complete — nothing was touched"
     else
         say "Deploy verified: $(basename "${REL}")"
+        # A re-deploy of a previously failed release that now verifies is
+        # clean again — clear the marker so --rollback may use it.
+        run rm -f "${REL}/.verify_failed"
         prune_releases
     fi
 else
     show_journal_tail
+    # Mark the release so --rollback never flips INTO it later: it stays on
+    # disk (.complete, newest) for inspection, which used to make it exactly
+    # what the --rollback candidate loop picked.
+    run touch "${REL}/.verify_failed"
     if [[ -n "${PREV_REL}" && "${PREV_REL}" != "$(readlink -f "${REL}")" ]]; then
         say "VERIFY FAILED — rolling back to $(basename "${PREV_REL}")"
         run flip_current "${PREV_REL}"
@@ -700,39 +857,11 @@ else
         if (( EARS_RESTARTED )); then
             sysctl_run restart cortana-ears.service
         fi
-        die "deploy of $(basename "${REL}") failed verification and was rolled back to $(basename "${PREV_REL}") — see the journal tail above. The bad release is kept in ${RELEASES} for inspection."
+        die "deploy of $(basename "${REL}") failed verification and was rolled back to $(basename "${PREV_REL}") — see the journal tail above. The bad release is kept in ${RELEASES} for inspection (marked .verify_failed; --rollback will skip it)."
     fi
     die "deploy failed verification and there is no previous release to roll back to — see the journal tail above"
 fi
 
 # --------------------------------------------------------------- checklist
-cat <<'CHECKLIST'
-
-==> Done. First-time setup that still needs a human (skip what's done):
-
-  1. Piper TTS binary at /usr/local/bin/piper
-     (https://github.com/OHF-Voice/piper1-gpl — not in Ubuntu's archive).
-
-  2. Model files (GDD §4 Assets):
-       /opt/cortana/models/wake/     openWakeWord ONNX chain (melspec, embedding,
-                                     and the trained "hey cortana" model)
-       /opt/cortana/models/whisper/  Whisper small int8 CTranslate2 weights
-       /opt/cortana/models/piper/    Piper voice .onnx + .onnx.json
-
-  3. Edit /etc/cortana/{cortana,routing,gazetteer,ears}.yaml — installed
-     copies are examples with placeholder IDs.
-
-  4. Seed the gazetteer AS THE SERVICE USER so the database stays writable:
-       sudo -u aura /opt/cortana/current/venv/bin/python -m cortana.nlu.seed \
-           --db /var/lib/cortana/cortana.db ...
-
-  5. Failure alerts to Discord: put a webhook URL in /etc/cortana/alert_webhook
-     (mode 0600). Without it, alerts only land in /var/lib/cortana/alerts.log.
-
-  6. Firewall: ufw deny incoming except SSH. CORTANA opens no listening ports.
-
-  Useful afterwards:
-       journalctl -u cortana-brain -u cortana-ears -f
-       sudo deploy/install.sh --rollback     # flip back to the previous release
-
-CHECKLIST
+say "Done."
+print_checklist

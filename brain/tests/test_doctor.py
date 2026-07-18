@@ -19,9 +19,11 @@ from cortana.doctor import (
     EXIT_CONFIG_INVALID,
     EXIT_FAIL,
     EXIT_OK,
+    FIRST_INSTALL_MARKER,
     CheckResult,
     DoctorContext,
     Status,
+    apply_first_install,
     compute_channel_permissions,
     exit_code,
     main,
@@ -305,6 +307,36 @@ def test_database_behind_migrations_warns(healthy, tmp_path) -> None:
     assert results["database"].status is Status.WARN
 
 
+def test_garbage_database_without_live_writer_fails(healthy, tmp_path) -> None:
+    (tmp_path / "cortana.db").write_bytes(b"this is definitely not sqlite")
+    results = _by_check(run_offline_checks(healthy))
+    assert results["database"].status is Status.FAIL
+    assert "restore the nightly backup" in results["database"].fix_hint
+
+
+def test_unreadable_database_under_live_writer_warns(healthy, tmp_path) -> None:
+    # The install gate runs while the OLD brain is still live and writing:
+    # an immutable read racing a WAL checkpoint can error. WAL side files are
+    # the evidence of that live writer — degrade to WARN, never abort a valid
+    # deploy with a bogus "corrupt database" verdict.
+    (tmp_path / "cortana.db").write_bytes(b"this is definitely not sqlite")
+    (tmp_path / "cortana.db-wal").write_bytes(b"")
+    results = _by_check(run_offline_checks(healthy))
+    assert results["database"].status is Status.WARN
+    assert "db busy" in results["database"].detail
+    assert "check skipped" in results["database"].detail
+    assert exit_code(list(results.values())) == EXIT_OK
+
+
+def test_healthy_database_with_wal_sidecars_still_checks(healthy, tmp_path) -> None:
+    # Side files alone must not skip the check — a readable db is read.
+    (tmp_path / "cortana.db-wal").write_bytes(b"")
+    (tmp_path / "cortana.db-shm").write_bytes(b"")
+    results = _by_check(run_offline_checks(healthy))
+    assert results["database"].status is Status.PASS
+    assert results["gazetteer.rows"].status is Status.PASS
+
+
 def test_empty_systems_table_fails_with_seed_hint(healthy, tmp_path) -> None:
     conn = sqlite3.connect(tmp_path / "cortana.db")
     conn.execute("DELETE FROM systems")
@@ -333,6 +365,77 @@ def test_placeholder_ids_warn(healthy) -> None:
     assert results["discord.ids"].status is Status.WARN
     assert "discord.guild_id" in results["discord.ids"].detail
     assert "discord.channels.health" in results["discord.ids"].detail
+
+
+# ── first install (--first-install) ──────────────────────────────────────────
+
+
+def _strip_assets(tmp_path: Path, ctx: DoctorContext) -> None:
+    """A fresh droplet: config/token/db exist, human-installed assets do not."""
+    (tmp_path / "wake.onnx").unlink()
+    (tmp_path / "voice.onnx").unlink()
+    (tmp_path / "voice.onnx.json").unlink()
+
+    def missing(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
+        raise FileNotFoundError(cmd[0])
+
+    ctx.run_binary = missing
+    conn = sqlite3.connect(tmp_path / "cortana.db")
+    conn.execute("DELETE FROM systems")
+    conn.commit()
+    conn.close()
+
+
+def test_first_install_downgrades_missing_assets_to_warn(healthy, tmp_path) -> None:
+    _strip_assets(tmp_path, healthy)
+    results = apply_first_install(run_offline_checks(healthy))
+    by = _by_check(results)
+    for name in ("wake.model", "tts.voice", "tts.voice.json", "tts.binary", "gazetteer.rows"):
+        assert by[name].status is Status.WARN, name
+        assert FIRST_INSTALL_MARKER in by[name].detail, name
+    assert exit_code(results) == EXIT_OK
+
+
+def test_first_install_never_downgrades_config_errors(tmp_path) -> None:
+    path = tmp_path / "cortana.yaml"
+    path.write_text("discord: [not, a, mapping]\n", encoding="utf-8")
+    ctx = DoctorContext(config_path=path, env={}, run_binary=_fake_run_ok)
+    results = apply_first_install(run_offline_checks(ctx))
+    assert results[0].status is Status.FAIL
+    assert exit_code(results) == EXIT_CONFIG_INVALID
+
+
+def test_first_install_leaves_non_asset_fails_alone(healthy, tmp_path) -> None:
+    # A missing token is an operator mistake install.sh aborts on, not a
+    # checklist asset — --first-install must not paper over it.
+    (tmp_path / "token").unlink()
+    results = apply_first_install(run_offline_checks(healthy))
+    by = _by_check(results)
+    assert by["credentials.token"].status is Status.FAIL
+    assert exit_code(results) == EXIT_FAIL
+
+
+def test_first_install_with_all_assets_present_marks_nothing(healthy) -> None:
+    results = apply_first_install(run_offline_checks(healthy))
+    assert all(FIRST_INSTALL_MARKER not in r.detail for r in results)
+    assert exit_code(results) == EXIT_OK
+
+
+def test_main_first_install_flag_returns_ok_and_marks_rows(
+    healthy, tmp_path, capsys, monkeypatch
+) -> None:
+    # main() builds its own context (real env, real subprocess runner):
+    # tts.binary points into tmp where no piper exists, wake model removed —
+    # both downgrade under --first-install and the marker reaches stdout for
+    # install.sh to grep.
+    (tmp_path / "wake.onnx").unlink()
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    assert main(["--config", str(healthy.config_path)]) == EXIT_FAIL
+    capsys.readouterr()
+    code = main(["--config", str(healthy.config_path), "--first-install"])
+    assert code == EXIT_OK
+    out = capsys.readouterr().out
+    assert FIRST_INSTALL_MARKER in out
 
 
 # ── exit codes + rendering ───────────────────────────────────────────────────
