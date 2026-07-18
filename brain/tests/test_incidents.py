@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1134,6 +1135,73 @@ async def test_broadcast_relays_freeform_intel(make_env: Callable[..., Env]) -> 
     assert card.embed["description"] == "blop fleet moving to Moe 8 gate"
     row = db.query_one(env.conn, "SELECT parsed_intent, outcome FROM command_log")
     assert row["parsed_intent"] == "BROADCAST" and row["outcome"] == "POSTED"
+
+
+async def test_failed_post_rolls_the_incident_back(make_env: Callable[..., Env]) -> None:
+    # A 403/REST failure on the card post must not leave an invisible ACTIVE
+    # incident: it would fold every duplicate report into a card that exists
+    # nowhere. The row is rolled back and the pilot hears the failure.
+    from aura.types import PostError
+
+    env = make_env()
+
+    fail_next = {"on": True}
+    original_post = env.poster.post
+
+    async def flaky_post(*args: Any, **kwargs: Any) -> tuple[int, int]:
+        if fail_next["on"]:
+            raise PostError("403 Forbidden")
+        return await original_post(*args, **kwargs)
+
+    env.poster.post = flaky_post  # type: ignore[method-assign]
+
+    out = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    assert out.outcome is Outcome.REJECTED
+    assert out.utterance == "Discord post failed."
+    rows = db.query(env.conn, "SELECT id FROM incidents", ())
+    assert rows == []  # rolled back — nothing to eat later reports
+
+    # Channel fixed → the SAME report posts a fresh card, not a fold.
+    fail_next["on"] = False
+    out2 = await env.engine.report(GUILD, 43, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    assert out2.outcome is Outcome.POSTED
+    assert len(env.poster.posts) == 1
+
+
+async def test_failed_relay_post_is_rejected_and_not_marked_seen(
+    make_env: Callable[..., Env],
+) -> None:
+    from aura.types import PostError
+
+    env = make_env()
+
+    async def dead_post(*args: Any, **kwargs: Any) -> tuple[int, int]:
+        raise PostError("403 Forbidden")
+
+    original_post = env.poster.post
+    env.poster.post = dead_post  # type: ignore[method-assign]
+    out = await env.engine.broadcast(GUILD, 42, "blop fleet moving to Moe 8 gate")
+    assert out.outcome is Outcome.REJECTED
+    assert out.utterance == "Discord post failed."
+
+    # The failed text must not count as "seen": once the channel works the
+    # same relay posts instead of silently folding into nothing.
+    env.poster.post = original_post  # type: ignore[method-assign]
+    again = await env.engine.broadcast(GUILD, 42, "blop fleet moving to Moe 8 gate")
+    assert again.outcome is Outcome.POSTED
+
+
+async def test_sweep_stale_drops_pending_candidates(make_env: Callable[..., Env]) -> None:
+    # STALE is terminal for unconfirmed cards; their candidate lists must not
+    # leak for the process lifetime.
+    env = make_env()
+    out = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), medium())
+    assert out.outcome is Outcome.ASKED  # uncertain card, confirm buttons armed
+    assert env.engine._pending_candidates
+    env.clock.advance(21 * 60)  # stale_after_min = 20
+    stale = await env.engine.sweep_stale()
+    assert stale
+    assert env.engine._pending_candidates == {}
 
 
 async def test_broadcast_dedupes_identical_text_within_window(

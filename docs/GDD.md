@@ -382,7 +382,9 @@ An **explicitly-invoked** chat channel, off by default (`chat.enabled`). When a 
 
 **Constraint 6 is untouched.** The incident grammar never sees an LLM: the override prefix is matched *first* and only in leading position, so a report containing the word "override" mid-sentence can never be diverted, and a non-override utterance never reaches the model. The model is instructed to never invent in-game intel — hostiles, timers, and system status come only from AURA's own reports.
 
-**Cost posture.** Default model is the cheapest Claude tier (fractions of a cent per question); replies are capped at `chat.max_tokens`, web search at one per question, and `chat.user_cooldown_s` throttles each pilot. The API key rides systemd `LoadCredential=` (`anthropic:` credential; constraint 12), with `chat.api_key_file` as the 0600 dev fallback.
+**Cost posture.** Default model is the cheapest Claude tier (fractions of a cent per question); replies are capped at `chat.max_tokens`, web search at one per question, and `chat.user_cooldown_s` throttles each pilot. The cooldown arms only on a successful answer — a failed request must not turn the pilot's retry into a throttle message. The API key rides systemd `LoadCredential=` (`anthropic:` credential; constraint 12), with `chat.api_key_file` as the 0600 dev fallback.
+
+**Liveness.** The whole `chat:` section applies on SIGHUP — flipping `chat.enabled` or dropping a key into place takes effect on `systemctl reload aura-brain`, no restart. A spoken "command override …" while the channel is down always gets the fixed *"Override channel unavailable."* line (never a silent fall-through to the grammar), and `/ask` distinguishes "not enabled" from "enabled but no key loaded".
 
 ---
 
@@ -709,6 +711,7 @@ Short. Always short. AURA is talking over a fight.
 | Ambiguous system | *"Hostiles Otanuomi — say again to confirm."* |
 | Unresolved system | *"Say again the system."* |
 | No command, no relay frame (§8.6) | *"Say again?"* |
+| Card post failed (channel perms/REST) | *"Discord post failed."* — the report is rolled back, not recorded |
 | Responders | *"Space Junkie responding to Otanuomi."* (callsign/display name; count as fallback) |
 | Resolved | *"Otanuomi clear."* |
 | Timer set | *"Timer Kisogo, four hours."* |

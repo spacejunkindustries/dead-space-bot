@@ -58,6 +58,7 @@ __all__ = [
     "ping_sent",
     "ping_types_phrase",
     "pinging_you",
+    "post_failed",
     "read_voice_sample_rate",
     "registered",
     "resolved",
@@ -160,6 +161,13 @@ def not_understood() -> str:
     """*"Say again?"* — the utterance matched no command and no relay frame
     (GDD §8.6 framed mode): AURA heard something but won't post it."""
     return "Say again?"
+
+
+def post_failed() -> str:
+    """*"Discord post failed."* — the card could not be posted (permissions,
+    deleted channel, REST failure). The report was NOT recorded; the pilot
+    must know their alert did not land (GDD §20 posture: fail loud)."""
+    return "Discord post failed."
 
 
 def go_ahead() -> str:

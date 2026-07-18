@@ -100,6 +100,12 @@ class HealthReporter:
         self._mentions_sent = 0
         self._wake_hits = 0
         self._commands_rejected = 0
+        # Discord post/edit failures (channel 403s etc.): counted per report
+        # window, announced to #bot-health once per window (not per failure —
+        # a broken channel would otherwise spam an alert on every sweep).
+        self._post_failures = 0
+        self._post_failure_announced = False
+        self._announce_post_failure = False
 
         # STT quality: rolling confidence ring + consecutive-LOW streak.
         self._confidences: deque[float] = deque(maxlen=_CONFIDENCE_RING)
@@ -136,6 +142,16 @@ class HealthReporter:
 
     def record_rejected(self) -> None:
         self._commands_rejected += 1
+
+    def record_post_failure(self) -> None:
+        """A Discord card post/edit failed (403, deleted channel, REST error).
+
+        Counted into the hourly report and announced ONCE per window — a
+        channel-permission problem used to be invisible outside journald."""
+        self._post_failures += 1
+        if not self._post_failure_announced:
+            self._post_failure_announced = True
+            self._announce_post_failure = True
 
     def record_stt(self, confidence: float, tier: Tier) -> None:
         """One STT+resolution result: confidence ring + LOW-tier streak (§20)."""
@@ -180,11 +196,38 @@ class HealthReporter:
         await self._check_ears(now)
         await self._check_voice(now)
         await self._check_stt()
+        await self._check_posting()
         await self._maybe_report(now)
+
+    async def _check_posting(self) -> None:
+        if self._announce_post_failure:
+            self._announce_post_failure = False
+            log.warning("post_failures_announced", count=self._post_failures)
+            await self._post(
+                "⚠️ **Discord post failed** — a card could not be posted or "
+                "edited (check AURA's channel permissions: View Channel, Send "
+                "Messages, Embed Links). Details are in the journal.",
+                None,
+            )
 
     async def _check_ears(self, now: float) -> None:
         seen = self._last_heartbeat_at
         alive = seen is not None and (now - seen) <= self._heartbeat_timeout_s
+        # Never-connected counts as down too: an Ears that fails at boot sends
+        # no heartbeat at all, and gating the alarm on "saw one once" left
+        # AURA silently deaf with a green systemd status. Give startup one
+        # timeout window of grace before alarming.
+        never_connected = seen is None and (now - self._started_at) > self._heartbeat_timeout_s
+        if never_connected and not self._ears_down:
+            self._ears_down = True
+            log.warning("ears_never_connected", waited_s=round(now - self._started_at, 1))
+            await self._post(
+                "⚠️ **Ears has not connected since startup** — voice is down. "
+                "Check `systemctl status aura-ears`. Slash commands and the "
+                "incident engine are unaffected.",
+                None,
+            )
+            return
         if not alive and seen is not None and not self._ears_down:
             self._ears_down = True
             log.warning("ears_heartbeat_missed", last_seen_s_ago=round(now - seen, 1))
@@ -275,6 +318,7 @@ class HealthReporter:
             {"name": "Mentions", "value": str(self._mentions_sent), "inline": True},
             {"name": "Wake hits", "value": str(self._wake_hits), "inline": True},
             {"name": "Rejected", "value": str(self._commands_rejected), "inline": True},
+            {"name": "Post failures", "value": str(self._post_failures), "inline": True},
             {
                 "name": f"STT confidence (last {len(self._confidences)})",
                 "value": "n/a" if avg_conf is None else str(avg_conf),
@@ -302,3 +346,5 @@ class HealthReporter:
         self._mentions_sent = 0
         self._wake_hits = 0
         self._commands_rejected = 0
+        self._post_failures = 0
+        self._post_failure_announced = False

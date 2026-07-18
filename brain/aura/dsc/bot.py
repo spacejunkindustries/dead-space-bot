@@ -30,7 +30,7 @@ from discord.ext import commands
 from aura.config import ConfigHolder, DiscordConfig
 from aura.core.discipline import Discipline
 from aura.core.incidents import IncidentEngine
-from aura.types import AlertChannel, CardRender, MatchCandidate, Resolution, Tier
+from aura.types import AlertChannel, CardRender, MatchCandidate, PostError, Resolution, Tier
 from aura.voice_gateway import ANNOUNCEMENT
 
 if TYPE_CHECKING:  # pragma: no cover — wiring types only
@@ -133,6 +133,7 @@ class AuraBot(commands.Bot):
         self.health_reporter: HealthReporter | None = None
         # The §6.6 out-of-band assistant; None = override channel disabled.
         self.chat: Any | None = None
+        self.chat_status: str = "disabled"  # "ready" | "no_key" | "disabled" (§6.6)
 
     # ── startup ──────────────────────────────────────────────────────────────
 
@@ -305,6 +306,11 @@ class AuraBot(commands.Bot):
             raise TypeError(f"channel {channel_id} is not a text channel")
         return found
 
+    def _record_post_failure(self) -> None:
+        reporter = getattr(self, "health_reporter", None)
+        if reporter is not None:
+            reporter.record_post_failure()
+
     async def post(
         self, guild_id: int, channel: AlertChannel, content: str, card: CardRender
     ) -> tuple[int, int]:
@@ -313,29 +319,44 @@ class AuraBot(commands.Bot):
         ``content`` carries the mentions the routing/discipline stack already
         approved — ``@here`` can only reach this point for UNDER_ATTACK /
         ASSIST_REQUEST (constraint 11 is enforced upstream in routing).
+
+        Raises :class:`PostError` on any Discord failure (403 on the channel,
+        deleted channel, REST error) so the engine rolls the incident back —
+        a raw discord exception here used to orphan an invisible ACTIVE
+        incident and, on the sweep path, crash-loop the whole process.
         """
         from aura.dsc.views import view_from_card
 
-        target = await self._alert_channel(channel)
-        # Silent mode hard-stop: even if a stray "@here" reached the content,
-        # Discord suppresses the actual notification when mentions are disabled.
-        if self.holder.current.discord.mentions_enabled:
-            allowed = discord.AllowedMentions(everyone=True, roles=True, users=False)
-        else:
-            allowed = discord.AllowedMentions.none()
-        message = await target.send(
-            content=content or None,
-            embed=discord.Embed.from_dict(card.embed),
-            view=view_from_card(card),
-            allowed_mentions=allowed,
-        )
+        try:
+            target = await self._alert_channel(channel)
+            # Silent mode hard-stop: even if a stray "@here" reached the
+            # content, Discord suppresses the actual notification when
+            # mentions are disabled.
+            if self.holder.current.discord.mentions_enabled:
+                allowed = discord.AllowedMentions(everyone=True, roles=True, users=False)
+            else:
+                allowed = discord.AllowedMentions.none()
+            message = await target.send(
+                content=content or None,
+                embed=discord.Embed.from_dict(card.embed),
+                view=view_from_card(card),
+                allowed_mentions=allowed,
+            )
+        except (discord.DiscordException, TypeError) as exc:
+            log.warning("card_post_failed", channel=str(channel), error=str(exc))
+            self._record_post_failure()
+            raise PostError(f"post to {channel} failed: {exc}") from exc
         return target.id, message.id
 
     async def edit(self, channel_id: int, message_id: int, content: str, card: CardRender) -> None:
-        """Edit the card in place — the only mutation an incident ever gets."""
+        """Edit the card in place — the only mutation an incident ever gets.
+
+        Never raises on Discord failures: an edit is best-effort (the card is
+        a view; the DB row is the state), and a 403/5xx propagating out of
+        here used to kill the stale sweep and take the whole process down.
+        """
         from aura.dsc.views import view_from_card
 
-        target = await self._messageable(channel_id)
         kwargs: dict[str, Any] = {
             "embed": discord.Embed.from_dict(card.embed),
             "view": view_from_card(card),  # None strips buttons off resolved cards
@@ -343,9 +364,18 @@ class AuraBot(commands.Bot):
         if content:
             kwargs["content"] = content
         try:
+            target = await self._messageable(channel_id)
             await target.get_partial_message(message_id).edit(**kwargs)
         except discord.NotFound:
             log.warning("card_message_deleted", channel_id=channel_id, message_id=message_id)
+        except (discord.DiscordException, TypeError) as exc:
+            log.warning(
+                "card_edit_failed",
+                channel_id=channel_id,
+                message_id=message_id,
+                error=str(exc),
+            )
+            self._record_post_failure()
 
     # ── routing-role helpers for the subscription surface (GDD §10.2) ────────
 

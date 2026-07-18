@@ -95,6 +95,29 @@ class OpenWakeWordDetector:
     def __init__(self, holder: ConfigHolder) -> None:
         self._holder = holder
         self._states: dict[int, _UserWakeState] = {}
+        # Eager first model: __main__ constructs this detector inside
+        # asyncio.to_thread precisely to keep the ONNX session load off the
+        # event loop — but the load used to happen lazily, on the first
+        # speech frame, ON the loop (stalling Discord heartbeats and IPC for
+        # the whole init). Building one model here moves that cost to
+        # startup, hands it to the first speaker, warms the OS file cache
+        # for later speakers, and fails fast at boot when wake.model is
+        # missing instead of killing the audio path at 02:00. An absent
+        # openwakeword package (unit tests fake the _predict_chunk seam and
+        # never install it) falls back to the lazy path.
+        self._spare_model: Any = None
+        try:
+            self._spare_model = self._build_model()
+        except ImportError:  # pragma: no cover — test envs without openwakeword
+            log.warning("openwakeword_unavailable_lazy_load")
+
+    def _build_model(self) -> Any:
+        from openwakeword.model import Model  # lazy
+
+        return Model(
+            wakeword_models=[self._holder.current.wake.model],
+            inference_framework="onnx",
+        )
 
     def score(self, user_id: int, frame: bytes) -> float:
         if len(frame) != FRAME_BYTES:
@@ -150,12 +173,10 @@ class OpenWakeWordDetector:
         import numpy as np  # lazy
 
         if state.model is None:
-            from openwakeword.model import Model  # lazy
-
-            state.model = Model(
-                wakeword_models=[self._holder.current.wake.model],
-                inference_framework="onnx",
-            )
+            if self._spare_model is not None:
+                state.model, self._spare_model = self._spare_model, None
+            else:
+                state.model = self._build_model()
         samples = np.frombuffer(chunk, dtype=np.int16)
         predictions: dict[str, float] = state.model.predict(samples)
         if not predictions:

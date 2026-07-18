@@ -136,7 +136,6 @@ class ChatClient:
         last = self._last_ask.get(user_id)
         if last is not None and now - last < cfg.user_cooldown_s:
             raise ChatCooldownError(f"cooldown: {cfg.user_cooldown_s}s per pilot")
-        self._last_ask[user_id] = now
         kwargs: dict[str, Any] = {
             "model": cfg.model,
             "max_tokens": cfg.max_tokens,
@@ -169,6 +168,10 @@ class ChatClient:
         ).strip()
         if not text:
             raise ChatError("empty reply")
+        # Cooldown arms only on SUCCESS: a failed request must not convert a
+        # pilot's immediate retry into "Override cooling down" — during an
+        # outage that masks the real error behind a throttle message.
+        self._last_ask[user_id] = time.monotonic()
         log.info(
             "override_answered",
             model=cfg.model,

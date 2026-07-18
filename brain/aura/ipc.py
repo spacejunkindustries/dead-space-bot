@@ -78,6 +78,10 @@ PRIORITY_ALERT = 2
 #: prefix cannot make us buffer unbounded garbage.
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
+#: Bound on one outbound socket drain. A UDS to a live local process drains
+#: in microseconds; hitting this means Ears has stopped reading — see _send.
+_SEND_STALL_S = 5.0
+
 _LEN_STRUCT = struct.Struct(">I")  # 4-byte big-endian length prefix
 _AUDIO_HEADER = struct.Struct("<QQ")  # user_id u64 LE, guild_id u64 LE
 _TTS_HEADER = struct.Struct("<QB")  # guild_id u64 LE, priority u8
@@ -323,7 +327,15 @@ class IpcServer:
                 return
             try:
                 writer.write(frame)
-                await writer.drain()
+                # Bounded drain: an Ears that stops reading but keeps the
+                # socket open would otherwise park this await forever WITH
+                # the send lock held — every later join/leave/TTS frame then
+                # queues behind it and voice control dies silently. Past the
+                # bound we drop the connection; Ears reconnects with backoff.
+                await asyncio.wait_for(writer.drain(), timeout=_SEND_STALL_S)
+            except TimeoutError:
+                log.warning("ipc_send_stalled", stall_s=_SEND_STALL_S, **log_fields)
+                await self._drop_client("send stalled")
             except (ConnectionError, OSError) as exc:
                 log.warning("ipc_send_failed", error=str(exc), **log_fields)
                 await self._drop_client("write failed")

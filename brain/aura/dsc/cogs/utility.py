@@ -476,9 +476,18 @@ class UtilityCog(commands.Cog):
 
         chat = self.bot.chat
         if chat is None:
-            await interaction.response.send_message(
-                "The override channel is not enabled on this server.", ephemeral=True
-            )
+            # Distinguish "operator chose off" from "enabled but no key
+            # loaded" — the latter used to claim the feature was disabled,
+            # sending an admin to the wrong config knob mid-outage.
+            if getattr(self.bot, "chat_status", "disabled") == "no_key":
+                msg = (
+                    "The override channel is enabled but no API key is loaded — "
+                    "check `/etc/aura/anthropic` and the service credential, "
+                    "then `systemctl reload aura-brain`."
+                )
+            else:
+                msg = "The override channel is not enabled on this server."
+            await interaction.response.send_message(msg, ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
         timeout_s = self.bot.holder.current.chat.timeout_s

@@ -1,5 +1,13 @@
 # AURA main configuration — GDD §16.
-# Production copy lives at /etc/aura/aura.yaml and is hot-reloaded on SIGHUP.
+# Production copy lives at /etc/aura/aura.yaml and is hot-reloaded on SIGHUP
+# (systemctl reload aura-brain).
+#
+# HOT-RELOAD SCOPE: thresholds, weights, windows, channel/role ids, tts
+# lines/personality, and the whole chat: section apply on reload. Sections
+# that pick an ENGINE at startup need a full restart instead:
+#   stt: (backend/model/threads), capture.vad_aggressiveness,
+#   gazetteer: (file/scope), ipc.socket, database.path, discord.token_file.
+#
 # Every tunable in the system lives here; code contains no magic numbers.
 # The numeric defaults below are starting values tuned from real fleet audio —
 # expect them to move (see CLAUDE.md conventions).
