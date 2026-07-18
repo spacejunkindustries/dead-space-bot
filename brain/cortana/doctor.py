@@ -385,7 +385,7 @@ def check_piper(ctx: DoctorContext) -> list[CheckResult]:
     return results
 
 
-def _credential_result(check: str, path: Path, fix: str) -> CheckResult:
+def _credential_result(check: str, path: Path, fix: str, *, systemd_managed: bool) -> CheckResult:
     if not path.is_file():
         return CheckResult(check, Status.FAIL, f"credential missing: {path}", fix)
     if not os.access(path, os.R_OK):
@@ -396,6 +396,13 @@ def _credential_result(check: str, path: Path, fix: str) -> CheckResult:
             "fix ownership/permissions so the service user can read it",
         )
     mode = path.stat().st_mode & 0o777
+    if systemd_managed:
+        # systemd's LoadCredential runtime copies live in a directory only
+        # the service can enter and are (re)created at mode 0440/0400 by
+        # systemd itself on every start — the file mode is not operator
+        # policy and a chmod would not survive a restart. Warning on it was
+        # a live false alarm.
+        return CheckResult(check, Status.PASS, f"systemd credential, mode {mode:03o}")
     if mode & 0o077:
         return CheckResult(
             check,
@@ -416,6 +423,7 @@ def check_credentials(ctx: DoctorContext) -> list[CheckResult]:
             token_path,
             "provide the Discord token via systemd LoadCredential=token:... "
             "(or discord.token_file for dev runs)",
+            systemd_managed=cred_dir is not None,
         )
     ]
     if ctx.cfg.chat.enabled:
@@ -426,6 +434,7 @@ def check_credentials(ctx: DoctorContext) -> list[CheckResult]:
                 key_path,
                 "provide the Anthropic key via LoadCredential=anthropic:... "
                 "or disable chat.enabled",
+                systemd_managed=cred_dir is not None,
             )
         )
     return results
