@@ -61,6 +61,11 @@ _SWEEP_INTERVAL_S = 60.0
 _TIMER_POLL_INTERVAL_S = 15.0
 _HEALTH_CHECK_INTERVAL_S = 5.0
 
+#: Upper bound on the startup STT model warm: enough for a cold model load on
+#: the droplet's disk, small enough that a stalled network download of
+#: ``stt.model`` cannot park setup() indefinitely behind a green unit status.
+_STT_WARM_TIMEOUT_S = 120.0
+
 #: Upper bound on graceful shutdown. Kept well under systemd's TimeoutStopSec
 #: so a hung close never escalates to SIGKILL (which slows restarts and forces
 #: Ears to re-negotiate DAVE on every rejoin).
@@ -163,11 +168,19 @@ class App:
         self.transcriber = await asyncio.to_thread(make_transcriber, cfg.stt)
         # Load the Whisper weights now, off the request path: the first real
         # utterance must not pay the model load inside the STT watchdog (that
-        # loop never produced a transcript on a 2-vCPU box).
+        # loop never produced a transcript on a 2-vCPU box). BOUNDED: stt.model
+        # can be a Hugging Face name that downloads on first load — a stalled
+        # download must not wedge setup forever (systemd would see a live
+        # process and never restart it). On timeout, log and continue: the
+        # lazy load plus the watchdog cover the cold path.
         warm = getattr(self.transcriber, "warm", None)
         if callable(warm):
-            await asyncio.to_thread(warm)
-            log.info("stt_model_warmed", model=cfg.stt.model)
+            try:
+                await asyncio.wait_for(asyncio.to_thread(warm), timeout=_STT_WARM_TIMEOUT_S)
+            except TimeoutError:
+                log.warning("stt_warm_timed_out", timeout_s=_STT_WARM_TIMEOUT_S)
+            else:
+                log.info("stt_model_warmed", model=cfg.stt.model)
         vad = VadGate(cfg.capture.vad_aggressiveness)
         # The detector reads holder.current at the point of use (config.py
         # contract) so SIGHUP retunes apply to it and CaptureManager alike.
