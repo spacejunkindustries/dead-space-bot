@@ -253,7 +253,8 @@ Songbird VoiceTick (20ms, per-user decoded PCM 48kHz)
        │        │ hit
        │        ▼
        │   capture window opens
-       │   (300ms pre-roll + speech until 400ms silence, hard cap 6s)
+       │   (pre-roll seed + speech until the dialog wheel's wall-clock
+       │    endpoint fires; frame-counted hard cap as the backstop — §5.4)
        │        │
        │        ▼
        │   STT — gazetteer-biased
