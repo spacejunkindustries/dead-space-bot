@@ -366,12 +366,22 @@ class TimeoutTranscriber:
             threading.Thread(target=warm, name="aura-stt-rewarm", daemon=True).start()
 
 
+#: The whisper-cpp HTTP timeout runs at this fraction of ``stt.watchdog_s``
+#: so the socket gives up (raising a clean :class:`SttError`) slightly BEFORE
+#: the outer watchdog abandons the worker thread — the two deadlines used to
+#: race at exactly the same instant.
+_HTTP_TIMEOUT_FRACTION = 0.9
+
+
 def make_transcriber(cfg: SttConfig) -> Transcriber:
-    """Build the configured backend (GDD §16 ``stt.backend``) behind the watchdog."""
+    """Build the configured backend (GDD §16 ``stt.backend``) behind the watchdog.
+
+    The watchdog deadline comes from ``stt.watchdog_s`` (GDD §20) — a
+    restart-bound tunable, not a code constant."""
 
     def factory() -> Transcriber:
         if cfg.backend == "whisper-cpp":
-            return WhisperCppTranscriber(cfg)
+            return WhisperCppTranscriber(cfg, timeout_s=cfg.watchdog_s * _HTTP_TIMEOUT_FRACTION)
         return FasterWhisperTranscriber(cfg)
 
-    return TimeoutTranscriber(factory, timeout_s=DEFAULT_WATCHDOG_S)
+    return TimeoutTranscriber(factory, timeout_s=cfg.watchdog_s)

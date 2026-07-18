@@ -1,34 +1,57 @@
 """Configuration loading, validation, and hot-reload for CORTANA Brain.
 
 Mirrors ``config/cortana.yaml.example`` / GDD §16 one dataclass per section.
-``load_config`` validates types and ranges and raises :class:`ConfigError`
-messages that always name the offending key path (``wake.threshold: ...``).
+Validation is driven by the declarative table in :mod:`cortana.config_schema`
+— one :class:`~cortana.config_schema.Key` per tunable carrying type, range,
+allowed values, default, and reload class. ``load_config`` raises
+:class:`ConfigError` messages that always follow the contract
+``section.key: problem — Fix: <action>``. Unknown keys are rejected with a
+did-you-mean suggestion — a typo can no longer silently revert a knob to its
+default.
 
-Hot reload: ``__main__`` owns the SIGHUP handler and calls
-``ConfigHolder.reload()``; long-lived objects hold the :class:`ConfigHolder`
-and read ``holder.current`` at the point of use, never a cached snapshot.
+Hot reload: ``__main__`` owns the SIGHUP handler; :mod:`cortana.reload`
+validates all config inputs together and swaps them all-or-nothing.
+Long-lived objects hold the :class:`ConfigHolder` and read ``holder.current``
+at the point of use, never a cached snapshot. :func:`diff_configs` buckets
+changed keys by reload class so restart-bound edits are reported as
+"restart pending" instead of silently absorbed.
 
 Secrets: the Discord token is NOT config. Config carries ``discord.token_file``
-(a path) only. ``aura.dsc.bot`` reads the token at startup from
+(a path) only. ``cortana.dsc.bot`` reads the token at startup from
 ``$CREDENTIALS_DIRECTORY/token`` (systemd ``LoadCredential=``, GDD §18/§22),
 falling back to ``discord.token_file`` for development runs.
 """
 
 from __future__ import annotations
 
+import difflib
 import threading
 from dataclasses import dataclass, field
+from functools import reduce
 from pathlib import Path
 from typing import Any
 
 import structlog
 import yaml
 
+from cortana.config_schema import (
+    CROSS_CHECKS,
+    KEYS,
+    REQUIRED,
+    Key,
+    Reload,
+    child_sections,
+    key_by_path,
+    keys_in_section,
+)
+
 log = structlog.get_logger(__name__)
 
 _MISSING = object()
 
-STT_BACKENDS = ("faster-whisper", "whisper-cpp")
+#: Legal values, re-exported for callers that render them in messages.
+STT_BACKENDS = key_by_path("stt.backend").choices or ()
+RELAY_MODES = key_by_path("stt.relay_mode").choices or ()
 
 
 class ConfigError(Exception):
@@ -36,6 +59,8 @@ class ConfigError(Exception):
 
 
 # ── section dataclasses (GDD §16) ────────────────────────────────────────────
+# Field defaults mirror the schema defaults (asserted by the schema tests) so
+# tests and tools can construct sections directly without re-stating them.
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +189,10 @@ class SttConfig:
     #:   open   — any unmatched transcript relays (confidence-gated).
     #:   off    — the freeform relay never posts; commands only.
     relay_mode: str = "framed"
+    #: GDD §20 "STT worker hang" watchdog deadline, seconds. The whisper-cpp
+    #: HTTP timeout is derived slightly below it (the socket gives up before
+    #: the watchdog abandons the worker thread).
+    watchdog_s: float = 15.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +267,21 @@ class GazetteerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RoutingFileConfig:
+    """Where ``routing.yaml`` lives. The empty default means "a file named
+    ``routing.yaml`` next to ``cortana.yaml``" — the previously hardcoded,
+    undocumented behaviour, now an explicit key (``routing.file``)."""
+
+    file: str = ""
+
+    def resolve(self, config_path: Path) -> Path:
+        """The effective routing.yaml path, given where cortana.yaml lives."""
+        if self.file:
+            return Path(self.file)
+        return config_path.parent / "routing.yaml"
+
+
+@dataclass(frozen=True, slots=True)
 class IpcConfig:
     socket: str
     # Ears' outbound ring size lives in /etc/cortana/ears.yaml (buffer_seconds):
@@ -270,368 +314,402 @@ class AuraConfig:
     health: HealthConfig
     database: DatabaseConfig
     chat: ChatConfig = field(default_factory=ChatConfig)
+    routing: RoutingFileConfig = field(default_factory=RoutingFileConfig)
 
 
-# ── validation helpers ───────────────────────────────────────────────────────
+# ── schema-driven validation ─────────────────────────────────────────────────
+# The walkers below are a generic interpreter over cortana.config_schema:
+# they know how to check a Key, not what any particular key means.
+
+#: YAML 1.1 parses bare ``off``/``no`` as boolean False and ``on``/``yes`` as
+#: True. For any key whose legal values include one of those WORDS, the
+#: boolean is coerced back to the word so operators don't need quotes — an
+#: unquoted ``join_announcement: off`` once crash-looped a deployment.
+_YAML11_WORDS: dict[bool, tuple[str, ...]] = {
+    False: ("off", "no", "false"),
+    True: ("on", "yes", "true"),
+}
 
 
-def _mapping(data: Any, dotted: str) -> dict[str, Any]:
-    if not isinstance(data, dict):
-        raise ConfigError(f"{dotted}: expected a mapping, got {type(data).__name__}")
-    return data
+def _fix(action: str) -> str:
+    return f" — Fix: {action}"
 
 
-def _section(data: dict[str, Any], dotted: str) -> dict[str, Any]:
-    value = data.get(dotted.rsplit(".", 1)[-1], _MISSING)
-    if value is _MISSING:
-        raise ConfigError(f"{dotted}: missing required section")
-    # A bare `section:` header with every key commented out parses as None.
-    # Treat it as empty so the error the operator sees names the missing KEY
-    # ("...: missing required key"), not "expected a mapping, got NoneType".
-    if value is None:
-        return {}
-    return _mapping(value, dotted)
+def _coerce_choice(key: Key, value: Any) -> Any:
+    """Generic YAML-1.1 boolean→word coercion for a choices-key."""
+    choices = key.choices or ()
+    if isinstance(value, bool):
+        for word in _YAML11_WORDS[value]:
+            if word in choices:
+                return word
+    return value
 
 
-def _optional_section(data: dict[str, Any], dotted: str) -> dict[str, Any]:
-    """Like :func:`_section` but a missing or empty section is just ``{}``."""
-    value = data.get(dotted.rsplit(".", 1)[-1])
-    if value is None:
-        return {}
-    return _mapping(value, dotted)
+def _check_choice(key: Key, value: Any, dotted: str) -> str:
+    value = _coerce_choice(key, value)
+    normalised = str(value).lower()
+    choices = key.choices or ()
+    if normalised not in choices:
+        raise ConfigError(
+            f"{dotted}: must be one of {'|'.join(choices)}, got {normalised!r}"
+            + _fix(f"use one of {'|'.join(choices)}")
+        )
+    return normalised
 
 
-def _get(section: dict[str, Any], dotted: str, expected: type, default: Any = _MISSING) -> Any:
-    key = dotted.rsplit(".", 1)[-1]
-    value = section.get(key, _MISSING)
-    if value is _MISSING:
-        if default is _MISSING:
-            raise ConfigError(f"{dotted}: missing required key")
-        return default
+def _check_range(key: Key, value: float, dotted: str) -> None:
+    if key.exclusive_minimum:
+        if key.minimum is not None and value <= key.minimum:
+            bound = "> 0" if key.minimum == 0 else f"> {key.minimum:g}"
+            raise ConfigError(
+                f"{dotted}: must be {bound}, got {value}" + _fix(f"set a value {bound}")
+            )
+        return
+    if key.minimum is not None and key.maximum is not None:
+        if not (key.minimum <= value <= key.maximum):
+            raise ConfigError(
+                f"{dotted}: must be between {key.minimum:g} and {key.maximum:g}, "
+                f"got {value}" + _fix(f"set a value in [{key.minimum:g}, {key.maximum:g}]")
+            )
+        return
+    if key.minimum is not None and value < key.minimum:
+        raise ConfigError(
+            f"{dotted}: must be >= {key.minimum:g}, got {value}"
+            + _fix(f"set a value >= {key.minimum:g}")
+        )
+
+
+def _check_int(value: Any, dotted: str) -> int:
     # bool is a subclass of int — reject it explicitly for numeric keys.
-    if isinstance(value, bool) and expected in (int, float):
-        raise ConfigError(f"{dotted}: expected {expected.__name__}, got bool")
-    if expected is float and isinstance(value, int):
-        return float(value)
-    if not isinstance(value, expected):
-        raise ConfigError(f"{dotted}: expected {expected.__name__}, got {type(value).__name__}")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(
+            f"{dotted}: expected int, got {type(value).__name__}" + _fix("set a plain integer")
+        )
     return value
 
 
-def _int_list(section: dict[str, Any], dotted: str) -> tuple[int, ...]:
-    value = _get(section, dotted, list)
-    for i, item in enumerate(value):
-        if isinstance(item, bool) or not isinstance(item, int):
-            raise ConfigError(f"{dotted}[{i}]: expected int, got {type(item).__name__}")
-    return tuple(value)
+def _check_float(value: Any, dotted: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ConfigError(
+            f"{dotted}: expected float, got {type(value).__name__}" + _fix("set a number")
+        )
+    return float(value)
 
 
-def _in_range(value: float, dotted: str, lo: float, hi: float) -> float:
-    if not (lo <= value <= hi):
-        raise ConfigError(f"{dotted}: must be between {lo} and {hi}, got {value}")
-    return value
+def _validate_key(key: Key, section: dict[str, Any]) -> Any:
+    dotted = key.path
+    value = section.get(key.name, _MISSING)
+    if value is _MISSING:
+        if key.default is REQUIRED:
+            raise ConfigError(
+                f"{dotted}: missing required key"
+                + _fix(f"add {key.name} to the {key.section} section (see cortana.yaml.example)")
+            )
+        return key.default
+    if key.coerce is not None:
+        value = key.coerce(value)
+
+    if key.choices is not None and key.type == "str":
+        return _check_choice(key, value, dotted)
+
+    if key.type == "int":
+        out_i = _check_int(value, dotted)
+        _check_range(key, out_i, dotted)
+        return out_i
+    if key.type == "float":
+        out_f = _check_float(value, dotted)
+        _check_range(key, out_f, dotted)
+        return out_f
+    if key.type == "bool":
+        if not isinstance(value, bool):
+            raise ConfigError(
+                f"{dotted}: expected bool, got {type(value).__name__}" + _fix("set true or false")
+            )
+        return value
+    if key.type == "str":
+        if not isinstance(value, str):
+            raise ConfigError(
+                f"{dotted}: expected str, got {type(value).__name__}" + _fix("set a string")
+            )
+        return value
+    if key.type == "opt_str":
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str):
+            raise ConfigError(
+                f"{dotted}: expected string or null, got {type(value).__name__}"
+                + _fix("set a string, or null to disable")
+            )
+        return value
+    if key.type == "int_list":
+        if not isinstance(value, list):
+            raise ConfigError(
+                f"{dotted}: expected list, got {type(value).__name__}"
+                + _fix("set a YAML list, e.g. [123, 456]")
+            )
+        for i, item in enumerate(value):
+            _check_int(item, f"{dotted}[{i}]")
+        return tuple(value)
+    if key.type == "str_list":
+        if not isinstance(value, list):
+            raise ConfigError(
+                f"{dotted}: expected list, got {type(value).__name__}"
+                + _fix("set a YAML list, e.g. [high]")
+            )
+        if key.choices is not None:
+            return tuple(_check_choice(key, item, f"{dotted}[{i}]") for i, item in enumerate(value))
+        return tuple(str(item).lower() for item in value)
+    raise AssertionError(f"unhandled schema type {key.type!r} for {dotted}")  # pragma: no cover
 
 
-def _positive(value: float, dotted: str) -> Any:
-    if value <= 0:
-        raise ConfigError(f"{dotted}: must be > 0, got {value}")
-    return value
+def _reject_unknown_keys(section_path: str, mapping: dict[str, Any]) -> None:
+    display = section_path or "top level"
+    allowed = {k.name for k in keys_in_section(section_path)} | {
+        s.name for s in child_sections(section_path)
+    }
+    for name in mapping:
+        if str(name) in allowed:
+            continue
+        suggestions = difflib.get_close_matches(str(name), sorted(allowed), n=1, cutoff=0.6)
+        if suggestions:
+            hint = _fix(f"did you mean {suggestions[0]!r}?")
+        else:
+            hint = _fix("remove it (unknown keys would otherwise hide a typo as a default)")
+        raise ConfigError(f"{display}: unknown key {name!r}" + hint)
 
 
-def _non_negative(value: float, dotted: str) -> Any:
-    if value < 0:
-        raise ConfigError(f"{dotted}: must be >= 0, got {value}")
-    return value
+def _walk_section(section_path: str, mapping: dict[str, Any], values: dict[str, Any]) -> None:
+    """Validate one mapping node: unknown keys, leaf keys, child sections."""
+    _reject_unknown_keys(section_path, mapping)
+    for key in keys_in_section(section_path):
+        values[key.path] = _validate_key(key, mapping)
+    for child in child_sections(section_path):
+        raw = mapping.get(child.name, _MISSING)
+        if raw is _MISSING:
+            if not child.optional:
+                raise ConfigError(
+                    f"{child.path}: missing required section"
+                    + _fix(f"add a {child.name}: section (see cortana.yaml.example)")
+                )
+            _walk_section(child.path, {}, values)
+            continue
+        # A bare `section:` header with every key commented out parses as
+        # None. Treat it as empty so the error the operator sees names the
+        # missing KEY, not "expected a mapping, got NoneType".
+        if raw is None:
+            _walk_section(child.path, {}, values)
+            continue
+        if not isinstance(raw, dict):
+            raise ConfigError(
+                f"{child.path}: expected a mapping, got {type(raw).__name__}"
+                + _fix(f"indent the {child.name} keys under the {child.name}: header")
+            )
+        _walk_section(child.path, raw, values)
 
 
-# ── section builders ─────────────────────────────────────────────────────────
+def _validate_tree(data: dict[str, Any]) -> dict[str, Any]:
+    """Validate the whole YAML tree; returns ``{key_path: value}``."""
+    values: dict[str, Any] = {}
+    _walk_section("", data, values)
+    return values
+
+
+def _section_values(data: dict[str, Any], root: str) -> dict[str, Any]:
+    """Validate the subtree rooted at top-level section ``root`` only."""
+    values: dict[str, Any] = {}
+    raw = data.get(root, _MISSING)
+    if raw is _MISSING or raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"{root}: expected a mapping, got {type(raw).__name__}"
+            + _fix(f"indent the {root} keys under the {root}: header")
+        )
+    _walk_section(root, raw, values)
+    return values
+
+
+# ── dataclass assembly ───────────────────────────────────────────────────────
+
+
+def _assemble_discord(v: dict[str, Any]) -> DiscordConfig:
+    return DiscordConfig(
+        token_file=v["discord.token_file"],
+        guild_id=v["discord.guild_id"],
+        channels=ChannelsConfig(
+            intel_alerts=v["discord.channels.intel_alerts"],
+            intel_live=v["discord.channels.intel_live"],
+            health=v["discord.channels.health"],
+        ),
+        roles=RolesConfig(
+            pilot=v["discord.roles.pilot"],
+            fc=v["discord.roles.fc"],
+        ),
+        watch_voice_channels=v["discord.watch_voice_channels"],
+        auto_join=v["discord.auto_join"],
+        mentions_enabled=v["discord.mentions_enabled"],
+        here_on_severity=v["discord.here_on_severity"],
+        join_announcement=v["discord.join_announcement"],
+    )
+
+
+def _assemble_wake(v: dict[str, Any]) -> WakeConfig:
+    return WakeConfig(
+        model=v["wake.model"],
+        threshold=v["wake.threshold"],
+        refractory_ms=v["wake.refractory_ms"],
+        ack=v["wake.ack"],
+        vad_threshold=v["wake.vad_threshold"],
+    )
+
+
+def _assemble_capture(v: dict[str, Any]) -> CaptureConfig:
+    return CaptureConfig(
+        preroll_ms=v["capture.preroll_ms"],
+        endpoint_silence_ms=v["capture.endpoint_silence_ms"],
+        max_utterance_ms=v["capture.max_utterance_ms"],
+        vad_aggressiveness=v["capture.vad_aggressiveness"],
+    )
+
+
+def _assemble_stt(v: dict[str, Any]) -> SttConfig:
+    return SttConfig(
+        backend=v["stt.backend"],
+        model=v["stt.model"],
+        compute_type=v["stt.compute_type"],
+        cpu_threads=v["stt.cpu_threads"],
+        bias_with_gazetteer=v["stt.bias_with_gazetteer"],
+        whisper_cpp_url=v["stt.whisper_cpp_url"],
+        relay_min_logprob=v["stt.relay_min_logprob"],
+        relay_mode=v["stt.relay_mode"],
+        watchdog_s=v["stt.watchdog_s"],
+    )
+
+
+def _assemble_matching(v: dict[str, Any]) -> MatchingConfig:
+    return MatchingConfig(
+        phonetic_weight=v["matching.phonetic_weight"],
+        text_weight=v["matching.text_weight"],
+        tiers=TiersConfig(
+            high_min=v["matching.tiers.high_min"],
+            high_margin=v["matching.tiers.high_margin"],
+            medium_min=v["matching.tiers.medium_min"],
+        ),
+        priors=PriorsConfig(
+            recency_weight=v["matching.priors.recency_weight"],
+            recency_window_min=v["matching.priors.recency_window_min"],
+            proximity_weight=v["matching.priors.proximity_weight"],
+            proximity_max_jumps=v["matching.priors.proximity_max_jumps"],
+            reporter_history_weight=v["matching.priors.reporter_history_weight"],
+            home_weight=v["matching.priors.home_weight"],
+        ),
+    )
+
+
+def _assemble_incidents(v: dict[str, Any]) -> IncidentsConfig:
+    return IncidentsConfig(
+        dedupe_window_s=v["incidents.dedupe_window_s"],
+        stale_after_min=v["incidents.stale_after_min"],
+        cancel_window_s=v["incidents.cancel_window_s"],
+    )
+
+
+def _assemble_discipline(v: dict[str, Any]) -> DisciplineConfig:
+    return DisciplineConfig(
+        user_cooldown_s=v["discipline.user_cooldown_s"],
+        circuit_breaker=CircuitBreakerConfig(
+            max_mentions=v["discipline.circuit_breaker.max_mentions"],
+            window_min=v["discipline.circuit_breaker.window_min"],
+        ),
+        personal_pings_max=v["discipline.personal_pings_max"],
+    )
+
+
+def _assemble_tts(v: dict[str, Any]) -> TtsConfig:
+    return TtsConfig(
+        enabled=v["tts.enabled"],
+        voice=v["tts.voice"],
+        binary=v["tts.binary"],
+        max_utterance_s=v["tts.max_utterance_s"],
+        effect=v["tts.effect"],
+        personality=v["tts.personality"],
+    )
+
+
+def _assemble_chat(v: dict[str, Any]) -> ChatConfig:
+    return ChatConfig(
+        enabled=v["chat.enabled"],
+        model=v["chat.model"],
+        api_key_file=v["chat.api_key_file"],
+        max_tokens=v["chat.max_tokens"],
+        user_cooldown_s=v["chat.user_cooldown_s"],
+        timeout_s=v["chat.timeout_s"],
+        web_search=v["chat.web_search"],
+        answer_channel=v["chat.answer_channel"],
+    )
+
+
+def _assemble_gazetteer(v: dict[str, Any]) -> GazetteerConfig:
+    return GazetteerConfig(
+        file=v["gazetteer.file"],
+        home_system=v["gazetteer.home_system"],
+        include_all=v["gazetteer.include_all"],
+    )
+
+
+def _assemble(values: dict[str, Any]) -> AuraConfig:
+    return AuraConfig(
+        discord=_assemble_discord(values),
+        wake=_assemble_wake(values),
+        capture=_assemble_capture(values),
+        stt=_assemble_stt(values),
+        matching=_assemble_matching(values),
+        incidents=_assemble_incidents(values),
+        discipline=_assemble_discipline(values),
+        tts=_assemble_tts(values),
+        gazetteer=_assemble_gazetteer(values),
+        ipc=IpcConfig(socket=values["ipc.socket"]),
+        health=HealthConfig(
+            report_interval_min=values["health.report_interval_min"],
+            voice_silence_alarm_s=values["health.voice_silence_alarm_s"],
+        ),
+        database=DatabaseConfig(path=values["database.path"]),
+        chat=_assemble_chat(values),
+        routing=RoutingFileConfig(file=values["routing.file"]),
+    )
+
+
+# ── single-section builders (kept for tests and targeted validation) ─────────
 
 
 def _build_discord(data: dict[str, Any]) -> DiscordConfig:
-    s = _section(data, "discord")
-    channels = _section(s, "discord.channels")
-    roles = _optional_section(s, "discord.roles")
-    return DiscordConfig(
-        token_file=_get(s, "discord.token_file", str),
-        guild_id=_get(s, "discord.guild_id", int),
-        channels=ChannelsConfig(
-            intel_alerts=_get(channels, "discord.channels.intel_alerts", int),
-            intel_live=_get(channels, "discord.channels.intel_live", int),
-            health=_get(channels, "discord.channels.health", int),
-        ),
-        roles=RolesConfig(
-            pilot=_get(roles, "discord.roles.pilot", int, default=0),
-            fc=_get(roles, "discord.roles.fc", int, default=0),
-        ),
-        watch_voice_channels=_int_list(s, "discord.watch_voice_channels"),
-        auto_join=_get(s, "discord.auto_join", bool, default=True),
-        mentions_enabled=_get(s, "discord.mentions_enabled", bool, default=True),
-        here_on_severity=tuple(
-            str(x).lower() for x in (_get(s, "discord.here_on_severity", list, default=["high"]))
-        ),
-        join_announcement=_join_announcement(s),
-    )
-
-
-def _yaml_offable(value: Any) -> Any:
-    """YAML 1.1 parses a bare ``off``/``no`` as boolean False (and ``on``/
-    ``yes`` as True). For keys whose legal values include the WORD "off",
-    coerce the boolean back to the word so operators don't need quotes —
-    an unquoted ``join_announcement: off`` once crash-looped a deployment."""
-    if value is False:
-        return "off"
-    return value
-
-
-def _join_announcement(s: dict[str, Any]) -> str:
-    raw = _yaml_offable(_get(s, "discord.join_announcement", object, default="daily"))
-    mode = str(raw).lower()
-    if mode not in ("every", "daily", "off"):
-        raise ConfigError(
-            f"discord.join_announcement: must be one of every|daily|off, got {mode!r}"
-        )
-    return mode
+    return _assemble_discord(_section_values(data, "discord"))
 
 
 def _build_wake(data: dict[str, Any]) -> WakeConfig:
-    s = _section(data, "wake")
-    ack = str(_get(s, "wake.ack", str, default="beep")).lower()
-    if ack not in ("voice", "beep", "none"):
-        raise ConfigError(f"wake.ack: must be one of voice|beep|none, got {ack!r}")
-    return WakeConfig(
-        model=_get(s, "wake.model", str),
-        threshold=_in_range(_get(s, "wake.threshold", float), "wake.threshold", 0.0, 1.0),
-        refractory_ms=_positive(_get(s, "wake.refractory_ms", int), "wake.refractory_ms"),
-        ack=ack,
-        vad_threshold=_in_range(
-            float(_get(s, "wake.vad_threshold", float, default=0.0)),
-            "wake.vad_threshold",
-            0.0,
-            1.0,
-        ),
-    )
+    return _assemble_wake(_section_values(data, "wake"))
 
 
 def _build_capture(data: dict[str, Any]) -> CaptureConfig:
-    s = _section(data, "capture")
-    return CaptureConfig(
-        preroll_ms=_positive(_get(s, "capture.preroll_ms", int), "capture.preroll_ms"),
-        endpoint_silence_ms=_positive(
-            _get(s, "capture.endpoint_silence_ms", int), "capture.endpoint_silence_ms"
-        ),
-        max_utterance_ms=_positive(
-            _get(s, "capture.max_utterance_ms", int), "capture.max_utterance_ms"
-        ),
-        vad_aggressiveness=int(
-            _in_range(
-                _get(s, "capture.vad_aggressiveness", int), "capture.vad_aggressiveness", 0, 3
-            )
-        ),
-    )
-
-
-RELAY_MODES = ("framed", "open", "off")
+    return _assemble_capture(_section_values(data, "capture"))
 
 
 def _build_stt(data: dict[str, Any]) -> SttConfig:
-    s = _section(data, "stt")
-    backend = _get(s, "stt.backend", str)
-    if backend not in STT_BACKENDS:
-        raise ConfigError(f"stt.backend: must be one of {list(STT_BACKENDS)}, got {backend!r}")
-    relay_mode = _yaml_offable(_get(s, "stt.relay_mode", object, default="framed"))
-    relay_mode = str(relay_mode).lower()
-    if relay_mode not in RELAY_MODES:
-        raise ConfigError(f"stt.relay_mode: must be one of {list(RELAY_MODES)}, got {relay_mode!r}")
-    return SttConfig(
-        backend=backend,
-        model=_get(s, "stt.model", str),
-        compute_type=_get(s, "stt.compute_type", str),
-        cpu_threads=_positive(_get(s, "stt.cpu_threads", int), "stt.cpu_threads"),
-        bias_with_gazetteer=_get(s, "stt.bias_with_gazetteer", bool, default=True),
-        whisper_cpp_url=_get(s, "stt.whisper_cpp_url", str),
-        relay_min_logprob=float(_get(s, "stt.relay_min_logprob", float, default=-0.9)),
-        relay_mode=relay_mode,
-    )
-
-
-def _build_matching(data: dict[str, Any]) -> MatchingConfig:
-    s = _section(data, "matching")
-    tiers = _section(s, "matching.tiers")
-    priors = _section(s, "matching.priors")
-    return MatchingConfig(
-        phonetic_weight=_in_range(
-            _get(s, "matching.phonetic_weight", float), "matching.phonetic_weight", 0.0, 1.0
-        ),
-        text_weight=_in_range(
-            _get(s, "matching.text_weight", float), "matching.text_weight", 0.0, 1.0
-        ),
-        tiers=TiersConfig(
-            high_min=_in_range(
-                _get(tiers, "matching.tiers.high_min", float), "matching.tiers.high_min", 0.0, 1.0
-            ),
-            high_margin=_in_range(
-                _get(tiers, "matching.tiers.high_margin", float),
-                "matching.tiers.high_margin",
-                0.0,
-                1.0,
-            ),
-            medium_min=_in_range(
-                _get(tiers, "matching.tiers.medium_min", float),
-                "matching.tiers.medium_min",
-                0.0,
-                1.0,
-            ),
-        ),
-        priors=PriorsConfig(
-            recency_weight=_non_negative(
-                _get(priors, "matching.priors.recency_weight", float),
-                "matching.priors.recency_weight",
-            ),
-            recency_window_min=_positive(
-                _get(priors, "matching.priors.recency_window_min", int),
-                "matching.priors.recency_window_min",
-            ),
-            proximity_weight=_non_negative(
-                _get(priors, "matching.priors.proximity_weight", float),
-                "matching.priors.proximity_weight",
-            ),
-            proximity_max_jumps=_positive(
-                _get(priors, "matching.priors.proximity_max_jumps", int),
-                "matching.priors.proximity_max_jumps",
-            ),
-            reporter_history_weight=_non_negative(
-                _get(priors, "matching.priors.reporter_history_weight", float),
-                "matching.priors.reporter_history_weight",
-            ),
-            home_weight=_non_negative(
-                _get(priors, "matching.priors.home_weight", float), "matching.priors.home_weight"
-            ),
-        ),
-    )
-
-
-def _build_incidents(data: dict[str, Any]) -> IncidentsConfig:
-    s = _section(data, "incidents")
-    return IncidentsConfig(
-        dedupe_window_s=_positive(
-            _get(s, "incidents.dedupe_window_s", int), "incidents.dedupe_window_s"
-        ),
-        stale_after_min=_positive(
-            _get(s, "incidents.stale_after_min", int), "incidents.stale_after_min"
-        ),
-        cancel_window_s=_positive(
-            _get(s, "incidents.cancel_window_s", int), "incidents.cancel_window_s"
-        ),
-    )
-
-
-def _build_discipline(data: dict[str, Any]) -> DisciplineConfig:
-    s = _section(data, "discipline")
-    cb = _section(s, "discipline.circuit_breaker")
-    return DisciplineConfig(
-        user_cooldown_s=_positive(
-            _get(s, "discipline.user_cooldown_s", int), "discipline.user_cooldown_s"
-        ),
-        circuit_breaker=CircuitBreakerConfig(
-            max_mentions=_positive(
-                _get(cb, "discipline.circuit_breaker.max_mentions", int),
-                "discipline.circuit_breaker.max_mentions",
-            ),
-            window_min=_positive(
-                _get(cb, "discipline.circuit_breaker.window_min", int),
-                "discipline.circuit_breaker.window_min",
-            ),
-        ),
-        personal_pings_max=_positive(
-            _get(s, "discipline.personal_pings_max", int, default=10),
-            "discipline.personal_pings_max",
-        ),
-    )
-
-
-def _build_tts(data: dict[str, Any]) -> TtsConfig:
-    s = _section(data, "tts")
-    return TtsConfig(
-        enabled=_get(s, "tts.enabled", bool, default=True),
-        voice=_get(s, "tts.voice", str),
-        binary=_get(s, "tts.binary", str),
-        max_utterance_s=_positive(_get(s, "tts.max_utterance_s", float), "tts.max_utterance_s"),
-        effect=_get(s, "tts.effect", str, default="none"),
-        personality=_personality(_get(s, "tts.personality", str, default="standard")),
-    )
-
-
-def _personality(value: str) -> str:
-    v = value.lower()
-    if v not in ("standard", "cortana", "bratty"):
-        raise ConfigError(f"tts.personality: must be standard, cortana or bratty, got {value!r}")
-    return v
+    return _assemble_stt(_section_values(data, "stt"))
 
 
 def _build_chat(data: dict[str, Any]) -> ChatConfig:
-    # The whole section is optional — an existing cortana.yaml without it keeps
-    # loading, with the override channel simply off.
-    s = data.get("chat")
-    if not isinstance(s, dict):
-        return ChatConfig()
-    return ChatConfig(
-        enabled=_get(s, "chat.enabled", bool, default=False),
-        model=_get(s, "chat.model", str, default="claude-haiku-4-5"),
-        api_key_file=_get(s, "chat.api_key_file", str, default="/etc/cortana/anthropic"),
-        max_tokens=_positive(_get(s, "chat.max_tokens", int, default=300), "chat.max_tokens"),
-        user_cooldown_s=_positive(
-            _get(s, "chat.user_cooldown_s", int, default=10), "chat.user_cooldown_s"
-        ),
-        timeout_s=_positive(
-            float(_get(s, "chat.timeout_s", float, default=25.0)), "chat.timeout_s"
-        ),
-        web_search=_get(s, "chat.web_search", bool, default=True),
-        answer_channel=int(_get(s, "chat.answer_channel", int, default=0)),
-    )
+    return _assemble_chat(_section_values(data, "chat"))
 
 
 def _build_gazetteer(data: dict[str, Any]) -> GazetteerConfig:
-    s = _section(data, "gazetteer")
-    # home_system is optional: an explicit null/empty (or missing) disables the
-    # home-bias prior — nomadic corps have no home system (GDD §8.1/§8.4).
-    raw_home = s.get("home_system", _MISSING)
-    if raw_home is _MISSING or raw_home is None or raw_home == "":
-        home_system: str | None = None
-    elif isinstance(raw_home, str):
-        home_system = raw_home
-    else:
-        raise ConfigError(
-            f"gazetteer.home_system: expected string or null, got {type(raw_home).__name__}"
-        )
-    return GazetteerConfig(
-        file=_get(s, "gazetteer.file", str),
-        home_system=home_system,
-        include_all=_get(s, "gazetteer.include_all", bool, default=False),
-    )
+    return _assemble_gazetteer(_section_values(data, "gazetteer"))
 
 
-def _build_ipc(data: dict[str, Any]) -> IpcConfig:
-    s = _section(data, "ipc")
-    return IpcConfig(
-        socket=_get(s, "ipc.socket", str),
-    )
-
-
-def _build_health(data: dict[str, Any]) -> HealthConfig:
-    s = _section(data, "health")
-    return HealthConfig(
-        report_interval_min=_positive(
-            _get(s, "health.report_interval_min", int), "health.report_interval_min"
-        ),
-        voice_silence_alarm_s=_positive(
-            _get(s, "health.voice_silence_alarm_s", int), "health.voice_silence_alarm_s"
-        ),
-    )
-
-
-def _build_database(data: dict[str, Any]) -> DatabaseConfig:
-    s = _section(data, "database")
-    return DatabaseConfig(path=_get(s, "database.path", str))
+def _personality(value: str) -> str:
+    """Validate a tts.personality value (schema-driven; kept as a helper)."""
+    key = key_by_path("tts.personality")
+    return _check_choice(key, value, key.path)
 
 
 # ── public API ───────────────────────────────────────────────────────────────
@@ -651,30 +729,44 @@ def load_config(path: str | Path) -> AuraConfig:
     if not isinstance(data, dict):
         raise ConfigError(f"{p}: top level must be a mapping")
 
-    return AuraConfig(
-        discord=_build_discord(data),
-        wake=_build_wake(data),
-        capture=_build_capture(data),
-        stt=_build_stt(data),
-        matching=_build_matching(data),
-        incidents=_build_incidents(data),
-        discipline=_build_discipline(data),
-        tts=_build_tts(data),
-        gazetteer=_build_gazetteer(data),
-        ipc=_build_ipc(data),
-        health=_build_health(data),
-        database=_build_database(data),
-        chat=_build_chat(data),
-    )
+    cfg = _assemble(_validate_tree(data))
+    for check in CROSS_CHECKS:
+        problem = check.fn(cfg)
+        if problem is not None:
+            raise ConfigError(problem)
+    return cfg
+
+
+def _value_at(cfg: AuraConfig, path: str) -> Any:
+    """Resolve a schema key path against the loaded dataclass tree."""
+    return reduce(getattr, path.split("."), cfg)
+
+
+def diff_configs(old: AuraConfig, new: AuraConfig) -> dict[Reload, tuple[str, ...]]:
+    """Bucket every changed key by its reload class.
+
+    Every bucket is present (possibly empty) so callers can render the full
+    receipt without membership checks. Used by :mod:`cortana.reload` to
+    apply hot keys, trigger engine reloads, and report restart-bound edits
+    as "restart pending" instead of silently absorbing them.
+    """
+    buckets: dict[Reload, list[str]] = {r: [] for r in Reload}
+    for key in KEYS:
+        if _value_at(old, key.path) != _value_at(new, key.path):
+            buckets[key.reload].append(key.path)
+    return {r: tuple(paths) for r, paths in buckets.items()}
 
 
 class ConfigHolder:
     """Holds the live :class:`AuraConfig` and swaps it atomically on reload.
 
-    ``__main__`` installs the SIGHUP handler and calls :meth:`reload`; every
-    other module keeps a reference to the holder and reads :attr:`current` at
-    the point of use. If a reload fails validation the previous config stays
-    in force and the :class:`ConfigError` propagates to the caller.
+    ``__main__`` installs the SIGHUP handler and calls :meth:`reload` (or,
+    preferably, :func:`cortana.reload.reload_all`, which validates every
+    config input together and swaps all-or-nothing via :meth:`replace`);
+    every other module keeps a reference to the holder and reads
+    :attr:`current` at the point of use. If a reload fails validation the
+    previous config stays in force and the :class:`ConfigError` propagates
+    to the caller.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -690,6 +782,12 @@ class ConfigHolder:
     def current(self) -> AuraConfig:
         with self._lock:
             return self._current
+
+    def replace(self, new: AuraConfig) -> None:
+        """Swap in an already-validated config (the reload transaction)."""
+        with self._lock:
+            self._current = new
+        log.info("config_swapped", path=str(self._path))
 
     def reload(self) -> AuraConfig:
         """Re-read the file. On failure the old config is kept and the error raised."""
