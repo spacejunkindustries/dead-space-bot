@@ -52,6 +52,12 @@ stt:
   relay_min_logprob: -0.9              # freeform relays below this Whisper confidence are
                                        # dropped with "Say again" instead of posted (GDD §8.6);
                                        # recognised commands are never gated by this.
+  relay_mode: framed                   # what unmatched speech may become a relay card (§8.6):
+                                       #   framed = only explicitly framed intel — a "report …"
+                                       #            opener, a spoken colour code, or an
+                                       #            all-hands phrase. Mishearings never post.
+                                       #   open   = any unmatched transcript relays
+                                       #   off    = freeform relay disabled; commands only
 
 matching:
   phonetic_weight: 0.6                 # weight of metaphone similarity (constraint 7)

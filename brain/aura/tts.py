@@ -29,6 +29,7 @@ import json
 import math
 import random
 import struct
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,8 +48,10 @@ __all__ = [
     "degraded",
     "flood_control",
     "help_hint",
+    "hot_lines",
     "no_pings",
     "not_registered",
+    "not_understood",
     "number_word",
     "ping_cleared",
     "ping_limit",
@@ -79,6 +82,12 @@ SYNTHESIS_TIMEOUT_S = 10.0
 
 _CHANNELS = 1
 _BYTES_PER_SAMPLE = 2  # s16le
+
+#: Line cache bounds: the §12.1 acknowledgement pool is a few dozen short
+#: strings; anything longer (override answers, named callouts with arbitrary
+#: text) varies per use and would only churn the cache.
+_LINE_CACHE_MAX = 64
+_LINE_CACHE_TEXT_MAX = 80
 
 
 class SynthesisError(Exception):
@@ -145,6 +154,12 @@ def ambiguous(type_word: str, system: str) -> str:
 def say_again() -> str:
     """*"Say again the system."* — unresolved system name (LOW tier)."""
     return "Say again the system."
+
+
+def not_understood() -> str:
+    """*"Say again?"* — the utterance matched no command and no relay frame
+    (GDD §8.6 framed mode): AURA heard something but won't post it."""
+    return "Say again?"
 
 
 def go_ahead() -> str:
@@ -311,6 +326,33 @@ def ping_limit() -> str:
     return "Ping limit reached."
 
 
+def hot_lines() -> tuple[str, ...]:
+    """Every short scripted line on the wake/ack hot path, for the current
+    personality — the set :meth:`Speaker.warm` pre-synthesises into the line
+    cache so acknowledgements play without paying a Piper model load."""
+    lines: list[str] = [
+        "Go ahead.",
+        "Say again?",
+        "Say again the system.",
+        "Say again the callsign.",
+        "Relayed.",
+        "Flood control active.",
+        "Voice offline, use slash commands.",
+        "Command list posted to Discord.",
+        "Override channel unavailable.",
+        "Override cooling down.",
+        "Answer posted to Discord.",
+    ]
+    for colour in _SEVERITY_SPOKEN.values():
+        lines.append(f"Code {colour}. Go ahead.")
+    if _personality == "cortana":
+        lines += ["Listening.", "I'm here. Go ahead.", "Send it.", "Copy. Go ahead."]
+        lines += ["Copy that. Relayed.", "On the wire.", "Sent it up the chain."]
+        for colour in _SEVERITY_SPOKEN.values():
+            lines += [f"Code {colour} logged. Go ahead.", f"Copy code {colour}. Send it."]
+    return tuple(dict.fromkeys(lines))
+
+
 # ── WAV wrapping (in memory — constraint 5 adjacent: nothing touches disk) ───
 
 
@@ -466,6 +508,13 @@ class Speaker:
         self._workers: dict[int, asyncio.Task[None]] = {}
         self._closed = False
         self._voice_mutes: set[int] = set()
+        # Rendered-PCM cache for the short scripted lines (§12.1). Piper
+        # reloads its voice model on every subprocess spawn — ~1s on this
+        # class of CPU — so acknowledgements ("Go ahead.", "Relayed.") are
+        # synthesised once and replayed from RAM. Keyed by (text, voice,
+        # effect) so a SIGHUP voice/effect swap misses cleanly.
+        self._line_cache: OrderedDict[tuple[str, str, str], bytes] = OrderedDict()
+        self._prime_task: asyncio.Task[None] | None = None
         # Pre-built "listening" chirp — a short tone, generated once in memory.
         # The wake acknowledgement uses this instead of Piper so it is instant
         # (no neural-voice model load) and gives the pilot immediate feedback.
@@ -585,10 +634,32 @@ class Speaker:
             log.info("tts_warmed")
         except Exception as exc:  # noqa: BLE001 — warming is best-effort
             log.warning("tts_warm_failed", error=str(exc))
+            return
+        # Fill the line cache in the background so the first "Go ahead." of
+        # the day is already rendered. Best-effort: a failure only means that
+        # line synthesises on first use instead.
+        self._prime_task = asyncio.create_task(self._prime_lines(), name="tts-prime")
+
+    async def _prime_lines(self) -> None:
+        primed = 0
+        for line in hot_lines():
+            if self._closed:
+                return
+            try:
+                await self._render(line)
+                primed += 1
+            except Exception:  # noqa: BLE001 — priming is best-effort
+                return
+        log.info("tts_lines_primed", count=primed)
 
     async def close(self) -> None:
         """Stop accepting work, drain nothing, cancel all guild workers."""
         self._closed = True
+        if self._prime_task is not None:
+            self._prime_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._prime_task
+            self._prime_task = None
         workers = list(self._workers.values())
         for task in workers:
             task.cancel()
@@ -630,22 +701,44 @@ class Speaker:
             if not job.done.done():
                 job.done.set_result(spoken)
 
-    async def _speak(self, guild_id: int, job: _SayJob) -> bool:
+    async def _render(self, text: str) -> bytes:
+        """Synthesise ``text`` to effect-applied PCM, via the line cache.
+
+        Short scripted lines are rendered once per (text, voice, effect) and
+        replayed from RAM; everything else synthesises fresh. Raises
+        :class:`SynthesisError` on failure (never cached).
+        """
         cfg = self._holder.current.tts
         if cfg.voice != self._voice_path:
             # SIGHUP swapped the voice model: refresh the cached rate so the
             # WAV header and duration check match the new voice. Safe to
-            # mutate here — _speak runs only inside per-guild workers and
-            # synthesis is serialised by _synth_lock.
+            # mutate here — rendering runs only inside per-guild workers and
+            # the prime task, and synthesis is serialised by _synth_lock.
             self._sample_rate = await asyncio.to_thread(read_voice_sample_rate, cfg.voice)
             self._voice_path = cfg.voice
+        cacheable = len(text) <= _LINE_CACHE_TEXT_MAX
+        key = (text, cfg.voice, cfg.effect)
+        if cacheable:
+            cached = self._line_cache.get(key)
+            if cached is not None:
+                self._line_cache.move_to_end(key)
+                return cached
+        pcm = await self.synthesize(text)
+        if cfg.effect == "holographic":
+            pcm = await asyncio.to_thread(holographic, pcm, self._sample_rate)
+        if cacheable:
+            self._line_cache[key] = pcm
+            while len(self._line_cache) > _LINE_CACHE_MAX:
+                self._line_cache.popitem(last=False)
+        return pcm
+
+    async def _speak(self, guild_id: int, job: _SayJob) -> bool:
+        cfg = self._holder.current.tts
         try:
-            pcm = await self.synthesize(job.text)
+            pcm = await self._render(job.text)
         except SynthesisError as exc:
             log.warning("tts_synthesis_failed", guild_id=guild_id, text=job.text, error=str(exc))
             return False
-        if cfg.effect == "holographic":
-            pcm = await asyncio.to_thread(holographic, pcm, self._sample_rate)
         duration_s = len(pcm) / (self._sample_rate * _BYTES_PER_SAMPLE)
         if duration_s > cfg.max_utterance_s:
             # §12.2: hard cap — if it does not fit, it goes to the channel instead.

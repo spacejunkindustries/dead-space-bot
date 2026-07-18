@@ -598,3 +598,44 @@ def test_override_never_diverts_reports() -> None:
     assert override_query("hostiles in Otanuomi") is None
     # A bare "command override" with no question is not a query either.
     assert override_query("command override") is None
+
+
+def test_override_accepts_stt_phonetic_renderings() -> None:
+    # STT renders "override" phonetically; the doorway must still open.
+    from aura.nlu.grammar import override_query
+
+    expected = "what's the weather in Chicago"
+    for heard in (
+        "command over ride what's the weather in Chicago",
+        "command over-ride what's the weather in Chicago",
+        "command overide what's the weather in Chicago",
+        "command overdrive what's the weather in Chicago",
+        "command overwrite what's the weather in Chicago",
+        "commander override what's the weather in Chicago",
+        "hey cortana over ride what's the weather in Chicago",
+    ):
+        assert override_query(heard) == expected, heard
+
+
+# ── relay framing (GDD §8.6, relay_mode: framed) ─────────────────────────────
+
+
+def test_relay_framed_accepts_explicit_frames() -> None:
+    from aura.nlu.grammar import relay_framed
+
+    assert relay_framed("report blop fleet on the Kisogo gate end report")
+    assert relay_framed("hey jarvis reporting fleet movement to Rens, over")
+    assert relay_framed("code red blop fleet inbound")
+    assert relay_framed("cyno up, all hands")
+
+
+def test_relay_framed_rejects_unframed_speech() -> None:
+    from aura.nlu.grammar import relay_framed
+
+    # The junk that used to become CODE YELLOW cards: crosstalk, lone system
+    # names, hallucinated repeats.
+    assert not relay_framed("Arvas")
+    assert not relay_framed("How's everybody else doing")
+    assert not relay_framed("Rens, Rens, Rens")
+    assert not relay_framed("hey jarvis Kisogo")
+    assert not relay_framed("")

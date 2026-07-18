@@ -95,6 +95,7 @@ def make_config(
     mentions_enabled: bool = True,
     wake_ack: str = "beep",
     chat_enabled: bool = False,
+    relay_mode: str = "framed",
 ) -> AuraConfig:
     return AuraConfig(
         discord=DiscordConfig(
@@ -117,6 +118,7 @@ def make_config(
             cpu_threads=2,
             bias_with_gazetteer=True,
             whisper_cpp_url="http://127.0.0.1:8080/inference",
+            relay_mode=relay_mode,
         ),
         matching=MatchingConfig(
             phonetic_weight=0.6,
@@ -1132,6 +1134,26 @@ async def test_broadcast_relays_freeform_intel(make_env: Callable[..., Env]) -> 
     assert card.embed["description"] == "blop fleet moving to Moe 8 gate"
     row = db.query_one(env.conn, "SELECT parsed_intent, outcome FROM command_log")
     assert row["parsed_intent"] == "BROADCAST" and row["outcome"] == "POSTED"
+
+
+async def test_broadcast_dedupes_identical_text_within_window(
+    make_env: Callable[..., Env],
+) -> None:
+    # A repeated relay (missed ack, STT double-decode) folds: the pilot hears
+    # "Relayed." again, but no second card posts.
+    env = make_env()
+    first = await env.engine.broadcast(GUILD, 42, "blop fleet moving to Moe 8 gate")
+    assert first.outcome is Outcome.POSTED
+    env.clock.advance(10)
+    again = await env.engine.broadcast(GUILD, 43, "Blop fleet moving to Moe 8 gate")
+    assert again.outcome is Outcome.FOLDED  # case-insensitive, any reporter
+    assert again.utterance  # still acknowledged
+    assert len(env.poster.posts) == 1
+
+    env.clock.advance(91)  # dedupe_window_s = 90: expired → fresh intel again
+    later = await env.engine.broadcast(GUILD, 42, "blop fleet moving to Moe 8 gate")
+    assert later.outcome is Outcome.POSTED
+    assert len(env.poster.posts) == 2
 
 
 async def test_broadcast_all_hands_pings_here(make_env: Callable[..., Env]) -> None:

@@ -37,6 +37,7 @@ __all__ = [
     "encode_ping_types",
     "override_query",
     "parse",
+    "relay_framed",
     "sanitize_callsign",
     "system_reply",
 ]
@@ -404,7 +405,15 @@ def broadcast_severity(transcript: str) -> Severity | None:
 # "Command override" — the explicit doorway to the out-of-band assistant
 # (GDD §6.6). Leading position only (after wake residue), so a report that
 # happens to contain the word "override" mid-sentence can never be diverted.
-_OVERRIDE_RE = re.compile(r"^\W*(?:command\s+|com+a?nd\s+)?override\b[\s,.:;-]*", re.I)
+# STT renders "override" phonetically — "over ride", "overide", "over-ride",
+# "overdrive", "overwrite" — and a doorway that only opens on the dictionary
+# spelling stays shut half the time. All variants are accepted; leading
+# position keeps them from ever claiming a real report.
+_OVERRIDE_RE = re.compile(
+    r"^\W*(?:command(?:er|s)?[\s,]+|com+a?nd[\s,]+)?"
+    r"(?:over\s*[- ]?\s*(?:ride|write|drive)|over(?:r?ide|ride|write|drive))\b[\s,.:;-]*",
+    re.I,
+)
 
 
 def override_query(transcript: str) -> str | None:
@@ -448,6 +457,27 @@ def bare_code(transcript: str) -> Severity | None:
 def wants_all_hands(transcript: str) -> bool:
     """True when a freeform message asks to ping everyone (@here)."""
     return bool(_ALL_HANDS_RE.search(transcript))
+
+
+def relay_framed(transcript: str) -> bool:
+    """True when a freeform utterance is *explicitly framed* as intel —
+    a "report …" opener, a spoken colour code, or an all-hands phrase.
+
+    Under ``stt.relay_mode: framed`` (the default) only framed speech may
+    post a relay card: an unmatched transcript with no framing is far more
+    likely an STT mishearing or crosstalk than intel, and every junk card
+    costs the channel trust (GDD §8.6).
+    """
+    if not transcript or not transcript.strip():
+        return False
+    work = _BROADCAST_WAKE_RE.sub("", transcript, count=1)
+    work = _WAKE_RE.sub("", work, count=1)
+    if _REPORT_OPENER_RE.match(work):
+        return True
+    severity, _ = _extract_code(work)
+    if severity is not None:
+        return True
+    return wants_all_hands(work)
 
 
 def parse(transcript: str) -> ParsedCommand | None:

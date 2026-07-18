@@ -174,8 +174,9 @@ def make_app(
     transcriber: _Transcriber,
     outcome: IncidentOutcome | None = None,
     wake_ack: str = "beep",
+    relay_mode: str = "framed",
 ) -> tuple[App, _Engine, _Health, _Speaker, _Capture]:
-    holder = StubHolder(make_config(wake_ack=wake_ack))
+    holder = StubHolder(make_config(wake_ack=wake_ack, relay_mode=relay_mode))
     app = App(holder)  # type: ignore[arg-type]
     app.gazetteer = _Gazetteer(  # type: ignore[assignment]
         entries={
@@ -310,9 +311,11 @@ async def test_low_tier_retry_rebinds_bare_system_name() -> None:
     assert USER not in app._pending_retry  # consumed
 
 
-async def test_bare_no_intent_utterance_is_relayed() -> None:
-    # No intent matched → freeform intel relay (GDD §8.6), not a drop.
-    app, engine, _, _, _ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]))
+async def test_bare_no_intent_utterance_is_relayed_in_open_mode() -> None:
+    # relay_mode: open — the old catch-all: anything unmatched relays.
+    app, engine, _, _, _ = make_app(
+        roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]), relay_mode="open"
+    )
     await app._on_utterance(USER, GUILD, b"\x00\x00")
     assert engine.reports == []
     assert engine.broadcasts == [(GUILD, USER, "Kisogo", False)]
@@ -320,7 +323,9 @@ async def test_bare_no_intent_utterance_is_relayed() -> None:
 
 async def test_expired_pending_retry_falls_through_to_relay() -> None:
     # An expired retry no longer re-binds; the utterance is relayed instead.
-    app, engine, _, _, _ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]))
+    app, engine, _, _, _ = make_app(
+        roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]), relay_mode="open"
+    )
     stale = ParsedCommand(
         intent=Intent.HOSTILE_SPOTTED, system_text="x", group_alias=None, detail=None, raw="x"
     )
@@ -475,6 +480,7 @@ async def test_low_confidence_gibberish_is_not_relayed() -> None:
     app, engine, health, speaker, _ = make_app(
         roles=[PILOT_ROLE],
         transcriber=_Transcriber(["Rens, Rens, Rens"], avg_logprob=-2.4),
+        relay_mode="open",  # open mode so the confidence gate itself is what fires
     )
     await app._on_utterance(USER, GUILD, b"\x00\x00")
     assert engine.broadcasts == []  # hallucinated noise never becomes a card
@@ -487,10 +493,53 @@ async def test_confident_relay_posts_and_acks() -> None:
         roles=[PILOT_ROLE],
         transcriber=_Transcriber(["blop fleet moving to Kisogo gate whatever"]),
         outcome=IncidentOutcome(Outcome.POSTED, "Relayed.", None, None),
+        relay_mode="open",
     )
     await app._on_utterance(USER, GUILD, b"\x00\x00")
     assert len(engine.broadcasts) == 1
     assert (GUILD, "Relayed.") in speaker.said
+
+
+# ── relay framing (GDD §8.6, relay_mode) ─────────────────────────────────────
+
+
+async def test_unframed_speech_never_becomes_a_card_by_default() -> None:
+    # relay_mode: framed (default) — crosstalk and mishearings get "Say
+    # again?", never a card. This is the fix for junk relays like a lone
+    # system name decoded from noise.
+    app, engine, health, speaker, _ = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["How's everybody else doing"]),
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert engine.broadcasts == []
+    assert health.rejected == 1
+    assert speaker.said == [(GUILD, "Say again?")]
+
+
+async def test_framed_report_relays_under_default_mode() -> None:
+    # A "report … end report" envelope is explicit framing: it relays.
+    app, engine, _, speaker, _ = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey jarvis report blop fleet on the Kisogo gate end report"]),
+        outcome=IncidentOutcome(Outcome.POSTED, "Relayed.", None, None),
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert len(engine.broadcasts) == 1
+    assert engine.broadcasts[0][2] == "blop fleet on the Kisogo gate"
+    assert (GUILD, "Relayed.") in speaker.said
+
+
+async def test_relay_off_drops_even_framed_speech() -> None:
+    app, engine, health, speaker, _ = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["report blop fleet on the Kisogo gate end report"]),
+        relay_mode="off",
+    )
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert engine.broadcasts == []
+    assert health.rejected == 1
+    assert speaker.said == [(GUILD, "Say again?")]
 
 
 # ── command override wiring (GDD §6.6) ───────────────────────────────────────
@@ -545,6 +594,7 @@ async def test_override_disabled_falls_through_to_relay() -> None:
     app, engine, _, _, _ = make_app(
         roles=[PILOT_ROLE],
         transcriber=_Transcriber(["command override what's the weather in Chicago"]),
+        relay_mode="open",
     )
     app.chat = None  # type: ignore[assignment]
     await app._on_utterance(USER, GUILD, b"\x00\x00")
