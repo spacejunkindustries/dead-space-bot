@@ -281,6 +281,40 @@ def build_chirp(sample_rate: int, freq_hz: int = 880, ms: int = 130) -> bytes:
     return build_wav(bytes(samples), sample_rate)
 
 
+def holographic(pcm_s16le: bytes, sample_rate: int) -> bytes:
+    """Give a synthesised voice a sci-fi "AI hologram" sheen — GDD §12.
+
+    A light modulated-delay chorus (the shimmer) plus a few decaying reflections
+    (a spacious, projected feel). This is an audio *effect* over an ordinary
+    synthetic voice — it clones no one; it just makes AURA sound less like a
+    plain TTS and more like a ship's AI. numpy is imported lazily (audio dep).
+    Returns s16le at the same rate; empty input passes through untouched."""
+    import numpy as np  # lazy — audio dependency
+
+    x = np.frombuffer(pcm_s16le, dtype=np.int16).astype(np.float32) / 32768.0
+    n = x.size
+    if n == 0:
+        return pcm_s16le
+    t = np.arange(n)
+
+    # Chorus: mix in a copy read through a slowly modulated delay line.
+    base = max(1, int(0.018 * sample_rate))  # 18 ms
+    depth = max(1, int(0.002 * sample_rate))  # ±2 ms wobble
+    lfo = (depth * np.sin(2 * np.pi * 0.15 * t / sample_rate)).astype(np.int64)
+    idx = np.clip(t - base - lfo, 0, n - 1)
+    y = x + 0.35 * x[idx]
+
+    # Subtle reverb: a handful of decaying early reflections.
+    for delay_ms, gain in ((37, 0.24), (53, 0.17), (71, 0.11)):
+        d = int(delay_ms / 1000 * sample_rate)
+        if 0 < d < n:
+            y[d:] += gain * y[:-d]
+
+    peak = float(np.max(np.abs(y))) or 1.0
+    y = (y / peak) * 0.9  # normalise to avoid clipping the effect's sum
+    return (y * 32767.0).astype(np.int16).tobytes()
+
+
 def read_voice_sample_rate(voice_path: str | Path) -> int:
     """Read the native sample rate from the Piper voice config JSON.
 
@@ -526,6 +560,8 @@ class Speaker:
         except SynthesisError as exc:
             log.warning("tts_synthesis_failed", guild_id=guild_id, text=job.text, error=str(exc))
             return False
+        if cfg.effect == "holographic":
+            pcm = await asyncio.to_thread(holographic, pcm, self._sample_rate)
         duration_s = len(pcm) / (self._sample_rate * _BYTES_PER_SAMPLE)
         if duration_s > cfg.max_utterance_s:
             # §12.2: hard cap — if it does not fit, it goes to the channel instead.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import struct
 import wave
 from types import SimpleNamespace
@@ -195,6 +196,7 @@ def _holder(tmp_path, *, enabled: bool = True, max_utterance_s: float = 3.0) -> 
             voice=str(voice),
             binary="/nonexistent/piper",
             max_utterance_s=max_utterance_s,
+            effect="none",
         )
     )
     return SimpleNamespace(current=cfg)
@@ -369,3 +371,22 @@ def test_build_chirp_is_valid_wav() -> None:
         assert r.getnchannels() == 1
         assert r.getframerate() == 22050
         assert r.getnframes() > 0  # non-empty tone
+
+
+def test_holographic_effect_preserves_format() -> None:
+    pytest.importorskip("numpy")  # lazy audio dep; skip in the light CI env
+    import struct
+
+    from aura.tts import holographic
+
+    # 200ms of a 220Hz tone at 22050Hz, s16le.
+    rate = 22050
+    n = rate // 5
+    pcm = b"".join(
+        struct.pack("<h", int(8000 * math.sin(2 * math.pi * 220 * i / rate))) for i in range(n)
+    )
+    out = holographic(pcm, rate)
+    assert isinstance(out, bytes)
+    assert len(out) == len(pcm)  # same length, same s16le format
+    assert len(out) % 2 == 0
+    assert holographic(b"", rate) == b""  # empty passes through
