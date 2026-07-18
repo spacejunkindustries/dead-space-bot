@@ -123,8 +123,16 @@ class WakeConfig:
     #: model hard, and it shipped ON by default once and silently killed the
     #: wake word on a live deployment. OPT-IN only (0.0 = off, the default);
     #: enable at ~0.3-0.5 and verify wake still fires before trusting it.
-    #: Applied at model build — needs a restart, not just SIGHUP.
+    #: Applied at model build; the pool rebuilds per-user models live on
+    #: reload (sighup class, like ``model`` and ``extra_models``).
     vad_threshold: float = 0.0
+    #: Additional openWakeWord ONNX chains scored in parallel with ``model``
+    #: — any listed phrase wakes CORTANA (run the old and new phrase side by
+    #: side through a transition). ``threshold`` applies to the MAX score
+    #: across all models; a broken/missing extra is logged once and skipped
+    #: (only a broken PRIMARY latches the detector faulted). Each extra adds
+    #: its own false-fire budget — keep the total to 2-3 models (GDD §5.2).
+    extra_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,7 +497,14 @@ def _validate_key(key: Key, section: dict[str, Any]) -> Any:
             )
         if key.choices is not None:
             return tuple(_check_choice(key, item, f"{dotted}[{i}]") for i, item in enumerate(value))
-        return tuple(str(item).lower() for item in value)
+        # Free-form string lists (e.g. wake.extra_models paths) keep their
+        # case — Linux paths are case-sensitive.
+        for i, item in enumerate(value):
+            if not isinstance(item, str):
+                raise ConfigError(
+                    f"{dotted}[{i}]: expected str, got {type(item).__name__}" + _fix("set a string")
+                )
+        return tuple(value)
     raise AssertionError(f"unhandled schema type {key.type!r} for {dotted}")  # pragma: no cover
 
 
@@ -591,6 +606,7 @@ def _assemble_wake(v: dict[str, Any]) -> WakeConfig:
         refractory_ms=v["wake.refractory_ms"],
         ack=v["wake.ack"],
         vad_threshold=v["wake.vad_threshold"],
+        extra_models=v["wake.extra_models"],
     )
 
 

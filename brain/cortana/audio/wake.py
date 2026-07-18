@@ -10,28 +10,41 @@ openWakeWord's native input granularity is 80 ms (1280 samples); Ears delivers
 20 ms frames, so the detector accumulates four frames per inference call and
 holds the last score in between.
 
+Multiple wake phrases (GDD §5.1): ``wake.model`` is the primary phrase;
+``wake.extra_models`` (default empty) lists additional ONNX chains scored in
+parallel — a corp mid-transition runs the old and new phrase side by side.
+Each per-user unit is a **bank** of ``(path, model)`` pairs, one instance per
+configured path; a chunk's score is the MAX across the bank and
+``wake.threshold`` applies to that max. Hits are counted per model
+(:meth:`counters`) so #bot-health shows which phrase pilots actually use.
+
 Model lifecycle (the hardened pool):
 
 - **Models are NEVER built on the audio hot path.** :meth:`score` runs on the
   event loop (IPC reader → CaptureManager.feed) and an ONNX session load
-  stalls it for hundreds of ms. A spare model is built at init (off-loop, via
+  stalls it for hundreds of ms. A spare bank is built at init (off-loop, via
   ``asyncio.to_thread`` in ``__main__``) and handed to the first speaker;
   whenever a spare is consumed a replacement is built in the background via
   ``asyncio.to_thread``. A NEW speaker who arrives before a spare is ready is
   simply not wake-scored until it lands — their frames still roll through the
   pre-roll ring upstream, so nothing else degrades.
-- **Config-generation tagging.** Every model (spare or live) is stamped with
-  the ``(wake.model, wake.vad_threshold)`` it was built from; a SIGHUP that
-  changes either drops stale models lazily and rebuilds through the pool.
+- **Config-generation tagging.** Every bank (spare or live) is stamped with
+  the ``(wake.model, wake.extra_models, wake.vad_threshold)`` it was built
+  from; a SIGHUP that changes any of them — including any change to the
+  extra-model list — drops stale banks lazily and rebuilds through the pool.
   ``wake.threshold`` needs no rebuild — it is read per frame.
-- **Faulted state.** A model BUILD failure (file removed by a config push, a
-  broken openwakeword upgrade) latches the detector faulted for the current
-  config generation: logged loudly ONCE, :meth:`score` returns 0.0, and no
-  per-chunk retry storm grinds the loop. A config change (new generation)
-  clears the fault and retries. Health reads :attr:`faulted`.
+- **Faulted state.** A PRIMARY model build failure (file removed by a config
+  push, a broken openwakeword upgrade) latches the detector faulted for the
+  current config generation: logged loudly ONCE, :meth:`score` returns 0.0,
+  and no per-chunk retry storm grinds the loop. A config change (new
+  generation) clears the fault and retries. A broken EXTRA model never
+  faults the detector: it is logged once per config generation and skipped —
+  the primary and the remaining extras keep running. Health reads
+  :attr:`faulted`.
 - **Stage counters.** :meth:`counters` exposes frames_seen → vad_speech →
-  inferences → hits/near_misses so a silent wake death is a visible zero in
-  ``#bot-health`` instead of a green status over a dead pipeline.
+  inferences → hits/near_misses (plus per-model hit attribution) so a silent
+  wake death is a visible zero in ``#bot-health`` instead of a green status
+  over a dead pipeline.
 
 The wake **refractory period is owned by the capture layer**
 (``audio/capture.py``): after an emitted utterance the CaptureManager stops
@@ -47,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import PurePath
 from typing import Any, Protocol
 
 import structlog
@@ -76,13 +90,17 @@ _NEAR_MISS_FLOOR = 0.3
 #: emits a couple of lines, not fifty.
 _NEAR_MISS_STEP = 0.05
 
-#: The pool keeps this many pre-built models ready for new speakers.
+#: The pool keeps this many pre-built model banks ready for new speakers.
 _SPARE_TARGET = 1
 
-#: (wake.model, wake.vad_threshold) — the config inputs baked into a built
-#: model instance. wake.threshold is deliberately NOT part of the key: it is
-#: read per frame and needs no rebuild.
-_CfgKey = tuple[str, float]
+#: (wake.model, wake.extra_models, wake.vad_threshold) — the config inputs
+#: baked into a built model bank. ANY change to the model list (primary or
+#: extras, including ordering) rebuilds. wake.threshold is deliberately NOT
+#: part of the key: it is read per frame and needs no rebuild.
+_CfgKey = tuple[str, tuple[str, ...], float]
+
+#: One model instance per configured path, primary first: ((path, model), …).
+_Bank = tuple[tuple[str, Any], ...]
 
 
 class WakeDetector(Protocol):
@@ -103,23 +121,28 @@ class _UserWakeState:
 
     pending: bytearray = field(default_factory=bytearray)
     last_score: float = 0.0
+    #: Path of the model behind ``last_score`` ("" until a chunk is scored);
+    #: attributes hits/near-misses to a phrase in logs and counters.
+    last_model: str = ""
     #: Highest near-miss already logged this episode; reset when the score
     #: falls back under the floor or a hit re-arms the detector.
     peak_logged: float = 0.0
-    model: Any = None  # openwakeword.model.Model, from the spare pool
-    #: Config generation this user's model was built from; a mismatch with
-    #: the live config drops the model for a lazy rebuild (SIGHUP retune).
+    #: The per-user model bank ((path, openwakeword Model), …) from the pool.
+    bank: _Bank | None = None
+    #: Config generation this user's bank was built from; a mismatch with
+    #: the live config drops the bank for a lazy rebuild (SIGHUP retune).
     cfg_key: _CfgKey | None = None
 
 
 class OpenWakeWordDetector:
-    """openWakeWord-backed :class:`WakeDetector` for the configured ONNX model.
+    """openWakeWord-backed :class:`WakeDetector` for the configured ONNX models.
 
-    A hit (score >= ``wake.threshold``) clears this user's streaming state —
-    pending bytes, held score, and the model's prediction buffer — so the
-    detector re-arms clean and the same utterance's tail cannot retrigger
-    from the held score. Wake-hit *suppression* for ``wake.refractory_ms`` is
-    the CaptureManager's job (GDD §5); no second refractory lives here.
+    A hit (max score across the bank >= ``wake.threshold``) clears this
+    user's streaming state — pending bytes, held score, and every bank
+    model's prediction buffer — so the detector re-arms clean and the same
+    utterance's tail cannot retrigger from the held score. Wake-hit
+    *suppression* for ``wake.refractory_ms`` is the CaptureManager's job
+    (GDD §5); no second refractory lives here.
 
     See the module docstring for the model-pool / fault / counter contract.
     """
@@ -127,21 +150,27 @@ class OpenWakeWordDetector:
     def __init__(self, holder: ConfigHolder) -> None:
         self._holder = holder
         self._states: dict[int, _UserWakeState] = {}
-        self._spares: list[Any] = []
+        self._spares: list[_Bank] = []
         self._spares_key: _CfgKey = self._cfg_key()
         self._build_inflight = False
         self._replenish_tasks: set[asyncio.Task[None]] = set()
         self._faulted = False
         self._fault_key: _CfgKey | None = None
+        #: (config generation, path) pairs whose extra-model build failure was
+        #: already logged — a broken extra is loud once, then silent until the
+        #: wake config changes.
+        self._extra_warned: set[tuple[_CfgKey, str]] = set()
         # Stage counters (cumulative; health snapshots them).
         self._c_frames_seen = 0
         self._c_vad_speech = 0
         self._c_inferences = 0
         self._c_hits = 0
         self._c_near_misses = 0
+        #: Per-model hit attribution, keyed by configured model path.
+        self._c_hits_by_model: dict[str, int] = {}
         # Eager first spare: __main__ constructs this detector inside
         # asyncio.to_thread precisely to keep the ONNX session load off the
-        # event loop. Building one model here hands it to the first speaker,
+        # event loop. Building one bank here hands it to the first speaker,
         # warms the OS file cache for later builds, and fails fast at boot
         # when wake.model is missing instead of killing the audio path at
         # 02:00. An absent openwakeword package (unit tests fake the
@@ -156,7 +185,7 @@ class OpenWakeWordDetector:
 
     @property
     def faulted(self) -> bool:
-        """True while model builds are latched off after a build failure."""
+        """True while model builds are latched off after a PRIMARY build failure."""
         return self._faulted
 
     def counters(self) -> dict[str, int]:
@@ -165,21 +194,28 @@ class OpenWakeWordDetector:
         - ``frames_seen`` — frames offered to the wake stage (CaptureManager
           only forwards VAD-speech frames while IDLE, so these already passed
           the VAD gate).
-        - ``vad_speech`` — frames actually accepted into a live model's
+        - ``vad_speech`` — frames actually accepted into a live bank's
           stream. Diverges from ``frames_seen`` exactly when scoring is
           skipped (faulted, or a new speaker awaiting a spare) — the visible
           zero that turns a silent wake death into an alarm.
-        - ``inferences`` — 80 ms chunks run through a model.
+        - ``inferences`` — 80 ms chunks run through a bank (every model in
+          the bank scores the chunk; the count is per chunk, not per model).
         - ``hits`` / ``near_misses`` — threshold crossings / logged
           near-misses (§16 tuning signal).
+        - ``hits[<model stem>]`` — hits attributed to each configured model
+          (multi-phrase mode, GDD §5.1); models sharing a file stem merge.
         """
-        return {
+        out = {
             "frames_seen": self._c_frames_seen,
             "vad_speech": self._c_vad_speech,
             "inferences": self._c_inferences,
             "hits": self._c_hits,
             "near_misses": self._c_near_misses,
         }
+        for path, hits in self._c_hits_by_model.items():
+            key = f"hits[{PurePath(path).stem}]"
+            out[key] = out.get(key, 0) + hits
+        return out
 
     # ── hot path ─────────────────────────────────────────────────────────────
 
@@ -200,24 +236,26 @@ class OpenWakeWordDetector:
         if state is None:
             state = self._states[user_id] = _UserWakeState()
         if state.cfg_key is not None and state.cfg_key != key:
-            # SIGHUP changed wake.model / wake.vad_threshold: drop the stale
-            # model and rebuild lazily through the pool (never inline here).
+            # SIGHUP changed wake.model / wake.extra_models /
+            # wake.vad_threshold: drop the stale bank and rebuild lazily
+            # through the pool (never inline here).
             log.info("wake_model_stale_dropped", user_id=user_id)
-            state.model = None
+            state.bank = None
             state.pending.clear()
             state.last_score = 0.0
+            state.last_model = ""
             state.peak_logged = 0.0
         state.cfg_key = key
 
-        if state.model is None:
-            state.model = self._take_spare(key)
+        if state.bank is None:
+            state.bank = self._take_spare(key)
             # Top the pool back up for the NEXT speaker (with no running loop
             # — pure-sync tests — this may complete inline; retry the take so
             # the sync path loses no frames).
             self._request_spare(key)
-            if state.model is None:
-                state.model = self._take_spare(key)
-            if state.model is None:
+            if state.bank is None:
+                state.bank = self._take_spare(key)
+            if state.bank is None:
                 # No spare ready: skip wake scoring for this user until the
                 # background build lands. Never build on the hot path.
                 return 0.0
@@ -233,9 +271,18 @@ class OpenWakeWordDetector:
         threshold = self._holder.current.wake.threshold
         if state.last_score >= threshold:
             hit_score = state.last_score
+            # Attribute the hit to the winning model (the primary when a
+            # faked/legacy predict seam never set last_model).
+            hit_model = state.last_model or key[0]
             self._rearm_after_hit(state)
             self._c_hits += 1
-            log.info("wake_hit", user_id=user_id, score=round(hit_score, 3))
+            self._c_hits_by_model[hit_model] = self._c_hits_by_model.get(hit_model, 0) + 1
+            log.info(
+                "wake_hit",
+                user_id=user_id,
+                score=round(hit_score, 3),
+                model=PurePath(hit_model).stem,
+            )
             return hit_score
         # Near-miss visibility: without this, a phrase that scores just under
         # the threshold is indistinguishable from silence in the log — the exact
@@ -249,6 +296,7 @@ class OpenWakeWordDetector:
                     user_id=user_id,
                     score=round(state.last_score, 3),
                     threshold=threshold,
+                    model=PurePath(state.last_model or key[0]).stem,
                 )
         else:
             state.peak_logged = 0.0
@@ -261,10 +309,10 @@ class OpenWakeWordDetector:
 
     def _cfg_key(self) -> _CfgKey:
         cfg = self._holder.current.wake
-        return (cfg.model, cfg.vad_threshold)
+        return (cfg.model, cfg.extra_models, cfg.vad_threshold)
 
-    def _take_spare(self, key: _CfgKey) -> Any:
-        """Hand out a pre-built model matching ``key``; None when empty."""
+    def _take_spare(self, key: _CfgKey) -> _Bank | None:
+        """Hand out a pre-built model bank matching ``key``; None when empty."""
         if self._spares_key != key:
             # Spares built for a superseded config are worthless — drop them.
             self._spares.clear()
@@ -291,31 +339,35 @@ class OpenWakeWordDetector:
 
     async def _build_spare_off_loop(self, key: _CfgKey) -> None:
         try:
-            model = await asyncio.to_thread(self._build_model)
+            bank = await asyncio.to_thread(self._build_model)
         except Exception as exc:  # noqa: BLE001 — a bad build must latch, not raise
             self._enter_fault(key, exc)
             return
-        self._store_spare(key, model)
+        self._store_spare(key, bank)
 
     def _build_spare_blocking(self, key: _CfgKey) -> None:
         try:
-            model = self._build_model()
+            bank = self._build_model()
         except Exception as exc:  # noqa: BLE001 — a bad build must latch, not raise
             self._enter_fault(key, exc)
             return
-        self._store_spare(key, model)
+        self._store_spare(key, bank)
 
-    def _store_spare(self, key: _CfgKey, model: Any) -> None:
+    def _store_spare(self, key: _CfgKey, bank: _Bank) -> None:
         self._build_inflight = False
         if key != self._cfg_key():
             return  # config changed mid-build; the next frame re-requests
         if self._spares_key != key:
             self._spares.clear()
             self._spares_key = key
-        self._spares.append(model)
+        self._spares.append(bank)
 
     def _enter_fault(self, key: _CfgKey, exc: Exception) -> None:
-        """Latch the detector faulted for this config generation. Loud, once."""
+        """Latch the detector faulted for this config generation. Loud, once.
+
+        Only the PRIMARY model can land here — a broken extra is skipped
+        inside :meth:`_build_model` and never reaches the latch.
+        """
         self._build_inflight = False
         self._faulted = True
         self._fault_key = key
@@ -329,23 +381,48 @@ class OpenWakeWordDetector:
 
     # ── internals ────────────────────────────────────────────────────────────
 
-    def _build_model(self) -> Any:
+    def _build_model(self) -> _Bank:
+        """Build one model bank: the primary plus every extra that loads.
+
+        A primary failure raises (→ fault latch upstream). An extra failure
+        is logged once per (config generation, path) and skipped — the
+        primary and remaining extras keep the detector alive.
+        """
+        cfg = self._holder.current.wake
+        key: _CfgKey = (cfg.model, cfg.extra_models, cfg.vad_threshold)
+        bank: list[tuple[str, Any]] = [(cfg.model, self._build_one(cfg.model, cfg.vad_threshold))]
+        for path in cfg.extra_models:
+            try:
+                bank.append((path, self._build_one(path, cfg.vad_threshold)))
+            except Exception as exc:  # noqa: BLE001 — an extra must never fault the bank
+                if (key, path) not in self._extra_warned:
+                    self._extra_warned.add((key, path))
+                    log.warning(
+                        "wake_extra_model_build_failed",
+                        model=path,
+                        error=str(exc),
+                        detail="extra wake model skipped; the primary model and "
+                        "remaining extras keep running",
+                    )
+        return tuple(bank)
+
+    @staticmethod
+    def _build_one(model_path: str, vad_threshold: float) -> Any:
         from openwakeword.model import Model  # lazy
 
-        cfg = self._holder.current.wake
         kwargs: dict[str, Any] = {
-            "wakeword_models": [cfg.model],
+            "wakeword_models": [model_path],
             "inference_framework": "onnx",
         }
         # Silero VAD gate (GDD §5.3): a wake trigger only counts when the VAD
         # simultaneously scores speech — music/game-audio/keyboard noise on
         # busy comms can no longer false-fire on its own. 0.0 disables.
-        if cfg.vad_threshold > 0.0:
-            kwargs["vad_threshold"] = cfg.vad_threshold
+        if vad_threshold > 0.0:
+            kwargs["vad_threshold"] = vad_threshold
             try:
                 return Model(**kwargs)
             except Exception as exc:  # noqa: BLE001 — degrade, never kill wake
-                log.warning("wake_vad_gate_unavailable", error=str(exc))
+                log.warning("wake_vad_gate_unavailable", model=model_path, error=str(exc))
                 del kwargs["vad_threshold"]
         return Model(**kwargs)
 
@@ -353,17 +430,28 @@ class OpenWakeWordDetector:
     def _rearm_after_hit(state: _UserWakeState) -> None:
         """Clear the streaming state after a hit so the detector re-arms clean."""
         state.last_score = 0.0
+        state.last_model = ""
         state.peak_logged = 0.0
         state.pending.clear()
-        if state.model is not None and hasattr(state.model, "reset"):
-            state.model.reset()
+        for _path, model in state.bank or ():
+            if hasattr(model, "reset"):
+                model.reset()
 
     def _predict_chunk(self, state: _UserWakeState, chunk: bytes) -> float:
-        """Run one 80 ms chunk through this user's model; return the top score."""
+        """Run one 80 ms chunk through this user's bank; return the max score."""
         import numpy as np  # lazy
 
         samples = np.frombuffer(chunk, dtype=np.int16)
-        predictions: dict[str, float] = state.model.predict(samples)
-        if not predictions:
-            return 0.0
-        return float(max(predictions.values()))
+        bank = state.bank or ()
+        best = 0.0
+        best_path = bank[0][0] if bank else ""
+        for path, model in bank:
+            predictions: dict[str, float] = model.predict(samples)
+            if not predictions:
+                continue
+            model_score = float(max(predictions.values()))
+            if model_score > best:
+                best = model_score
+                best_path = path
+        state.last_model = best_path
+        return best

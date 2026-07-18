@@ -26,13 +26,14 @@ tests inject a deterministic clock without changing any signature.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import structlog
 
@@ -50,6 +51,7 @@ from cortana.types import (
     AlertChannel,
     ButtonSpec,
     CardRender,
+    EditNotFound,
     Incident,
     IncidentOutcome,
     IncidentStatus,
@@ -159,18 +161,26 @@ class Poster(Protocol):
         card: CardRender,
         *,
         mentions: MentionDecision | None = None,
+        channel_id: int | None = None,
     ) -> tuple[int, int]:
         """Post a card; returns ``(channel_id, message_id)``.
 
         ``mentions`` is the escalation authority's grant: the implementation
         builds its ``AllowedMentions`` allowlist from it verbatim (explicit
         user ids, explicit role ids, ``everyone`` only when ``here``).
-        ``None`` means nothing in the content may ping.
+        ``None`` means nothing in the content may ping. ``channel_id``
+        overrides the :class:`AlertChannel` lookup with an exact channel —
+        used by re-posts so a replacement card never migrates channels.
+        Raises :class:`PostError` on any Discord failure.
         """
         ...
 
     async def edit(self, channel_id: int, message_id: int, content: str, card: CardRender) -> None:
-        """Edit the card in place. ``content == ""`` means keep/clear mentions."""
+        """Edit the card in place. ``content == ""`` means keep/clear mentions.
+
+        Raises :class:`EditNotFound` when the message was deleted (the
+        engine re-posts, §9.1); every other failure is swallowed best-effort.
+        """
         ...
 
 
@@ -185,6 +195,48 @@ class TimerPing:
     note: str | None
     fires_at: str
     created_by: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Delivery:
+    """One unit of Discord I/O, produced under the engine lock, executed by
+    the single deliverer (:meth:`IncidentEngine._deliver`) after release.
+
+    ``kind="post"`` is a fresh card: failure raises :class:`PostError` to the
+    caller, which rolls the incident back. ``kind="edit"`` is a re-render:
+    best-effort, except that a lost message (NULL ids or the Poster raising
+    :class:`EditNotFound`) re-posts the card and stores the new ids when
+    ``repost_if_lost`` — the §9.1 invariant is one LIVE message per incident.
+    ``channel`` is the post target, and the re-post fallback when the
+    incident never recorded a channel.
+    """
+
+    kind: Literal["post", "edit"]
+    guild_id: int
+    card: CardRender
+    content: str = ""
+    incident_id: int | None = None
+    channel: AlertChannel = AlertChannel.LIVE
+    mentions: MentionDecision | None = None
+    channel_id: int | None = None
+    message_id: int | None = None
+    repost_if_lost: bool = False
+
+
+@dataclass(slots=True)
+class _OpenPrep:
+    """Everything ``_open_incident`` decides under the lock, for the
+    deliverer to execute and finish outside it."""
+
+    incident_id: int
+    work: _Delivery
+    outcome_ok: Outcome
+    utterance_ok: str
+    card: CardRender
+    #: (user_id, charged_at, previous_anchor) when discipline was charged —
+    #: rolled back via ``unrecord_mention`` if the post fails.
+    charge: tuple[int, datetime, datetime | None] | None
+    log_fields: dict[str, object] = field(default_factory=dict)
 
 
 # ── small pure helpers ───────────────────────────────────────────────────────
@@ -553,11 +605,17 @@ class IncidentEngine:
         # Personal ping subscriptions (GDD §10.3): same pattern; the routing
         # evaluator reads its mirror on every incident open.
         self._personal_pings = PersonalPingRegistry(conn, holder)
-        # In-memory only: candidate lists for uncertain (MEDIUM-tier) cards so
-        # re-renders keep their pick buttons until confirmed/corrected. After a
-        # restart an uncertain card keeps its already-posted buttons (persistent
-        # views) but re-renders fall back to a confirmed layout.
+        # Candidate lists for uncertain (MEDIUM-tier) cards so re-renders keep
+        # their pick buttons until confirmed/corrected. This dict is the
+        # runtime source; it is mirrored to the incident row's
+        # ``pending_candidates`` column and restored by
+        # :meth:`load_pending_candidates` at startup, so a restart never
+        # renders a 0.55-confidence guess as a confirmed card.
         self._pending_candidates: dict[int, tuple[MatchCandidate, ...]] = {}
+        # Incident ids whose FIRST post is still in flight (the deliverer runs
+        # outside the lock): the edit-or-repost policy must not "recover" a
+        # card whose original post has simply not returned yet.
+        self._posting: set[int] = set()
         # Freeform-relay dedupe (constraint 9 spirit): identical relay text
         # within incidents.dedupe_window_s folds instead of posting a second
         # card — pilots repeat when they miss the ack, and STT decodes the
@@ -592,6 +650,129 @@ class IncidentEngine:
         self._rules = load_routing_rules_file(rules_path, self._gazetteer, resolve_role)
         self._alias_roles = load_group_aliases(rules_path, resolve_role)
         return len(self._rules)
+
+    async def load_pending_candidates(self) -> int:
+        """Restore uncertain-card candidate lists from the incident rows.
+
+        Called once at startup (composition root): every ACTIVE incident with
+        a persisted ``pending_candidates`` column re-arms its confirm/pick
+        state, so a restart never re-renders an unconfirmed card as
+        confirmed. Returns the number of cards restored.
+        """
+        rows = await asyncio.to_thread(
+            db.query,
+            self._conn,
+            "SELECT id, pending_candidates FROM incidents"
+            " WHERE status = 'ACTIVE' AND pending_candidates IS NOT NULL",
+        )
+        restored = 0
+        for row in rows:
+            try:
+                candidates = tuple(
+                    MatchCandidate(system_id=int(c[0]), name=str(c[1]), score=float(c[2]))
+                    for c in json.loads(row["pending_candidates"])
+                )
+            except (ValueError, TypeError, IndexError):
+                log.warning("pending_candidates_unreadable", incident_id=row["id"])
+                continue
+            if candidates:
+                self._pending_candidates[row["id"]] = candidates
+                restored += 1
+        if restored:
+            log.info("pending_candidates_restored", count=restored)
+        return restored
+
+    # ── the single deliverer (render under the lock, deliver outside it) ─────
+
+    async def _deliver(self, work: _Delivery) -> tuple[int, int] | None:
+        """Execute one delivery. MUST be called outside the engine lock —
+        discord.py can sleep on rate-limit buckets, and holding the lock
+        through Discord I/O blocks every report, fold, and button press
+        (button interactions have a 3s answer window).
+
+        ONE failure policy for every path:
+
+        - ``post`` → :class:`PostError` propagates; the caller rolls back.
+        - ``edit`` with a live message → best-effort (the DB row is the state).
+        - ``edit`` against a lost message (NULL ids or :class:`EditNotFound`)
+          with ``repost_if_lost`` → re-post mention-free and store the new
+          ids: one incident, one LIVE message (§9.1). A re-post failure is
+          logged and dropped — the Poster already raised its alarm.
+
+        Returns ``(channel_id, message_id)`` when a message was created.
+        """
+        if work.kind == "post":
+            ids = await self._poster.post(
+                work.guild_id, work.channel, work.content, work.card, mentions=work.mentions
+            )
+            if work.incident_id is not None:
+                await self._store_message_ids(work.incident_id, ids)
+            return ids
+        if work.channel_id is not None and work.message_id is not None:
+            try:
+                await self._poster.edit(work.channel_id, work.message_id, work.content, work.card)
+                return None
+            except EditNotFound:
+                if not work.repost_if_lost or work.incident_id is None:
+                    log.warning("card_lost_not_reposted", incident_id=work.incident_id)
+                    return None
+        elif (
+            not work.repost_if_lost or work.incident_id is None or work.incident_id in self._posting
+        ):
+            # No message yet: either this card's first post is still in
+            # flight, or the caller opted out of recovery (bulk sweeps).
+            return None
+        kwargs: dict[str, object] = {"mentions": None}
+        if work.channel_id is not None:
+            kwargs["channel_id"] = work.channel_id  # same channel, never migrates
+        try:
+            ids = await self._poster.post(work.guild_id, work.channel, "", work.card, **kwargs)
+        except PostError as exc:
+            log.warning("card_repost_failed", incident_id=work.incident_id, error=str(exc))
+            return None
+        await self._store_message_ids(work.incident_id, ids)
+        log.info(
+            "card_reposted",
+            incident_id=work.incident_id,
+            channel_id=ids[0],
+            message_id=ids[1],
+        )
+        return ids
+
+    async def _deliver_all(self, works: list[_Delivery]) -> None:
+        for work in works:
+            await self._deliver(work)
+
+    async def _store_message_ids(self, incident_id: int, ids: tuple[int, int]) -> None:
+        channel_id, message_id = ids
+        await asyncio.to_thread(
+            db.execute,
+            self._conn,
+            "UPDATE incidents SET channel_id = ?, message_id = ? WHERE id = ?",
+            (channel_id, message_id, incident_id),
+        )
+
+    def _edit_work(
+        self, incident: Incident, card: CardRender, *, repost_if_lost: bool, content: str = ""
+    ) -> _Delivery:
+        """Build the edit-or-repost work item for an incident's re-render.
+
+        The re-post fallback channel (used only when the incident never
+        recorded a channel id) mirrors routing's channel rule: HIGH severity
+        → #intel-alerts, everything else → #intel-live.
+        """
+        fallback = AlertChannel.ALERTS if incident.severity is Severity.HIGH else AlertChannel.LIVE
+        return _Delivery(
+            kind="edit",
+            guild_id=incident.guild_id,
+            card=card,
+            content=content,
+            incident_id=incident.id,
+            channel=fallback,
+            channel_id=incident.channel_id,
+            message_id=incident.message_id,
+            repost_if_lost=repost_if_lost,
+        )
 
     # ── the single entry point (constraint 10) ───────────────────────────────
 
@@ -824,20 +1005,33 @@ class IncidentEngine:
                     "footer": {"text": "CORTANA voice relay"},
                 }
             )
-            try:
-                await self._poster.post(
-                    guild_id, decision.channel, content, card, mentions=decision
-                )
-            except PostError as exc:
-                del self._recent_relays[relay_key]  # a failed relay is not "seen"
-                log.warning("relay_post_failed", reporter_id=reporter_id, error=str(exc))
-                return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
-            # Discipline is charged only after the post actually went out —
-            # a phantom mention from a failed post must never open the breaker.
+            # Discipline is charged under the lock — BEFORE delivery — so
+            # concurrent relays still serialize against the cooldown; a
+            # failed post rolls the charge back below (a phantom mention
+            # must never run a cooldown or open the breaker).
+            charge: tuple[int, datetime, datetime | None] | None = None
             if decision.wants_mentions:
+                charge = (reporter_id, now, self._discipline.last_mention_at(reporter_id))
                 self._discipline.record_mention(reporter_id, now)
-                if self._on_mention is not None:
-                    self._on_mention()
+            work = _Delivery(
+                kind="post",
+                guild_id=guild_id,
+                card=card,
+                content=content,
+                channel=decision.channel,
+                mentions=decision,
+            )
+        # Discord I/O outside the lock (render-then-deliver).
+        try:
+            await self._deliver(work)
+        except PostError as exc:
+            self._recent_relays.pop(relay_key, None)  # a failed relay is not "seen"
+            if charge is not None:
+                self._discipline.unrecord_mention(*charge)
+            log.warning("relay_post_failed", reporter_id=reporter_id, error=str(exc))
+            return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
+        if charge is not None and self._on_mention is not None:
+            self._on_mention()
         await asyncio.to_thread(
             db.execute,
             self._conn,
@@ -895,6 +1089,9 @@ class IncidentEngine:
         resolution: Resolution,
         caller_may_mention: bool,
     ) -> IncidentOutcome:
+        outcome: IncidentOutcome | None = None
+        work: _Delivery | None = None
+        prep: _OpenPrep | None = None
         async with self._lock:
             now = self._clock()
             cfg = self._holder.current
@@ -930,17 +1127,27 @@ class IncidentEngine:
                     (guild_id, parsed.system_text, str(parsed.intent), _iso(now - window)),
                 )
             if existing_id is not None:
-                return await self._fold(int(existing_id), reporter_id, parsed, now, system_name)
-            return await self._open_incident(
-                guild_id,
-                reporter_id,
-                parsed,
-                resolution,
-                now,
-                system_name,
-                resolved,
-                caller_may_mention,
-            )
+                outcome, work = await self._fold(
+                    int(existing_id), reporter_id, parsed, now, system_name
+                )
+            else:
+                prep = await self._open_incident(
+                    guild_id,
+                    reporter_id,
+                    parsed,
+                    resolution,
+                    now,
+                    system_name,
+                    resolved,
+                    caller_may_mention,
+                )
+        # Discord I/O outside the lock (render-then-deliver).
+        if prep is not None:
+            return await self._finish_open(prep)
+        assert outcome is not None
+        if work is not None:
+            await self._deliver(work)
+        return outcome
 
     async def _fold(
         self,
@@ -949,14 +1156,15 @@ class IncidentEngine:
         parsed: ParsedCommand,
         now: datetime,
         system_name: str,
-    ) -> IncidentOutcome:
+    ) -> tuple[IncidentOutcome, _Delivery | None]:
         """Fold a duplicate report into the live incident: edit, never re-mention.
 
         Severity raises but never lowers: a pilot escalating with a spoken
         colour ("code red, hostiles UMI" folding into a plain sighting) turns
         the card red on the re-render instead of being silently dropped. The
         no-re-mention rule is untouched — severity display and mention policy
-        are separable (GDD §9.2).
+        are separable (GDD §9.2). Runs under the engine lock; the returned
+        work item is the caller's to deliver after release.
         """
 
         def _write() -> Incident | None:
@@ -987,10 +1195,8 @@ class IncidentEngine:
 
         incident = await asyncio.to_thread(_write)
         if incident is None:  # pragma: no cover — row deleted mid-flight
-            return IncidentOutcome(Outcome.REJECTED, None, None, None)
+            return IncidentOutcome(Outcome.REJECTED, None, None, None), None
         card = self._render(incident, system_name)
-        if incident.channel_id is not None and incident.message_id is not None:
-            await self._poster.edit(incident.channel_id, incident.message_id, "", card)
         log.info(
             "incident_folded",
             incident_id=incident_id,
@@ -998,7 +1204,8 @@ class IncidentEngine:
             reporter_count=incident.reporter_count,
         )
         utterance = f"Added to {system_name}, reported by {incident.reporter_count}."
-        return IncidentOutcome(Outcome.FOLDED, utterance, card, incident_id)
+        outcome = IncidentOutcome(Outcome.FOLDED, utterance, card, incident_id)
+        return outcome, self._edit_work(incident, card, repost_if_lost=True)
 
     async def _open_incident(
         self,
@@ -1010,7 +1217,10 @@ class IncidentEngine:
         system_name: str,
         resolved: bool,
         caller_may_mention: bool,
-    ) -> IncidentOutcome:
+    ) -> _OpenPrep:
+        """Insert the row, decide mentions, charge discipline, render — all
+        under the engine lock. The returned prep carries the post for
+        :meth:`_finish_open` to deliver after release."""
         best = resolution.best if resolution is not None else None
         # A spoken colour code (GDD §6.4) overrides the intent's default:
         # "code red, hostiles in UMI" is a HIGH-severity sighting.
@@ -1022,13 +1232,21 @@ class IncidentEngine:
         uncertain = resolved and resolution is not None and resolution.tier is Tier.MEDIUM
         system_id = best.system_id if resolved and best is not None else None
         confidence = best.score if resolved and best is not None else None
+        # The confirm candidates ride the row (JSON) so a restart re-arms the
+        # uncertain card instead of rendering the guess as confirmed.
+        pending_json = (
+            json.dumps([[c.system_id, c.name, c.score] for c in resolution.candidates])
+            if uncertain and resolution is not None
+            else None
+        )
 
         incident_id = await asyncio.to_thread(
             db.execute,
             self._conn,
             "INSERT INTO incidents (guild_id, system_id, system_confidence, type, severity,"
-            " reporter_id, detail, opened_at, updated_at, status, raw_system_text)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+            " reporter_id, detail, opened_at, updated_at, status, raw_system_text,"
+            " pending_candidates)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)",
             (
                 guild_id,
                 system_id,
@@ -1042,6 +1260,7 @@ class IncidentEngine:
                 # The transcript window that named the system (§8.5): survives
                 # restarts so a later [Wrong — fix] press can learn the alias.
                 parsed.system_text,
+                pending_json,
             ),
         )
         incident = await asyncio.to_thread(_load_incident, self._conn, incident_id)
@@ -1073,42 +1292,23 @@ class IncidentEngine:
             decision = decision.suppressed()
             flood_announced = self._discipline.should_announce_flood(now)
 
-        if uncertain:
+        if uncertain and resolution is not None:
             self._pending_candidates[incident_id] = resolution.candidates
+
+        # Discipline is charged under the lock — BEFORE delivery — so
+        # concurrent reports serialize against the cooldown; _finish_open
+        # rolls the charge back if the post fails (a phantom mention must
+        # never run a cooldown or open the breaker).
+        charge: tuple[int, datetime, datetime | None] | None = None
+        if decision.wants_mentions:
+            charge = (reporter_id, now, self._discipline.last_mention_at(reporter_id))
+            self._discipline.record_mention(reporter_id, now)
 
         card = self._render(incident, system_name)
         content = (
             "⚠️ Flood control active — mentions suppressed."
             if flood_announced
             else _mention_content(decision)
-        )
-        try:
-            channel_id, message_id = await self._poster.post(
-                guild_id, decision.channel, content, card, mentions=decision
-            )
-        except PostError as exc:
-            # Roll the incident back: an ACTIVE row with no message would
-            # silently fold every duplicate report into a card that exists
-            # nowhere — pilots would hear confirmations for an alert nobody
-            # can see. The pilot is told the post failed instead. Discipline
-            # was never charged — a phantom mention must not run a cooldown
-            # or open the breaker.
-            self._pending_candidates.pop(incident_id, None)
-            await asyncio.to_thread(
-                db.execute, self._conn, "DELETE FROM incidents WHERE id = ?", (incident_id,)
-            )
-            log.warning("incident_rolled_back_post_failed", incident_id=incident_id, error=str(exc))
-            return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
-        # Discipline is charged only after the post actually went out.
-        if decision.wants_mentions:
-            self._discipline.record_mention(reporter_id, now)
-            if self._on_mention is not None:
-                self._on_mention()
-        await asyncio.to_thread(
-            db.execute,
-            self._conn,
-            "UPDATE incidents SET channel_id = ?, message_id = ? WHERE id = ?",
-            (channel_id, message_id, incident_id),
         )
 
         label = _TYPE_LABELS[parsed.intent]
@@ -1132,19 +1332,61 @@ class IncidentEngine:
         else:
             utterance = f"{label} {system_name}{spoken_code}, posted."
 
-        log.info(
-            "incident_opened",
+        self._posting.add(incident_id)
+        return _OpenPrep(
             incident_id=incident_id,
-            type=str(parsed.intent),
-            system=system_name,
-            severity=str(severity),
-            uncertain=uncertain,
-            mentions=len(decision.role_ids),
-            personal_pings=len(decision.user_ids),
-            here=decision.here,
+            work=_Delivery(
+                kind="post",
+                guild_id=guild_id,
+                card=card,
+                content=content,
+                incident_id=incident_id,
+                channel=decision.channel,
+                mentions=decision,
+            ),
+            outcome_ok=Outcome.ASKED if uncertain else Outcome.POSTED,
+            utterance_ok=utterance,
+            card=card,
+            charge=charge,
+            log_fields={
+                "type": str(parsed.intent),
+                "system": system_name,
+                "severity": str(severity),
+                "uncertain": uncertain,
+                "mentions": len(decision.role_ids),
+                "personal_pings": len(decision.user_ids),
+                "here": decision.here,
+            },
         )
-        outcome = Outcome.ASKED if uncertain else Outcome.POSTED
-        return IncidentOutcome(outcome, utterance, card, incident_id)
+
+    async def _finish_open(self, prep: _OpenPrep) -> IncidentOutcome:
+        """Deliver a fresh card's post (outside the lock) and settle the
+        outcome — the post half of the ONE failure policy."""
+        try:
+            await self._deliver(prep.work)
+        except PostError as exc:
+            # Roll the incident back: an ACTIVE row with no message would
+            # silently fold every duplicate report into a card that exists
+            # nowhere — pilots would hear confirmations for an alert nobody
+            # can see. The pilot is told the post failed instead, and the
+            # discipline charge is rolled back — a phantom mention must not
+            # run a cooldown or open the breaker.
+            self._pending_candidates.pop(prep.incident_id, None)
+            if prep.charge is not None:
+                self._discipline.unrecord_mention(*prep.charge)
+            await asyncio.to_thread(
+                db.execute, self._conn, "DELETE FROM incidents WHERE id = ?", (prep.incident_id,)
+            )
+            log.warning(
+                "incident_rolled_back_post_failed", incident_id=prep.incident_id, error=str(exc)
+            )
+            return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
+        finally:
+            self._posting.discard(prep.incident_id)
+        if prep.charge is not None and self._on_mention is not None:
+            self._on_mention()
+        log.info("incident_opened", incident_id=prep.incident_id, **prep.log_fields)
+        return IncidentOutcome(prep.outcome_ok, prep.utterance_ok, prep.card, prep.incident_id)
 
     # ── resolve / cancel (GDD §9.1, §6.1) ────────────────────────────────────
 
@@ -1209,7 +1451,8 @@ class IncidentEngine:
                 db.execute(
                     self._conn,
                     "UPDATE incidents SET system_id = ?, system_confidence = ?,"
-                    " raw_system_text = ?, updated_at = ? WHERE id = ?",
+                    " raw_system_text = ?, updated_at = ?, pending_candidates = NULL"
+                    " WHERE id = ?",
                     (system_id, confidence, system_text, _iso(now), incident_id),
                 )
                 db.execute(
@@ -1227,17 +1470,16 @@ class IncidentEngine:
             # pointed at the OLD heard name.
             self._pending_candidates.pop(incident_id, None)
             card = self._render(incident, system_name)
-            if incident.channel_id is not None and incident.message_id is not None:
-                await self._poster.edit(incident.channel_id, incident.message_id, "", card)
+            work = self._edit_work(incident, card, repost_if_lost=True)
             log.info(
                 "chase_updated",
                 incident_id=incident_id,
                 system=system_name,
                 resolved=system_id is not None,
             )
-            return IncidentOutcome(
-                Outcome.POSTED, tts.chase_updated(system_name), card, incident_id
-            )
+        # Discord I/O outside the lock (render-then-deliver).
+        await self._deliver(work)
+        return IncidentOutcome(Outcome.POSTED, tts.chase_updated(system_name), card, incident_id)
 
     async def resolve_system(self, guild_id: int, user_id: int, system_id: int) -> IncidentOutcome:
         """ "clear <system>" / ``/clear`` — resolve every open incident there."""
@@ -1256,7 +1498,8 @@ class IncidentEngine:
                 for row in rows:
                     db.execute(
                         self._conn,
-                        "UPDATE incidents SET status = 'RESOLVED', updated_at = ? WHERE id = ?",
+                        "UPDATE incidents SET status = 'RESOLVED', updated_at = ?,"
+                        " pending_candidates = NULL WHERE id = ?",
                         (_iso(now), row["id"]),
                     )
                     incident = _load_incident(self._conn, row["id"])
@@ -1270,18 +1513,22 @@ class IncidentEngine:
                     Outcome.REJECTED, f"No active incident for {system_name}.", None, None
                 )
             card: CardRender | None = None
+            works: list[_Delivery] = []
             for incident in resolved:
                 self._pending_candidates.pop(incident.id, None)
                 card = self._render(incident, system_name)
-                if incident.channel_id is not None and incident.message_id is not None:
-                    await self._poster.edit(incident.channel_id, incident.message_id, "", card)
+                # A resolution the corp cannot see is a resolution that did
+                # not happen — a lost card re-posts in its resolved state.
+                works.append(self._edit_work(incident, card, repost_if_lost=True))
             log.info(
                 "incidents_resolved",
                 system=system_name,
                 count=len(resolved),
                 user_id=user_id,
             )
-            return IncidentOutcome(Outcome.POSTED, f"{system_name} clear.", card, resolved[-1].id)
+        # Discord I/O outside the lock (render-then-deliver).
+        await self._deliver_all(works)
+        return IncidentOutcome(Outcome.POSTED, f"{system_name} clear.", card, resolved[-1].id)
 
     async def cancel(self, guild_id: int, user_id: int) -> IncidentOutcome:
         """Kill this user's last incident, inside ``incidents.cancel_window_s``."""
@@ -1301,7 +1548,8 @@ class IncidentEngine:
                     return None
                 db.execute(
                     self._conn,
-                    "UPDATE incidents SET status = 'RESOLVED', updated_at = ? WHERE id = ?",
+                    "UPDATE incidents SET status = 'RESOLVED', updated_at = ?,"
+                    " pending_candidates = NULL WHERE id = ?",
                     (_iso(now), row["id"]),
                 )
                 return _load_incident(self._conn, row["id"])
@@ -1314,10 +1562,11 @@ class IncidentEngine:
                 incident.system_id, incident.raw_system_text or "unknown"
             )
             card = self._render(incident, system_name, cancelled=True)
-            if incident.channel_id is not None and incident.message_id is not None:
-                await self._poster.edit(incident.channel_id, incident.message_id, "", card)
+            work = self._edit_work(incident, card, repost_if_lost=True)
             log.info("incident_cancelled", incident_id=incident.id, user_id=user_id)
-            return IncidentOutcome(Outcome.POSTED, "Cancelled.", card, incident.id)
+        # Discord I/O outside the lock (render-then-deliver).
+        await self._deliver(work)
+        return IncidentOutcome(Outcome.POSTED, "Cancelled.", card, incident.id)
 
     # ── response loop (GDD §9.3) ─────────────────────────────────────────────
 
@@ -1365,8 +1614,7 @@ class IncidentEngine:
                 incident.system_id, incident.raw_system_text or "unknown"
             )
             card = self._render(incident, system_name)
-            if incident.channel_id is not None and incident.message_id is not None:
-                await self._poster.edit(incident.channel_id, incident.message_id, "", card)
+            work = self._edit_work(incident, card, repost_if_lost=True)
             utterance: str | None = None
             if state is ResponderState.OTW and previous is not ResponderState.OTW:
                 name = self._callsigns.lookup(user_id) or display_name
@@ -1382,7 +1630,10 @@ class IncidentEngine:
                 user_id=user_id,
                 state=str(state),
             )
-            return IncidentOutcome(Outcome.POSTED, utterance, card, incident_id)
+        # Discord I/O outside the lock: a rate-limited edit must not block
+        # the 3-second button-interaction window (render-then-deliver).
+        await self._deliver(work)
+        return IncidentOutcome(Outcome.POSTED, utterance, card, incident_id)
 
     # ── [Wrong — fix] correction + alias learning (GDD §8.5) ─────────────────
 
@@ -1414,7 +1665,7 @@ class IncidentEngine:
                 db.execute(
                     self._conn,
                     "UPDATE incidents SET system_id = ?, system_confidence = 1.0,"
-                    " updated_at = ? WHERE id = ?",
+                    " updated_at = ?, pending_candidates = NULL WHERE id = ?",
                     (system_id, _iso(now), incident_id),
                 )
                 if alias_key:
@@ -1435,8 +1686,7 @@ class IncidentEngine:
             self._pending_candidates.pop(incident_id, None)
             system_name = self._system_name(system_id, str(system_id))
             card = self._render(incident, system_name)
-            if incident.channel_id is not None and incident.message_id is not None:
-                await self._poster.edit(incident.channel_id, incident.message_id, "", card)
+            work = self._edit_work(incident, card, repost_if_lost=True)
             log.info(
                 "system_corrected",
                 incident_id=incident_id,
@@ -1444,9 +1694,29 @@ class IncidentEngine:
                 alias=learned_alias,
                 user_id=user_id,
             )
-            return IncidentOutcome(
-                Outcome.POSTED, f"Corrected to {system_name}.", card, incident_id
-            )
+        # Discord I/O outside the lock (render-then-deliver).
+        await self._deliver(work)
+        return IncidentOutcome(Outcome.POSTED, f"Corrected to {system_name}.", card, incident_id)
+
+    async def confirm_system(
+        self, incident_id: int, user_id: int, system_id: int
+    ) -> IncidentOutcome:
+        """Confirm an uncertain card's heard candidate — the voice twin of
+        tapping that candidate's pick button (GDD §8.3, constraint 10).
+
+        Same path as :meth:`correct_system` — confidence pinned, candidates
+        cleared, and the alias still learns from the stored transcript
+        (§8.5: a confirmed hearing is as much signal as a corrected one) —
+        only the spoken wording differs, because confirming the heard name
+        is not a correction.
+        """
+        outcome = await self.correct_system(incident_id, user_id, system_id, raw_text="")
+        if outcome.outcome is not Outcome.POSTED:
+            return outcome
+        system_name = self._system_name(system_id, str(system_id))
+        return IncidentOutcome(
+            outcome.outcome, f"Confirmed {system_name}.", outcome.card, outcome.incident_id
+        )
 
     # ── staleness sweep (GDD §9.1) ───────────────────────────────────────────
 
@@ -1472,7 +1742,8 @@ class IncidentEngine:
                 for row in rows:
                     db.execute(
                         self._conn,
-                        "UPDATE incidents SET status = 'STALE' WHERE id = ?",
+                        "UPDATE incidents SET status = 'STALE', pending_candidates = NULL"
+                        " WHERE id = ?",
                         (row["id"],),
                     )
                     incident = _load_incident(self._conn, row["id"])
@@ -1481,7 +1752,7 @@ class IncidentEngine:
                 return stale
 
             stale = await asyncio.to_thread(_sweep)
-            cards: list[tuple[Incident, CardRender]] = []
+            works: list[_Delivery] = []
             for incident in stale:
                 # STALE is a terminal state for unconfirmed cards — drop their
                 # candidate lists or they leak for the process lifetime.
@@ -1489,14 +1760,15 @@ class IncidentEngine:
                 system_name = self._system_name(
                     incident.system_id, incident.raw_system_text or "unknown"
                 )
-                cards.append((incident, self._render(incident, system_name)))
+                card = self._render(incident, system_name)
+                # No re-post for the silent bulk sweep: resurrecting a lost
+                # card just to grey it out is noise, not recovery (§9.1).
+                works.append(self._edit_work(incident, card, repost_if_lost=False))
         # Card edits happen OUTSIDE the engine lock: discord.py can sleep on
         # rate-limit buckets mid-edit, and holding the lock through a
         # multi-card sweep would block every report, fold, and button press
         # for the duration (button interactions have a 3s answer window).
-        for incident, card in cards:
-            if incident.channel_id is not None and incident.message_id is not None:
-                await self._poster.edit(incident.channel_id, incident.message_id, "", card)
+        await self._deliver_all(works)
         if stale:
             log.info("incidents_stale", ids=[i.id for i in stale])
         return [i.id for i in stale]
@@ -1520,7 +1792,8 @@ class IncidentEngine:
                 for row in rows:
                     db.execute(
                         self._conn,
-                        "UPDATE incidents SET status = 'RESOLVED' WHERE id = ?",
+                        "UPDATE incidents SET status = 'RESOLVED', pending_candidates = NULL"
+                        " WHERE id = ?",
                         (row["id"],),
                     )
                     incident = _load_incident(self._conn, row["id"])
@@ -1529,17 +1802,17 @@ class IncidentEngine:
                 return cleared
 
             cleared = await asyncio.to_thread(_clear)
-            cards: list[tuple[Incident, CardRender]] = []
+            works: list[_Delivery] = []
             for incident in cleared:
                 self._pending_candidates.pop(incident.id, None)
                 system_name = self._system_name(
                     incident.system_id, incident.raw_system_text or "unknown"
                 )
-                cards.append((incident, self._render(incident, system_name)))
+                card = self._render(incident, system_name)
+                # Bulk board-wipe: like sweep_stale, lost cards stay lost.
+                works.append(self._edit_work(incident, card, repost_if_lost=False))
         # Edits outside the lock, same reasoning as sweep_stale.
-        for incident, card in cards:
-            if incident.channel_id is not None and incident.message_id is not None:
-                await self._poster.edit(incident.channel_id, incident.message_id, "", card)
+        await self._deliver_all(works)
         if cleared:
             log.info("incidents_cleared_all", guild_id=guild_id, count=len(cleared))
         return [i.id for i in cleared]
@@ -1601,58 +1874,70 @@ class IncidentEngine:
             incident = await asyncio.to_thread(_load_incident, self._conn, incident_id)
             assert incident is not None
             card = self._render(incident, system_name, formup_at=_iso(fires_at))
-            try:
-                channel_id, message_id = await self._poster.post(
-                    guild_id, AlertChannel.LIVE, "", card
-                )
-            except PostError as exc:
-                # Same rollback guard as _open_incident: an ACTIVE FORMUP row
-                # with no message (and no countdown timer yet) is invisible —
-                # delete it and tell the pilot the post failed.
-                await asyncio.to_thread(
-                    db.execute, self._conn, "DELETE FROM incidents WHERE id = ?", (incident_id,)
-                )
-                log.warning(
-                    "formup_rolled_back_post_failed", incident_id=incident_id, error=str(exc)
-                )
-                return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
-            await asyncio.to_thread(
-                db.execute,
-                self._conn,
-                "UPDATE incidents SET channel_id = ?, message_id = ? WHERE id = ?",
-                (channel_id, message_id, incident_id),
-            )
-            # Countdown ping when the form-up comes due.
-            await asyncio.to_thread(
-                db.execute,
-                self._conn,
-                "INSERT INTO timers (guild_id, system_id, fires_at, note, created_by, fired)"
-                " VALUES (?, ?, ?, ?, ?, 0)",
-                (
-                    guild_id,
-                    best.system_id,
-                    _iso(fires_at),
-                    f"Form-up {system_name}",
-                    created_by,
-                ),
-            )
-            log.info(
-                "formup_created",
+            self._posting.add(incident_id)
+            work = _Delivery(
+                kind="post",
+                guild_id=guild_id,
+                card=card,
                 incident_id=incident_id,
-                system=system_name,
-                fires_at=_iso(fires_at),
+                channel=AlertChannel.LIVE,
             )
-            utterance = f"Form up {system_name}, {_format_duration(duration)}."
-            return IncidentOutcome(Outcome.POSTED, utterance, card, incident_id)
+        # Discord I/O outside the lock (render-then-deliver).
+        try:
+            await self._deliver(work)
+        except PostError as exc:
+            # Same rollback guard as _open_incident: an ACTIVE FORMUP row
+            # with no message (and no countdown timer yet) is invisible —
+            # delete it and tell the pilot the post failed.
+            await asyncio.to_thread(
+                db.execute, self._conn, "DELETE FROM incidents WHERE id = ?", (incident_id,)
+            )
+            log.warning("formup_rolled_back_post_failed", incident_id=incident_id, error=str(exc))
+            return IncidentOutcome(Outcome.REJECTED, tts.post_failed(), None, None)
+        finally:
+            self._posting.discard(incident_id)
+        # Countdown ping when the form-up comes due.
+        await asyncio.to_thread(
+            db.execute,
+            self._conn,
+            "INSERT INTO timers (guild_id, system_id, fires_at, note, created_by, fired)"
+            " VALUES (?, ?, ?, ?, ?, 0)",
+            (
+                guild_id,
+                best.system_id,
+                _iso(fires_at),
+                f"Form-up {system_name}",
+                created_by,
+            ),
+        )
+        log.info(
+            "formup_created",
+            incident_id=incident_id,
+            system=system_name,
+            fires_at=_iso(fires_at),
+        )
+        utterance = f"Form up {system_name}, {_format_duration(duration)}."
+        return IncidentOutcome(Outcome.POSTED, utterance, card, incident_id)
 
     async def fire_due_timers(self, now: datetime) -> list[TimerPing]:
-        """Poll for due timers, mark them fired, and return their ping payloads."""
+        """Poll for due timers and CLAIM them (two-phase, at-least-once — §13).
+
+        The claim (``fired = 1``) marks the row as picked up; the caller
+        announces each ping and confirms delivery with
+        :meth:`mark_timer_announced`. A claim whose announcement never
+        confirmed (403, crash mid-announce) keeps ``announced_at`` NULL and
+        is RE-OFFERED on the next poll — a structure timer is exactly the
+        loss the corp set the timer to avoid, so undelivered beats
+        never-duplicated here. The caller's alarm (TIMER_UNDELIVERED) makes
+        the retrying visible instead of silent.
+        """
         async with self._lock:
 
             def _fire() -> list[sqlite3.Row]:
                 rows = db.query(
                     self._conn,
-                    "SELECT * FROM timers WHERE fired = 0 AND fires_at <= ? ORDER BY fires_at",
+                    "SELECT * FROM timers WHERE announced_at IS NULL AND fires_at <= ?"
+                    " ORDER BY fires_at",
                     (_iso(now),),
                 )
                 for row in rows:
@@ -1660,6 +1945,7 @@ class IncidentEngine:
                 return rows
 
             rows = await asyncio.to_thread(_fire)
+            reoffered = [row["id"] for row in rows if row["fired"]]
             pings = [
                 TimerPing(
                     timer_id=row["id"],
@@ -1676,9 +1962,21 @@ class IncidentEngine:
                 )
                 for row in rows
             ]
+            if reoffered:
+                log.warning("timers_reoffered_unannounced", ids=reoffered)
             if pings:
                 log.info("timers_fired", ids=[p.timer_id for p in pings])
             return pings
+
+    async def mark_timer_announced(self, timer_id: int) -> None:
+        """Confirm a claimed timer's announcement actually reached Discord —
+        the second phase; the timer will never be offered again."""
+        await asyncio.to_thread(
+            db.execute,
+            self._conn,
+            "UPDATE timers SET announced_at = ? WHERE id = ?",
+            (_iso(self._clock()), timer_id),
+        )
 
     # ── status query (GDD §6.1 "status") ─────────────────────────────────────
 

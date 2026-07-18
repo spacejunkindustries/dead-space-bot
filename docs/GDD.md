@@ -194,7 +194,7 @@ Every module in the finished system.
 | `config.py` | YAML load, schema validation, hot-reload on SIGHUP |
 | `ipc.py` | UDS server, frame codec, per-user stream demux, Ears liveness |
 | `audio/vad.py` | webrtcvad wrapper; utterance endpointing |
-| `audio/wake.py` | openWakeWord instances, per-user state, score thresholds; off-loop spare-model pool, fault latch, stage counters |
+| `audio/wake.py` | openWakeWord instances (one per configured phrase: `wake.model` + `wake.extra_models`, scored as a max), per-user state, score thresholds; off-loop spare-model pool, fault latch, stage counters |
 | `audio/capture.py` | Per-user capture state machine: pre-roll ring buffer → wake hit → capture → endpoint → emit; owns the wake refractory period |
 | `audio/stt.py` | `Transcriber` protocol; faster-whisper (default) and whisper.cpp HTTP backends; gazetteer prompt biasing; bounded serialized decode queue + `stt.watchdog_s` hang watchdog |
 | `nlu/grammar.py` | Intent extraction, group-alias extraction, detail capture |
@@ -277,6 +277,8 @@ Songbird VoiceTick (20ms, per-user decoded PCM 48kHz)
 
 *Porcupine is the mature commercial alternative — type-to-train, instant custom words — but its free tier is scoped to personal use and commercial licensing starts around $6k/yr. A 50-pilot corp bot is not a comfortable fit for the free tier. CORTANA does not require it.*
 
+**Multiple wake phrases.** `wake.model` is the primary phrase; `wake.extra_models` (default empty) lists additional ONNX chains scored **in parallel** — built for phrase transitions, e.g. keeping `hey_jarvis` live beside a freshly trained custom phrase until pilots retrain their reflexes. Every 80 ms chunk runs through every configured model; the chunk's score is the **max** across them, and `wake.threshold` applies to that max, so any listed phrase wakes CORTANA. Per-model thresholds are deliberately not supported — one bar, one knob to tune. Mechanics: each per-user unit is a *bank* holding one model instance per path, generation-tagged on the full model list (any list change — add, remove, reorder — rebuilds live banks through the spare pool on reload, no restart). A missing or broken **extra** model is logged once per config generation and skipped — the primary and the remaining extras keep running; only a broken **primary** latches the detector faulted (§20). The wake stage counters report hits per model (`hits[<model>]` in `#bot-health` / `/botstatus`), so an operator can see which phrase pilots actually use and retire the old one on evidence.
+
 ### 5.2 The wake phrase
 
 Two constraints govern the choice:
@@ -292,6 +294,8 @@ Two constraints govern the choice:
 
 The phrase is configurable. The 6-phoneme / no-collision rule is not optional — it is the difference between a tool and a nuisance.
 
+Every entry in `wake.extra_models` (§5.1) must pass the same two rules, and the accuracy cost is additive: each model brings its **own** false-fire budget — false accepts across models add up, they do not average out, and one sloppy extra phrase can undo a carefully tuned primary. Run **2–3 models at most**, treat the multi-phrase state as transitional, and drop the old phrase once the per-model hit counters show pilots have switched.
+
 ### 5.3 Speech recognition
 
 **Default backend: faster-whisper, `small`, int8, CPU.** ~3.4% WER on clean English, ~2GB RAM, and sub-second on the 2–4s clips CORTANA actually feeds it. CTranslate2 releases the GIL during inference, so it runs in a thread pool without blocking the event loop.
@@ -306,7 +310,7 @@ Everything conversational — say-again retries, the "code *colour*" opener, the
 
 *History note: dialog state used to be five independent wall-clock dicts plus a frame-counted reopen window. Discord DTX sends no packets during silence, so the frame-counted half could never expire while the meaning half aged out on its own clock — the direct cause of the say-again loop, stuck-open wake-free windows, and mid-question interruption incidents. This design replaces that, and its three rules are what make those classes unreachable.*
 
-**States.** `IDLE → LISTENING (capture open) → THINKING (STT/engine) → IDLE`, plus four `AWAIT_*` states in which a wake-free window is armed: `AWAIT_REPEAT` (say-again), `AWAIT_RETRY_SYSTEM` (§8.3 LOW-tier rebind), `AWAIT_SEVERITY_REPORT` (§6.4 code opener), `AWAIT_OVERRIDE_QUESTION` (§6.6).
+**States.** `IDLE → LISTENING (capture open) → THINKING (STT/engine) → IDLE`, plus five `AWAIT_*` states in which a wake-free window is armed: `AWAIT_REPEAT` (say-again), `AWAIT_RETRY_SYSTEM` (§8.3 LOW-tier rebind), `AWAIT_SEVERITY_REPORT` (§6.4 code opener), `AWAIT_OVERRIDE_QUESTION` (§6.6), `AWAIT_CONFIRM` (§8.3 MEDIUM-tier confirm).
 
 **Rule 1 — one door.** The machine's `fail()` / `open_subdialog()` helpers are the *only* code paths that can arm a wake-free capture window. Every failure class — STT error, unmatched speech, low-confidence transcript, override noise, LOW-tier rejection — flows through the same door and draws on one per-dialog **retry budget** (`dialog.max_retries`, default 2, shared with deliberate subdialog openers). Only a fresh wake refills the budget; exhaustion always terminates *audibly* ("Standing down. Wake me to retry."). A self-sustaining reopen loop is structurally impossible, not merely guarded against.
 
@@ -340,7 +344,7 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 |---|---|---|---|
 | "hostiles \<system\>" / "reds \<system\>" / "neuts \<system\>" | `HOSTILE_SPOTTED` | medium | role mention |
 | "under attack \<system\>" / "tackled \<system\>" / "point on me \<system\>" | `UNDER_ATTACK` | **high** | role mention + `@here` |
-| "need help \<system\>" / "need backup \<system\>" | `ASSIST_REQUEST` | **high** | role mention + `@here` |
+| "need help \<system\>" / "need backup \<system\>" / "request(ing) [heavy] assistance\|backup\|reinforcements\|support \<system\>" | `ASSIST_REQUEST` | **high** | role mention + `@here` |
 | "gate camp \<system\>" | `GATE_CAMP` | medium | role mention |
 | "clear \<system\>" | `RESOLVE` | none | edits card, no mention |
 | "timer \<system\> \<duration\>" | `TIMER` | none | schedules a future ping |
@@ -355,6 +359,8 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 | "stop pinging me" | `PING_ME_CLEAR` | none | spoken reply only |
 
 Higher-severity patterns are matched first, so *"tackled, need help in Kisogo"* resolves to `UNDER_ATTACK`, not a sighting. The personal-ping intents are the one exception: their utterances *contain* type words ("ping me for gate camps"), so `PING_ME`/`PING_ME_CLEAR` are matched before the type words can claim the utterance — a genuine distress call never contains "ping me".
+
+**Padding tolerance.** Stressed pilots narrate: *"please report that I am tackled by enemies in system M tack O and request heavy assistance please"* must parse exactly like *"tackled M-OEE8"* (and it does: `UNDER_ATTACK` — tackled outranks the assist phrasing — with the spelled system intact). Two mechanisms, still fixed grammar (constraint 6): intent keywords are matched on the **raw text first**, so no courtesy word can ever break recognition; and the **system window** is then cleaned aggressively — a finite courtesy vocabulary (*please, kindly, that, by enemies/hostiles, request(ing), heavy, immediate(ly), send, right now, …* plus the phrase forms *I am / we are / I've been / be advised / thank you*) is stripped, and when the pilot anchors the name with a preposition (*"in system X"*, *"in X"*, *"at X"*), everything before the **last** anchor is treated as narrative and discarded. The stripping applies to the system window only — `detail` stays verbatim (§6.3) and callsigns keep their words. The article *"a"* survives inside a spelling (*"one d q one tack a"* → 1DQ1-A, §8.2) but is stripped everywhere else. Note *assistance/backup/reinforcements/support* are `ASSIST_REQUEST` **type words** when prefixed by *need/request* — they are matched (and removed from the window) as whole intent phrases before the courtesy set touches anything.
 
 `PING_ME` (§10.3) reuses the type vocabulary above: *hostiles/reds/neuts* → `HOSTILE_SPOTTED`, *gate camp(s)* → `GATE_CAMP`, *under attack/attacks/tackled* → `UNDER_ATTACK`, *need help/need backup/assist request(s)* → `ASSIST_REQUEST`, and *"anything"/"everything"/"all"* (or no type word at all) → all four. The optional system window resolves through the same phonetic pipeline as reports (§8.2); anything below HIGH tier is treated as unresolved — a subscription silently scoped to the wrong system would never fire, so CORTANA answers *"Say again the system."* instead of guessing. No system means the subscription covers all systems. The recognised types travel to the engine encoded in `detail` (comma-separated `Intent` values), shared by the `/pingme` twin.
 
@@ -534,7 +540,8 @@ raw transcript
    │
    ├─► alias table lookup ────────────► exact hit? done.       [learned, §8.5]
    │
-   ├─► normalise (lowercase, strip filler, expand numerals)
+   ├─► normalise (lowercase, strip filler, expand numerals,
+   │              fuse spelled names — "m tack o double e 8" → "m-oee8")
    │
    ├─► sliding 1–3 token windows over the remainder
    │
@@ -551,15 +558,27 @@ raw transcript
 
 Levenshtein on raw text alone is the wrong tool: STT errors are **phonetic, not typographic**. Whisper writes *"oh tan you oh me"* — character-distance-far from *Otanuomi*, phonetically adjacent. Metaphone collapses that gap.
 
+**The "tack" convention — spelled system names.** EVE pilots speak the hyphen in a nullsec designation as *"tack"* (also *"dash"*, *"hyphen"*) and spell the characters: M-OEE8 is said *"m tack o double e 8"*, UMI-KK is *"u m i tack k k"*, 1DQ1-A is *"one d q one tack a"*. The normalise step folds these spellings before windowing: hyphen words become `-`, adjacent single letters/digits (and spoken digit words inside a spelling) fuse into one token, and *"double e"* / *"triple x"* expand to `ee` / `xxx`. So *"m tack o double e 8"* becomes the single token `m-oee8` and scores as an exact hit against `M-OEE8`. A bare pair of numerals (*"4 4"*) is not a spelling and keeps the standalone-numeral expansion.
+
+Hyphenated names are also matched by their **spoken short form** — the pre-hyphen prefix (*"UMI"* → UMI-KK, *"Moe 8"* → MOEE-8), promoted only when the abbreviation match is strong (≥ 0.78). Names with a **1-character head** (M-OEE8) have no speakable short form, so they get **unique-prefix promotion** instead: a collapsed spoken form (*"mo"*, *"moee"*) that is a prefix of **exactly one** active-set collapsed name promotes that name to a strong match (0.90 — HIGH-tier on its own; a deliberate spelling is not a fuzzy hearing). A prefix shared by several active names is ambiguous and never promotes — the confirm-flow (§8.3) owns that case, not a guess. Both promotions matter more in `include_all` mode (§8.1), where the wider set makes full-name scores drag.
+
 ### 8.3 Confidence tiers — CORTANA never silently guesses
 
 | Tier | Rule | Behaviour |
 |---|---|---|
 | **High** | `top1 ≥ 0.80` and `top1 − top2 ≥ 0.12` | Post immediately. Speak *"Hostiles Otanuomi, pinged."* |
-| **Medium** | `top1 ≥ 0.55` | **Post anyway**, flagged uncertain, with buttons `[Otanuomi] [Kisogo] [Wrong — fix]`. Speak *"Hostiles Otanuomi — say again to confirm."* Speed beats certainty when a pilot is in structure; get the ping out and let humans correct it. |
+| **Medium** | `top1 ≥ 0.55` | **Post anyway**, flagged uncertain, with buttons `[Otanuomi] [Kisogo] [Wrong — fix]`. Speak *"Hostiles Otanuomi — say again to confirm."* and arm the wake-free confirm window (below). Speed beats certainty when a pilot is in structure; get the ping out and let humans correct it. |
 | **Low** | below | Do not post. Speak *"Say again the system."* Reopen the capture window for 4s. A bare system name spoken into the reopened window is re-bound to the rejected command's intent and resolved as its system. |
 
-**Destructive and scheduling commands need HIGH.** The tier table above governs *reports*, which post-anyway because speed beats certainty. `clear`, `timer`, and `form up` act irreversibly on a *specific* system — resolving the wrong system's incidents or scheduling a rally in the wrong place has no undo — so they act only on a High-tier match. A Medium match answers *"Heard Otanuomi — say again to confirm."* (the same ASKED outcome as an uncertain report) and does nothing; the pilot repeats the command, and a confirmed hearing resolves High. Low still gets *"Say again the system."*
+**Destructive and scheduling commands need HIGH.** The tier table above governs *reports*, which post-anyway because speed beats certainty. `clear`, `timer`, and `form up` act irreversibly on a *specific* system — resolving the wrong system's incidents or scheduling a rally in the wrong place has no undo — so they act only on a High-tier match. A Medium match answers *"Heard Otanuomi — say again to confirm."* (the same ASKED outcome as an uncertain report) and holds the command pending in the confirm window. Low still gets *"Say again the system."*
+
+**The confirm completes by voice, end to end.** Every ASKED outcome parks the dialog in `AWAIT_CONFIRM` — a wake-free window armed through the machine's one budgeted door (§5.4), carrying the pending command and the heard candidate in the session. Into that window:
+
+- **An affirmative** — *"yes"*, *"confirm"*, *"affirmative"*, *"correct"*, *"do it"*, *"roger"* — completes the confirm. Affirmatives are short — exactly what Whisper hallucinates from noise — so they are confidence-gated like override continuations.
+- **An exact repeat** — the same intent naming the same system (the heard window or the candidate's real name), or the bare system name alone — also completes it: "say again to confirm" taken literally.
+- **A negative** — *"no"*, *"cancel"*, *"wrong"* — or anything else closes the dialog **silently** with standing-down semantics: budget stays spent, a fresh wake is the way back in. A destructive confirm fails closed; it is never guessed from an unmatched utterance, and the window never re-asks — the retry budget bounds the whole exchange.
+
+Completion runs the same engine path as the buttons (constraint 10, both directions). For an uncertain *report*, the confirm pins the already-posted card's heard candidate through the pick-button path (`confirm_system` → `correct_system`), so the alias table still learns (§8.5) — a confirmed hearing is as much signal as a corrected one. For `clear`/`timer`/`form up`, nothing was posted: the stored candidate re-enters `report()` as a ready-made HIGH-tier resolution, exactly as if the repeat had been heard cleanly. The `/`-command twins never need this flow — typed input is exact.
 
 **Spoken readback.** When the pilot spoke a colour code, the confirmation reads the report back — *"Under attack UMI, code red, posted."* — so they hear exactly what the card says without looking at Discord. Combined with the catch-all posture (§8.6) this is the contract for misheard systems: **the action always continues**; the card carries the heard name verbatim, the readback surfaces it, and *"cancel"* (30s) or **[Wrong — fix]** repairs it.
 
@@ -626,6 +645,12 @@ Incident
 - *"Hey Cortana, clear Otanuomi"* edits that card to ✅ **RESOLVED** and greys it out.
 - Someone scrolling back reads **state**, not archaeology.
 - No updates for 20 minutes → auto-marked **STALE**, silently. Form-ups are exempt: a rally card legitimately sits quiet until it fires — its staleness is anchored by its countdown timer (§13), not by update chatter.
+
+**Render-then-deliver.** Every engine method mutates the database and renders the card *under* the engine lock, then hands the Discord I/O to a single deliverer that runs *after* the lock is released. Discord can sleep on rate-limit buckets mid-call; under flood conditions a rate-limited edit must never block the 3-second button-interaction window. One failure policy covers every path: a fresh card's **post** failure raises `PostError` and rolls the incident row (and any discipline charge) back; an **edit** is best-effort — the DB row is the state — except for a lost message.
+
+**Lost-message recovery.** The invariant is one **LIVE** message per incident, not one message id forever. A fold, responder press, correction, chase, resolve, or cancel that hits a NULL message id or a deleted message (`EditNotFound`) **re-posts the card and stores the new ids** — mention-free, pinned to the original channel (severity fallback when no channel was ever recorded) — instead of silently editing a ghost. The bulk sweeps (`sweep_stale`, `/clearall`) are the deliberate exception: resurrecting a lost card just to grey it out is noise, so they never re-post.
+
+**Uncertain cards survive restarts.** A MEDIUM-tier card's confirm candidates are persisted on the incident row (`pending_candidates`) and restored at startup, so a restart never re-renders a 0.55-confidence guess as a confirmed system; the column is cleared the moment the card is confirmed, corrected, retargeted, resolved, or swept.
 
 ### 9.2 Dedupe rule
 
@@ -748,6 +773,8 @@ The alarm codes are a **closed** enum — a failure class earns a code or it doe
 
 `/fleetmode on` restricts voice triggering to the FC role for the duration of a structured op. Slash commands remain open to everyone. This exists because §1.2 is real: during a fleet fight, twenty pilots talking to a bot is worse than no bot.
 
+Fleetmode — together with the circuit-breaker window and per-user cooldowns (§11.1) — is snapshotted to `app_state` (key `discipline_state`) on every change and restored at startup: a Brain restart mid-op keeps the FC gate up, and a restart mid-flood does **not** close the breaker. When the restore leaves fleetmode active, startup logs `fleetmode_restored_active` so the non-default state is visible.
+
 ---
 
 ## 12. Voice back-channel
@@ -825,6 +852,7 @@ Beyond intel, CORTANA carries the utilities a corp actually asks for. Each is vo
 | Feature | Voice | Value |
 |---|---|---|
 | **Structure timers** | *"Hey Cortana, timer Kisogo four hours"* | Schedules a mention ahead of a structure coming out. Enormous value in EVE, and a natural voice command — you're looking at the timer in-game right now. |
+| | | Delivery is **at-least-once, two-phase**: the poll CLAIMS due rows (`fired = 1`), and only a confirmed announcement retires them (`announced_at`). A claim whose post never landed (403, crash mid-announce) is re-offered every poll tick — with the `TIMER_UNDELIVERED` alarm raised in `#bot-health` so the retrying is visible, and the spoken "timer due" line held until the channel post actually lands. A structure timer eaten silently is exactly the loss the corp set the timer to avoid. |
 | **Form-ups** | *"Hey Cortana, form up Otanuomi fifteen minutes"* | Posts an op card with RSVP buttons and a countdown. |
 | **Roll call** | `/rollcall` | Who's in voice, who's subscribed, who's responding. |
 | **Jump distance** | *"Hey Cortana, jumps to Jita"* | Spoken reply, no post. BFS over the adjacency graph. |
@@ -891,8 +919,12 @@ CREATE TABLE incidents (
     status             TEXT NOT NULL DEFAULT 'ACTIVE',
     message_id         INTEGER,
     channel_id         INTEGER,
-    raw_system_text    TEXT               -- transcript window that named the
+    raw_system_text    TEXT,              -- transcript window that named the
                                           -- system; alias key for [Wrong — fix]
+    pending_candidates TEXT               -- MEDIUM-tier confirm candidates
+                                          -- (JSON [[id, name, score], …]);
+                                          -- NULL once confirmed — restarts
+                                          -- re-arm the pick buttons (§9.1)
 );
 CREATE INDEX idx_inc_active ON incidents(guild_id, status, system_id, type, opened_at);
 
@@ -939,14 +971,17 @@ CREATE TABLE personal_pings (
 CREATE INDEX idx_personal_pings_guild ON personal_pings(guild_id);
 
 -- ── scheduled ────────────────────────────────────────────────
+-- Two-phase, at-least-once delivery (§13): fired=1 is the CLAIM,
+-- announced_at the confirmed delivery; unannounced claims re-offer.
 CREATE TABLE timers (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id    INTEGER NOT NULL,
-    system_id   INTEGER REFERENCES systems(id),
-    fires_at    TEXT NOT NULL,
-    note        TEXT,
-    created_by  INTEGER NOT NULL,
-    fired       INTEGER NOT NULL DEFAULT 0
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    system_id    INTEGER REFERENCES systems(id),
+    fires_at     TEXT NOT NULL,
+    note         TEXT,
+    created_by   INTEGER NOT NULL,
+    fired        INTEGER NOT NULL DEFAULT 0,
+    announced_at TEXT
 );
 CREATE INDEX idx_timers_pending ON timers(fired, fires_at);
 
@@ -1002,6 +1037,15 @@ CREATE TABLE callsigns (
     registered_at  TEXT NOT NULL
 );
 
+-- ── process-level state that must survive restarts ───────────
+-- Key/value store: join-announcement cadence (§19), alarm-card message
+-- ids (§11.3, alarm:<code>:<key>), the synced command-tree payload hash,
+-- and the notification-discipline snapshot (§11.4, discipline_state).
+CREATE TABLE IF NOT EXISTS app_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 -- ── observability: transcripts only, never audio ─────────────
 CREATE TABLE command_log (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1018,6 +1062,8 @@ CREATE INDEX idx_cmdlog_at ON command_log(at);
 ```
 
 `command_log` is the accuracy dashboard. Queried weekly, it shows which systems mismatch, whose voice fails most often, and how confidence is distributed — the feedback loop that tunes §8.
+
+Schema revisions are tracked with `PRAGMA user_version` and applied by the runner in `core/db.py` (`brain/migrations/NNNN_*.sql`, one transaction per file); `brain/schema.sql` is the regenerated reference snapshot, never executed directly. Concurrent runners **serialize**: each file's transaction opens `BEGIN IMMEDIATE` and re-checks `user_version` inside it, so Brain startup and the gazetteer seeder migrating the same database at once end with the loser skipping — never a re-executed `CREATE TABLE`.
 
 ---
 
@@ -1124,6 +1170,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `discord.join_announcement` | str | `'daily'` | hot | §19 consent notice cadence on voice join. One of: `every`, `daily`, `off`. |
 | **`wake:`** | | | | *openWakeWord model and trigger thresholds.* |
 | `wake.model` | str | **required** | sighup | Trained openWakeWord ONNX chain; per-user models are built from it at speaker onset and cached for the process lifetime. |
+| `wake.extra_models` | str_list | `()` | sighup | Additional openWakeWord ONNX chains scored in parallel with wake.model — any listed phrase wakes CORTANA; wake.threshold applies to the max score across all models. Broken/missing extras are logged once and skipped. Each extra adds its own false-fire budget: keep the total to 2-3 models (GDD §5.2). |
 | `wake.threshold` | float | **required** | hot | Wake score needed to open a capture window. |
 | `wake.refractory_ms` | int | **required** | hot | Per-user dead time after a wake hit. |
 | `wake.ack` | str | `'beep'` | hot | Wake acknowledgement: spoken, tone, or silent. One of: `voice`, `beep`, `none`. |

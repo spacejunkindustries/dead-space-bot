@@ -11,12 +11,13 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Union
 
-from cortana.types import ParsedCommand, Severity
+from cortana.types import MatchCandidate, ParsedCommand, Resolution, Severity
 
 __all__ = [
     "Action",
     "ArmWindow",
     "Classified",
+    "ConfirmPending",
     "DialogEvent",
     "DialogSession",
     "DialogState",
@@ -24,6 +25,7 @@ __all__ = [
     "Ev",
     "Line",
     "NoteRejected",
+    "PendingConfirm",
     "PendingKind",
     "Relay",
     "Report",
@@ -49,6 +51,9 @@ class DialogState(Enum):
     AWAIT_OVERRIDE_QUESTION = "await_override_question"
     #: A wake-free window is armed after an unintelligible utterance.
     AWAIT_REPEAT = "await_repeat"
+    #: A wake-free window is armed after a MEDIUM-tier "say again to confirm"
+    #: (GDD §8.3): an affirmative or an exact repeat completes the command.
+    AWAIT_CONFIRM = "await_confirm"
 
 
 #: The AWAIT_* states — a wake-free window is armed in exactly these.
@@ -58,6 +63,7 @@ AWAIT_STATES = frozenset(
         DialogState.AWAIT_SEVERITY_REPORT,
         DialogState.AWAIT_OVERRIDE_QUESTION,
         DialogState.AWAIT_REPEAT,
+        DialogState.AWAIT_CONFIRM,
     }
 )
 
@@ -70,6 +76,7 @@ class PendingKind(Enum):
     SEVERITY = "severity"
     OVERRIDE = "override"
     REPEAT = "repeat"
+    CONFIRM = "confirm"
 
 
 class Ev(Enum):
@@ -82,8 +89,22 @@ class Ev(Enum):
     STT_FAILED = "stt_failed"
     CLASSIFIED = "classified"  # STT + grammar produced a Classified
     ENGINE_REJECTED_LOW = "engine_rejected_low"  # report bounced at LOW tier
+    ENGINE_ASKED = "engine_asked"  # MEDIUM tier: "say again to confirm"
     DEADLINE = "deadline"  # the armed window / AWAIT state timed out
     RESET = "reset"  # user left / Ears reconnected
+
+
+@dataclass(frozen=True, slots=True)
+class PendingConfirm:
+    """One §8.3 confirm awaiting the pilot's answer: the command as parsed,
+    the MEDIUM-tier candidate CORTANA read back, and — when the engine already
+    posted an uncertain card — the incident whose pick button this mirrors.
+    ``incident_id`` is ``None`` for destructive/scheduling commands
+    (clear/timer/form up), which post nothing until confirmed."""
+
+    parsed: ParsedCommand
+    candidate: MatchCandidate
+    incident_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +127,9 @@ class Classified:
     relay_text: str = ""
     relay_mode: str = "framed"
     chat_available: bool = False
+    #: Standalone yes/no verdict for an AWAIT_CONFIRM window (GDD §8.3):
+    #: ``"yes"`` / ``"no"`` / ``None`` when the utterance is neither.
+    confirm_reply: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +140,7 @@ class DialogEvent:
     gen: int | None = None
     classified: Classified | None = None
     parsed: ParsedCommand | None = None  # ENGINE_REJECTED_LOW payload
+    confirm: PendingConfirm | None = None  # ENGINE_ASKED payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +162,7 @@ class DialogSession:
     pending: PendingKind = PendingKind.NONE
     ctx_severity: Severity | None = None
     ctx_retry: ParsedCommand | None = None
+    ctx_confirm: PendingConfirm | None = None
 
     def fresh(self, *, max_retries: int) -> DialogSession:
         """A new dialog for this user: budget refilled, context cleared."""
@@ -148,6 +174,7 @@ class DialogSession:
             pending=PendingKind.NONE,
             ctx_severity=None,
             ctx_retry=None,
+            ctx_confirm=None,
         )
 
     def idle(self) -> DialogSession:
@@ -159,6 +186,7 @@ class DialogSession:
             pending=PendingKind.NONE,
             ctx_severity=None,
             ctx_retry=None,
+            ctx_confirm=None,
         )
 
 
@@ -207,6 +235,10 @@ class Report:
     inherited: Severity | None = None
     #: The LOW-retry rebind source, when this Report came from a system reply.
     rebound_from: ParsedCommand | None = None
+    #: A confirmed §8.3 candidate rides here as a ready-made HIGH-tier
+    #: resolution: the engine skips phonetic re-resolution entirely — the
+    #: pilot already vouched for exactly this system.
+    forced_resolution: Resolution | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +256,14 @@ class RunOverride:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfirmPending:
+    """Complete a pending §8.3 confirm: apply the stored candidate through
+    the same engine path the card's confirm/pick buttons use."""
+
+    confirm: PendingConfirm
+
+
+@dataclass(frozen=True, slots=True)
 class NoteRejected:
     """Count a rejection in health without any user-facing output."""
 
@@ -231,7 +271,15 @@ class NoteRejected:
 
 
 Action = Union[  # noqa: UP007 - a named union reads better in match sites
-    Speak, ArmWindow, DisarmWindow, RunStt, Report, Relay, RunOverride, NoteRejected
+    Speak,
+    ArmWindow,
+    DisarmWindow,
+    RunStt,
+    Report,
+    Relay,
+    RunOverride,
+    ConfirmPending,
+    NoteRejected,
 ]
 
 

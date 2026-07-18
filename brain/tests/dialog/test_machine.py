@@ -16,6 +16,7 @@ from cortana.dialog.machine import transition
 from cortana.dialog.types import (
     ArmWindow,
     Classified,
+    ConfirmPending,
     DialogEvent,
     DialogSession,
     DialogState,
@@ -23,13 +24,14 @@ from cortana.dialog.types import (
     Ev,
     Line,
     NoteRejected,
+    PendingConfirm,
     Relay,
     Report,
     RunOverride,
     RunStt,
     Speak,
 )
-from cortana.types import Intent, ParsedCommand, Severity
+from cortana.types import Intent, MatchCandidate, ParsedCommand, Severity
 
 MAX_RETRIES = 2
 
@@ -327,6 +329,179 @@ def test_system_reply_rebinds_to_rejected_intent() -> None:
     assert actions[0].parsed.system_text == "otanuomi"
     assert actions[0].parsed.intent is p.intent
     assert actions[0].rebound_from == p
+
+
+# ── MEDIUM-tier confirm flow (GDD §8.3 AWAIT_CONFIRM) ────────────────────────
+
+
+def pending_confirm(**kw) -> PendingConfirm:
+    defaults = dict(
+        parsed=parsed_cmd(intent=Intent.RESOLVE, raw="clear otanumi", system_text="otanumi"),
+        candidate=MatchCandidate(1, "Otanuomi", 0.62),
+        incident_id=None,
+    )
+    defaults.update(kw)
+    return PendingConfirm(**defaults)
+
+
+def to_await_confirm(conf: PendingConfirm):
+    """Wake → command → engine ASKED: session parked in AWAIT_CONFIRM."""
+    s, _ = wake(idle())
+    s = _to_thinking(s)
+    s, _ = classified(s, c(parsed=conf.parsed))  # → IDLE + Report
+    s, actions = step(s, DialogEvent(Ev.ENGINE_ASKED, confirm=conf))
+    return s, actions
+
+
+def confirm_window_open(s: DialogSession) -> DialogSession:
+    s, _ = step(s, DialogEvent(Ev.WINDOW_OPENED, gen=s.gen))
+    return _to_thinking(s)
+
+
+def test_engine_asked_arms_confirm_window_carrying_the_candidate() -> None:
+    conf = pending_confirm()
+    s, actions = to_await_confirm(conf)
+    assert s.state is DialogState.AWAIT_CONFIRM
+    assert s.ctx_confirm == conf
+    assert ArmWindow(s.gen) in actions
+    # The engine's "Heard X — say again to confirm." was the prompt.
+    assert not any(isinstance(a, Speak) for a in actions)
+    assert s.retries_left == MAX_RETRIES - 1  # through the one budgeted door
+
+
+def test_engine_asked_without_budget_stands_down_audibly() -> None:
+    s, _ = wake(idle())
+    s = dataclasses.replace(s, retries_left=0)
+    s = _to_thinking(s)
+    s, _ = classified(s, c(parsed=parsed_cmd(intent=Intent.RESOLVE)))
+    s2, actions = step(s, DialogEvent(Ev.ENGINE_ASKED, confirm=pending_confirm()))
+    assert s2.state is DialogState.IDLE
+    assert Speak(Line.STANDING_DOWN) in actions
+    assert ArmWindow not in kinds(actions)
+
+
+def test_engine_asked_ignored_outside_idle_or_without_payload() -> None:
+    s, _ = wake(idle())  # LISTENING, not IDLE
+    s2, actions = step(s, DialogEvent(Ev.ENGINE_ASKED, confirm=pending_confirm()))
+    assert s2 == s and actions == []
+    s3, _ = classified(_to_thinking(s), c(parsed=parsed_cmd()))  # back to IDLE
+    s4, actions = step(s3, DialogEvent(Ev.ENGINE_ASKED))  # no payload
+    assert s4 == s3 and actions == []
+
+
+def test_affirmative_completes_the_confirm() -> None:
+    conf = pending_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="yes", confirm_reply="yes"))
+    assert actions == [ConfirmPending(conf)]
+    assert s2.state is DialogState.IDLE
+    assert s2.ctx_confirm is None
+
+
+def test_unconfident_affirmative_never_confirms() -> None:
+    # A hallucinated "yes" must not resolve/schedule against a guessed
+    # system: destructive confirms fail closed, silently.
+    conf = pending_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="yes", confirm_reply="yes", confident=False))
+    assert not any(isinstance(a, ConfirmPending) for a in actions)
+    assert kinds(actions) == [NoteRejected]
+    assert s2.state is DialogState.IDLE
+
+
+def test_negative_closes_silently_with_standing_down_semantics() -> None:
+    conf = pending_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="no", confirm_reply="no"))
+    assert kinds(actions) == [NoteRejected]  # no Speak, no ArmWindow, no confirm
+    assert s2.state is DialogState.IDLE
+    assert s2.ctx_confirm is None
+
+
+def test_exact_repeat_of_the_command_completes_the_confirm() -> None:
+    conf = pending_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    repeat = parsed_cmd(intent=Intent.RESOLVE, raw="clear otanumi", system_text="otanumi")
+    s2, actions = classified(s, c(text="clear otanumi", parsed=repeat))
+    assert actions == [ConfirmPending(conf)]
+    assert s2.state is DialogState.IDLE
+
+
+def test_repeat_naming_the_candidate_completes_the_confirm() -> None:
+    # The pilot repeats with the CANDIDATE's name ("clear Otanuomi") after
+    # hearing the readback — same intent, confirmed system.
+    conf = pending_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    repeat = parsed_cmd(intent=Intent.RESOLVE, raw="clear Otanuomi", system_text="Otanuomi")
+    s2, actions = classified(s, c(text="clear Otanuomi", parsed=repeat))
+    assert actions == [ConfirmPending(conf)]
+
+
+def test_bare_candidate_name_reply_completes_the_confirm() -> None:
+    conf = pending_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="Otanuomi", system_reply="Otanuomi"))
+    assert actions == [ConfirmPending(conf)]
+
+
+def test_different_command_or_noise_closes_silently() -> None:
+    conf = pending_confirm()
+    for reply in (
+        c(text="timer kisogo four hours", parsed=parsed_cmd(intent=Intent.TIMER)),
+        c(text="clear kisogo", parsed=parsed_cmd(intent=Intent.RESOLVE, system_text="kisogo")),
+        c(text="mumble static"),
+    ):
+        s, _ = to_await_confirm(conf)
+        s = confirm_window_open(s)
+        s2, actions = classified(s, reply)
+        assert kinds(actions) == [NoteRejected], reply.text
+        assert s2.state is DialogState.IDLE, reply.text
+
+
+def test_confirm_window_deadline_expires_silently() -> None:
+    s, _ = to_await_confirm(pending_confirm())
+    s2, actions = step(s, DialogEvent(Ev.DEADLINE, gen=s.gen))
+    assert s2.state is DialogState.IDLE
+    assert DisarmWindow() in actions
+    assert not any(isinstance(a, Speak) for a in actions)
+
+
+def test_wake_during_confirm_supersedes_and_clears_context() -> None:
+    s, _ = to_await_confirm(pending_confirm())
+    s2, actions = wake(s)
+    assert s2.state is DialogState.LISTENING
+    assert s2.ctx_confirm is None
+    assert s2.retries_left == MAX_RETRIES
+    assert DisarmWindow() in actions
+
+
+def test_abandoned_confirm_capture_rearms_keeping_context() -> None:
+    # A VAD blip that opened-then-abandoned the window must not strand the
+    # pending confirm: re-arm through the budget, silently.
+    conf = pending_confirm()
+    s, _ = to_await_confirm(conf)
+    s, _ = step(s, DialogEvent(Ev.WINDOW_OPENED, gen=s.gen))
+    s2, actions = step(s, DialogEvent(Ev.CAPTURE_ABANDONED, gen=s.gen))
+    assert s2.state is DialogState.AWAIT_CONFIRM
+    assert s2.ctx_confirm == conf
+    assert ArmWindow(s2.gen) in actions
+    assert s2.retries_left == MAX_RETRIES - 2
+
+
+def test_stt_failure_in_confirm_window_keeps_context() -> None:
+    conf = pending_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = step(s, DialogEvent(Ev.STT_FAILED, gen=s.gen))
+    assert s2.state is DialogState.AWAIT_CONFIRM
+    assert s2.ctx_confirm == conf
+    assert Speak(Line.SAY_AGAIN) in actions
 
 
 # ── relay gating ─────────────────────────────────────────────────────────────

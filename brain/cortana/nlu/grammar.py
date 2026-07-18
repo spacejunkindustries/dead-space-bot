@@ -35,6 +35,7 @@ __all__ = [
     "bare_override",
     "broadcast_severity",
     "clean_callsign",
+    "confirm_reply",
     "encode_ping_types",
     "override_query",
     "parse",
@@ -146,7 +147,19 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
     ),
     (Intent.PING_ME, re.compile(r"\b(?:ping|pin|pink|pinging)[\s-]*me\b", re.I)),
     (Intent.UNDER_ATTACK, re.compile(r"\bunder\s+attack\b|\btackled\b|\bpoint\s+on\s+me\b", re.I)),
-    (Intent.ASSIST_REQUEST, re.compile(r"\bneed\s+(?:help|backup|back\s*up)\b", re.I)),
+    # "need help" plus the freeform phrasing "request(ing) [heavy] assistance"
+    # — courtesy adjectives are optional, the type word is what matters. Sits
+    # BELOW UNDER_ATTACK so "tackled … and request heavy assistance" is
+    # always the distress call, never demoted to the assist phrasing.
+    (
+        Intent.ASSIST_REQUEST,
+        re.compile(
+            r"\bneed\s+(?:help|backup|back\s*up|assistance|reinforcements|support)\b"
+            r"|\brequest(?:ing)?\s+(?:heavy\s+|immediate\s+|urgent\s+)?"
+            r"(?:assistance|help|backup|back\s*up|reinforcements|support)\b",
+            re.I,
+        ),
+    ),
     (Intent.HOSTILE_SPOTTED, re.compile(r"\bhostiles?\b|\breds?\b|\bneuts?\b", re.I)),
     (Intent.GATE_CAMP, re.compile(r"\bgate\s*camp(?:ed|ers)?\b", re.I)),
     (Intent.RESOLVE, re.compile(r"\bclear(?:ed)?\b", re.I)),
@@ -220,6 +233,69 @@ _FILLER = frozenset(
         "systems",
     )
 )
+
+# Freeform courtesy padding (GDD §6.1): stressed pilots wrap commands in
+# narrative — "please report that I am tackled by enemies in system M tack O
+# and request heavy assistance please". Intent keywords are matched on the
+# raw text FIRST, so no word here can break recognition; this finite set is
+# stripped from the *system window only* — never from ``detail``, never from
+# callsigns. "assistance"/"backup"/"reinforcements" are ASSIST_REQUEST type
+# words when prefixed by need/request (removed as whole intent phrases before
+# this set applies); here they only mop up unprefixed stragglers that would
+# otherwise pollute the window.
+_COURTESY = frozenset(
+    (
+        "please",
+        "kindly",
+        "that",
+        "this",
+        "by",
+        "with",
+        "for",
+        "and",
+        "some",
+        "enemies",
+        "enemy",
+        "guys",
+        "request",
+        "requesting",
+        "requested",
+        "heavy",
+        "immediate",
+        "immediately",
+        "urgent",
+        "urgently",
+        "assistance",
+        "backup",
+        "reinforcements",
+        "send",
+        "sending",
+        "right",
+        "now",
+    )
+)
+
+#: Everything stripped from a system window: prepositions + courtesy padding.
+_WINDOW_FILLER = _FILLER | _COURTESY
+
+# Multi-word courtesy phrases, stripped from the system window before
+# tokenisation. These can NOT be token filler: "i" is a letter pilots spell
+# ("u m i tack k k" → UMI-KK) and "you" appears inside STT renderings of real
+# names ("oh tan you oh me" → Otanuomi) — only the exact phrases are safe.
+_PADDING_PHRASES_RE = re.compile(
+    r"\b(?:i\s+am|we\s+are|i'?ve\s+been|we'?ve\s+been|they\s+are"
+    r"|there\s+(?:is|are)|be\s+advised|thank\s+you|thanks)\b",
+    re.I,
+)
+
+# "in system X" / "in X" / "at X" — when the pilot anchors the system name
+# with a preposition, everything before the LAST anchor is narrative padding.
+_ANCHOR_TOKENS = frozenset(("in", "at", "near"))
+
+#: Spoken hyphens inside a spelled system name ("m tack o" → M-O…). Mirrors
+#: the vocabulary in ``cortana.nlu.phonetics``; here it only guards the
+#: article "a" from being stripped out of a spelling ("one d q one tack a").
+_TACK_WORDS = frozenset(("tack", "tac", "dash", "hyphen"))
 
 # Where a spoken duration starts, for splitting "timer Kisogo four hours".
 # Vocabulary mirrors aura.core.incidents.parse_duration.
@@ -303,7 +379,7 @@ def _parse_ping_me(remainder: str) -> tuple[str | None, str]:
         types = set(PING_TYPE_ORDER)
         work = _PING_ALL_RE.sub(" ", work)
     tokens = [t for t in re.split(r"[\s,.;:!?]+", work) if t]
-    kept = [t for t in tokens if t.lower() not in (_FILLER | _PING_FILLER)]
+    kept = _keep_window_tokens(tokens, _WINDOW_FILLER | _PING_FILLER)
     system_text = " ".join(kept) or None
     return system_text, encode_ping_types(frozenset(types))
 
@@ -348,10 +424,34 @@ def clean_callsign(text: str) -> str | None:
     return cleaned.title() if cleaned else None
 
 
+def _spelled_neighbor(tokens: list[str], idx: int) -> bool:
+    """True when the token at ``idx`` sits next to a spelled-name part —
+    a single letter/digit or a spoken hyphen ("tack")."""
+    for j in (idx - 1, idx + 1):
+        if 0 <= j < len(tokens):
+            t = tokens[j].lower()
+            if t in _TACK_WORDS or (len(t) == 1 and t.isalnum()):
+                return True
+    return False
+
+
+def _keep_window_tokens(tokens: list[str], filler: frozenset[str]) -> list[str]:
+    """Drop filler/courtesy tokens from a system window. The article "a" is
+    also a letter pilots spell ("one d q one tack a" → 1DQ1-A): it survives
+    when adjacent to other spelled parts."""
+    kept: list[str] = []
+    for idx, tok in enumerate(tokens):
+        low = tok.lower()
+        if low in filler and not (low == "a" and _spelled_neighbor(tokens, idx)):
+            continue
+        kept.append(tok)
+    return kept
+
+
 def _strip_filler(text: str) -> str:
+    text = _PADDING_PHRASES_RE.sub(" ", text)
     tokens = [t for t in re.split(r"[\s,.;:!?]+", text) if t]
-    kept = [t for t in tokens if t.lower() not in _FILLER]
-    return " ".join(kept)
+    return " ".join(_keep_window_tokens(tokens, _WINDOW_FILLER))
 
 
 def _remove_intent_phrases(text: str) -> str:
@@ -365,6 +465,29 @@ def _remove_intent_phrases(text: str) -> str:
     return text
 
 
+def _extract_system(segment: str) -> str | None:
+    """The system window of one segment (GDD §6.1 padding tolerance).
+
+    Secondary intent phrases and courtesy padding are stripped aggressively.
+    When the pilot anchors the name with a preposition — "in system X",
+    "in X", "at X" — everything before the LAST anchor is narrative
+    ("tackled *by enemies in* system M tack O") and is discarded, provided
+    something substantive survives after the anchor.
+    """
+    work = _PADDING_PHRASES_RE.sub(" ", _remove_intent_phrases(segment))
+    tokens = [t for t in re.split(r"[\s,.;:!?]+", work) if t]
+    anchor: int | None = None
+    for idx, tok in enumerate(tokens):
+        if tok.lower() in _ANCHOR_TOKENS:
+            anchor = idx
+    if anchor is not None:
+        tail = _keep_window_tokens(tokens[anchor + 1 :], _WINDOW_FILLER)
+        if tail:
+            return " ".join(tail)
+    kept = _keep_window_tokens(tokens, _WINDOW_FILLER)
+    return " ".join(kept) or None
+
+
 def _split_system_detail(remainder: str) -> tuple[str | None, str | None]:
     """Comma-segment the remainder: first substantive segment names the
     system, the rest is verbatim detail (GDD §6.3)."""
@@ -373,7 +496,7 @@ def _split_system_detail(remainder: str) -> tuple[str | None, str | None]:
     detail_segments: list[str] = []
     for seg in segments:
         if system_text is None:
-            candidate = _strip_filler(_remove_intent_phrases(seg))
+            candidate = _extract_system(seg)
             if candidate:
                 system_text = candidate
             continue
@@ -389,11 +512,10 @@ def _split_timer(remainder: str) -> tuple[str | None, str | None]:
     flat = remainder.replace(",", " ")
     m = _DURATION_START_RE.search(flat)
     if m is None:
-        system_text = _strip_filler(_remove_intent_phrases(flat))
-        return system_text or None, None
-    system_text = _strip_filler(_remove_intent_phrases(flat[: m.start()]))
+        return _extract_system(flat), None
+    system_text = _extract_system(flat[: m.start()])
     detail = flat[m.start() :].strip()
-    return system_text or None, detail or None
+    return system_text, detail or None
 
 
 def system_reply(transcript: str) -> str | None:
@@ -410,6 +532,85 @@ def system_reply(transcript: str) -> str | None:
     work = _SIGNOFF_RE.sub("", work)
     cleaned = _strip_filler(work.strip(" ,.;:!?-"))
     return cleaned or None
+
+
+# ── confirm-window replies (GDD §8.3 AWAIT_CONFIRM) ──────────────────────────
+
+# Standalone yes/no vocabulary for the §8.3 confirm window. A small fixed
+# table (constraint 6) of the words pilots actually answer with, plus the
+# radio-procedure acknowledgements ("roger", "copy") that the sign-off strip
+# would otherwise swallow — which is why this runs on the raw wake-stripped
+# text, before any sign-off handling.
+_CONFIRM_YES = frozenset(
+    (
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "ya",
+        "yah",
+        "aye",
+        "affirmative",
+        "affirm",
+        "confirm",
+        "confirmed",
+        "correct",
+        "roger",
+        "copy",
+        "right",
+        "positive",
+    )
+)
+_CONFIRM_NO = frozenset(
+    (
+        "no",
+        "nope",
+        "nah",
+        "negative",
+        "cancel",
+        "canceled",
+        "cancelled",
+        "wrong",
+        "incorrect",
+        "belay",
+        "disregard",
+        "abort",
+        "stop",
+    )
+)
+# Words allowed to ride along without breaking standalone-ness ("yes please",
+# "yeah do it", "confirm it, over").
+_CONFIRM_FILLER = frozenset(
+    ("do", "it", "that", "thats", "is", "the", "please", "over", "out", "um", "uh", "er", "and")
+)
+_CONFIRM_YES_ALLOWED = _CONFIRM_YES | _CONFIRM_FILLER
+_DO_IT_RE = re.compile(r"\bdo\s+it\b", re.I)
+
+
+def confirm_reply(transcript: str) -> str | None:
+    """Classify a standalone confirm-window reply: ``"yes"``, ``"no"``, or
+    ``None`` when the utterance carries other content (GDD §8.3).
+
+    Any negative word anywhere vetoes ("no, wrong", "yes— no, cancel"): a
+    destructive confirm must fail closed. An affirmative counts only when the
+    whole utterance is affirmation ("yes", "yeah do it", "confirm, over") —
+    "yes, hostiles Kisogo" is a command, not a reply, and returns ``None``
+    so the grammar can claim it.
+    """
+    if not transcript or not transcript.strip():
+        return None
+    work = _BROADCAST_WAKE_RE.sub("", transcript, count=1)
+    work = _WAKE_RE.sub("", work, count=1)
+    work = work.replace("'", "")
+    tokens = [t for t in re.split(r"[\s,.;:!?-]+", work.lower()) if t]
+    if not tokens:
+        return None
+    if any(t in _CONFIRM_NO for t in tokens):
+        return "no"
+    has_yes = any(t in _CONFIRM_YES for t in tokens) or _DO_IT_RE.search(work) is not None
+    if has_yes and all(t in _CONFIRM_YES_ALLOWED for t in tokens):
+        return "yes"
+    return None
 
 
 # Freeform relay (GDD §8.6): leading wake residue, tolerant of any wake phrase

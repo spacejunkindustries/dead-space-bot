@@ -50,8 +50,12 @@ CREATE TABLE incidents (
     status             TEXT NOT NULL DEFAULT 'ACTIVE',
     message_id         INTEGER,
     channel_id         INTEGER,
-    raw_system_text    TEXT               -- transcript window that named the
+    raw_system_text    TEXT,              -- transcript window that named the
                                           -- system; alias key for [Wrong — fix]
+    pending_candidates TEXT               -- MEDIUM-tier confirm candidates
+                                          -- (JSON [[id, name, score], …]);
+                                          -- NULL once confirmed/corrected —
+                                          -- restarts re-arm the pick buttons
 );
 CREATE INDEX idx_inc_active ON incidents(guild_id, status, system_id, type, opened_at);
 
@@ -98,14 +102,18 @@ CREATE TABLE personal_pings (
 CREATE INDEX idx_personal_pings_guild ON personal_pings(guild_id);
 
 -- ── scheduled ────────────────────────────────────────────────
+-- Two-phase, at-least-once delivery (GDD §13): fired=1 is the CLAIM,
+-- announced_at the actual delivery. Claims with announced_at NULL are
+-- re-offered on the next poll tick instead of being silently eaten.
 CREATE TABLE timers (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id    INTEGER NOT NULL,
-    system_id   INTEGER REFERENCES systems(id),
-    fires_at    TEXT NOT NULL,
-    note        TEXT,
-    created_by  INTEGER NOT NULL,
-    fired       INTEGER NOT NULL DEFAULT 0
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    system_id    INTEGER REFERENCES systems(id),
+    fires_at     TEXT NOT NULL,
+    note         TEXT,
+    created_by   INTEGER NOT NULL,
+    fired        INTEGER NOT NULL DEFAULT 0,
+    announced_at TEXT
 );
 CREATE INDEX idx_timers_pending ON timers(fired, fires_at);
 
@@ -159,6 +167,15 @@ CREATE TABLE poll_votes (
     option_idx  INTEGER NOT NULL,
     at          TEXT NOT NULL,
     PRIMARY KEY (poll_id, user_id)     -- one vote per pilot; switchable
+);
+
+-- ── process-level state that must survive restarts ───────────
+-- Key/value store: join-announcement cadence, alarm-card message ids
+-- (alarm:<code>:<key>), the synced command-tree payload hash, and the
+-- notification-discipline snapshot (fleetmode + breaker window + cooldowns).
+CREATE TABLE IF NOT EXISTS app_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 -- ── observability: transcripts only, never audio ─────────────

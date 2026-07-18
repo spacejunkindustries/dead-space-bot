@@ -9,6 +9,7 @@ from cortana.nlu.grammar import (
     broadcast_severity,
     broadcast_text,
     clean_callsign,
+    confirm_reply,
     parse,
     sanitize_callsign,
     system_reply,
@@ -751,3 +752,192 @@ def test_stop_pinging_survives_phonetic_mangling() -> None:
         cmd = parse(heard)
         assert cmd is not None
         assert cmd.intent is Intent.PING_ME_CLEAR
+
+
+# ── freeform padding + spelled system names (GDD §6.1 / §8.2) ────────────────
+
+
+def test_operator_acceptance_sentence() -> None:
+    """The spec sentence: tackled outranks the assist phrasing, and the
+    spelled system survives the padding intact."""
+    cmd = parse(
+        "please report that i am tackled by enemies in system m tack o"
+        " and request heavy assistance please"
+    )
+    assert cmd is not None
+    assert cmd.intent is Intent.UNDER_ATTACK
+    assert cmd.system_text == "m tack o"
+
+
+@pytest.mark.parametrize(
+    ("heard", "intent", "system_text"),
+    [
+        # tack-spelled names, "in system" anchored
+        (
+            "please report that i am tackled by enemies in system m tack o"
+            " and request heavy assistance please",
+            Intent.UNDER_ATTACK,
+            "m tack o",
+        ),
+        (
+            "hey cortana i am under attack in system u m i tack k k please send help",
+            Intent.UNDER_ATTACK,
+            "u m i tack k k",
+        ),
+        (
+            "request backup in system one d q one tack a please",
+            Intent.ASSIST_REQUEST,
+            "one d q one tack a",
+        ),
+        # tack-spelled, plain "in"/"at" anchors
+        (
+            "we are under attack at m tack o double e 8 send reinforcements now",
+            Intent.UNDER_ATTACK,
+            "m tack o double e 8",
+        ),
+        ("hostiles reported in m tack o, three battleships", Intent.HOSTILE_SPOTTED, "m tack o"),
+        (
+            "please be advised hostiles in u m i tack k k right now",
+            Intent.HOSTILE_SPOTTED,
+            "u m i tack k k",
+        ),
+        (
+            "please ping me for gate camps in m tack o double e 8",
+            Intent.PING_ME,
+            "m tack o double e 8",
+        ),
+        # plain names, anchored
+        ("we are requesting heavy assistance in kisogo", Intent.ASSIST_REQUEST, "kisogo"),
+        (
+            "requesting immediate assistance in system kisogo please",
+            Intent.ASSIST_REQUEST,
+            "kisogo",
+        ),
+        (
+            "kindly be advised there are hostiles in otanuomi right now",
+            Intent.HOSTILE_SPOTTED,
+            "otanuomi",
+        ),
+        ("there is a gate camp at otanuomi, three destroyers", Intent.GATE_CAMP, "otanuomi"),
+        ("i'm tackled in kisogo please help", Intent.UNDER_ATTACK, "kisogo"),
+        (
+            "we are under attack in system otanuomi kindly send backup immediately",
+            Intent.UNDER_ATTACK,
+            "otanuomi",
+        ),
+        ("timer in kisogo for four hours please", Intent.TIMER, "kisogo"),
+        ("please form up at kisogo in fifteen minutes", Intent.FORMUP, "kisogo"),
+        ("hostiles in moe 8 please", Intent.HOSTILE_SPOTTED, "moe 8"),
+        # plain names, no anchor at all
+        ("request support otanuomi", Intent.ASSIST_REQUEST, "otanuomi"),
+        ("hey cortana please clear kisogo thank you", Intent.RESOLVE, "kisogo"),
+    ],
+)
+def test_padded_real_speech_matrix(heard: str, intent: Intent, system_text: str) -> None:
+    """Courtesy/narrative padding never breaks intent or system extraction."""
+    cmd = parse(heard)
+    assert cmd is not None
+    assert cmd.intent is intent
+    assert cmd.system_text is not None
+    assert cmd.system_text.lower() == system_text
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "request assistance",
+        "requesting heavy assistance",
+        "request immediate backup",
+        "requesting support",
+        "need reinforcements",
+        "need assistance",
+    ],
+)
+def test_request_assistance_phrasings_are_assist_requests(heard: str) -> None:
+    cmd = parse(heard)
+    assert cmd is not None
+    assert cmd.intent is Intent.ASSIST_REQUEST
+    assert cmd.system_text is None
+
+
+def test_tackled_outranks_request_assistance() -> None:
+    cmd = parse("request heavy assistance we are tackled")
+    assert cmd is not None
+    assert cmd.intent is Intent.UNDER_ATTACK
+
+
+def test_courtesy_chatter_without_intent_still_drops() -> None:
+    assert parse("please kindly thank you") is None
+
+
+def test_spelled_article_a_survives_the_window() -> None:
+    """ "a" is an article everywhere except inside a spelling."""
+    cmd = parse("tackled in one d q one tack a")
+    assert cmd is not None
+    assert cmd.system_text == "one d q one tack a"
+    # …but a real article is still stripped.
+    cmd2 = parse("under attack in the Kisogo")
+    assert cmd2 is not None
+    assert cmd2.system_text == "Kisogo"
+
+
+# ── confirm-window replies (GDD §8.3 AWAIT_CONFIRM) ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "yes",
+        "Yes.",
+        "yeah",
+        "yep",
+        "aye",
+        "affirmative",
+        "confirm",
+        "confirmed",
+        "correct",
+        "do it",
+        "yeah do it",
+        "yes please",
+        "confirm it, over",  # radio tail rides along
+        "roger",  # radio ack — would vanish under the sign-off strip
+        "copy that",
+        "hey cortana yes",  # wake residue survives into the window transcript
+    ],
+)
+def test_confirm_reply_affirmatives(heard: str) -> None:
+    assert confirm_reply(heard) == "yes"
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "no",
+        "No.",
+        "nope",
+        "negative",
+        "cancel",
+        "wrong",
+        "no that's wrong",
+        "belay that",
+        "yes— no, cancel",  # any negative vetoes: destructive confirms fail closed
+    ],
+)
+def test_confirm_reply_negatives(heard: str) -> None:
+    assert confirm_reply(heard) == "no"
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "",
+        "   ",
+        "yes hostiles Kisogo",  # a command, not a reply — the grammar claims it
+        "clear Otanuomi",
+        "mumble static",
+        "Otanuomi",
+        "thank you",
+    ],
+)
+def test_confirm_reply_other_content_is_neither(heard: str) -> None:
+    assert confirm_reply(heard) is None

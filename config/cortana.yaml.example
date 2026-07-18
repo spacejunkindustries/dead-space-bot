@@ -6,11 +6,12 @@
 #   hot     — live on `systemctl reload cortana-brain` (most thresholds,
 #             weights, windows, channel/role ids, tts lines, chat knobs)
 #   sighup  — applied by an explicit reload step (tts.personality,
-#             chat.enabled / chat.api_key_file)
+#             chat.enabled / chat.api_key_file) or a live rebuild through the
+#             wake model pool (wake.model, wake.extra_models, wake.vad_threshold)
 #   engine  — rebuilds the gazetteer/routing engine on reload
 #   restart — bound at startup: stt.* (backend/model/threads/watchdog_s),
-#             capture.vad_aggressiveness, wake.model, wake.vad_threshold,
-#             ipc.socket, database.path, discord.token_file, discord.guild_id
+#             capture.vad_aggressiveness, ipc.socket, database.path,
+#             discord.token_file, discord.guild_id
 # Reload validates cortana.yaml + gazetteer.yaml + routing.yaml TOGETHER and
 # swaps all-or-nothing; restart-bound edits are reported as "restart
 # pending", never silently absorbed. Unknown/misspelled keys are REJECTED.
@@ -51,6 +52,15 @@ wake:
   # The phrase itself ("hey cortana", GDD §5.2) is baked into the trained
   # model below — changing it means training a new model, not editing config.
   model:  /opt/cortana/models/wake/hey_cortana.onnx  # trained openWakeWord ONNX chain
+  extra_models: []                     # additional openWakeWord ONNX chains scored in
+                                       # parallel — ANY listed phrase wakes CORTANA
+                                       # (e.g. keep hey_jarvis alongside a new custom
+                                       # phrase through a transition). The threshold
+                                       # below applies to the MAX score across models.
+                                       # A broken/missing extra is logged once and
+                                       # skipped; only a broken PRIMARY disables wake.
+                                       # Every extra adds its own false-fire budget —
+                                       # keep the total to 2-3 models (GDD §5.2).
   threshold: 0.55                      # wake score needed to open a capture window.
                                        # The trigger is single-frame (no debounce): below
                                        # ~0.45 ambient chatter false-fires constantly, and
@@ -62,7 +72,8 @@ wake:
                                        # false fires from music/game audio). It once
                                        # silently killed the wake word when enabled
                                        # by default — try ~0.3-0.5 and VERIFY wake
-                                       # still fires. Needs a restart to apply.
+                                       # still fires. Applied at model build; the
+                                       # pool rebuilds live on reload.
   ack: beep                            # how CORTANA acknowledges the wake word:
                                        #   voice = speak "Go ahead." (talks back)
                                        #   beep  = instant tone (no synth latency)

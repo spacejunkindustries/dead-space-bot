@@ -63,16 +63,29 @@ class _StubHolder:
         self.current = types.SimpleNamespace(wake=wake)
 
 
-def make_wake_config(threshold: float = 0.5, refractory_ms: int = 200) -> WakeConfig:
+WAKE_MODEL = "/opt/cortana/models/wake/aura_command.onnx"
+EXTRA_MODEL = "/opt/cortana/models/wake/hey_jarvis_v0.1.onnx"
+
+
+def make_wake_config(
+    threshold: float = 0.5,
+    refractory_ms: int = 200,
+    extra_models: tuple[str, ...] = (),
+) -> WakeConfig:
     return WakeConfig(
-        model="/opt/cortana/models/wake/aura_command.onnx",
+        model=WAKE_MODEL,
         threshold=threshold,
         refractory_ms=refractory_ms,
+        extra_models=extra_models,
     )
 
 
-def make_wake_holder(threshold: float = 0.5, refractory_ms: int = 200) -> _StubHolder:
-    return _StubHolder(make_wake_config(threshold, refractory_ms))
+def make_wake_holder(
+    threshold: float = 0.5,
+    refractory_ms: int = 200,
+    extra_models: tuple[str, ...] = (),
+) -> _StubHolder:
+    return _StubHolder(make_wake_config(threshold, refractory_ms, extra_models))
 
 
 def make_stt_config(
@@ -174,13 +187,18 @@ class _FakeModel:
         self.resets += 1
 
 
+def _fake_bank(*paths: str) -> tuple[tuple[str, Any], ...]:
+    """A model bank of fresh :class:`_FakeModel` instances (primary first)."""
+    return tuple((path, _FakeModel()) for path in (paths or (WAKE_MODEL,)))
+
+
 def make_detector(
     scores: list[float], threshold: float = 0.5, refractory_ms: int = 200
 ) -> tuple[OpenWakeWordDetector, _ScriptedPredict]:
     detector = OpenWakeWordDetector(make_wake_holder(threshold, refractory_ms))  # type: ignore[arg-type]
     # openwakeword isn't installed in the test env (__init__ logged the lazy
-    # fallback); give the pool a build seam so models "build" instantly.
-    detector._build_model = _FakeModel  # type: ignore[method-assign]
+    # fallback); give the pool a build seam so model banks "build" instantly.
+    detector._build_model = _fake_bank  # type: ignore[method-assign]
     predict = _ScriptedPredict(scores)
     detector._predict_chunk = predict  # type: ignore[method-assign]
     return detector, predict
@@ -213,7 +231,7 @@ def test_hit_clears_streaming_state_but_not_scoring() -> None:
         detector.score(USER, FRAME)  # accumulate a partial chunk
     state = detector._states[USER]
     model = _ResettableModel()
-    state.model = model
+    state.bank = ((WAKE_MODEL, model),)
 
     assert detector.score(USER, FRAME) == pytest.approx(0.9)  # chunk complete: hit
     assert state.last_score == 0.0  # held score cleared: the tail cannot retrigger
@@ -312,7 +330,7 @@ def test_no_spare_ready_skips_scoring_until_the_build_lands() -> None:
     assert c["vad_speech"] == 0  # the visible zero: frames flow, none scored
 
     # The background build completes (what _build_spare_off_loop does):
-    detector._store_spare(detector._cfg_key(), _FakeModel())
+    detector._store_spare(detector._cfg_key(), _fake_bank())
     for _ in range(4):
         detector.score(USER, FRAME)
     assert len(predict.chunks) == 1  # scoring resumed with the delivered model
@@ -323,12 +341,12 @@ async def test_consumed_spare_is_replenished_off_the_event_loop() -> None:
     detector, predict = make_detector([0.1, 0.1])
     build_threads: list[threading.Thread] = []
 
-    def build() -> _FakeModel:
+    def build() -> tuple[tuple[str, Any], ...]:
         build_threads.append(threading.current_thread())
-        return _FakeModel()
+        return _fake_bank()
 
     detector._build_model = build  # type: ignore[method-assign]
-    detector._spares.append(_FakeModel())  # the spare __init__ would have built
+    detector._spares.append(_fake_bank())  # the spare __init__ would have built
 
     _emit_one_chunk(detector)  # first speaker consumes the spare
     assert detector._spares == []
@@ -373,7 +391,7 @@ def test_build_failure_latches_faulted_without_a_retry_storm(
     assert c["vad_speech"] == 0
 
     # A wake config change (new generation) clears the fault and retries.
-    detector._build_model = _FakeModel  # type: ignore[method-assign]
+    detector._build_model = _fake_bank  # type: ignore[method-assign]
     detector._holder.current.wake = WakeConfig(
         model="/opt/cortana/models/wake/retrained.onnx", threshold=0.5, refractory_ms=200
     )
@@ -388,18 +406,18 @@ def test_config_change_drops_and_rebuilds_live_models_lazily() -> None:
     # ones — per-user models are generation-tagged and rebuilt via the pool.
     detector, predict = make_detector([0.1, 0.1])
     _emit_one_chunk(detector)
-    model_a = detector._states[USER].model
-    assert model_a is not None
+    bank_a = detector._states[USER].bank
+    assert bank_a is not None
 
     new_cfg = WakeConfig(
         model="/opt/cortana/models/wake/retrained.onnx", threshold=0.5, refractory_ms=200
     )
     detector._holder.current.wake = new_cfg
-    _emit_one_chunk(detector)  # stale model dropped, fresh one from the pool
+    _emit_one_chunk(detector)  # stale bank dropped, fresh one from the pool
     state = detector._states[USER]
-    assert state.model is not None
-    assert state.model is not model_a
-    assert state.cfg_key == (new_cfg.model, new_cfg.vad_threshold)
+    assert state.bank is not None
+    assert state.bank is not bank_a
+    assert state.cfg_key == (new_cfg.model, new_cfg.extra_models, new_cfg.vad_threshold)
     assert len(predict.chunks) == 2
 
 
@@ -407,13 +425,157 @@ def test_counters_track_every_pipeline_stage() -> None:
     detector, _ = make_detector([0.9, 0.4, 0.1], threshold=0.5)
     for _ in range(3):
         _emit_one_chunk(detector)  # hit, near-miss, quiet
+    # The faked predict seam never sets last_model, so the hit attributes to
+    # the PRIMARY model (the documented fallback).
     assert detector.counters() == {
         "frames_seen": 12,
         "vad_speech": 12,
         "inferences": 3,
         "hits": 1,
         "near_misses": 1,
+        "hits[aura_command]": 1,
     }
+
+
+# ── multiple wake phrases (wake.extra_models — GDD §5.1) ─────────────────────
+
+
+class _ScriptedOwwModel:
+    """Duck-types openwakeword.model.Model for the real ``_predict_chunk``."""
+
+    def __init__(self, scores: list[float]) -> None:
+        self.scores = list(scores)
+        self.resets = 0
+
+    def predict(self, samples: Any) -> dict[str, float]:
+        return {"phrase": self.scores.pop(0) if self.scores else 0.0}
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+@pytest.fixture
+def fake_numpy(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    """A numpy stand-in for the real ``_predict_chunk`` (lazy import seam)."""
+    module = types.ModuleType("numpy")
+    module.int16 = "int16"  # type: ignore[attr-defined]
+    module.frombuffer = lambda data, dtype=None: data  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "numpy", module)
+    return module
+
+
+def test_multi_model_score_is_the_max_and_the_winner_takes_the_hit(
+    fake_numpy: types.ModuleType,
+) -> None:
+    holder = make_wake_holder(threshold=0.5, extra_models=(EXTRA_MODEL,))
+    detector = OpenWakeWordDetector(holder)  # type: ignore[arg-type]
+    primary = _ScriptedOwwModel([0.2])
+    extra = _ScriptedOwwModel([0.9])
+    bank = ((WAKE_MODEL, primary), (EXTRA_MODEL, extra))
+    detector._build_model = lambda: bank  # type: ignore[method-assign]
+    detector._spares.append(bank)
+
+    scores = [detector.score(USER, FRAME) for _ in range(4)]
+    # Exact equality on purpose: pytest.approx would probe the faked numpy.
+    assert scores[-1] == 0.9  # the MAX across the bank hit
+    # A hit clears the WHOLE bank's prediction buffers, not just the winner's.
+    assert primary.resets == 1
+    assert extra.resets == 1
+    c = detector.counters()
+    assert c["hits"] == 1
+    assert c["hits[hey_jarvis_v0.1]"] == 1  # attributed to the winning model
+    assert "hits[aura_command]" not in c
+
+
+def test_multi_model_subthreshold_max_is_held_not_summed(
+    fake_numpy: types.ModuleType,
+) -> None:
+    # Two models each under the threshold must NOT combine into a hit —
+    # the frame score is the max, never a sum.
+    holder = make_wake_holder(threshold=0.5, extra_models=(EXTRA_MODEL,))
+    detector = OpenWakeWordDetector(holder)  # type: ignore[arg-type]
+    bank = ((WAKE_MODEL, _ScriptedOwwModel([0.3])), (EXTRA_MODEL, _ScriptedOwwModel([0.4])))
+    detector._build_model = lambda: bank  # type: ignore[method-assign]
+    detector._spares.append(bank)
+
+    scores = [detector.score(USER, FRAME) for _ in range(4)]
+    # Exact equality on purpose: pytest.approx would probe the faked numpy.
+    assert scores[-1] == 0.4
+    assert detector.counters()["hits"] == 0
+
+
+def test_broken_extra_model_is_skipped_logged_once_and_never_faults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cortana.audio.wake as wake_mod
+
+    warnings: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        wake_mod.log, "warning", lambda event, **kw: warnings.append((event, kw)), raising=False
+    )
+    broken = "/opt/cortana/models/wake/deleted_by_config_push.onnx"
+    holder = make_wake_holder(extra_models=(broken, EXTRA_MODEL))
+    detector = OpenWakeWordDetector(holder)  # type: ignore[arg-type]
+
+    def build_one(path: str, vad_threshold: float) -> Any:
+        if path == broken:
+            raise RuntimeError("onnx file missing")
+        return _FakeModel()
+
+    detector._build_one = build_one  # type: ignore[method-assign]
+    bank_1 = detector._build_model()
+    bank_2 = detector._build_model()  # a second spare for the next speaker
+
+    # The broken extra is dropped; primary and the healthy extra survive.
+    assert [path for path, _ in bank_1] == [WAKE_MODEL, EXTRA_MODEL]
+    assert [path for path, _ in bank_2] == [WAKE_MODEL, EXTRA_MODEL]
+    assert detector.faulted is False  # the fault latch is for the PRIMARY only
+    fails = [kw for event, kw in warnings if event == "wake_extra_model_build_failed"]
+    assert len(fails) == 1  # loud once, then silent until the config changes
+    assert fails[0]["model"] == broken
+
+
+def test_primary_build_failure_faults_even_with_healthy_extras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cortana.audio.wake as wake_mod
+
+    errors: list[str] = []
+    monkeypatch.setattr(
+        wake_mod.log, "error", lambda event, **kw: errors.append(event), raising=False
+    )
+    holder = make_wake_holder(extra_models=(EXTRA_MODEL,))
+    detector = OpenWakeWordDetector(holder)  # type: ignore[arg-type]
+
+    def build_one(path: str, vad_threshold: float) -> Any:
+        if path == WAKE_MODEL:
+            raise RuntimeError("primary onnx gone")
+        return _FakeModel()
+
+    detector._build_one = build_one  # type: ignore[method-assign]
+    for _ in range(8):
+        assert detector.score(USER, FRAME) == 0.0
+    assert detector.faulted is True
+    assert errors == ["wake_model_build_failed"]
+
+
+def test_extra_model_list_change_rebuilds_live_banks() -> None:
+    # The config generation covers the FULL model list: adding, removing, or
+    # reordering extras must reach ACTIVE speakers via the pool, exactly like
+    # a wake.model swap.
+    detector, predict = make_detector([0.1, 0.1])
+    _emit_one_chunk(detector)
+    bank_a = detector._states[USER].bank
+    assert bank_a is not None
+
+    new_cfg = make_wake_config(extra_models=(EXTRA_MODEL,))
+    detector._holder.current.wake = new_cfg
+    _emit_one_chunk(detector)
+    state = detector._states[USER]
+    assert state.bank is not None
+    assert state.bank is not bank_a
+    assert state.cfg_key == (WAKE_MODEL, (EXTRA_MODEL,), new_cfg.vad_threshold)
+    assert len(predict.chunks) == 2
 
 
 # ── pcm_to_wav_bytes ─────────────────────────────────────────────────────────
