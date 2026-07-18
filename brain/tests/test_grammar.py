@@ -965,3 +965,63 @@ def test_trailing_continuation_verb_is_cut_from_the_window() -> None:
     cmd2 = parse("hostiles M-TAC-O requiring backup")
     assert cmd2 is not None and cmd2.system_text is not None
     assert "requiring" not in cmd2.system_text
+
+
+# ── fun commands (GDD §13.2): FACT / INSULT ──────────────────────────────────
+
+
+def test_fact_bare() -> None:
+    cmd = parse("hey cortana, tell me a fact")
+    assert cmd is not None
+    assert cmd.intent is Intent.FACT
+    assert cmd.system_text is None
+
+
+def test_fact_topic_before_the_intent_word_survives() -> None:
+    # The category word PRECEDES "fact" — the detail window must keep it.
+    cmd = parse("hey cortana, give me a space fact")
+    assert cmd is not None
+    assert cmd.intent is Intent.FACT
+    assert cmd.detail is not None and "space" in cmd.detail
+
+
+def test_fact_topic_after_the_intent_word_survives() -> None:
+    cmd = parse("hey cortana, fact about animals please")
+    assert cmd is not None
+    assert cmd.intent is Intent.FACT
+    assert cmd.detail is not None and "animals" in cmd.detail
+
+
+def test_trivia_is_a_fact_request() -> None:
+    cmd = parse("hey cortana, trivia time")
+    assert cmd is not None
+    assert cmd.intent is Intent.FACT
+
+
+def test_insult_untargeted() -> None:
+    cmd = parse("hey cortana, insult this guy")
+    assert cmd is not None
+    assert cmd.intent is Intent.INSULT
+    assert cmd.detail == "this guy"
+
+
+def test_roast_with_name_carries_target_in_detail() -> None:
+    cmd = parse("hey cortana, roast dave")
+    assert cmd is not None
+    assert cmd.intent is Intent.INSULT
+    assert cmd.detail == "dave"
+
+
+def test_distress_call_never_demoted_to_a_fact() -> None:
+    # Severity-first (GDD §6.1): a real report containing "fact"/"roast"
+    # stays a report.
+    cmd = parse("tackled in Kisogo, that's a fact")
+    assert cmd is not None
+    assert cmd.intent is Intent.UNDER_ATTACK
+    assert cmd.system_text == "Kisogo"
+
+
+def test_fact_never_claims_a_ping_me() -> None:
+    cmd = parse("ping me for gate camps in Otanuomi")
+    assert cmd is not None
+    assert cmd.intent is Intent.PING_ME

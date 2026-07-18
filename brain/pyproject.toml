@@ -20,6 +20,11 @@ dependencies = [
 [tool.setuptools.packages.find]
 include = ["cortana*"]
 
+[tool.setuptools.package-data]
+# The bundled fact/insult library (GDD §13.2) — plain JSON, loaded once at
+# startup via importlib.resources.
+cortana = ["data/facts/*.json"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

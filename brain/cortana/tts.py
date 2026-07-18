@@ -51,6 +51,8 @@ __all__ = [
     "chase_updated",
     "degraded",
     "flood_control",
+    "fun_cooldown",
+    "fun_disabled",
     "help_hint",
     "hot_lines",
     "no_pings",
@@ -292,6 +294,26 @@ def flood_control() -> str:
 def degraded() -> str:
     """*"Voice offline, use slash commands."*"""
     return "Voice offline, use slash commands."
+
+
+_FUN_COOLDOWN_BRATTY = (
+    "Give it a rest. Cooling down.",
+    "One at a time, jeez.",
+    "Cooling down. Patience.",
+    "Not yet. I'm not a jukebox.",
+)
+
+
+def fun_cooldown() -> str:
+    """*"Cooling down."* — the fun-command throttle (GDD §13.2): facts and
+    insults share per-guild cooldowns so comedy can't crowd real comms."""
+    return _pick("Cooling down.", bratty=_FUN_COOLDOWN_BRATTY)
+
+
+def fun_disabled() -> str:
+    """*"Fun commands are off."* — fun.enabled is false; the pilot asked for
+    a fact/insult and must hear WHY nothing follows, not dead air."""
+    return "Fun commands are off."
 
 
 def help_hint() -> str:
@@ -608,6 +630,10 @@ class _SayJob:
     text: str
     priority: int
     done: asyncio.Future[bool]
+    #: Per-utterance override of ``tts.max_utterance_s`` — the fun path
+    #: (GDD §13.2) speaks whole facts, which run longer than command replies.
+    #: ``None`` = the configured cap applies.
+    max_s: float | None = None
 
 
 #: Priority-queue entry: (rank, seq, job). Rank is the NEGATED wire priority
@@ -707,20 +733,28 @@ class Speaker:
         priority: int = PRIORITY_NORMAL,
         *,
         user_id: int | None = None,
+        max_s: float | None = None,
     ) -> bool:
         """Queue ``text`` for spoken playback in ``guild_id``.
 
         ``user_id`` is the pilot whose command triggered the reply; if they
-        ran ``/mute-voice`` the utterance is suppressed for them. Returns
-        ``True`` once the WAV has been sent to Ears, ``False`` when the speech
-        was dropped for any reason — callers fall back to channel text.
+        ran ``/mute-voice`` the utterance is suppressed for them. ``max_s``
+        overrides ``tts.max_utterance_s`` for this one utterance (the fun
+        path speaks whole facts). Returns ``True`` once the WAV has been sent
+        to Ears, ``False`` when the speech was dropped for any reason —
+        callers fall back to channel text.
         """
         if self._closed or not self._holder.current.tts.enabled:
             return False
         if user_id is not None and user_id in self._voice_mutes:
             log.debug("tts_suppressed_muted_user", user_id=user_id, guild_id=guild_id)
             return False
-        job = _SayJob(text=text, priority=priority, done=asyncio.get_running_loop().create_future())
+        job = _SayJob(
+            text=text,
+            priority=priority,
+            done=asyncio.get_running_loop().create_future(),
+            max_s=max_s,
+        )
         # ALERT (higher wire priority) sorts ahead of queued NORMAL jobs; the
         # seq counter keeps arrival order within a class.
         self._queue_for(guild_id).put_nowait((-priority, next(self._seq), job))
@@ -913,14 +947,15 @@ class Speaker:
             log.warning("tts_synthesis_failed", guild_id=guild_id, text=job.text, error=str(exc))
             return False
         duration_s = len(pcm) / (sample_rate * _BYTES_PER_SAMPLE)
-        if duration_s > cfg.max_utterance_s:
+        cap_s = job.max_s if job.max_s is not None else cfg.max_utterance_s
+        if duration_s > cap_s:
             # §12.2: hard cap — if it does not fit, it goes to the channel instead.
             log.info(
                 "tts_over_cap_dropped",
                 guild_id=guild_id,
                 text=job.text,
                 duration_s=round(duration_s, 2),
-                cap_s=cfg.max_utterance_s,
+                cap_s=cap_s,
             )
             return False
         sent = await self._ipc.send_tts(guild_id, job.priority, build_wav(pcm, sample_rate))

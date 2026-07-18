@@ -109,6 +109,13 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "• *“help”* — speaks a hint and posts this guide",
             ),
             (
+                "Fun",
+                "• *“tell me a fact”* — a random true fact, spoken; name a "
+                "topic: *“space fact”*, *“fact about animals”*\n"
+                "• *“insult this guy”* / *“roast Dave”* — a roast, spoken\n"
+                "Voice fun stays in voice — nothing posts to a channel.",
+            ),
+            (
                 "How she behaves",
                 "Misheard? She says *“Say again?”* and listens without a new "
                 "wake word — twice max, then *“Standing down”* means wake her "
@@ -294,6 +301,43 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 '*"command override, …"* (e.g. *"command override, what\'s the '
                 'weather in Chicago?"*). Separate from intel — CORTANA never uses '
                 "it to interpret reports.",
+            ),
+        ),
+    ),
+    "fun": HelpTopic(
+        key="fun",
+        label="Facts & roasts",
+        emoji="🎲",
+        title="🎲 Facts & roasts",
+        description=(
+            "A big bundled library of true facts across 16 categories, plus a "
+            "roast generator — entertainment kept strictly off the intel path: "
+            "own cooldowns, and alert speech always talks over it."
+        ),
+        fields=(
+            (
+                "Facts",
+                "• *“hey cortana, tell me a fact”* — speaks one into voice; add "
+                "a topic: *“space fact”*, *“fact about the ocean”*\n"
+                "• `/fact [category]` — posts one in the channel you ran it in\n"
+                "Every fact was written and accuracy-checked before shipping — "
+                "no myths, no internet lookups mid-fight.",
+            ),
+            (
+                "Roasts",
+                "• *“hey cortana, insult this guy”* / *“roast Dave”* — spoken roast\n"
+                "• `/insult [target]` — posts in-channel; naming a target renders "
+                "their @ but **never pings** them\n"
+                "All in good fun: friendly-fire humor about piloting and gaming "
+                "skill only — no slurs, ever. `fun.insults_spicy: false` switches "
+                "to the clean-burn pool.",
+            ),
+            (
+                "Rules of engagement",
+                "Voice requests answer in voice only — nothing is posted. Slash "
+                "replies stay in the channel they were invoked in. Per-guild "
+                "cooldowns (`fun.fact_cooldown_s` / `fun.insult_cooldown_s`) keep "
+                "the comedy from crowding comms during a fight.",
             ),
         ),
     ),

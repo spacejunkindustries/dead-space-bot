@@ -227,10 +227,6 @@ class SttConfig:
     #:   open   — any unmatched transcript relays (confidence-gated).
     #:   off    — the freeform relay never posts; commands only.
     relay_mode: str = "framed"
-    #: GDD §20 "STT worker hang" watchdog deadline, seconds. The whisper-cpp
-    #: HTTP timeout is derived slightly below it (the socket gives up before
-    #: the watchdog abandons the worker thread).
-    watchdog_s: float = 15.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +294,23 @@ class TtsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class FunConfig:
+    """The fact library / insult maker (GDD §13.2). Optional section; the
+    defaults ship the feature on with modest throttles."""
+
+    enabled: bool = True
+    #: Per-guild seconds between served facts / insults — comedy must never
+    #: crowd real comms (ALERT speech also jumps the queue regardless).
+    fact_cooldown_s: int = 10
+    insult_cooldown_s: int = 10
+    #: true = the full sailor-mouth pool; false = clean burns only.
+    insults_spicy: bool = True
+    #: Spoken-length cap for fun lines, overriding tts.max_utterance_s — a
+    #: whole fact runs longer than a §12.2 command reply.
+    max_speak_s: float = 20.0
+
+
+@dataclass(frozen=True, slots=True)
 class GazetteerConfig:
     file: str
     home_system: str | None  # None/empty = no home-bias prior (nomadic corp)
@@ -354,6 +367,7 @@ class AuraConfig:
     chat: ChatConfig = field(default_factory=ChatConfig)
     routing: RoutingFileConfig = field(default_factory=RoutingFileConfig)
     dialog: DialogConfig = field(default_factory=DialogConfig)
+    fun: FunConfig = field(default_factory=FunConfig)
 
 
 # ── schema-driven validation ─────────────────────────────────────────────────
@@ -704,6 +718,16 @@ def _assemble_gazetteer(v: dict[str, Any]) -> GazetteerConfig:
     )
 
 
+def _assemble_fun(v: dict[str, Any]) -> FunConfig:
+    return FunConfig(
+        enabled=v["fun.enabled"],
+        fact_cooldown_s=v["fun.fact_cooldown_s"],
+        insult_cooldown_s=v["fun.insult_cooldown_s"],
+        insults_spicy=v["fun.insults_spicy"],
+        max_speak_s=v["fun.max_speak_s"],
+    )
+
+
 def _assemble_dialog(v: dict[str, Any]) -> DialogConfig:
     return DialogConfig(
         window_ms=v["dialog.window_ms"],
@@ -733,6 +757,7 @@ def _assemble(values: dict[str, Any]) -> AuraConfig:
         chat=_assemble_chat(values),
         routing=RoutingFileConfig(file=values["routing.file"]),
         dialog=_assemble_dialog(values),
+        fun=_assemble_fun(values),
     )
 
 

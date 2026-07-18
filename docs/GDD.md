@@ -205,12 +205,14 @@ Every module in the finished system.
 | `core/personal_pings.py` | Personal ping subscriptions (§10.3): capped per-user store, sync mirror for routing |
 | `core/routing.py` | Subscription evaluation, role union, escalation, quiet hours, personal-ping user mentions |
 | `core/discipline.py` | Per-user cooldowns, global circuit breaker, flood control |
+| `core/fun.py` | Fact library + insult maker (§13.2): bundled-JSON load, per-guild shuffle bags, cooldowns, spicy filter, topic/target extraction |
 | `core/db.py` | SQLite access, migrations, backup hook |
 | `dsc/bot.py` | discord.py client, intents, persistent view registration |
 | `dsc/views.py` | Incident buttons, ambiguity resolver, subscription picker |
 | `dsc/cogs/intel.py` | `/hostiles`, `/under-attack`, `/help-me`, `/camp`, `/clear`, `/status`, `/cancel` |
 | `dsc/cogs/subs.py` | `/subscribe`, `/mysubs`, `/pingme`, `/mypings`, `/pingme-clear`, `/optout`, `/mute-voice`, `/register`, `/unregister`, `/whoami` |
 | `dsc/cogs/ops.py` | `/timer`, `/formup`, `/rollcall`, `/jumps` |
+| `dsc/cogs/fun.py` | `/fact`, `/insult` — slash twins of the voice FACT/INSULT intents (§13.2) |
 | `dsc/cogs/admin.py` | `/routing`, `/gazetteer`, `/health`, `/fleetmode` |
 | `dsc/cogs/help.py` | `/help` — interactive help topics; the slash twin of voice "help" |
 | `tts.py` | Piper subprocess, raw→WAV wrapping, priority-ordered utterance queue (ALERT ahead of queued NORMAL), length cap |
@@ -222,6 +224,7 @@ Every module in the finished system.
 | Path | Contents |
 |---|---|
 | `/opt/cortana/models/wake/` | openWakeWord ONNX chain (melspec → embedding → wakeword) |
+| `brain/cortana/data/facts/` | The bundled fact/insult library (§13.2): 16 category JSON files + 3 insult-flavour files, shipped inside the package |
 | `/var/lib/cortana/hf/` | Whisper `small` int8 CTranslate2 weights — the Hugging Face cache shared between install.sh's prefetch and the service (`Environment=HF_HOME`), so a size-name `stt.model` never re-downloads at runtime |
 | `/opt/cortana/models/whisper/` | Hand-installed weights for a *path-based* `stt.model` only (unused by the shipped `model: small`) |
 | `/opt/cortana/models/piper/` | Piper voice `.onnx` + `.onnx.json` |
@@ -857,6 +860,7 @@ Beyond intel, CORTANA carries the utilities a corp actually asks for. Each is vo
 | **Roll call** | `/rollcall` | Who's in voice, who's subscribed, who's responding. |
 | **Jump distance** | *"Hey Cortana, jumps to Jita"* | Spoken reply, no post. BFS over the adjacency graph. |
 | **Chase mode** | *"update chase Kisogo"* → `/chase` | Retargets your live incident card as the target moves — one card, edited in place, with a movement trail. |
+| **Facts & roasts** | *"tell me a fact"* / *"insult this guy"* → `/fact` `/insult` | Morale. A bundled, accuracy-gated fact library and a roast generator — strictly throttled off the intel path (§13.2). |
 
 ### 13.1 Chase mode
 
@@ -865,6 +869,23 @@ A tackled target that jumps out is not a new incident — it is the same inciden
 - The card is **edited in place** (constraint 9) — never a second post — and each hop is appended to the card's updates as a movement trail (*chase → Kisogo → Alenia*).
 - System matching is **flexible**: a confident gazetteer match binds the real system (routing and the proximity prior keep working); anything else — a misheard name, a system outside the gazetteer's scope — goes on the card **verbatim**. A chase never stops to ask *"say again the system"* mid-pursuit.
 - Confirmation is spoken: *"Chase updated, Kisogo."* With no active incident of yours to retarget: *"No active incident to chase."*; a bare *"chase mode"* with no system: *"Say update chase and a system, or clear to finish."*
+
+### 13.2 Fun commands: the fact library and the insult maker
+
+Entertainment for the quiet stretches between fights — designed so it can never cost the intel path anything.
+
+**Content is bundled, not fetched.** `brain/cortana/data/facts/*.json` ships ~16 categories of short, TTS-shaped true facts (space, physics, history, military, tech, animals, the human body, the ocean, gaming, math, geography, engineering, language, food, science, New Eden lore) plus a three-flavour insult pool (`insults_*.json`, each line flagged `spicy` when it carries profanity). Every line was written and then **accuracy/safety-gated offline** before shipping: no myths in the facts; no slurs, no protected-class jokes, no sexual content in the roasts — profanity is allowed (the corp's explicit choice, mirroring `tts.personality: bratty`), cruelty is not. Constraint 6 stands: serving a line is a lookup, not generation — no LLM, no network, deterministic and debuggable.
+
+**One engine, two doors (constraint 10).** `cortana.core.fun.FunEngine` serves both the voice intents (`FACT`: *"tell me a fact"*, *"space fact"*, *"fact about the ocean"*; `INSULT`: *"insult this guy"*, *"roast Dave"*) and the slash twins `/fact [category]` / `/insult [target]`. A per-guild **shuffle bag** deals the whole deck before any repeat (and never repeats a line back-to-back across refills); facts and insults carry separate per-guild cooldowns (`fun.fact_cooldown_s` / `fun.insult_cooldown_s`).
+
+**Delivery is surface-symmetric, by explicit design:**
+
+- **Voice in → voice out, only.** A spoken request is answered in voice at NORMAL priority (ALERT incident speech always jumps it) under its own length cap (`fun.max_speak_s` — a whole fact outruns the §12.2 command-reply cap). Nothing posts to any channel; a failed synthesis is logged and dropped.
+- **Slash in → invoking channel, only.** `/fact` and `/insult` reply in the channel they were run in. An `/insult` naming a member renders the mention but never notifies (`AllowedMentions.none()`) — the escalation authority (constraint 11) is untouched because this path cannot ping anyone.
+
+**Targets.** The voice path extracts a short spoken name from the remainder (*"roast Dave"* → *"Dave. \<line\>"*), discarding pronouns ("this guy", "him") for an untargeted roast; names pass the callsign sanitiser so they can never smuggle markdown or a mention. Insults are written second-person and punch at piloting, decision-making and gaming skill — friendly fire between consenting corpmates, not harassment; `fun.insults_spicy: false` restricts to the clean pool.
+
+**Failure posture.** Empty/missing library → the fixed line *"Fun commands are off."* (voice) or an ephemeral pointer at the logs (slash); throttled → *"Cooling down."*. `fun.enabled: false` turns both surfaces off with the same fixed line. The engine loads once at startup, off the event loop; a malformed file or line is logged and skipped — a bad joke must never stop the intel bot.
 
 ---
 
@@ -1223,6 +1244,12 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `tts.max_utterance_s` | float | **required** | hot | Hard cap; longer text goes to the channel instead. |
 | `tts.effect` | str | `'none'` | hot | Post-synthesis effect: chorus+reverb "ship AI" sheen or none. One of: `none`, `holographic`. |
 | `tts.personality` | str | `'standard'` | sighup | Spoken-line flavour; applied by set_personality() in the reload transaction. One of: `standard`, `cortana`, `bratty`. |
+| **`fun:`** | | | | *OPTIONAL fact library / insult maker (GDD §13.2); absent = defaults (on).* |
+| `fun.enabled` | bool | `True` | hot | The fact library and insult maker (GDD §13.2). Off = both voice intents and slash twins answer with a fixed refusal line. |
+| `fun.fact_cooldown_s` | int | `10` | hot | Per-guild seconds between served facts — comedy never crowds comms. |
+| `fun.insult_cooldown_s` | int | `10` | hot | Per-guild seconds between served insults. |
+| `fun.insults_spicy` | bool | `True` | hot | true = the full sailor-mouth pool; false = clean burns only. |
+| `fun.max_speak_s` | float | `20.0` | hot | Spoken-length cap for facts/insults, overriding tts.max_utterance_s — a whole fact runs longer than a command reply. |
 | **`chat:`** | | | | *OPTIONAL "command override" assistant (GDD §6.6); absent = off.* |
 | `chat.enabled` | bool | `False` | sighup | Pilots can say "command override, <question>" (/ask twin). Costs real money per question. |
 | `chat.model` | str | `'claude-haiku-4-5'` | hot | Claude model for override replies. |

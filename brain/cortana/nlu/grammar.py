@@ -172,6 +172,12 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
     # "cancelled"/"canceled" too: "chase cancelled" must land here, not on
     # the chase pattern below.
     (Intent.CANCEL, re.compile(r"\bcancel(?:led|ed)?\b", re.I)),
+    # Fun commands (GDD §13.2). Below every report/manage intent so a real
+    # distress call containing one of these words ("that's a fact") can
+    # never be demoted to entertainment; above CHASE so a bare leading
+    # "roast him" isn't claimed as a chase retarget.
+    (Intent.FACT, re.compile(r"\bfacts?\b|\btrivia\b", re.I)),
+    (Intent.INSULT, re.compile(r"\binsult(?:s|ed|ing)?\b|\broast(?:s|ing)?\b", re.I)),
     # Chase mode (GDD §13.1): "update chase Kisogo" / "chase Kisogo"
     # retargets the pilot's live incident card as the target moves. Sits
     # BELOW the distress intents, RESOLVE and CANCEL — "tackled … giving
@@ -863,6 +869,33 @@ def parse(transcript: str) -> ParsedCommand | None:
             system_text=None,
             group_alias=group_alias,
             detail=clean_callsign(remainder),
+            raw=transcript,
+            severity=severity,
+        )
+
+    if intent is Intent.FACT:
+        # Fun command (GDD §13.2): the topic word usually PRECEDES the intent
+        # word ("space fact"), so the topic window is the whole utterance
+        # minus the intent match; the FunEngine matches it against its
+        # category aliases. Never resolved against the gazetteer.
+        topic = match.re.sub(" ", work).strip(" ,.;:!?-")
+        return ParsedCommand(
+            intent=intent,
+            system_text=None,
+            group_alias=group_alias,
+            detail=topic or None,
+            raw=transcript,
+            severity=severity,
+        )
+
+    if intent is Intent.INSULT:
+        # The remainder may name a target ("insult Dave") — cleaned by the
+        # FunEngine, never parsed here beyond capture (GDD §6.3 spirit).
+        return ParsedCommand(
+            intent=intent,
+            system_text=None,
+            group_alias=group_alias,
+            detail=remainder or None,
             raw=transcript,
             severity=severity,
         )

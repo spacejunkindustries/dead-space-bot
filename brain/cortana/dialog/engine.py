@@ -66,6 +66,7 @@ if TYPE_CHECKING:
 
     from cortana.config import ConfigHolder
     from cortana.core.discipline import Discipline
+    from cortana.core.fun import FunEngine
     from cortana.core.incidents import IncidentEngine
     from cortana.health import HealthReporter
     from cortana.nlu.gazetteer import Gazetteer
@@ -103,6 +104,7 @@ class DialogEngine:
         member_role_ids: Callable[[int], list[int]],
         send_channel: SendChannel,
         shutdown: asyncio.Event,
+        fun: FunEngine | None = None,
     ) -> None:
         self._holder = holder
         self._capture = capture
@@ -117,6 +119,7 @@ class DialogEngine:
         self._member_role_ids = member_role_ids
         self._send_channel = send_channel
         self._shutdown = shutdown
+        self._fun = fun
 
         self._sessions: dict[int, DialogSession] = {}
         self._feed_errors = 0
@@ -411,6 +414,12 @@ class DialogEngine:
         """Full command path: pilot gate → resolve → IncidentEngine → reply."""
         cfg = self._holder.current
         parsed = action.parsed
+        # Fun commands (GDD §13.2) never reach the incident engine: the reply
+        # is voice-ONLY by explicit design — no card, no channel post, no
+        # command_log row. The slash twins answer in their invoking channel.
+        if parsed.intent in (Intent.FACT, Intent.INSULT):
+            await self._fun_reply(s, parsed)
+            return
         if action.inherited is not None and parsed.severity is None:
             # A severity spoken in the opener ("code orange" → "go ahead" →
             # the report) attaches to the report; an inline code wins.
@@ -511,6 +520,38 @@ class DialogEngine:
                     ),
                 ),
             )
+
+    async def _fun_reply(self, s: DialogSession, parsed: Any) -> None:
+        """Speak one fact or insult (GDD §13.2). Voice in, voice out — a
+        failed synthesis is logged and dropped, never posted to a channel."""
+        from cortana.core.fun import FunCooldown, FunUnavailable
+
+        cfg = self._holder.current
+        if self._fun is None or not cfg.fun.enabled:
+            await self._speak_or_post(s, tts_mod.fun_disabled())
+            return
+        try:
+            if parsed.intent is Intent.FACT:
+                line = self._fun.next_fact(s.guild_id, parsed.detail).text
+            else:
+                line = self._fun.next_insult(s.guild_id, parsed.detail)
+        except FunCooldown:
+            await self._speak_or_post(s, tts_mod.fun_cooldown())
+            return
+        except FunUnavailable:
+            log.warning("fun_library_empty", intent=str(parsed.intent))
+            await self._speak_or_post(s, tts_mod.fun_disabled())
+            return
+        log.info("fun_served", user_id=s.user_id, intent=str(parsed.intent), text=line)
+        spoken = await self._speaker.say(
+            s.guild_id,
+            line,
+            PRIORITY_NORMAL,
+            user_id=s.user_id,
+            max_s=cfg.fun.max_speak_s,
+        )
+        if not spoken:
+            log.info("fun_line_unspoken_dropped", user_id=s.user_id)
 
     async def _confirm(self, s: DialogSession, confirm: PendingConfirm) -> None:
         """Complete a pending §8.3 confirm — the voice twin of the card's

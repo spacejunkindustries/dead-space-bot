@@ -164,6 +164,11 @@ SECTIONS: Final[tuple[Section, ...]] = (
     Section("discipline.circuit_breaker", "Corp-wide mention flood control."),
     Section("tts", "Piper synthesis and spoken-line personality."),
     Section(
+        "fun",
+        "OPTIONAL fact library / insult maker (GDD §13.2); absent = defaults (on).",
+        optional=True,
+    ),
+    Section(
         "chat",
         'OPTIONAL "command override" assistant (GDD §6.6); absent = off.',
         optional=True,
@@ -651,6 +656,48 @@ KEYS: Final[tuple[Key, ...]] = (
         "Spoken-line flavour; applied by set_personality() in the reload transaction.",
         default="standard",
         choices=("standard", "cortana", "bratty"),
+    ),
+    # fun (optional section)
+    Key(
+        "fun.enabled",
+        "bool",
+        Reload.HOT,
+        "The fact library and insult maker (GDD §13.2). Off = both voice "
+        "intents and slash twins answer with a fixed refusal line.",
+        default=True,
+    ),
+    Key(
+        "fun.fact_cooldown_s",
+        "int",
+        Reload.HOT,
+        "Per-guild seconds between served facts — comedy never crowds comms.",
+        default=10,
+        minimum=0,
+    ),
+    Key(
+        "fun.insult_cooldown_s",
+        "int",
+        Reload.HOT,
+        "Per-guild seconds between served insults.",
+        default=10,
+        minimum=0,
+    ),
+    Key(
+        "fun.insults_spicy",
+        "bool",
+        Reload.HOT,
+        "true = the full sailor-mouth pool; false = clean burns only.",
+        default=True,
+    ),
+    Key(
+        "fun.max_speak_s",
+        "float",
+        Reload.HOT,
+        "Spoken-length cap for facts/insults, overriding tts.max_utterance_s "
+        "— a whole fact runs longer than a command reply.",
+        default=20.0,
+        minimum=0,
+        exclusive_minimum=True,
     ),
     # chat (optional section)
     Key(

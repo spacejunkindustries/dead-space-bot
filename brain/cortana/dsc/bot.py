@@ -74,6 +74,7 @@ _COG_MODULES = (
     "cortana.dsc.cogs.subs",
     "cortana.dsc.cogs.ops",
     "cortana.dsc.cogs.utility",
+    "cortana.dsc.cogs.fun",
     "cortana.dsc.cogs.admin",
     "cortana.dsc.cogs.help",
     "cortana.dsc.cogs.status",
@@ -231,6 +232,9 @@ class AuraBot(commands.Bot):
         self.health_reporter: HealthReporter | None = None
         #: Dialog-engine cleanup hook (GDD §5.4) — set by the composition root.
         self.on_user_left_voice: Callable[[int], None] | None = None
+        #: The fact library / insult maker (GDD §13.2) — set by the
+        #: composition root; the FunCog reads it (same engine as voice).
+        self.fun: Any | None = None
         # The §6.6 out-of-band assistant; None = override channel disabled.
         self.chat: Any | None = None
         self.chat_status: str = "disabled"  # "ready" | "no_key" | "disabled" (§6.6)
@@ -256,6 +260,7 @@ class AuraBot(commands.Bot):
         # Imported here, not at module top: the cogs import this module.
         from cortana.dsc import views
         from cortana.dsc.cogs.admin import AdminCog
+        from cortana.dsc.cogs.fun import FunCog
         from cortana.dsc.cogs.help import HelpCog, HelpTopicSelect
         from cortana.dsc.cogs.intel import IntelCog
         from cortana.dsc.cogs.ops import OpsCog
@@ -272,6 +277,7 @@ class AuraBot(commands.Bot):
             SubsCog(self),
             OpsCog(self),
             UtilityCog(self),
+            FunCog(self),
             AdminCog(self),
             HelpCog(self),
             StatusCog(self),
