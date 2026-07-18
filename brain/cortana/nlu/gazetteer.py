@@ -33,7 +33,7 @@ from typing import Any
 import structlog
 import yaml
 
-from cortana.config import GazetteerConfig
+from cortana.config import ConfigHolder
 from cortana.core import db
 from cortana.nlu.phonetics import double_metaphone
 from cortana.types import SystemEntry
@@ -115,9 +115,14 @@ def _load_scope(path: Path) -> dict[str, Any]:
 class Gazetteer:
     """The pruned active system set + adjacency graph with memoised BFS."""
 
-    def __init__(self, conn: sqlite3.Connection, cfg: GazetteerConfig) -> None:
+    def __init__(self, conn: sqlite3.Connection, holder: ConfigHolder) -> None:
+        # The HOLDER, not a config snapshot: ``load()`` reads
+        # ``holder.current.gazetteer`` at the point of use, so a SIGHUP or
+        # /reload that changes gazetteer.file / home_system / include_all is
+        # picked up by the next reload instead of being silently pinned to
+        # the boot-time snapshot.
         self._conn = conn
-        self._cfg = cfg
+        self._holder = holder
         self._systems: tuple[SystemEntry, ...] = ()
         self._by_id: dict[int, SystemEntry] = {}
         self._by_name: dict[str, SystemEntry] = {}
@@ -136,7 +141,8 @@ class Gazetteer:
         Raises :class:`GazetteerError` on a bad scope file; on failure the
         previously loaded state stays in force.
         """
-        scope = _load_scope(Path(self._cfg.file))
+        cfg = self._holder.current.gazetteer
+        scope = _load_scope(Path(cfg.file))
 
         rows = db.query(
             self._conn, "SELECT id, name, region, constellation FROM systems ORDER BY name"
@@ -167,7 +173,7 @@ class Gazetteer:
             adjacency.setdefault(row["b_id"], []).append(row["a_id"])
         adj: dict[int, tuple[int, ...]] = {k: tuple(v) for k, v in adjacency.items()}
 
-        include_all = scope["include_all"] or self._cfg.include_all
+        include_all = scope["include_all"] or cfg.include_all
         active: set[int] = set()
 
         if include_all:
@@ -200,10 +206,10 @@ class Gazetteer:
                 active.add(entry.id)
 
         home: SystemEntry | None = None
-        if self._cfg.home_system:
-            home = all_by_name.get(self._cfg.home_system.lower())
+        if cfg.home_system:
+            home = all_by_name.get(cfg.home_system.lower())
             if home is None:
-                log.warning("gazetteer_home_system_unknown", name=self._cfg.home_system)
+                log.warning("gazetteer_home_system_unknown", name=cfg.home_system)
             else:
                 active.add(home.id)
         else:
@@ -221,7 +227,7 @@ class Gazetteer:
 
         systems = tuple(sorted((all_by_id[i] for i in active), key=lambda e: e.name.lower()))
         if not systems:
-            log.warning("gazetteer_empty_active_set", file=self._cfg.file)
+            log.warning("gazetteer_empty_active_set", file=cfg.file)
         if len(systems) > 500 and not include_all:
             # Constraint 8: in scoped mode the gazetteer stays small ON PURPOSE.
             # A huge scoped set is an FC misconfiguration worth shouting about,
@@ -252,7 +258,7 @@ class Gazetteer:
             active=len(systems),
             include_all=include_all,
             regions=sorted(scope["regions"]),
-            home=self._cfg.home_system,
+            home=cfg.home_system,
         )
 
     def _alias_system_ids(self) -> frozenset[int]:

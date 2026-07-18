@@ -11,11 +11,19 @@ on:
       # config-only change must run CI too or a breaking example edit
       # surfaces later on some unrelated brain PR.
       - "config/**"
+      - "docs/GDD.md"
+      - "scripts/**"
+      # The deploy scripts get a cheap bash syntax gate here — an unparseable
+      # install.sh otherwise ships straight to the droplet.
+      - "deploy/**"
       - ".github/workflows/ci.yml"
   pull_request:
     paths:
       - "brain/**"
       - "config/**"
+      - "docs/GDD.md"
+      - "scripts/**"
+      - "deploy/**"
       - ".github/workflows/ci.yml"
 
 jobs:
@@ -27,6 +35,16 @@ jobs:
         working-directory: brain
     steps:
       - uses: actions/checkout@v4
+
+      # Cheap syntax gate for the deploy scripts. Full deploy CI (shellcheck,
+      # systemd-analyze verify, twice-run idempotency in a container) is a
+      # separate workflow; this catches the "install.sh does not even parse"
+      # class before it reaches the droplet.
+      - name: Deploy script syntax (bash -n)
+        working-directory: .
+        run: |
+          bash -n deploy/install.sh
+          bash -n deploy/alert.sh
 
       - uses: actions/setup-python@v5
         with:
@@ -54,3 +72,9 @@ jobs:
 
       - name: Pytest
         run: pytest
+
+      # The GDD §16 table is generated from the config schema — a schema
+      # change without the regenerated table is spec drift and fails here.
+      - name: GDD config table in sync
+        working-directory: .
+        run: python scripts/gen_config_docs.py --check

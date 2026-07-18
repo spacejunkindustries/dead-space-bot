@@ -211,13 +211,23 @@ class FakePoster:
     def __init__(self) -> None:
         self.posts: list[tuple[int, AlertChannel, str, CardRender]] = []
         self.edits: list[tuple[int, int, str, CardRender]] = []
+        #: The MentionDecision grant per post — the AllowedMentions allowlist
+        #: the real Poster would build (None = nothing may ping).
+        self.mentions: list[Any] = []
         self._msg = 5000
 
     async def post(
-        self, guild_id: int, channel: AlertChannel, content: str, card: CardRender
+        self,
+        guild_id: int,
+        channel: AlertChannel,
+        content: str,
+        card: CardRender,
+        *,
+        mentions: Any = None,
     ) -> tuple[int, int]:
         self._msg += 1
         self.posts.append((guild_id, channel, content, card))
+        self.mentions.append(mentions)
         return (900, self._msg)
 
     async def edit(self, channel_id: int, message_id: int, content: str, card: CardRender) -> None:
@@ -1224,12 +1234,50 @@ async def test_broadcast_dedupes_identical_text_within_window(
     assert len(env.poster.posts) == 2
 
 
-async def test_broadcast_all_hands_pings_here(make_env: Callable[..., Env]) -> None:
+async def test_broadcast_all_hands_mentions_roles_never_here(
+    make_env: Callable[..., Env],
+) -> None:
+    # An "all hands" relay widens the mention to every subscribed role, but a
+    # freeform relay is not UNDER_ATTACK/ASSIST_REQUEST so it can NEVER @here
+    # (constraint 11 — the old engine-level here=True override is gone).
     env = make_env()
     out = await env.engine.broadcast(GUILD, 42, "cyno up, all hands", here=True)
     assert out.outcome is Outcome.POSTED
+    _, channel, content, _ = env.poster.posts[-1]
+    assert "@here" not in content
+    assert f"<@&{HD_ROLE}>" in content
+    assert f"<@&{MINERS_ROLE}>" in content
+    assert channel is AlertChannel.ALERTS  # a mention is a mention
+
+
+async def test_broadcast_group_alias_matches_voice_all_hands(
+    make_env: Callable[..., Env],
+) -> None:
+    # group_alias="all_hands" (the /relay spelling) behaves exactly like the
+    # deprecated here=True voice spelling.
+    env = make_env()
+    await env.engine.broadcast(GUILD, 42, "cyno up, all hands", group_alias="all_hands")
     _, _, content, _ = env.poster.posts[-1]
-    assert "@here" in content
+    assert "@here" not in content
+    assert f"<@&{HD_ROLE}>" in content
+
+
+async def test_broadcast_non_pilot_never_mentions(make_env: Callable[..., Env]) -> None:
+    # The broadcast bypass class: a caller failing the @Pilot gate still gets
+    # the relay posted, but no mention of any kind — even "all hands".
+    env = make_env()
+    out = await env.engine.broadcast(
+        GUILD,
+        42,
+        "cyno up, all hands",
+        group_alias="all_hands",
+        severity=Severity.HIGH,
+        caller_may_mention=False,
+    )
+    assert out.outcome is Outcome.POSTED
+    _, channel, content, _ = env.poster.posts[-1]
+    assert content == ""
+    assert channel is AlertChannel.LIVE
 
 
 async def test_silent_mode_posts_without_pinging(make_env: Callable[..., Env]) -> None:
@@ -1273,8 +1321,9 @@ async def test_here_on_severity_pings_red_without_rules(make_env: Callable[..., 
 
 async def test_spoken_code_red_overrides_intent_severity(make_env: Callable[..., Env]) -> None:
     # "code red, hostiles in Otanuomi" — a sighting is MEDIUM by default, but
-    # the spoken colour makes it CODE RED: red card, and @here via the default
-    # here_on_severity=("high",).
+    # the spoken colour makes it CODE RED: red card. It does NOT @here —
+    # constraint 11 clamps here_on_severity to UNDER_ATTACK/ASSIST_REQUEST,
+    # so a severity code on a sighting can never escalate it.
     env = make_env()
     out = await env.engine.report(
         GUILD, 42, cmd(Intent.HOSTILE_SPOTTED, severity=Severity.HIGH), high(1, "Otanuomi")
@@ -1282,7 +1331,8 @@ async def test_spoken_code_red_overrides_intent_severity(make_env: Callable[...,
     assert out.outcome is Outcome.POSTED
     _, _, content, card = env.poster.posts[-1]
     assert "CODE RED" in card.embed["title"]
-    assert "@here" in content
+    assert "@here" not in content
+    assert f"<@&{HD_ROLE}>" in content  # subscribed roles still mentioned
 
 
 async def test_spoken_code_yellow_downgrades_the_card_colour(
@@ -1300,18 +1350,23 @@ async def test_spoken_code_yellow_downgrades_the_card_colour(
     assert "@here" not in content  # NONE is not in here_on_severity
 
 
-async def test_broadcast_severity_colours_the_relay_and_pings(
+async def test_broadcast_severity_colours_the_relay_but_never_pings(
     make_env: Callable[..., Env],
 ) -> None:
+    # Constraint 11: a spoken colour code colours the relay card ONLY — a
+    # freeform relay is not an escalatable incident type, so here_on_severity
+    # can never earn it an @here (the old engine-level escalation is gone).
     env = make_env()
     out = await env.engine.broadcast(
         GUILD, 42, "blop fleet inbound", severity=Severity.HIGH, confidence=-0.2
     )
     assert out.outcome is Outcome.POSTED
     assert out.utterance == "Relayed."
-    _, _, content, card = env.poster.posts[-1]
+    _, channel, content, card = env.poster.posts[-1]
     assert "CODE RED" in card.embed["title"]
-    assert "@here" in content  # ping-by-colour applies to relays too
+    assert "@here" not in content
+    assert content == ""
+    assert channel is AlertChannel.LIVE  # mention-free → the quiet feed (§11.2)
     row = db.query_one(
         env.conn, "SELECT confidence FROM command_log WHERE parsed_intent = 'BROADCAST'"
     )
@@ -1499,3 +1554,268 @@ async def test_folded_co_reporter_may_drive_the_chase(make_env: Callable[..., En
     out = await env.engine.report(GUILD, 43, chase, high(2, "Kisogo"))  # the SECOND pilot
     assert out.outcome is Outcome.POSTED
     assert out.incident_id == first.incident_id
+
+
+# ── decide_mentions integration: the single escalation authority ─────────────
+
+
+async def test_here_on_severity_without_rules_lands_in_alerts(
+    make_env: Callable[..., Env],
+) -> None:
+    """THE @here-in-#intel-live regression: a CODE RED matching zero routing
+    rules used to get here=True with the channel still #intel-live. The
+    channel is now recomputed from the final mention set."""
+    env = make_env()
+    env.engine._rules = []  # noqa: SLF001 — simulate no rules wired up yet
+    out = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    assert out.outcome is Outcome.POSTED
+    _, channel, content, _ = env.poster.posts[-1]
+    assert "@here" in content
+    assert channel is AlertChannel.ALERTS
+
+
+async def test_all_hands_report_on_sighting_never_here(make_env: Callable[..., Env]) -> None:
+    """apply_group_alias's unconditional here=True is gone: 'all hands' on a
+    sighting widens the roles but cannot @here (constraint 11)."""
+    env = make_env()
+    out = await env.engine.report(
+        GUILD, 42, cmd(Intent.HOSTILE_SPOTTED, alias="all_hands"), high(1, "Otanuomi")
+    )
+    assert out.outcome is Outcome.POSTED
+    _, channel, content, _ = env.poster.posts[-1]
+    assert "@here" not in content
+    assert f"<@&{HD_ROLE}>" in content
+    assert f"<@&{MINERS_ROLE}>" in content
+    assert channel is AlertChannel.ALERTS
+    assert out.utterance == "Hostiles Otanuomi, pinged all hands."
+
+
+async def test_caller_may_mention_false_strips_all_mentions(
+    make_env: Callable[..., Env],
+) -> None:
+    """The pilot gate threaded into the engine: a non-Pilot report (defence in
+    depth behind the surface rejection) posts a card that pings nobody."""
+    env = make_env()
+    out = await env.engine.report(
+        GUILD,
+        42,
+        cmd(Intent.UNDER_ATTACK, severity=Severity.HIGH),
+        high(1, "Otanuomi"),
+        caller_may_mention=False,
+    )
+    assert out.outcome is Outcome.POSTED
+    _, channel, content, _ = env.poster.posts[-1]
+    assert content == ""
+    assert channel is AlertChannel.LIVE
+
+
+async def test_post_receives_the_mention_decision_allowlist(
+    make_env: Callable[..., Env],
+) -> None:
+    """The Poster gets the decision itself so AllowedMentions is an explicit
+    allowlist: listed role ids, listed user ids, everyone only when here."""
+    env = make_env()
+    await env.engine.report(GUILD, 99, ping_cmd("GATE_CAMP", "Otanuomi"), high(1, "Otanuomi"))
+    await env.engine.report(GUILD, 42, cmd(Intent.GATE_CAMP), high(1, "Otanuomi"))
+    grant = env.poster.mentions[-1]
+    assert grant is not None
+    assert grant.user_ids == (99,)
+    assert grant.role_ids == (MINERS_ROLE,)
+    assert grant.here is False
+
+
+async def test_discipline_charged_only_after_successful_post(
+    make_env: Callable[..., Env],
+) -> None:
+    """A failed post must not charge the cooldown or the breaker: the pilot's
+    immediate retry (channel fixed) still mentions — no phantom mentions."""
+    from cortana.types import PostError
+
+    env = make_env()
+    fail = {"on": True}
+    original_post = env.poster.post
+
+    async def flaky_post(*args: Any, **kwargs: Any) -> tuple[int, int]:
+        if fail["on"]:
+            raise PostError("403 Forbidden")
+        return await original_post(*args, **kwargs)
+
+    env.poster.post = flaky_post  # type: ignore[method-assign]
+    out = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    assert out.outcome is Outcome.REJECTED
+
+    fail["on"] = False  # channel fixed — NO clock advance: cooldown must be uncharged
+    out2 = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    assert out2.outcome is Outcome.POSTED
+    _, channel, content, _ = env.poster.posts[-1]
+    assert "@here" in content  # mention went out: the failed post never counted
+    assert channel is AlertChannel.ALERTS
+
+
+async def test_broadcast_discipline_charged_only_after_successful_post(
+    make_env: Callable[..., Env],
+) -> None:
+    from cortana.types import PostError
+
+    env = make_env()
+
+    async def dead_post(*args: Any, **kwargs: Any) -> tuple[int, int]:
+        raise PostError("403 Forbidden")
+
+    original_post = env.poster.post
+    env.poster.post = dead_post  # type: ignore[method-assign]
+    out = await env.engine.broadcast(GUILD, 42, "cyno up, all hands", group_alias="all_hands")
+    assert out.outcome is Outcome.REJECTED
+
+    env.poster.post = original_post  # type: ignore[method-assign]
+    # Same user, same instant: an uncharged cooldown means this one mentions.
+    again = await env.engine.broadcast(GUILD, 42, "second call, all hands", group_alias="all_hands")
+    assert again.outcome is Outcome.POSTED
+    assert f"<@&{HD_ROLE}>" in env.poster.posts[-1][2]
+
+
+# ── fold raises-never-lowers severity (GDD §9.2) ─────────────────────────────
+
+
+async def test_fold_raises_severity_and_rerenders(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    opened = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    _, _, _, card = env.poster.posts[-1]
+    assert "CODE ORANGE" in card.embed["title"]
+
+    env.clock.advance(10)
+    folded = await env.engine.report(
+        GUILD, 43, cmd(Intent.HOSTILE_SPOTTED, severity=Severity.HIGH), high(1, "Otanuomi")
+    )
+    assert folded.outcome is Outcome.FOLDED
+    assert folded.incident_id == opened.incident_id
+    row = db.query_one(
+        env.conn, "SELECT severity FROM incidents WHERE id = ?", (opened.incident_id,)
+    )
+    assert row["severity"] == "high"  # the spoken escalation landed
+    _, _, edit_content, edit_card = env.poster.edits[-1]
+    assert "CODE RED" in edit_card.embed["title"]  # re-rendered red
+    assert edit_content == ""  # still no re-mention (constraint 9 / §9.2)
+
+
+async def test_fold_never_lowers_severity(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    opened = await env.engine.report(
+        GUILD, 42, cmd(Intent.HOSTILE_SPOTTED, severity=Severity.HIGH), high(1, "Otanuomi")
+    )
+    env.clock.advance(10)
+    folded = await env.engine.report(
+        GUILD, 43, cmd(Intent.HOSTILE_SPOTTED, severity=Severity.NONE), high(1, "Otanuomi")
+    )
+    assert folded.outcome is Outcome.FOLDED
+    row = db.query_one(
+        env.conn, "SELECT severity FROM incidents WHERE id = ?", (opened.incident_id,)
+    )
+    assert row["severity"] == "high"  # a lower colour never downgrades
+
+
+# ── FORMUP durability ────────────────────────────────────────────────────────
+
+
+async def test_formup_excluded_from_stale_sweep(make_env: Callable[..., Env]) -> None:
+    """A rally card legitimately sits quiet until fires_at — it must not grey
+    out 20 minutes in while its countdown timer is still live."""
+    env = make_env()
+    out = await env.engine.report(
+        GUILD, 42, cmd(Intent.FORMUP, detail="four hours"), high(1, "Otanuomi")
+    )
+    assert out.outcome is Outcome.POSTED
+    env.clock.advance(2 * 3600)  # far past stale_after_min = 20
+    assert await env.engine.sweep_stale() == []
+    row = db.query_one(env.conn, "SELECT status FROM incidents WHERE id = ?", (out.incident_id,))
+    assert row["status"] == "ACTIVE"
+
+
+async def test_formup_post_failure_rolls_back(make_env: Callable[..., Env]) -> None:
+    """PostError symmetry with _open_incident: a failed form-up post leaves no
+    orphaned ACTIVE row and no countdown timer — and the pilot hears it."""
+    from cortana.types import PostError
+
+    env = make_env()
+
+    async def dead_post(*args: Any, **kwargs: Any) -> tuple[int, int]:
+        raise PostError("403 Forbidden")
+
+    env.poster.post = dead_post  # type: ignore[method-assign]
+    out = await env.engine.report(
+        GUILD, 42, cmd(Intent.FORMUP, detail="fifteen minutes"), high(1, "Otanuomi")
+    )
+    assert out.outcome is Outcome.REJECTED
+    assert out.utterance == "Discord post failed."
+    assert db.query(env.conn, "SELECT * FROM incidents") == []
+    assert db.query(env.conn, "SELECT * FROM timers") == []
+
+
+# ── MEDIUM-tier destructive actions ask instead of acting (GDD §8.3) ─────────
+
+
+async def test_medium_tier_resolve_asks_instead_of_acting(
+    make_env: Callable[..., Env],
+) -> None:
+    """A borderline 'clear <system>' must not grey out incidents in a guessed
+    system: destructive actions need HIGH; MEDIUM speaks a confirm question —
+    the same ASKED outcome uncertain reports use."""
+    env = make_env()
+    opened = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    env.clock.advance(60)
+    out = await env.engine.report(GUILD, 43, cmd(Intent.RESOLVE), medium())
+    assert out.outcome is Outcome.ASKED
+    assert out.utterance == "Heard Otanuomi — say again to confirm."
+    row = db.query_one(env.conn, "SELECT status FROM incidents WHERE id = ?", (opened.incident_id,))
+    assert row["status"] == "ACTIVE"  # nothing was resolved on a guess
+    log_row = db.query_one(
+        env.conn, "SELECT tier, outcome FROM command_log WHERE parsed_intent = 'RESOLVE'"
+    )
+    assert log_row is not None
+    assert log_row["outcome"] == "ASKED"
+    assert log_row["tier"] == "MEDIUM"
+
+
+async def test_medium_tier_timer_and_formup_ask_instead_of_acting(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env()
+    timer = await env.engine.report(GUILD, 42, cmd(Intent.TIMER, detail="four hours"), medium())
+    assert timer.outcome is Outcome.ASKED
+    assert timer.utterance == "Heard Otanuomi — say again to confirm."
+    assert db.query(env.conn, "SELECT * FROM timers") == []
+
+    formup = await env.engine.report(
+        GUILD, 42, cmd(Intent.FORMUP, detail="fifteen minutes"), medium()
+    )
+    assert formup.outcome is Outcome.ASKED
+    assert db.query(env.conn, "SELECT * FROM incidents") == []
+    assert env.poster.posts == []
+
+
+def test_rules_path_resolver_is_reread_on_every_load(tmp_path: Path) -> None:
+    """routing.file is ENGINE-reload class: the engine resolves the
+    routing.yaml location through its resolver on EVERY (re)load, never a
+    path baked at construction — a /reload after a routing.file edit must
+    pick up the new file, not silently keep reading the old one."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    holder = StubHolder(make_config())
+    path_a = tmp_path / "a.yaml"
+    path_b = tmp_path / "b.yaml"
+    path_a.write_text(RULES_YAML, encoding="utf-8")
+    path_b.write_text("rules: []\n", encoding="utf-8")
+    active = {"path": path_a}
+    engine = IncidentEngine(
+        conn,
+        holder,  # type: ignore[arg-type]
+        FakeGazetteer(entries={}),  # type: ignore[arg-type]
+        Discipline(holder),  # type: ignore[arg-type]
+        FakePoster(),
+        lambda: active["path"],
+    )
+
+    assert engine.load_routing_rules(ROLE_IDS.get) == 2
+
+    active["path"] = path_b  # the operator repointed routing.file + /reload
+    assert engine.load_routing_rules(ROLE_IDS.get) == 0

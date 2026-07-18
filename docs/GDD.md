@@ -194,9 +194,9 @@ Every module in the finished system.
 | `config.py` | YAML load, schema validation, hot-reload on SIGHUP |
 | `ipc.py` | UDS server, frame codec, per-user stream demux, Ears liveness |
 | `audio/vad.py` | webrtcvad wrapper; utterance endpointing |
-| `audio/wake.py` | openWakeWord instances, per-user state, score thresholds |
+| `audio/wake.py` | openWakeWord instances, per-user state, score thresholds; off-loop spare-model pool, fault latch, stage counters |
 | `audio/capture.py` | Per-user capture state machine: pre-roll ring buffer → wake hit → capture → endpoint → emit; owns the wake refractory period |
-| `audio/stt.py` | `Transcriber` protocol; faster-whisper (default) and whisper.cpp HTTP backends; gazetteer prompt biasing |
+| `audio/stt.py` | `Transcriber` protocol; faster-whisper (default) and whisper.cpp HTTP backends; gazetteer prompt biasing; bounded serialized decode queue + `stt.watchdog_s` hang watchdog |
 | `nlu/grammar.py` | Intent extraction, group-alias extraction, detail capture |
 | `nlu/gazetteer.py` | System load, region pruning, adjacency graph, jump-distance BFS with memo |
 | `nlu/phonetics.py` | Double Metaphone + Levenshtein scoring, alias-table lookup, context priors, confidence tiers |
@@ -213,7 +213,7 @@ Every module in the finished system.
 | `dsc/cogs/ops.py` | `/timer`, `/formup`, `/rollcall`, `/jumps` |
 | `dsc/cogs/admin.py` | `/routing`, `/gazetteer`, `/health`, `/fleetmode` |
 | `dsc/cogs/help.py` | `/help` — interactive help topics; the slash twin of voice "help" |
-| `tts.py` | Piper subprocess, raw→WAV wrapping, utterance queue, length cap |
+| `tts.py` | Piper subprocess, raw→WAV wrapping, priority-ordered utterance queue (ALERT ahead of queued NORMAL), length cap |
 | `health.py` | Heartbeats, degradation detection, `#bot-health` reporting |
 | `voice_gateway.py` | Voice-state watch, auto-join/leave, Ears join/leave commands |
 
@@ -222,7 +222,8 @@ Every module in the finished system.
 | Path | Contents |
 |---|---|
 | `/opt/cortana/models/wake/` | openWakeWord ONNX chain (melspec → embedding → wakeword) |
-| `/opt/cortana/models/whisper/` | Whisper `small` int8 CTranslate2 weights |
+| `/var/lib/cortana/hf/` | Whisper `small` int8 CTranslate2 weights — the Hugging Face cache shared between install.sh's prefetch and the service (`Environment=HF_HOME`), so a size-name `stt.model` never re-downloads at runtime |
+| `/opt/cortana/models/whisper/` | Hand-installed weights for a *path-based* `stt.model` only (unused by the shipped `model: small`) |
 | `/opt/cortana/models/piper/` | Piper voice `.onnx` + `.onnx.json` |
 | `/etc/cortana/cortana.yaml` | Main configuration (§16) |
 | `/etc/cortana/routing.yaml` | Subscription rules (§12) |
@@ -253,7 +254,8 @@ Songbird VoiceTick (20ms, per-user decoded PCM 48kHz)
        │        │ hit
        │        ▼
        │   capture window opens
-       │   (300ms pre-roll + speech until 400ms silence, hard cap 6s)
+       │   (pre-roll seed + speech until the dialog wheel's wall-clock
+       │    endpoint fires; frame-counted hard cap as the backstop — §5.4)
        │        │
        │        ▼
        │   STT — gazetteer-biased
@@ -298,6 +300,30 @@ The phrase is configurable. The 6-phoneme / no-collision rule is not optional �
 
 **Gazetteer biasing** is applied on every call: the active system list is passed as Whisper's `initial_prompt`, pulling decoding toward real system names instead of English word salad.
 
+### 5.4 The dialog engine — one state machine, one clock, one door
+
+Everything conversational — say-again retries, the "code *colour*" opener, the bare "command override" question flow, endpointing, timeouts — runs through **one per-user state machine** (`brain/cortana/dialog/`). This section is the contract; the transition function is pure and table-tested against it.
+
+*History note: dialog state used to be five independent wall-clock dicts plus a frame-counted reopen window. Discord DTX sends no packets during silence, so the frame-counted half could never expire while the meaning half aged out on its own clock — the direct cause of the say-again loop, stuck-open wake-free windows, and mid-question interruption incidents. This design replaces that, and its three rules are what make those classes unreachable.*
+
+**States.** `IDLE → LISTENING (capture open) → THINKING (STT/engine) → IDLE`, plus four `AWAIT_*` states in which a wake-free window is armed: `AWAIT_REPEAT` (say-again), `AWAIT_RETRY_SYSTEM` (§8.3 LOW-tier rebind), `AWAIT_SEVERITY_REPORT` (§6.4 code opener), `AWAIT_OVERRIDE_QUESTION` (§6.6).
+
+**Rule 1 — one door.** The machine's `fail()` / `open_subdialog()` helpers are the *only* code paths that can arm a wake-free capture window. Every failure class — STT error, unmatched speech, low-confidence transcript, override noise, LOW-tier rejection — flows through the same door and draws on one per-dialog **retry budget** (`dialog.max_retries`, default 2, shared with deliberate subdialog openers). Only a fresh wake refills the budget; exhaustion always terminates *audibly* ("Standing down. Wake me to retry."). A self-sustaining reopen loop is structurally impossible, not merely guarded against.
+
+**Rule 2 — one clock.** All dialog timing lives in the engine's 100 ms wheel on the event loop's monotonic clock: DTX-tolerant utterance endpointing (`max(capture.endpoint_silence_ms, dialog.endpoint_gap_floor_ms)` of packet silence, gated by `dialog.ack_grace_ms` after any prompt), armed-window expiry (`dialog.window_ms` of real time, frames or no frames), and the `AWAIT_*` TTLs (same deadline as their window). The capture layer keeps exactly one frame-counted duration — the hard cap — because frames flow while a pilot is actually talking.
+
+**Rule 3 — generation tokens.** Every window arm and capture open mints/carries a generation token; emissions, STT results, and deadlines are dropped when their token is stale instead of being misattributed to a newer dialog. Pending context (an inherited severity, a retry rebind, an open override question) lives *in the session* and is consumed by the utterance its window actually captured — STT latency can never expire it mid-flight.
+
+Further contract points:
+
+- A capture that sees **zero speech frames** after opening (a wake-word tail and nothing else) is discarded before STT: no decode, no "Say again?", no retry spent, and the buffer is dropped at the capture layer (constraint 5).
+- A window-opened capture never plays the wake acknowledgement — the prompt that armed the window *was* the acknowledgement.
+- An inherited severity ("code orange" → next utterance) marks the continuation **severity-carrying but not framed**: it must still pass `relay_framed()` or parse as a command. Hallucinated noise can no longer mint a coloured card.
+- Override continuations are confidence-gated (`stt.relay_min_logprob`) before any paid API call.
+- Sessions are purged redundantly — IPC `left`, `on_voice_state_update` (authoritative; survives an Ears outage), and wholesale on every Ears `hello` — so no single restarting component can strand a wake-free window.
+
+Config: the optional `dialog:` section (`window_ms`, `ack_grace_ms`, `endpoint_gap_floor_ms`, `max_retries`) — §16. The timing defaults are the values tuned on live fleet audio; expect them to move.
+
 ---
 
 ## 6. Voice command reference
@@ -340,7 +366,7 @@ The callsign commands are a **name registry keyed on the Discord user id** Ears 
 |---|---|
 | "miners only" | Routes to `@Miners` alone |
 | "defense only" | Routes to `@Home-Defense` alone |
-| "all hands" | `@here` + every subscribed role, regardless of severity |
+| "all hands" | Every subscribed role, regardless of severity — and it *requests* `@here`, granted only when the report is `UNDER_ATTACK` or `ASSIST_REQUEST` (constraint 11; the request passes the same `decide_mentions()` clamp as everything else, §11.1) |
 
 Group aliases are configurable but deliberately few. Every alias added is another token the recogniser can confuse with a system name. Four is the recommended ceiling.
 
@@ -352,9 +378,12 @@ Anything after the system and group is captured verbatim into the incident body:
 
 The card labels (CODE RED / CODE ORANGE / CODE YELLOW, §9.1) are also **input**: a pilot can speak the colour to set or override severity.
 
-- **Inline** — *"code red, hostiles in UMI"*: the report parses normally and carries `severity=high`; the card renders CODE RED and, when `high` is in `here_on_severity`, fires the colour-based `@here` (§11.3). The colour phrase is stripped before intent matching, so *"code red"* can never be misread as a "reds" sighting.
+A colour code changes what the card **says** — its severity, colour, and readback. Whether anything gets **pinged** is decided separately, by exactly one function: `decide_mentions()` (`brain/cortana/core/routing.py`), the single escalation authority every mention flows through (§11.1). Constraint 11 always wins there: `@here` fires **only** for `UNDER_ATTACK` and `ASSIST_REQUEST`. A colour code can *request* an `@here` (via `discord.here_on_severity`, §16), but the request is clamped to those two types — a severity code on a sighting, and a freeform relay of any colour, can never `@here`.
+
+- **Inline** — *"code red, hostiles in UMI"*: the report parses normally and carries `severity=high`; the card renders CODE RED and subscribed roles are mentioned per the routing rules — but a sighting is not an escalatable type, so no `@here`. On an under-attack or help-me report, `high ∈ here_on_severity` fires the colour-based `@here` even with zero routing rules wired up, and it always lands in `#intel-alerts` (the channel is recomputed after every escalation decision — `@here` can never fire into `#intel-live`). The colour phrase is stripped before intent matching, so *"code red"* can never be misread as a "reds" sighting.
 - **Standalone (dialogue)** — *"code orange"* alone: CORTANA replies *"Code orange. Go ahead."*, reopens a wake-free capture window (the §8.3 mechanism), and the pilot's next utterance — report or freeform relay — inherits the severity. An inline colour on the follow-up wins over the opener.
-- **Relays** — a colour on a freeform relay colours the relay card and rides the same `here_on_severity` escalation: *"code red, blop fleet inbound"* pings like any CODE RED.
+- **Relays** — a colour on a freeform relay colours the relay card **only**: *"code red, blop fleet inbound"* posts a red relay card but never pings by colour (constraint 11 — a relay is not an incident type). An *"all hands"* phrase mentions every subscribed role (gated on the speaker's @Pilot standing), never `@here`. A mention-free relay posts to `#intel-live`, the quiet feed (§11.2).
+- **Folds** — a colour spoken on a duplicate report **raises (never lowers)** the live card's severity on the fold re-render, so a spoken escalation is never silently dropped; the fold's no-re-mention rule (§9.2) is untouched — severity display and mention policy are separable.
 
 Mapping: red → high, orange → medium, yellow → none/info. A leading *"report"* and a trailing *"end report"* / *"end of report"* / *"end transmission"* are radio-procedure framing and are stripped (*"report, I've been tackled in UMI, end report"*).
 
@@ -396,10 +425,11 @@ Full parity. Every voice command routes to the same engine.
 
 | Command | Purpose |
 |---|---|
-| `/hostiles system detail` | Report a sighting |
-| `/under-attack system detail` | You are under attack — tackled or taking damage |
-| `/help-me system detail` | High-severity assist request |
-| `/camp system detail` | Report a gate camp |
+| `/hostiles system detail [code] [audience]` | Report a sighting |
+| `/under-attack system detail [code] [audience]` | You are under attack — tackled or taking damage |
+| `/help-me system detail [code] [audience]` | High-severity assist request |
+| `/camp system detail [code] [audience]` | Report a gate camp |
+| `/relay message [code] [audience]` | Freeform intel relay, posted verbatim — twin of the voice relay (§8.6); never `@here` |
 | `/clear system` | Resolve an incident |
 | `/status` | Active incidents summary |
 | `/help [topic]` | Interactive help: main page + topic pages (reporting, responding, subscriptions, identity, ops, privacy, admin) via a select menu; twin of voice "help" |
@@ -424,10 +454,12 @@ Full parity. Every voice command routes to the same engine.
 | `/register callsign` | Register my pilot callsign, exactly as typed (fixes STT misspellings) |
 | `/unregister` | Delete my registered callsign |
 | `/whoami` | Show my registered callsign |
-| `/routing` | *(admin)* Manage subscription rules |
+| `/routing` | *(admin)* Manage subscription rules | `code: red\|orange\|yellow` and `audience: miners\|defense\|all-hands` parameters on the report commands and `/relay` are the typed twins of the spoken colour codes (§6.4) and group aliases (§6.2) — they map onto the exact `ParsedCommand.severity` / `ParsedCommand.group_alias` fields the voice grammar fills, so severity and group targeting survive a voice outage too (constraint 10).
 | `/gazetteer` | *(admin)* Reload / inspect / prune systems |
 | `/fleetmode` | *(admin)* Restrict voice triggering to FC role |
 | `/health` | *(admin)* Pipeline status, STT confidence, incident counts |
+
+The optional `code: red|orange|yellow` and `audience: miners|defense|all-hands` parameters on the four report commands and `/relay` are the typed twins of the spoken colour codes (§6.4) and group aliases (§6.2) — they map onto the exact `ParsedCommand.severity` / `ParsedCommand.group_alias` fields the voice grammar fills, so severity and group targeting survive a voice outage too (constraint 10).
 
 ---
 
@@ -527,6 +559,8 @@ Levenshtein on raw text alone is the wrong tool: STT errors are **phonetic, not 
 | **Medium** | `top1 ≥ 0.55` | **Post anyway**, flagged uncertain, with buttons `[Otanuomi] [Kisogo] [Wrong — fix]`. Speak *"Hostiles Otanuomi — say again to confirm."* Speed beats certainty when a pilot is in structure; get the ping out and let humans correct it. |
 | **Low** | below | Do not post. Speak *"Say again the system."* Reopen the capture window for 4s. A bare system name spoken into the reopened window is re-bound to the rejected command's intent and resolved as its system. |
 
+**Destructive and scheduling commands need HIGH.** The tier table above governs *reports*, which post-anyway because speed beats certainty. `clear`, `timer`, and `form up` act irreversibly on a *specific* system — resolving the wrong system's incidents or scheduling a rally in the wrong place has no undo — so they act only on a High-tier match. A Medium match answers *"Heard Otanuomi — say again to confirm."* (the same ASKED outcome as an uncertain report) and does nothing; the pilot repeats the command, and a confirmed hearing resolves High. Low still gets *"Say again the system."*
+
 **Spoken readback.** When the pilot spoke a colour code, the confirmation reads the report back — *"Under attack UMI, code red, posted."* — so they hear exactly what the card says without looking at Discord. Combined with the catch-all posture (§8.6) this is the contract for misheard systems: **the action always continues**; the card carries the heard name verbatim, the readback surfaces it, and *"cancel"* (30s) or **[Wrong — fix]** repairs it.
 
 ### 8.4 Context priors
@@ -591,13 +625,15 @@ Incident
 - Five pilots reporting the same gate camp produce **one** card reading *"reported by 5"* — not five pings.
 - *"Hey Cortana, clear Otanuomi"* edits that card to ✅ **RESOLVED** and greys it out.
 - Someone scrolling back reads **state**, not archaeology.
-- No updates for 20 minutes → auto-marked **STALE**, silently.
+- No updates for 20 minutes → auto-marked **STALE**, silently. Form-ups are exempt: a rally card legitimately sits quiet until it fires — its staleness is anchored by its countdown timer (§13), not by update chatter.
 
 ### 9.2 Dedupe rule
 
 > Same system + same type + within 90 seconds → **fold into the existing incident**, increment the reporter count, **do not re-mention**.
 
 This one rule is the primary defence against notification fatigue.
+
+A fold **raises but never lowers** severity: a spoken colour on the duplicate (*"code red, hostiles UMI"* folding into a plain sighting) turns the card red on the re-render instead of being silently discarded. Severity display and mention policy are separable — the escalated fold still re-mentions nobody.
 
 ### 9.3 Response loop
 
@@ -666,18 +702,20 @@ If CORTANA is annoying for one week, the corp mutes `#intel-alerts` and the proj
 ### 11.1 Layered defences
 
 1. **Dedupe window** (§9.2) — one incident, one mention.
-2. **Per-user cooldown** — 30s between mentions from the same pilot. A panicking player cannot ping six times.
-3. **Escalation discipline** — `@here` is reserved for `UNDER_ATTACK` and `ASSIST_REQUEST`. Sightings never `@here`. Ever.
-4. **Permission gate** — only members holding `@Pilot` can trigger a mention. The new guy cannot experiment at 03:00.
+2. **Per-user cooldown** — 30s between mentions from the same pilot. A panicking player cannot ping six times. Charged only after a post actually succeeds — a failed post never runs a cooldown or feeds the breaker.
+3. **Escalation discipline** — `@here` is reserved for `UNDER_ATTACK` and `ASSIST_REQUEST`. Sightings never `@here`. Severity codes never earn it for any other type (§6.4). Freeform relays never `@here`. Ever.
+4. **Permission gate** — only members holding `@Pilot` can trigger a mention. The new guy cannot experiment at 03:00. The gate result is threaded all the way into the escalation decision, so no engine path (relay escalation included) can mint a mention the caller wasn't entitled to.
 5. **Global circuit breaker** — more than *N* mentions in *M* minutes → CORTANA stops mentioning, posts **flood control active**, and keeps logging incidents silently. Something is wrong; do not amplify it.
 6. **Quiet hours** per role.
+
+**One authority.** Layers 3, 4, and 6 — plus group aliases, `here_on_severity`, silent mode (`mentions_enabled`), the personal-ping user list, and the channel choice — are computed in exactly one pure function: `decide_mentions()` in `brain/cortana/core/routing.py`. Every card post and every relay flows through it; the discipline layer (2, 5) may only *suppress* its decision, never widen it. The Poster then sends `AllowedMentions` as an explicit allowlist built verbatim from the decision — the listed role ids, the listed user ids (never `users=True`), and `everyone` only when the decision granted `@here`. Two properties are therefore structural, not guarded per-path: `@here` cannot occur outside the two escalatable types, and `@here` (or any mention) cannot occur in `#intel-live` — the channel is recomputed from the final mention set.
 
 ### 11.2 Two channels
 
 | Channel | Contents |
 |---|---|
-| `#intel-live` | Every incident that mentions nobody. The quiet feed, for people who want it. |
-| `#intel-alerts` | Only incidents that mention a role. |
+| `#intel-live` | Everything that mentions nobody — incidents and freeform relays alike. The quiet feed, for people who want it. |
+| `#intel-alerts` | Only cards that mention someone (a role, `@here`, or a personal-ping subscriber). |
 
 Let people choose their own volume. An incident card lives in exactly one of
 the two channels — one incident is one message, edited in place (§9.1), never
@@ -686,6 +724,25 @@ mirrored or reposted.
 ### 11.3 Health channel
 
 `#bot-health` receives hourly self-reports: pipeline status, STT confidence distribution, incident counts, mention counts, wake-word false-accept estimate.
+
+**Alarm cards.** Every "I dropped something the corp expects" event flows through the AlarmBus (`brain/cortana/alarms.py`) and appears in `#bot-health` as **one edited-in-place card per active `(code, key)`** — the incident-card invariant (§9.1) applied to operations. A card shows first-seen, last-seen, an occurrence count, and a phone-readable fix hint; repeats edit the card, and on recovery it is edited to a ✅ *resolved* state rather than deleted, so the operator sees that it broke *and* that it healed. Card message ids are persisted in `app_state` (key `alarm:<code>:<key>`), so a Brain restart re-adopts the existing card — restarts never duplicate cards, and an alarm raised before the restart (e.g. `CONFIG_RESTART_PENDING`) is resolved on the same card after it. Raising an alarm before Discord is ready is safe: the card queues dirty and is flushed from the health loop once the bot is up. Every raise/clear is mirrored to journald **code-first** — the structured log *event* is the alarm code, so `journalctl -u cortana-brain | grep EARS_DOWN` works.
+
+The alarm codes are a **closed** enum — a failure class earns a code or it does not get raised:
+
+| Code | Meaning | Raised by / cleared when |
+|---|---|---|
+| `ROUTING_ZERO_RULES` | Zero routing rules active (guild missing, routing.yaml rejected, or genuinely empty) — cards post, nobody is mentioned | rule load at `on_ready` and every reload; cleared when >0 rules load |
+| `ROLE_UNRESOLVED` | routing.yaml names roles that don't exist in the guild; those rules are skipped | rule load; cleared when all names resolve |
+| `CHANNEL_UNWRITABLE` | A configured channel can't be posted to (keyed by channel id) | composition-root channel sends; cleared on the next successful send |
+| `WAKE_FAULTED` | Wake model pool latched after a build failure — frames flow, nothing is scored | health check on the wake fault latch; cleared on rebuild |
+| `STT_DEGRADED` | Transcription degraded: `watchdog` key = respawn-cap latch (cleared by `/reload`/restart); `confidence` key = §20's 10-consecutive-LOW streak | health checks; cleared on unlatch / next confident resolution |
+| `EARS_DOWN` | Ears heartbeat missed or never seen — voice is down, slash path unaffected | health check; cleared on heartbeat recovery or the next Ears `hello` |
+| `CONFIG_RESTART_PENDING` | Restart-class config keys edited but not live | the reload transaction; cleared by a reload with none pending, or by the restart itself |
+| `TREE_SYNC_STALE` | Slash-command sync failed; the previous sync keeps serving | the background tree sync; cleared on the next successful/skipped sync |
+| `TIMER_UNDELIVERED` | A fired timer ping could not be posted to `#intel-alerts` | the timer announcer; cleared on the next delivered ping |
+| `INTERACTION_ERRORS` | A command/component handler failed repeatedly (keyed by command name; card after 3 failures) | the interaction error boundary |
+| `POST_FAILURE` | An incident card post/edit failed (permissions, deleted channel) | the Poster; cleared on the next successful post |
+| `VOICE_ABSENT` | No audio for `health.voice_silence_alarm_s` while Ears is connected and ≥2 unmuted pilots are present (§20 row 1) | health check; cleared when audio flows |
 
 ### 11.4 Fleet-ops mode
 
@@ -743,8 +800,9 @@ Personal-ping type words pluralize naturally: *hostiles*, *attacks*, *assist req
 
 ### 12.2 Speaking rules
 
-- **Never speak over a high-severity report in progress.** If VAD reports active speech, queue.
+- **Never speak over a high-severity report in progress.** If VAD reports active speech, queue. A non-alert utterance still blocked after **3 s** of continuous human speech is **dropped** (logged), never played late — a 3-seconds-stale "Go ahead." spoken over an FC mid-report is worse than none. Alerts always play.
 - Duck to 60% volume. CORTANA is not the FC. The duck level and talk-over suppression are fixed playback mechanics in Ears (`ears/src/playback.rs`), not config knobs.
+- Playback state (queue, playing slot, hold timer) and the speech-activity clock are **per guild** — speech in one voice call never gates or delays TTS in another.
 - Hard cap **3 seconds** per utterance. Information-carrying replies that do not fit go to the channel instead; **acknowledgement lines never do** — an unspoken ack ("Say again?", "Standing down…") is logged and dropped, because a retry prompt pasted into the intel channel is noise.
 - `/mute-voice` per user. Some pilots will hate this. They can silence it without leaving.
 
@@ -963,146 +1021,185 @@ CREATE INDEX idx_cmdlog_at ON command_log(at);
 
 ---
 
-## 15. IPC protocol
+## 15. IPC protocol (v2)
 
 Framed messages over `/run/cortana/cortana.sock`. **Brain binds; Ears connects and reconnects with backoff.** This ordering matters: it means Ears buffers when Brain restarts, rather than the reverse.
 
 ```
 Frame:  [4-byte BE length][1-byte type][body]
+        length = 1 + len(body)  (counts every byte after the length field)
 
 type 0x01  JSON control   (UTF-8)
 type 0x02  Audio          Ears→Brain
-           [8B user_id LE][8B guild_id LE][i16 LE PCM, 16kHz mono]
+           [8B user_id LE][8B guild_id LE]
+           [8B captured_at ms-since-epoch LE][i16 LE PCM, 16kHz mono]
 type 0x03  TTS            Brain→Ears
            [8B guild_id LE][1B priority][WAV bytes]
 ```
 
-### Control messages
+### 15.1 Version handshake
+
+Both binaries embed an **IPC protocol version** constant (`IPC_PROTOCOL_VERSION`, currently **2** — `ears/src/ipc.rs` and `brain/cortana/ipc.py`, bumped in lockstep, same commit, always). The first frame on every connection is Ears' `hello`, carrying it as `proto`:
+
+```jsonc
+{ "t": "hello", "proto": 2, "version": "1.0.0" }   // version = ears build (Cargo)
+```
+
+On mismatch (or a missing `proto` — a pre-v2 Ears) Brain logs `ipc_protocol_mismatch` loudly and **refuses the client**; Ears keeps retrying with backoff, so a desynced deploy is noisy on both sides and works on neither. `cortana-ears --version` prints both the build and protocol versions so an operator can confirm a matched pair. Brain drops any frame that arrives before a valid `hello`.
+
+### 15.2 Audio timestamps and the age gate
+
+Ears stamps every 0x02 frame with the wall-clock capture time at receipt (`captured_at`, ms since epoch). Ears applies no judgement to it — it just stamps the truth. **Brain age-gates**: frames older than `MAX_AUDIO_AGE_S` (3 s, `brain/cortana/ipc.py`) are dropped before they reach wake/capture. Ears buffers up to 60 s of audio through a Brain outage and flushes it on reconnect; without the gate that flush would replay stale wake words and feed the wall-clock endpointer a minute of audio arriving in milliseconds.
+
+### 15.3 Control messages
 
 ```jsonc
 // Ears → Brain
-{ "t": "hello",     "version": "1.0" }
+{ "t": "hello",     "proto": 2, "version": "1.0.0" }        // first frame, always
+{ "t": "snapshot",  "guilds": [                              // immediately after hello
+    { "guild_id": "…", "channel_id": "…" /* or null */,
+      "connected": true,
+      "users": [ { "ssrc": 12345, "user_id": "…" }, … ] } ] }
 { "t": "speaking",  "user_id": "…", "guild_id": "…", "state": "start" }
 { "t": "left",      "user_id": "…", "guild_id": "…" }
+{ "t": "join_ok",   "guild_id": "…", "channel_id": "…" }
+{ "t": "join_failed", "guild_id": "…", "channel_id": "…", "reason": "…" }
+{ "t": "driver_disconnected", "guild_id": "…",
+  "kind": "connect" /* | "reconnect" | "runtime" */, "reason": "…" }
 { "t": "heartbeat", "ticks": 15021, "active_ssrcs": 4, "connected": true }
 
 // Brain → Ears
 { "t": "join",    "guild_id": "…", "channel_id": "…" }
 { "t": "leave",   "guild_id": "…" }
 { "t": "optouts", "user_ids": ["…", "…"] }   // enforced in Ears, pre-IPC
+{ "t": "hb_ack" }                            // answer to every heartbeat
 ```
 
-Brain replays the current `join` (and the opt-out set) the moment Ears
-(re)connects. A freshly started Ears process reaches the socket before its
-own Discord gateway is READY, so Ears **holds join/leave commands until
-READY** and executes them then — the Songbird manager cannot create calls
-before serenity initialises it, and acting early would crash the voice
-control task.
+**Snapshot replaces lossy deltas.** Control events generated during an IPC outage are discarded; instead, right after `hello`, Ears sends its full state — per-guild connected flag, joined channel, and the live SSRC↔user roster. Brain reconciles: users it still tracks that Ears no longer sees are purged exactly as if their `left` event had arrived. State is reset only where the views differ.
+
+**Join results are events, not assumptions.** Every `join` command is answered with `join_ok` or `join_failed(reason)`; a voice session dying mid-flight (DAVE crash, 4014, channel deleted) produces `driver_disconnected(kind, reason)`. The retry/rejoin **policy lives in Brain** (`voice_gateway.py` re-schedules a debounced join while pilots remain; `driver_disconnected` is logged and noted in health) — Ears only reports what happened. This implements §20's "DAVE session crash → rebuild with backoff" row.
+
+### 15.4 Replay on (re)connect
+
+Brain replays state the moment Ears (re)connects, **opt-outs first**: on every `hello` Brain unconditionally sends `optouts` before anything else, then the current `join`. Ordering matters because Ears **fails closed** — a fresh Ears process drops ALL audio until the first `optouts` frame of its lifetime is applied (§19), so the sooner it lands, the sooner pilots are heard.
+
+A freshly started Ears process reaches the socket before its own Discord gateway is READY, so Ears **holds join/leave commands until READY** and executes them then — the Songbird manager cannot create calls before serenity initialises it, and acting early would crash the voice control task. `join` is **idempotent**: already connected to the requested guild+channel means Ears answers `join_ok` and touches nothing — in particular it does NOT re-register receive handlers, because the SSRC↔user map lives in per-guild process state and Discord never re-announces mappings mid-session. Only a genuine driver (re)connect, where the SSRCs actually change, may clear attribution state. A routine Brain restart can therefore never deafen the bot.
+
+### 15.5 Buffering, backpressure, and liveness
+
+- **One ring, always on.** Ears' outbound audio ALWAYS flows through the bounded `AudioRing` (60 s / ~1.9 MB, oldest evicted first) — connected or not. A wedged-but-connected Brain costs bounded, observable audio loss, never unbounded memory.
+- **Write deadline.** Every Ears socket write carries a 5 s deadline; a miss marks the connection Lost (Brain stopped reading) and Ears reconnects with backoff.
+- **Inbound liveness.** Brain answers every heartbeat with `hb_ack`, so a healthy link carries Brain→Ears bytes at least every 5 s. Ears treats **20 s without any inbound bytes** as Lost.
+- **Ring flush gated on proof of liveness.** After connecting, Ears sends `hello` + `snapshot` and then HOLDS the ring until Brain's first control frame arrives (in practice the `optouts` replay, within milliseconds). Only then is the buffered audio flushed and the reconnect backoff reset. A crash-looping Brain that accepts the socket and dies before speaking cannot destroy the buffer — Ears escalates backoff as if the connect had failed, ring intact.
+- Brain-side sends (`send_tts`/`send_control`) return a bool: `False` when no Ears client is attached or the write failed. Callers treat `False` as "not spoken/delivered" and fall back to channel text — an Ears outage degrades loudly, never silently.
+
+### 15.6 Preflight
+
+`cortana-ears --check [config]` parses `ears.yaml` (unknown keys still rejected), verifies the credential is readable and the socket directory exists, and constructs the statically linked Opus decoder; exit 0 on success, 78 (`EX_CONFIG`) on config/credential problems. Wired for `ExecStartPre=` so a bad edit fails the restart, not the running service.
 
 ---
 
 ## 16. Configuration reference
 
-`/etc/cortana/cortana.yaml` — hot-reloaded on `SIGHUP`.
+`/etc/cortana/cortana.yaml`. The annotated example (`config/cortana.yaml.example`) is the operator-facing copy; the table below is **generated from the declarative schema** (`brain/cortana/config_schema.py`) by `scripts/gen_config_docs.py`, and CI fails when it drifts — the schema, the example, and this table cannot disagree silently.
 
-```yaml
-discord:
-  token_file: /etc/cortana/token          # 0600, root:aura
-  guild_id: 000000000000000000
-  channels:
-    intel_alerts: 000000000000000000
-    intel_live:   000000000000000000
-    health:       000000000000000000
-  roles:
-    pilot: 000000000000000000          # gate: may trigger mentions
-    fc:    000000000000000000          # gate under fleetmode
-  watch_voice_channels: [000000000000000000]
-  auto_join: true                       # join when a pilot enters, leave when empty
+**Reload classes** (what it takes for an edit to reach live behaviour): `hot` — live on `systemctl reload cortana-brain`; `sighup` — applied by an explicit step in the reload transaction; `engine` — rebuilds the gazetteer/routing engine on reload; `restart` — bound at startup, reported as "restart pending" by the reload receipt, never silently absorbed. Validate any edit before restarting with `python -m cortana.doctor --config <file>`.
 
-wake:
-  model:  /opt/cortana/models/wake/hey_cortana.onnx   # the phrase is baked into the model
-  threshold: 0.55
-  refractory_ms: 2000
-  ack: beep                             # voice = speak "Go ahead." | beep = tone | none
+<!-- BEGIN GENERATED CONFIG TABLE (scripts/gen_config_docs.py) -->
 
-capture:
-  preroll_ms: 300
-  endpoint_silence_ms: 400
-  max_utterance_ms: 6000
-  vad_aggressiveness: 2                 # webrtcvad 0–3
+| Key | Type | Default | Reload | Purpose |
+|---|---|---|---|---|
+| **`discord:`** | | | | *Guild, channels, role gates, mention policy.* |
+| `discord.token_file` | str | **required** | restart | Dev-fallback token path (0600). Production reads $CREDENTIALS_DIRECTORY/token via systemd LoadCredential= (constraint 12) — the token is never in YAML. |
+| `discord.guild_id` | int | **required** | restart | The corp's guild snowflake. |
+| `discord.channels.intel_alerts` | int | **required** | hot | Channel for incidents that mention a role (GDD §11.2). |
+| `discord.channels.intel_live` | int | **required** | hot | Channel for every incident, no mentions — the firehose. |
+| `discord.channels.health` | int | **required** | hot | Channel for self-reports and degradation alerts. |
+| `discord.roles.pilot` | int | `0` | hot | Only members with this role may trigger mentions. 0 = gate off. |
+| `discord.roles.fc` | int | `0` | hot | Only this role voice-triggers under fleetmode / uses admin commands without Manage Guild. 0 = gate off. |
+| `discord.watch_voice_channels` | int_list | **required** | hot | Voice channels CORTANA watches / auto-joins. |
+| `discord.auto_join` | bool | `True` | hot | Join when a pilot enters, leave when empty. |
+| `discord.mentions_enabled` | bool | `True` | hot | false = silent mode: post cards, ping nobody. |
+| `discord.here_on_severity` | str_list | `('high',)` | hot | Threat colours that fire @here: high=RED, medium=ORANGE, none=YELLOW (never fires). One of: `high`, `medium`, `none`. |
+| `discord.join_announcement` | str | `'daily'` | hot | §19 consent notice cadence on voice join. One of: `every`, `daily`, `off`. |
+| **`wake:`** | | | | *openWakeWord model and trigger thresholds.* |
+| `wake.model` | str | **required** | sighup | Trained openWakeWord ONNX chain; per-user models are built from it at speaker onset and cached for the process lifetime. |
+| `wake.threshold` | float | **required** | hot | Wake score needed to open a capture window. |
+| `wake.refractory_ms` | int | **required** | hot | Per-user dead time after a wake hit. |
+| `wake.ack` | str | `'beep'` | hot | Wake acknowledgement: spoken, tone, or silent. One of: `voice`, `beep`, `none`. |
+| `wake.vad_threshold` | float | `0.0` | sighup | OPT-IN Silero VAD gate inside openWakeWord (0.0 = off). Applied at model build; the pool rebuilds per-user models live on reload. |
+| **`capture:`** | | | | *Utterance capture windows and VAD mode.* |
+| `capture.preroll_ms` | int | **required** | hot | Ring-buffer audio prepended to each capture. Must fit inside the fixed 1500 ms privacy ring (cross-checked). |
+| `capture.endpoint_silence_ms` | int | **required** | hot | Trailing silence that ends an utterance (wall-clock under DTX). |
+| `capture.max_utterance_ms` | int | **required** | hot | Hard cap on a single capture window. |
+| `capture.vad_aggressiveness` | int | **required** | restart | webrtcvad mode 0 (permissive) – 3 (aggressive); the VadGate is built once at startup. |
+| **`dialog:`** | | | | *OPTIONAL voice dialog engine timing/budgets (GDD §5.4); defaults are the tuned live values.* |
+| `dialog.window_ms` | int | `4000` | hot | Wall-clock lifetime of a wake-free window (say-again retry, code-colour opener, bare command override). DTX-proof: the dialog wheel expires it in real time, frames or no frames. |
+| `dialog.ack_grace_ms` | int | `2000` | hot | Endpoint grace after a capture opens or a prompt is spoken — cue playback plus pilot reaction time. |
+| `dialog.endpoint_gap_floor_ms` | int | `700` | hot | Floor under capture.endpoint_silence_ms for the wall-clock endpoint: DTX drops packets between words; a too-eager gap clips pilots mid-sentence. |
+| `dialog.max_retries` | int | `2` | hot | Wake-free windows per dialog TOTAL (subdialog openers and say-again retries share the budget). Only a fresh wake refills it; exhaustion ends audibly with standing-down. |
+| **`stt:`** | | | | *Speech-to-text backend and relay gates.* |
+| `stt.backend` | str | **required** | restart | Which Transcriber engine to build at startup. One of: `faster-whisper`, `whisper-cpp`. |
+| `stt.model` | str | **required** | restart | Whisper model size or path. |
+| `stt.compute_type` | str | **required** | restart | CTranslate2 quantization. |
+| `stt.cpu_threads` | int | **required** | restart | Inference threads (the droplet has 2 dedicated vCPUs). |
+| `stt.bias_with_gazetteer` | bool | `True` | restart | Pass system names as the Whisper initial_prompt. |
+| `stt.whisper_cpp_url` | str | `'http://127.0.0.1:8080/inference'` | restart | whisper.cpp server endpoint; required (non-empty) only when stt.backend is whisper-cpp (cross-checked). |
+| `stt.watchdog_s` | float | `15.0` | restart | GDD §20 "STT worker hang" watchdog deadline. The whisper-cpp HTTP timeout is derived slightly below it so the socket gives up before the watchdog abandons the worker. |
+| `stt.relay_min_logprob` | float | `-0.9` | hot | Freeform relays below this Whisper confidence are dropped with "Say again" (GDD §8.6); recognised commands are never gated. |
+| `stt.relay_mode` | str | `'framed'` | hot | What unmatched speech may become a relay card (GDD §8.6). One of: `framed`, `open`, `off`. |
+| **`matching:`** | | | | *Phonetic system-name matcher weights (constraint 7).* |
+| `matching.phonetic_weight` | float | **required** | hot | Weight of metaphone similarity (constraint 7). Must sum to 1.0 with text_weight (cross-checked). |
+| `matching.text_weight` | float | **required** | hot | Weight of raw-text Levenshtein similarity. |
+| `matching.tiers.high_min` | float | **required** | hot | top1 >= this (and margin) → post immediately. |
+| `matching.tiers.high_margin` | float | **required** | hot | top1 - top2 must also clear this for HIGH tier. |
+| `matching.tiers.medium_min` | float | **required** | hot | top1 >= this → post flagged uncertain, with buttons. Must be <= high_min (cross-checked). |
+| `matching.priors.recency_weight` | float | **required** | hot | Boost for systems with recent incidents. |
+| `matching.priors.recency_window_min` | int | **required** | hot | How recent counts as recent. |
+| `matching.priors.proximity_weight` | float | **required** | hot | Boost for systems near an active incident. |
+| `matching.priors.proximity_max_jumps` | int | **required** | hot | Beyond this many jumps, no proximity boost. |
+| `matching.priors.reporter_history_weight` | float | **required** | hot | Boost for systems this pilot reports from often. |
+| `matching.priors.home_weight` | float | **required** | hot | Standing boost for home and adjacent systems. |
+| **`incidents:`** | | | | *Dedupe / staleness / cancel windows.* |
+| `incidents.dedupe_window_s` | int | **required** | hot | Same system + type within this window → fold (GDD §9.2). |
+| `incidents.stale_after_min` | int | **required** | hot | No updates for this long → auto-STALE, silently. |
+| `incidents.cancel_window_s` | int | **required** | hot | "hey cortana, cancel" kills the user's last incident inside this. |
+| **`discipline:`** | | | | *Mention cooldowns and the flood breaker.* |
+| `discipline.user_cooldown_s` | int | **required** | hot | Min seconds between mentions from the same pilot. |
+| `discipline.circuit_breaker.max_mentions` | int | **required** | hot | More than this many mentions in window_min → flood control. |
+| `discipline.circuit_breaker.window_min` | int | **required** | hot | The flood-control sliding window, in minutes. |
+| `discipline.personal_pings_max` | int | `10` | hot | Max personal /pingme subscriptions per pilot (GDD §10.3). |
+| **`tts:`** | | | | *Piper synthesis and spoken-line personality.* |
+| `tts.enabled` | bool | `True` | hot | Spoken back-channel on/off. |
+| `tts.voice` | str | **required** | hot | Piper voice model; the sample rate is re-read on config swap. |
+| `tts.binary` | str | **required** | hot | Piper invoked as a subprocess per synthesis (GDD §12). |
+| `tts.max_utterance_s` | float | **required** | hot | Hard cap; longer text goes to the channel instead. |
+| `tts.effect` | str | `'none'` | hot | Post-synthesis effect: chorus+reverb "ship AI" sheen or none. One of: `none`, `holographic`. |
+| `tts.personality` | str | `'standard'` | sighup | Spoken-line flavour; applied by set_personality() in the reload transaction. One of: `standard`, `cortana`, `bratty`. |
+| **`chat:`** | | | | *OPTIONAL "command override" assistant (GDD §6.6); absent = off.* |
+| `chat.enabled` | bool | `False` | sighup | Pilots can say "command override, <question>" (/ask twin). Costs real money per question. |
+| `chat.model` | str | `'claude-haiku-4-5'` | hot | Claude model for override replies. |
+| `chat.api_key_file` | str | `'/etc/cortana/anthropic'` | sighup | Dev fallback ONLY (0600); production reads $CREDENTIALS_DIRECTORY/anthropic via LoadCredential= (constraint 12). The client is rebuilt when the on-disk key changes. |
+| `chat.max_tokens` | int | `300` | hot | Hard cap per answer. |
+| `chat.user_cooldown_s` | int | `10` | hot | Per-pilot throttle — the cost control. |
+| `chat.timeout_s` | float | `25.0` | hot | Wall-clock cap per answer incl. web search. |
+| `chat.web_search` | bool | `True` | hot | Allow one live web search per question. |
+| `chat.answer_channel` | int | `0` | hot | Channel for answers too long to speak. 0 = intel_live. |
+| **`gazetteer:`** | | | | *Active system-set scoping — GDD §8.1.* |
+| `gazetteer.file` | str | **required** | engine | Scope rules file (regions/within_jumps_of/include_all, GDD §8.1). |
+| `gazetteer.home_system` | opt_str | `None` | engine | Anchor for the home-bias prior (§8.4). null/empty = no home system → prior off (nomadic corps, GDD §8.1). |
+| `gazetteer.include_all` | bool | `False` | engine | Nomadic override, mirrors gazetteer.yaml include_all — either being true activates the entire seeded map. |
+| **`routing:`** | | | | *OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.* |
+| `routing.file` | str | `''` | engine | routing.yaml location. Empty (the default) = routing.yaml in the same directory as cortana.yaml. |
+| **`ipc:`** | | | | *The Brain⇄Ears unix socket (GDD §15).* |
+| `ipc.socket` | str | **required** | restart | Brain binds; Ears connects (GDD §15). Bound once at startup. |
+| **`health:`** | | | | *Self-report cadence and degradation alarms.* |
+| `health.report_interval_min` | int | **required** | hot | Cadence of #bot-health self-reports. |
+| `health.voice_silence_alarm_s` | int | **required** | hot | No VoiceTick this long with >= 2 humans present → degraded. |
+| **`database:`** | | | | *SQLite location.* |
+| `database.path` | str | **required** | restart | SQLite (WAL) location; opened once at startup. |
 
-stt:
-  backend: faster-whisper               # or: whisper-cpp
-  model: small
-  compute_type: int8
-  cpu_threads: 2
-  bias_with_gazetteer: true
-  whisper_cpp_url: http://127.0.0.1:8080/inference
-  relay_min_logprob: -0.9               # freeform-relay confidence gate (§8.6)
-  relay_mode: framed                    # framed | open | off (§8.6)
-
-matching:
-  phonetic_weight: 0.6
-  text_weight: 0.4
-  tiers:
-    high_min: 0.80
-    high_margin: 0.12
-    medium_min: 0.55
-  priors:
-    recency_weight: 0.35
-    recency_window_min: 10
-    proximity_weight: 0.25
-    proximity_max_jumps: 5
-    reporter_history_weight: 0.15
-    home_weight: 0.10
-
-incidents:
-  dedupe_window_s: 90
-  stale_after_min: 20
-  cancel_window_s: 30
-
-discipline:
-  user_cooldown_s: 30
-  circuit_breaker:
-    max_mentions: 12
-    window_min: 10
-  personal_pings_max: 10       # per-user cap on /pingme subscriptions (§10.3)
-
-tts:
-  enabled: true
-  voice: /opt/cortana/models/piper/en_US-amy-medium.onnx
-  binary: /usr/local/bin/piper
-  max_utterance_s: 3
-  # Ducking (60%) and talk-over suppression are fixed playback mechanics in
-  # Ears (§12.2) — deliberately not tunables here.
-
-chat:                                   # §6.6 override assistant — off by default
-  enabled: false
-  model: claude-haiku-4-5
-  api_key_file: /etc/cortana/anthropic     # dev fallback; production = LoadCredential
-  max_tokens: 300
-  user_cooldown_s: 10
-  timeout_s: 25
-  web_search: true
-
-gazetteer:
-  file: /etc/cortana/gazetteer.yaml
-  home_system: Otanuomi        # null/empty = no home system → home-bias prior
-                               # off (nomadic corps, §8.1/§8.4)
-  include_all: false           # nomadic override, mirrors gazetteer.yaml's flag;
-                               # either being true activates the whole seeded map
-
-ipc:
-  socket: /run/cortana/cortana.sock
-  # Ears' outbound ring size (buffer_seconds) lives in Ears' own config,
-  # /etc/cortana/ears.yaml (token_file, socket_path, buffer_seconds — see
-  # ears/ears.yaml.example): the ring must survive Brain restarts, so Brain
-  # cannot own that knob.
-
-health:
-  report_interval_min: 60
-  voice_silence_alarm_s: 60
-```
+<!-- END GENERATED CONFIG TABLE -->
 
 `/etc/cortana/gazetteer.yaml` — scope rules over the SDE-seeded tables (§8.1). The
 tables themselves are filled by `python -m cortana.nlu.seed` (k-space New Eden),
@@ -1160,6 +1257,7 @@ Ubuntu 24.04 LTS
 │   └── models/{wake,whisper,piper}/
 ├── /etc/cortana/{cortana.yaml,routing.yaml,gazetteer.yaml,token}
 ├── /var/lib/cortana/cortana.db
+├── /var/lib/cortana/hf/              shared HF cache (whisper weights; HF_HOME)
 ├── /run/cortana/cortana.sock        (tmpfiles.d, mode 0660, root:aura)
 ├── user: aura  (nologin, owns runtime dirs)
 └── ufw: deny incoming, allow SSH only — CORTANA opens no listening ports
@@ -1205,6 +1303,15 @@ piper                  # /usr/local/bin/piper
 | **Secrets** | Token in `/etc/cortana/token`, mode 0600, loaded via `LoadCredential=` in the unit file. Never in the YAML, never in the environment, never in the repo. |
 | **Updates** | `systemctl reload cortana-brain` for config; restart for code. Ears stays connected across Brain restarts. |
 | **Accuracy review** | Weekly `command_log` query: confidence distribution, mismatch rate by system, per-pilot failure rate. Feeds §8 tuning. |
+| **Operator slash commands** | `/botstatus`, `/doctor`, `/reload` (all admin-gated: Manage Guild or the FC role). Slash-only is fine — constraint 10 governs the voice→slash direction only. |
+
+**`/botstatus`** — one phone-sized embed: Ears heartbeat state and age, voice-channel presence, STT health (watchdog latch / low-confidence degradation), wake pipeline counters and fault state, dialog sessions in flight, incidents in the last hour, fleet-ops mode, uptime, and the active alarm cards (§11.3). Named `botstatus` because `/status` is the voice QUERY intent's slash twin (the pilots' active-incident summary, §7) and cannot be repurposed.
+
+**`/doctor`** — runs the **offline** preflight checks (`cortana.doctor`, §17) in a worker thread and replies with the PASS/WARN/FAIL table ephemerally, chunked when long. Online checks stay CLI-only (`python -m cortana.doctor --online`) — this command exists precisely for when Discord-adjacent things are broken, so it depends on nothing beyond one followup message.
+
+**`/reload`** — the slash twin of SIGHUP. Both doors call the **same** reload transaction (`cortana.reload.reload_all`, wired by the composition root): all three config files validated together, swapped all-or-nothing, hot/sighup keys applied, engines rebuilt, and the receipt (`ReloadResult.summary()`) returned to the admin and posted to `#bot-health`. The transaction also resets the STT watchdog latch and raises/clears `CONFIG_RESTART_PENDING` (§11.3). `/routing reload` and `/gazetteer reload|prune` run through this same transaction, so the three files can never drift apart, and a rejected file always comes back as a receipt line — never an unanswered spinner.
+
+**Journal grammar** — every alarm transition logs with the alarm code as the event name: `journalctl -u cortana-brain -o cat | grep '"event": "EARS_DOWN"'` (or simply `grep EARS_DOWN`). Slash-command sync activity logs as `app_commands_synced` / `app_commands_sync_skipped` / `app_commands_sync_failed`; command-tree syncs run in the background, gated on a payload hash persisted in `app_state`, and never block or kill startup.
 
 ---
 
@@ -1242,13 +1349,14 @@ Because voice receive is undocumented and can break without warning (§2.2), COR
 | Discord breaks voice receive | No `VoiceTick` from anyone for 60s while ≥2 unmuted humans are in channel | Post **⚠️ Voice offline — use `/under-attack`, `/help-me` and `/hostiles`**; keep retrying. **Every slash command and the entire incident engine keep working.** |
 | Voice gateway 4017 | Close code on connect | Loud alert to `#bot-health` — the Songbird version needs updating |
 | DAVE session crash | Session exception | Rebuild, exponential backoff, cap retries, then degrade |
-| STT worker hang | 5s watchdog | Kill, respawn, speak *"say again"* |
+| STT worker hang | `stt.watchdog_s` (default 15s) watchdog on **queue-head service time** — decodes queue (depth 3, drop-oldest) behind one serialized worker, so overload shows up as queue time and never masquerades as a hang | Respawn (max 2 consecutive), speak *"say again"*; past the cap latch **STT degraded** (refuse decodes, alert `#bot-health`) until reload/restart |
 | Sustained low confidence | 10 consecutive low-tier results | Degrade and alert — something is wrong with the audio path |
+| Wake model build fails (bad `wake.model`, broken upgrade) | The model pool latches **faulted**; the wake stage counters (frames seen → scored → inferences → hits) reported to `#bot-health` show frames flowing with nothing scored | Score 0.0 with no per-chunk retry storm, alert `#bot-health`; a wake config change or restart clears the latch |
 | Brain down | Ears' socket write fails | Ears buffers 60s of frames, speaks *"system degraded"*, reconnects |
 | Ears down | Brain heartbeat miss | Post the degraded notice; text path unaffected |
 | Droplet down | External uptime check | `Restart=always` + a page |
 
-**The load-bearing invariant: every voice command has a slash-command twin hitting the same engine.** The voice path is a fast front-end to a system that is complete without it. This is what makes CORTANA survivable on a platform that never promised to support half of it.
+**The load-bearing invariant: every voice command has a slash-command twin hitting the same engine.** The voice path is a fast front-end to a system that is complete without it. This is what makes CORTANA survivable on a platform that never promised to support half of it. The parity surface is total: the freeform intel relay's slash twin is `/relay` (→ `IncidentEngine.broadcast`, the same `decide_mentions` authority), and spoken colour codes / group targeting ride the `code:` / `audience:` parameters on the report commands (§7) — severity and audience survive a voice outage along with the commands themselves.
 
 ---
 

@@ -91,7 +91,9 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "• *“update chase <system>”* → `/chase` — chase mode: retargets "
                 "your live card as the target moves, no new post\n"
                 "• *“status”* → `/status` — active incidents, spoken/ephemeral reply\n"
-                "• *“cancel”* → `/cancel` — retracts your last report (30s window)",
+                "• *“cancel”* → `/cancel` — retracts your last report (30s window)\n"
+                "• anything else you say (freeform intel) → `/relay` — posts it "
+                "verbatim as an intel-relay card; relays never `@here`",
             ),
             (
                 "Colour codes stack inline",
@@ -290,7 +292,9 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "• `/fleetmode on|off` — restrict voice triggering to the FC role "
                 "during structured ops; slash stays open to everyone\n"
                 "• `/health` — pipeline status, STT confidence, incident counts "
-                "(hourly self-reports also land in #bot-health)",
+                "(hourly self-reports also land in #bot-health)\n"
+                "• `/botstatus` · `/doctor` · `/reload` — one-screen ops status, "
+                "offline preflight checks, and the SIGHUP-equivalent config reload",
             ),
             (
                 "Config files (hot-reload: SIGHUP or the reload commands)",
@@ -461,10 +465,14 @@ class HelpTopicSelect(
         return cls(match.string)
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        from cortana.dsc.views import run_component_action
+
         values = self.item.values
         if not values:  # pragma: no cover — a select interaction always has one
             return
-        await dispatch_help_topic(interaction, values[0])
+        await run_component_action(
+            interaction, "help-menu", dispatch_help_topic(interaction, values[0])
+        )
 
 
 # ── the cog ──────────────────────────────────────────────────────────────────

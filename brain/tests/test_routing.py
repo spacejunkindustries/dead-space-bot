@@ -1,7 +1,9 @@
-"""Routing tests — GDD §10/§11. `evaluate` is pure: incident × rules × now × gazetteer."""
+"""Routing tests — GDD §10/§11. `evaluate` and `decide_mentions` are pure:
+incident × rules × now × gazetteer × config in, one decision out."""
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -9,12 +11,14 @@ from pathlib import Path
 import pytest
 
 from cortana.core.routing import (
+    ESCALATABLE_TYPES,
+    MentionDecision,
     PersonalPing,
     QuietHours,
     RoutingConfigError,
     RoutingRule,
     RuleScope,
-    apply_group_alias,
+    decide_mentions,
     evaluate,
     load_group_aliases,
     load_rules,
@@ -27,6 +31,7 @@ from cortana.types import (
     IncidentStatus,
     Intent,
     RoutingDecision,
+    Severity,
     SystemEntry,
 )
 
@@ -274,32 +279,220 @@ def test_quiet_hours_equal_bounds_never_active() -> None:
     assert not qh.active_at(datetime(2026, 7, 17, 8, 0, tzinfo=UTC))
 
 
-# ── group aliases (GDD §6.2) ─────────────────────────────────────────────────
+# ── decide_mentions: the single escalation authority ─────────────────────────
 
 
-def test_all_hands_forces_here_and_every_subscribed_role(gazetteer: FakeGazetteer) -> None:
-    rules = [hd_rule(), MINERS_RULE, ROAM_RULE]
-    base = evaluate(make_incident(Intent.HOSTILE_SPOTTED, 9), rules, NOW, gazetteer=gazetteer)
-    decision = apply_group_alias(base, "all_hands", rules, {})
+def decide(
+    intent: Intent | None,
+    *,
+    severity: Severity | None = None,
+    system_id: int | None = 1,
+    rules: list[RoutingRule] | None = None,
+    personal: tuple[PersonalPing, ...] | list[PersonalPing] = (),
+    group_alias: str | None = None,
+    alias_roles: dict[str, int] | None = None,
+    here_on_severity: tuple[str, ...] = ("high",),
+    mentions_enabled: bool = True,
+    caller_may_mention: bool = True,
+    now: datetime = NOW,
+    gazetteer: FakeGazetteer | None = None,
+) -> MentionDecision:
+    """One call into the authority with the same defaults the config ships."""
+    gaz = gazetteer or FakeGazetteer(
+        entries={
+            1: sys_entry(1, "Otanuomi", "Kisogo-region"),
+            2: sys_entry(2, "Kisogo", "Kisogo-region"),
+            5: sys_entry(5, "Alenia", "Lowsec-North"),
+            9: sys_entry(9, "Hulmate", "Far-Region"),
+        },
+        jumps_map={(1, 2): 1, (1, 5): 7, (1, 9): 4},
+        home=1,
+    )
+    use_rules = rules if rules is not None else [hd_rule(), MINERS_RULE, ROAM_RULE]
+    incident = make_incident(intent, system_id) if intent is not None else None
+    sev = (
+        severity
+        if severity is not None
+        else (INTENT_SEVERITY[intent] if intent is not None else Severity.NONE)
+    )
+    return decide_mentions(
+        intent=intent,
+        severity=sev,
+        now=now,
+        rules=use_rules,
+        incident=incident,
+        gazetteer=gaz,  # type: ignore[arg-type]
+        personal=personal,
+        group_alias=group_alias,
+        alias_roles=alias_roles if alias_roles is not None else {"miners": MINERS_ROLE},
+        here_on_severity=here_on_severity,
+        mentions_enabled=mentions_enabled,
+        caller_may_mention=caller_may_mention,
+    )
+
+
+# The two structural impossibilities (constraint 11 + GDD §11.2), asserted
+# over the full input cross product: every intent (plus the relay pseudo-
+# intent None) × every severity × every here_on_severity config × group
+# aliases × the pilot gate × mentions_enabled × quiet-hours state.
+_ALL_INTENTS: tuple[Intent | None, ...] = (None, *Intent)
+_HOS_CONFIGS: tuple[tuple[str, ...], ...] = (
+    (),
+    ("high",),
+    ("high", "medium"),
+    ("high", "medium", "none"),
+)
+_ALIASES: tuple[str | None, ...] = (None, "miners", "all_hands", "ninjas")
+_QUIET_NOW = datetime(2026, 7, 17, 5, 0, tzinfo=UTC)  # inside ROAM_RULE quiet hours
+
+
+def test_structurally_impossible_escalations_exhaustive() -> None:
+    """@here outside UNDER_ATTACK/ASSIST_REQUEST and @here in #intel-live are
+    impossible for EVERY input combination — not guarded per-path, impossible."""
+    for intent, severity, hos, alias, gate, enabled, now in itertools.product(
+        _ALL_INTENTS,
+        tuple(Severity),
+        _HOS_CONFIGS,
+        _ALIASES,
+        (True, False),
+        (True, False),
+        (NOW, _QUIET_NOW),
+    ):
+        decision = decide(
+            intent,
+            severity=severity,
+            group_alias=alias,
+            here_on_severity=hos,
+            caller_may_mention=gate,
+            mentions_enabled=enabled,
+            now=now,
+        )
+        ctx = f"{intent=} {severity=} {hos=} {alias=} {gate=} {enabled=} {now=}"
+        # Impossibility 1 — constraint 11: @here strictly for the two intents.
+        if decision.here:
+            assert intent in ESCALATABLE_TYPES, ctx
+        # Impossibility 2 — GDD §11.2: @here (any mention) never in #intel-live.
+        if decision.wants_mentions:
+            assert decision.channel is AlertChannel.ALERTS, ctx
+        else:
+            assert decision.channel is AlertChannel.LIVE, ctx
+        # The pilot gate and silent mode always strip everything.
+        if not gate or not enabled:
+            assert not decision.wants_mentions, ctx
+
+
+def test_here_on_severity_fires_only_for_the_two_intents() -> None:
+    """Severity codes request @here; only UNDER_ATTACK/ASSIST_REQUEST get it."""
+    for intent in Intent:
+        decision = decide(intent, severity=Severity.HIGH, here_on_severity=("high",))
+        assert decision.here is (intent in ESCALATABLE_TYPES), intent
+
+
+def test_here_on_severity_without_rules_never_fires_into_live() -> None:
+    """THE regression: a CODE RED matching zero routing rules used to get
+    here=True with the channel still #intel-live. The recomputed channel makes
+    that impossible — @here always lands in #intel-alerts."""
+    decision = decide(Intent.UNDER_ATTACK, severity=Severity.HIGH, rules=[])
+    assert decision.here is True
+    assert decision.role_ids == ()
+    assert decision.channel is AlertChannel.ALERTS
+
+
+def test_severity_code_on_relay_never_here() -> None:
+    """A freeform relay (intent None) can never @here, whatever was spoken."""
+    for severity in Severity:
+        decision = decide(None, severity=severity, here_on_severity=("high", "medium", "none"))
+        assert decision.here is False
+
+
+def test_non_pilot_code_red_gets_nothing() -> None:
+    """The broadcast-bypass class: a non-Pilot 'code red' must never mention."""
+    decision = decide(Intent.UNDER_ATTACK, severity=Severity.HIGH, caller_may_mention=False)
+    assert decision == MentionDecision(
+        role_ids=(), here=False, channel=AlertChannel.LIVE, user_ids=()
+    )
+
+
+def test_quiet_hours_apply_inside_decide_mentions() -> None:
+    decision = decide(
+        Intent.HOSTILE_SPOTTED, system_id=5, rules=[ROAM_RULE], here_on_severity=(), now=_QUIET_NOW
+    )
+    assert decision.role_ids == ()
+    assert decision.channel is AlertChannel.LIVE
+
+
+def test_personal_pings_returned_as_explicit_allowlist() -> None:
+    decision = decide(
+        Intent.GATE_CAMP,
+        rules=[],
+        here_on_severity=(),
+        personal=[ping(100, Intent.GATE_CAMP), ping(101, Intent.GATE_CAMP)],
+    )
+    assert decision.user_ids == (100, 101)
+    assert decision.here is False
+    assert decision.channel is AlertChannel.ALERTS
+
+
+def test_mention_decision_suppressed_strips_everything() -> None:
+    decision = MentionDecision(
+        role_ids=(HD_ROLE,), here=True, channel=AlertChannel.ALERTS, user_ids=(100,)
+    )
+    assert decision.wants_mentions
+    stripped = decision.suppressed()
+    assert stripped == MentionDecision(
+        role_ids=(), here=False, channel=AlertChannel.LIVE, user_ids=()
+    )
+    assert not stripped.wants_mentions
+
+
+# ── group aliases (GDD §6.2) — routed through the same clamp ─────────────────
+
+
+def test_all_hands_on_escalatable_type_gets_roles_and_here() -> None:
+    decision = decide(Intent.UNDER_ATTACK, group_alias="all_hands", here_on_severity=())
     assert set(decision.role_ids) == {HD_ROLE, MINERS_ROLE, ROAM_ROLE}
     assert decision.here is True
     assert decision.channel is AlertChannel.ALERTS
 
 
-def test_alias_restricts_to_single_role(gazetteer: FakeGazetteer) -> None:
-    rules = [hd_rule(), MINERS_RULE]
-    base = evaluate(make_incident(Intent.HOSTILE_SPOTTED, 1), rules, NOW, gazetteer=gazetteer)
-    assert set(base.role_ids) == {HD_ROLE, MINERS_ROLE}
-    decision = apply_group_alias(base, "miners", rules, {"miners": MINERS_ROLE})
+def test_all_hands_on_sighting_mentions_roles_but_never_here() -> None:
+    """all_hands widens the roles; its @here request passes the constraint-11
+    clamp, so a sighting still cannot @here (the unconditional here=True of
+    the old apply_group_alias is gone)."""
+    decision = decide(Intent.HOSTILE_SPOTTED, group_alias="all_hands", here_on_severity=())
+    assert set(decision.role_ids) == {HD_ROLE, MINERS_ROLE, ROAM_ROLE}
+    assert decision.here is False
+    assert decision.channel is AlertChannel.ALERTS
+
+
+def test_all_hands_on_relay_mentions_roles_never_here() -> None:
+    decision = decide(None, group_alias="all_hands", here_on_severity=())
+    assert set(decision.role_ids) == {HD_ROLE, MINERS_ROLE, ROAM_ROLE}
+    assert decision.here is False
+
+
+def test_alias_restricts_to_single_role() -> None:
+    decision = decide(Intent.HOSTILE_SPOTTED, group_alias="miners", here_on_severity=())
     assert decision.role_ids == (MINERS_ROLE,)
     assert decision.channel is AlertChannel.ALERTS
 
 
-def test_unknown_alias_leaves_decision_unchanged(gazetteer: FakeGazetteer) -> None:
-    rules = [MINERS_RULE]
-    base = evaluate(make_incident(Intent.GATE_CAMP, 1), rules, NOW, gazetteer=gazetteer)
-    assert apply_group_alias(base, "ninjas", rules, {"miners": MINERS_ROLE}) == base
-    assert apply_group_alias(base, None, rules, {}) == base
+def test_unknown_alias_keeps_rule_roles() -> None:
+    with_alias = decide(Intent.GATE_CAMP, group_alias="ninjas", here_on_severity=())
+    without = decide(Intent.GATE_CAMP, group_alias=None, here_on_severity=())
+    assert with_alias == without
+
+
+def test_group_alias_preserves_personal_pings() -> None:
+    personal = [ping(100, Intent.HOSTILE_SPOTTED)]
+    restricted = decide(
+        Intent.HOSTILE_SPOTTED, group_alias="miners", here_on_severity=(), personal=personal
+    )
+    assert restricted.user_ids == (100,)
+    all_hands = decide(
+        Intent.HOSTILE_SPOTTED, group_alias="all_hands", here_on_severity=(), personal=personal
+    )
+    assert all_hands.user_ids == (100,)
 
 
 def test_suppress_strips_all_mentions() -> None:
@@ -395,21 +588,6 @@ def test_suppress_strips_personal_pings_too() -> None:
         role_ids=(HD_ROLE,), here=True, channel=AlertChannel.ALERTS, user_ids=(100, 101)
     )
     assert suppress(decision).user_ids == ()
-
-
-def test_group_alias_preserves_personal_pings(gazetteer: FakeGazetteer) -> None:
-    rules = [hd_rule(), MINERS_RULE]
-    base = evaluate(
-        make_incident(Intent.HOSTILE_SPOTTED, 1),
-        rules,
-        NOW,
-        gazetteer=gazetteer,
-        personal=[ping(100, Intent.HOSTILE_SPOTTED)],
-    )
-    restricted = apply_group_alias(base, "miners", rules, {"miners": MINERS_ROLE})
-    assert restricted.user_ids == (100,)
-    all_hands = apply_group_alias(base, "all_hands", rules, {})
-    assert all_hands.user_ids == (100,)
 
 
 # ── rule loading ─────────────────────────────────────────────────────────────

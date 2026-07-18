@@ -23,8 +23,13 @@ like lurking.
 
 Opt-outs are enforced in Ears, before frames cross the IPC boundary
 (CLAUDE.md constraint); this module's job is only to push the current
-``optouts`` table across right after every join and whenever the set
-changes (the ``/optout`` cog calls :meth:`push_optouts`).
+``optouts`` table across — FIRST on every Ears hello (Ears fails closed
+until it arrives), right after every join, and whenever the set changes
+(the ``/optout`` cog calls :meth:`push_optouts`).
+
+Join results come back as ``join_ok`` / ``join_failed`` control events
+(GDD §15); the retry/rejoin judgement lives here in Brain — Ears only
+reports what happened.
 """
 
 from __future__ import annotations
@@ -150,37 +155,139 @@ class VoiceGateway:
                     await self._leave()
 
     async def on_ears_hello(self) -> None:
-        """Ears (re)connected: replay the join and the opt-out set.
+        """Ears (re)connected: push the opt-out set FIRST, then replay the join.
 
         Ears restarts lose all session state; without this replay a Brain
-        that thinks it is joined would sit deaf forever.
+        that thinks it is joined would sit deaf forever. The opt-out push is
+        unconditional and precedes everything else because a fresh Ears
+        process fails CLOSED — it drops all audio until its first ``optouts``
+        frame of the process lifetime arrives (GDD §19, §15).
+
+        The replay announces (``announce=True``): a hello from a genuinely
+        NEW Ears process performs a real voice join, and the §19 consent
+        notice is promised on every join. The cadence gate
+        (:meth:`_announcement_due`) is the one and only spam control — under
+        "daily" it suppresses replay churn, and "every" means exactly that.
         """
         async with self._lock:
+            await self.push_optouts()
             if self._joined_channel_id is not None:
-                # _send_join replays the opt-out set itself, right after the join.
-                await self._send_join(self._joined_channel_id, announce=False)
-            else:
-                await self.push_optouts()
+                await self._send_join(self._joined_channel_id, announce=True)
+
+    async def on_join_ok(self, channel_id: int) -> None:
+        """Ears confirmed a voice join (GDD §15 ``join_ok``)."""
+        log.info("voice_join_confirmed", channel_id=channel_id)
+
+    async def on_join_failed(self, channel_id: int, reason: str) -> None:
+        """Ears reported a failed voice join (GDD §15 ``join_failed``).
+
+        Rejoin policy is judgement and therefore lives HERE, not in Ears:
+        clear the joined state so Brain's view matches reality, then — if the
+        channel still has pilots — schedule another debounced join. Each
+        retry is loudly logged; a persistently failing join repeats at the
+        debounce cadence rather than silently giving up.
+        """
+        async with self._lock:
+            log.error("voice_join_failed", channel_id=channel_id, reason=reason)
+            if self._joined_channel_id == channel_id:
+                self._joined_channel_id = None
+                if self._on_census is not None:
+                    self._on_census(0)
+            if (
+                self._holder.current.discord.auto_join
+                and self._counts.get(channel_id, 0) > 0
+                and self._pending_channel_id != channel_id
+            ):
+                log.info("voice_join_retry_scheduled", channel_id=channel_id)
+                self._schedule_join(channel_id)
+
+    async def on_ears_state(self, connected: bool, channel_id: int | None) -> None:
+        """Reconcile against the per-guild connect state of Ears' snapshot.
+
+        The snapshot (sent right after every ``hello``, GDD §15) is truth
+        about where Ears actually sits; ``_joined_channel_id`` is where Brain
+        believes it told Ears to be. The judgement lives here, not in Ears:
+
+        - Ears parked in a **watched** channel Brain has no record of — an
+          unclean Brain death (only the census path sends ``leave``, and a
+          SIGKILLed Brain never ran it): adopt the channel, so the census
+          seed can drive a normal leave if it emptied during the outage,
+          instead of Ears lurking there forever (§19).
+        - Ears parked in an **unwatched** channel (config changed while
+          Brain was down): leave — lingering looks like lurking.
+        - ``connected`` False while Brain believes joined needs no action
+          HERE: the snapshot always follows a ``hello``, and
+          :meth:`on_ears_hello` already replayed the join before this runs
+          (the serial control consumer preserves that order).
+        """
+        async with self._lock:
+            if not connected or channel_id is None:
+                return  # the hello join replay owns the not-connected case
+            if self._joined_channel_id == channel_id:
+                return  # views agree
+            cfg = self._holder.current.discord
+            if self._joined_channel_id is not None:
+                # Ears sits somewhere else than Brain wants. The hello replay
+                # already re-sent the correct join (Ears will move); log the
+                # divergence loudly rather than double-joining here.
+                log.warning(
+                    "ears_voice_state_divergent",
+                    ears_channel_id=channel_id,
+                    joined_channel_id=self._joined_channel_id,
+                )
+                return
+            if channel_id not in cfg.watch_voice_channels:
+                log.warning("ears_in_unwatched_channel", channel_id=channel_id)
+                self._joined_channel_id = channel_id  # so _leave reports honestly
+                await self._leave()
+                return
+            # Adopt: Brain now tracks the channel Ears is really in.
+            if self._pending_channel_id == channel_id:
+                self._cancel_pending_join()  # no need to join — already there
+            self._joined_channel_id = channel_id
+            log.info("ears_voice_state_adopted", channel_id=channel_id)
+            if channel_id in self._counts and self._counts[channel_id] <= 0:
+                # The channel emptied while Brain was dead and the census
+                # seed already ran — nobody else will ever trigger the leave.
+                await self._leave()
+            elif self._on_census is not None:
+                self._on_census(self._unmuted.get(channel_id, 0))
 
     # ── opt-outs ─────────────────────────────────────────────────────────────
 
-    async def push_optouts(self) -> None:
-        """Push the current ``optouts`` table to Ears (enforced there, pre-IPC)."""
+    async def push_optouts(self) -> bool:
+        """Push the current ``optouts`` table to Ears (enforced there, pre-IPC).
+
+        Returns True when the set was handed to a connected Ears; False means
+        NOT delivered (GDD §15.5) — logged loudly, never claimed as pushed.
+        The failure direction is safe: a Ears process that has not received
+        its first ``optouts`` frame fails closed and drops ALL audio, and
+        every ``hello`` triggers a fresh unconditional push (the retry).
+        """
         rows = await asyncio.to_thread(
             db.query, self._conn, "SELECT user_id FROM optouts ORDER BY user_id"
         )
         user_ids = [str(row["user_id"]) for row in rows]
-        await self._ipc.send_control({"t": "optouts", "user_ids": user_ids})
-        log.info("optouts_pushed", count=len(user_ids))
+        delivered = bool(await self._ipc.send_control({"t": "optouts", "user_ids": user_ids}))
+        if delivered:
+            log.info("optouts_pushed", count=len(user_ids))
+        else:
+            log.warning("optouts_push_undelivered", count=len(user_ids))
+        return delivered
 
     # ── shutdown ─────────────────────────────────────────────────────────────
 
     async def close(self) -> None:
-        """Cancel any pending join and tell Ears to leave."""
+        """Cancel any pending join. Deliberately does NOT send ``leave``:
+        Ears stays in the voice channel across a routine Brain restart
+        (GDD §15.4 — "a routine Brain restart can never deafen the bot"),
+        keeping the DAVE session alive; the fresh Brain's hello replay
+        re-syncs the join state. The only leave door is the census path
+        (channel emptied) plus the snapshot reconcile above."""
         async with self._lock:
             self._cancel_pending_join()
             if self._joined_channel_id is not None:
-                await self._leave()
+                log.info("voice_gateway_closed_still_joined", channel_id=self._joined_channel_id)
 
     # ── internals (call with the lock held) ──────────────────────────────────
 
@@ -214,19 +321,30 @@ class VoiceGateway:
 
     async def _send_join(self, channel_id: int, *, announce: bool) -> None:
         cfg = self._holder.current.discord
-        await self._ipc.send_control(
-            {"t": "join", "guild_id": str(cfg.guild_id), "channel_id": str(channel_id)}
+        delivered = bool(
+            await self._ipc.send_control(
+                {"t": "join", "guild_id": str(cfg.guild_id), "channel_id": str(channel_id)}
+            )
         )
+        # State is set even when the send failed — DELIBERATE: the joined
+        # belief is what makes the next hello replay re-send this join once
+        # Ears is back (GDD §15.4). The log, however, must never claim a
+        # frame Ears did not get (GDD §15.5).
         self._joined_channel_id = channel_id
         if self._on_census is not None:
             self._on_census(self._unmuted.get(channel_id, 0))
-        log.info("voice_join_sent", channel_id=channel_id)
+        if delivered:
+            log.info("voice_join_sent", channel_id=channel_id)
+        else:
+            log.warning("voice_join_undelivered", channel_id=channel_id)
         try:
             await self.push_optouts()
         except Exception:
             # Never let a DB hiccup swallow the §19 consent announcement.
             log.exception("optouts_push_failed", channel_id=channel_id)
-        if announce and await self._announcement_due():
+        # No announcement for a join that never reached Ears: no join
+        # happened. The hello replay announces when it actually lands.
+        if announce and delivered and await self._announcement_due():
             try:
                 await self._announce(channel_id)
             except Exception:
@@ -270,8 +388,16 @@ class VoiceGateway:
 
     async def _leave(self) -> None:
         cfg = self._holder.current.discord
-        await self._ipc.send_control({"t": "leave", "guild_id": str(cfg.guild_id)})
-        log.info("voice_leave_sent", channel_id=self._joined_channel_id)
+        delivered = bool(
+            await self._ipc.send_control({"t": "leave", "guild_id": str(cfg.guild_id)})
+        )
+        if delivered:
+            log.info("voice_leave_sent", channel_id=self._joined_channel_id)
+        else:
+            # Recoverable: with the joined belief cleared below, the snapshot
+            # reconcile after Ears' next hello re-adopts the channel and
+            # re-issues the leave if it is still empty.
+            log.warning("voice_leave_undelivered", channel_id=self._joined_channel_id)
         self._joined_channel_id = None
         if self._on_census is not None:
             self._on_census(0)

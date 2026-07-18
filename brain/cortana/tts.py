@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import math
 import random
@@ -35,7 +36,7 @@ from pathlib import Path
 
 import structlog
 
-from cortana.config import ConfigHolder
+from cortana.config import ConfigHolder, TtsConfig
 from cortana.ipc import PRIORITY_ALERT, PRIORITY_NORMAL, IpcServer
 from cortana.types import Intent, Severity
 
@@ -596,13 +597,23 @@ class _SayJob:
     done: asyncio.Future[bool]
 
 
+#: Priority-queue entry: (rank, seq, job). Rank is the NEGATED wire priority
+#: (ipc.PRIORITY_ALERT=2 > NORMAL=1 > LOW=0, and PriorityQueue pops the
+#: smallest), seq keeps FIFO order within one priority class and breaks ties
+#: before the unorderable job ever gets compared.
+_QueueEntry = tuple[int, int, _SayJob]
+
+
 class Speaker:
     """Synthesises §12.1 utterances and ships them to Ears for playback.
 
-    One :class:`Speaker` serves all guilds. Each guild gets its own FIFO queue
-    and worker task so utterances within a guild play in order; the Piper
-    subprocess itself is serialised globally (one synthesis at a time — the
-    droplet's cores belong to Whisper).
+    One :class:`Speaker` serves all guilds. Each guild gets its own
+    priority-ordered queue and worker task: ALERT jobs jump ahead of QUEUED
+    NORMAL jobs (the in-flight synthesis is never preempted), so a wake ack
+    or a CODE RED confirmation can't sit behind an uncached NORMAL synthesis
+    past the dialog grace window; jobs of equal priority play in FIFO order.
+    The Piper subprocess itself is serialised globally (one synthesis at a
+    time — the droplet's cores belong to Whisper).
 
     :meth:`say` returns ``True`` when the utterance was synthesised and handed
     to IPC, ``False`` when it was suppressed (TTS disabled, muted trigger
@@ -614,11 +625,16 @@ class Speaker:
         self._holder = holder
         self._ipc = ipc
         # Cache the voice path with its rate so a SIGHUP voice swap refreshes
-        # the rate before the next WAV header is built (see _speak).
+        # the rate before the next WAV header is built (see _render). The
+        # per-voice rate cache keeps concurrent guild workers straddling a
+        # swap consistent: each render uses the rate of the voice it actually
+        # synthesised with, never a neighbour's refresh.
         self._voice_path = holder.current.tts.voice
         self._sample_rate = read_voice_sample_rate(self._voice_path)
+        self._rate_cache: dict[str, int] = {self._voice_path: self._sample_rate}
         self._synth_lock = asyncio.Lock()
-        self._queues: dict[int, asyncio.Queue[_SayJob]] = {}
+        self._queues: dict[int, asyncio.PriorityQueue[_QueueEntry]] = {}
+        self._seq = itertools.count()  # FIFO within a priority class
         self._workers: dict[int, asyncio.Task[None]] = {}
         self._closed = False
         self._voice_mutes: set[int] = set()
@@ -644,8 +660,9 @@ class Speaker:
             return False
         if user_id is not None and user_id in self._voice_mutes:
             return False
-        await self._ipc.send_tts(guild_id, PRIORITY_ALERT, self._chirp_wav)
-        return True
+        # send_tts is False when Ears is not connected: the chirp was NOT
+        # played — report that honestly so callers never assume an ack landed.
+        return await self._ipc.send_tts(guild_id, PRIORITY_ALERT, self._chirp_wav)
 
     @property
     def sample_rate(self) -> int:
@@ -691,17 +708,25 @@ class Speaker:
             log.debug("tts_suppressed_muted_user", user_id=user_id, guild_id=guild_id)
             return False
         job = _SayJob(text=text, priority=priority, done=asyncio.get_running_loop().create_future())
-        self._queue_for(guild_id).put_nowait(job)
+        # ALERT (higher wire priority) sorts ahead of queued NORMAL jobs; the
+        # seq counter keeps arrival order within a class.
+        self._queue_for(guild_id).put_nowait((-priority, next(self._seq), job))
         return await job.done
 
-    async def synthesize(self, text: str) -> bytes:
+    async def synthesize(self, text: str, cfg: TtsConfig | None = None) -> bytes:
         """Run Piper once and return raw s16le PCM at the voice's native rate.
+
+        ``cfg`` lets a caller thread ONE tts-config snapshot through an entire
+        render (:meth:`_render` passes its own): re-reading ``holder.current``
+        here would race a SIGHUP voice swap and cache the new voice's PCM
+        under the old voice's key. When omitted, the current config is read.
 
         Blocking process I/O rides asyncio's subprocess transport — nothing
         runs on the event loop thread itself. One synthesis at a time.
         Raises :class:`SynthesisError` on failure.
         """
-        cfg = self._holder.current.tts
+        if cfg is None:
+            cfg = self._holder.current.tts
         async with self._synth_lock:
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -790,26 +815,26 @@ class Speaker:
         self._workers.clear()
         for queue in self._queues.values():
             while not queue.empty():
-                job = queue.get_nowait()
+                _, _, job = queue.get_nowait()
                 if not job.done.done():
                     job.done.set_result(False)
         self._queues.clear()
 
     # ── internals ────────────────────────────────────────────────────────────
 
-    def _queue_for(self, guild_id: int) -> asyncio.Queue[_SayJob]:
+    def _queue_for(self, guild_id: int) -> asyncio.PriorityQueue[_QueueEntry]:
         queue = self._queues.get(guild_id)
         if queue is None:
-            queue = asyncio.Queue()
+            queue = asyncio.PriorityQueue()
             self._queues[guild_id] = queue
             self._workers[guild_id] = asyncio.create_task(
                 self._worker(guild_id, queue), name=f"tts-worker-{guild_id}"
             )
         return queue
 
-    async def _worker(self, guild_id: int, queue: asyncio.Queue[_SayJob]) -> None:
+    async def _worker(self, guild_id: int, queue: asyncio.PriorityQueue[_QueueEntry]) -> None:
         while True:
-            job = await queue.get()
+            _, _, job = await queue.get()
             try:
                 spoken = await self._speak(guild_id, job)
             except asyncio.CancelledError:
@@ -822,45 +847,59 @@ class Speaker:
             if not job.done.done():
                 job.done.set_result(spoken)
 
-    async def _render(self, text: str) -> bytes:
+    async def _rate_for(self, voice: str) -> int:
+        """Native sample rate for ``voice``, cached per path. Also tracks the
+        last-used voice on ``_voice_path``/``_sample_rate`` (the public
+        :attr:`sample_rate`). The attribute pair is mutated with no await in
+        between, so concurrent renders always see a consistent pair."""
+        rate = self._rate_cache.get(voice)
+        if rate is None:
+            rate = await asyncio.to_thread(read_voice_sample_rate, voice)
+            self._rate_cache[voice] = rate
+        self._voice_path = voice
+        self._sample_rate = rate
+        return rate
+
+    async def _render(self, text: str) -> tuple[bytes, int]:
         """Synthesise ``text`` to effect-applied PCM, via the line cache.
+
+        Returns ``(pcm, sample_rate)`` rendered under ONE tts-config snapshot
+        taken at entry: the cache key, the Piper invocation, the effect, and
+        the sample rate all come from the same voice. A SIGHUP voice swap
+        landing mid-render used to let ``synthesize`` re-read the NEW config
+        while the cache key and WAV-header rate still described the OLD voice
+        — a wrong-pitch line that persisted in the cache (review finding).
 
         Short scripted lines are rendered once per (text, voice, effect) and
         replayed from RAM; everything else synthesises fresh. Raises
         :class:`SynthesisError` on failure (never cached).
         """
         cfg = self._holder.current.tts
-        if cfg.voice != self._voice_path:
-            # SIGHUP swapped the voice model: refresh the cached rate so the
-            # WAV header and duration check match the new voice. Safe to
-            # mutate here — rendering runs only inside per-guild workers and
-            # the prime task, and synthesis is serialised by _synth_lock.
-            self._sample_rate = await asyncio.to_thread(read_voice_sample_rate, cfg.voice)
-            self._voice_path = cfg.voice
+        sample_rate = await self._rate_for(cfg.voice)
         cacheable = len(text) <= _LINE_CACHE_TEXT_MAX
         key = (text, cfg.voice, cfg.effect)
         if cacheable:
             cached = self._line_cache.get(key)
             if cached is not None:
                 self._line_cache.move_to_end(key)
-                return cached
-        pcm = await self.synthesize(text)
+                return cached, sample_rate
+        pcm = await self.synthesize(text, cfg)
         if cfg.effect == "holographic":
-            pcm = await asyncio.to_thread(holographic, pcm, self._sample_rate)
+            pcm = await asyncio.to_thread(holographic, pcm, sample_rate)
         if cacheable:
             self._line_cache[key] = pcm
             while len(self._line_cache) > _LINE_CACHE_MAX:
                 self._line_cache.popitem(last=False)
-        return pcm
+        return pcm, sample_rate
 
     async def _speak(self, guild_id: int, job: _SayJob) -> bool:
         cfg = self._holder.current.tts
         try:
-            pcm = await self._render(job.text)
+            pcm, sample_rate = await self._render(job.text)
         except SynthesisError as exc:
             log.warning("tts_synthesis_failed", guild_id=guild_id, text=job.text, error=str(exc))
             return False
-        duration_s = len(pcm) / (self._sample_rate * _BYTES_PER_SAMPLE)
+        duration_s = len(pcm) / (sample_rate * _BYTES_PER_SAMPLE)
         if duration_s > cfg.max_utterance_s:
             # §12.2: hard cap — if it does not fit, it goes to the channel instead.
             log.info(
@@ -871,7 +910,13 @@ class Speaker:
                 cap_s=cfg.max_utterance_s,
             )
             return False
-        await self._ipc.send_tts(guild_id, job.priority, build_wav(pcm, self._sample_rate))
+        sent = await self._ipc.send_tts(guild_id, job.priority, build_wav(pcm, sample_rate))
+        if not sent:
+            # Ears is disconnected (or the write failed): the utterance was
+            # never played. Returning False engages the caller's channel-text
+            # fallback instead of the prompt silently vanishing (GDD §20).
+            log.warning("tts_dropped_no_ears", guild_id=guild_id, text=job.text)
+            return False
         log.debug(
             "tts_sent",
             guild_id=guild_id,

@@ -1,10 +1,12 @@
-"""Voice-pipeline wiring tests for ``cortana.__main__.App`` — GDD §5, §8.3, §11.1.
+"""Voice-pipeline tests — GDD §5, §5.4, §8.3, §11.1.
 
-The App is assembled from stubs around the real ``_on_utterance`` flow: real
-grammar parse, real phonetic resolve (against a fake gazetteer), real
-Discipline, stubbed STT/engine/speaker/capture. Covers the @Pilot voice gate
-(constraint 10 parity with the slash path), the LOW-tier "say again" retry
-re-bind, the STT-failure reply, and the timer/reminder poll readiness guards.
+The DialogEngine is assembled from stubs around the real machine + grammar +
+phonetic resolve (fake gazetteer, real Discipline); STT/incidents/speaker/
+capture are stubbed. Covers the @Pilot voice gate (constraint 10 parity with
+the slash path), the LOW-tier "say again" retry re-bind, the STT-failure
+path, subdialogs (severity opener / override), relay framing, and the retry
+budget. App-level tests (supervision, shutdown, polls, chat refresh, IPC
+control routing) drive ``cortana.__main__.App`` directly.
 """
 
 from __future__ import annotations
@@ -20,13 +22,14 @@ import pytest
 
 import cortana.__main__ as app_main
 from cortana.__main__ import App
+from cortana.audio.capture import CaptureMeta, CaptureOrigin
 from cortana.audio.stt import SttTimeoutError
 from cortana.core.discipline import Discipline
+from cortana.dialog import DialogEngine, DialogState
 from cortana.types import (
     IncidentOutcome,
     Intent,
     Outcome,
-    ParsedCommand,
     PriorContext,
     Severity,
     SystemEntry,
@@ -69,10 +72,21 @@ class _Engine:
         self.outcome = outcome
         self.reports: list[tuple[int, int, Any, Any]] = []
         self.broadcasts: list[tuple[int, int, str, bool]] = []
+        self.broadcast_severities: list[Any] = []
         self.fired: list[datetime] = []
 
-    async def report(self, guild_id: int, user_id: int, parsed: Any, resolution: Any) -> Any:
+    async def report(
+        self,
+        guild_id: int,
+        user_id: int,
+        parsed: Any,
+        resolution: Any,
+        *,
+        caller_may_mention: bool = True,
+    ) -> Any:
         self.reports.append((guild_id, user_id, parsed, resolution))
+        self.report_gates = getattr(self, "report_gates", [])
+        self.report_gates.append(caller_may_mention)
         return self.outcome
 
     async def broadcast(
@@ -82,11 +96,12 @@ class _Engine:
         text: str,
         *,
         here: bool = False,
+        group_alias: str | None = None,
         severity: Any = None,
         confidence: Any = None,
+        caller_may_mention: bool = True,
     ) -> Any:
-        self.broadcasts.append((guild_id, user_id, text, here))
-        self.broadcast_severities = getattr(self, "broadcast_severities", [])
+        self.broadcasts.append((guild_id, user_id, text, group_alias == "all_hands"))
         self.broadcast_severities.append(severity)
         return self.outcome
 
@@ -104,6 +119,9 @@ class _Health:
         self.rejected = 0
         self.stt: list[tuple[float, Any]] = []
         self.degraded = False
+
+    def note_audio(self) -> None:
+        pass
 
     def record_wake_hit(self) -> None:
         self.wake_hits += 1
@@ -137,14 +155,27 @@ class _Speaker:
 
 @dataclass
 class _Capture:
-    reopened: list[tuple[int, int]] = field(default_factory=list)
+    armed: list[tuple[int, int, int]] = field(default_factory=list)  # (user, guild, gen)
+    disarmed: list[int] = field(default_factory=list)
     dropped: list[int] = field(default_factory=list)
 
-    def reopen(self, user_id: int, guild_id: int) -> None:
-        self.reopened.append((user_id, guild_id))
+    def arm_window(self, user_id: int, guild_id: int, gen: int) -> None:
+        self.armed.append((user_id, guild_id, gen))
+
+    def disarm(self, user_id: int) -> None:
+        self.disarmed.append(user_id)
 
     def drop_user(self, user_id: int) -> None:
         self.dropped.append(user_id)
+
+    def capturing_users(self) -> list[int]:
+        return []
+
+    def force_endpoint(self, user_id: int) -> bool:
+        return False
+
+    def feed(self, user_id: int, guild_id: int, pcm: bytes) -> None:
+        pass
 
 
 class _Bot:
@@ -169,20 +200,48 @@ class _Reminders:
         return 0
 
 
+class _Chat:
+    def __init__(self, reply: str | None = "Sunny, 21 degrees.", error: Exception | None = None):
+        self.reply = reply
+        self.error = error
+        self.asked: list[tuple[int, str]] = []
+
+    async def ask(self, user_id: int, query: str) -> str:
+        self.asked.append((user_id, query))
+        if self.error is not None:
+            raise self.error
+        assert self.reply is not None
+        return self.reply
+
+
 # ── assembly ─────────────────────────────────────────────────────────────────
 
 
-def make_app(
+@dataclass
+class Rig:
+    dialog: DialogEngine
+    engine: _Engine
+    health: _Health
+    speaker: _Speaker
+    capture: _Capture
+    sent: list[tuple[int, str]]
+    chat: _Chat | None
+
+
+def make_dialog(
     *,
     roles: list[int],
     transcriber: _Transcriber,
     outcome: IncidentOutcome | None = None,
     wake_ack: str = "beep",
     relay_mode: str = "framed",
-) -> tuple[App, _Engine, _Health, _Speaker, _Capture]:
-    holder = StubHolder(make_config(wake_ack=wake_ack, relay_mode=relay_mode))
-    app = App(holder)  # type: ignore[arg-type]
-    app.gazetteer = _Gazetteer(  # type: ignore[assignment]
+    chat: _Chat | None = None,
+    chat_enabled: bool = False,
+) -> Rig:
+    holder = StubHolder(
+        make_config(wake_ack=wake_ack, relay_mode=relay_mode, chat_enabled=chat_enabled)
+    )
+    gaz = _Gazetteer(
         entries={
             sid: SystemEntry(
                 id=sid, name=name, region=region, constellation=None, metaphone=name.upper()
@@ -190,103 +249,183 @@ def make_app(
             for sid, name, region in GAZ_SYSTEMS
         }
     )
-    app.transcriber = transcriber  # type: ignore[assignment]
     engine = _Engine(outcome or IncidentOutcome(Outcome.POSTED, None, None, 1))
-    app.engine = engine  # type: ignore[assignment]
     health = _Health()
-    app.health = health  # type: ignore[assignment]
-    app.discipline = Discipline(holder)  # type: ignore[arg-type]
     speaker = _Speaker()
-    app.speaker = speaker  # type: ignore[assignment]
     capture = _Capture()
-    app.capture = capture  # type: ignore[assignment]
-    app.bot = _Bot(roles)  # type: ignore[assignment]
-    app.conn = None
-    return app, engine, health, speaker, capture
+    sent: list[tuple[int, str]] = []
+
+    async def send_channel(channel_id: int, content: str, embed: Any = None) -> None:
+        sent.append((channel_id, content))
+
+    dialog = DialogEngine(
+        holder,  # type: ignore[arg-type]
+        capture=capture,  # type: ignore[arg-type]
+        transcriber=transcriber,
+        speaker=speaker,  # type: ignore[arg-type]
+        incidents=engine,  # type: ignore[arg-type]
+        discipline=Discipline(holder),  # type: ignore[arg-type]
+        gazetteer=gaz,  # type: ignore[arg-type]
+        conn=None,  # type: ignore[arg-type]
+        health=health,  # type: ignore[arg-type]
+        chat_provider=lambda: (chat, "ready" if chat is not None else "disabled"),
+        member_role_ids=lambda uid: roles,
+        send_channel=send_channel,
+        shutdown=asyncio.Event(),
+    )
+    return Rig(dialog, engine, health, speaker, capture, sent, chat)
+
+
+async def drain(rig: Rig) -> None:
+    """Let scheduled ack tasks run."""
+    for _ in range(3):
+        await asyncio.sleep(0)
+    if rig.dialog._voice_tasks:
+        await asyncio.gather(*rig.dialog._voice_tasks)
+
+
+def wake_open(rig: Rig, user: int = USER) -> int:
+    """Simulate CaptureManager opening a wake capture (returns the gen)."""
+    return rig.dialog.on_capture_start(user, GUILD, CaptureOrigin.WAKE, None)
+
+
+async def utter_wake(rig: Rig, user: int = USER, speech_frames: int = 5) -> None:
+    """One full wake-origin utterance through the dialog engine."""
+    gen = wake_open(rig, user)
+    await drain(rig)
+    meta = CaptureMeta(CaptureOrigin.WAKE, gen, speech_frames, "silence")
+    await rig.dialog.on_utterance(user, GUILD, b"\x00\x00", meta)
+
+
+async def utter_window(rig: Rig, user: int = USER) -> None:
+    """Speech inside the most recently armed window (the continuation)."""
+    assert rig.capture.armed, "no window armed"
+    armed_gen = rig.capture.armed[-1][2]
+    gen = rig.dialog.on_capture_start(user, GUILD, CaptureOrigin.WINDOW, armed_gen)
+    await drain(rig)
+    meta = CaptureMeta(CaptureOrigin.WINDOW, gen, 5, "silence")
+    await rig.dialog.on_utterance(user, GUILD, b"\x00\x00", meta)
 
 
 # ── wake acknowledgement (wake.ack: voice | beep | none) ─────────────────────
 
 
-async def _drain_voice_tasks(app: App) -> None:
-    if app._voice_tasks:
-        await asyncio.gather(*app._voice_tasks)
-
-
 async def test_wake_ack_voice_speaks_go_ahead() -> None:
-    app, _, _, speaker, _ = make_app(
-        roles=[PILOT_ROLE], transcriber=_Transcriber([]), wake_ack="voice"
-    )
-    app._on_capture_start(USER, GUILD)
-    await _drain_voice_tasks(app)
-    assert speaker.said == [(GUILD, "Go ahead.")]
-    assert speaker.chirped == []
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber([]), wake_ack="voice")
+    wake_open(rig)
+    await drain(rig)
+    assert rig.speaker.said == [(GUILD, "Go ahead.")]
+    assert rig.speaker.chirped == []
 
 
 async def test_wake_ack_beep_chirps() -> None:
-    app, _, _, speaker, _ = make_app(
-        roles=[PILOT_ROLE], transcriber=_Transcriber([]), wake_ack="beep"
-    )
-    app._on_capture_start(USER, GUILD)
-    await _drain_voice_tasks(app)
-    assert speaker.chirped == [GUILD]
-    assert speaker.said == []
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber([]), wake_ack="beep")
+    wake_open(rig)
+    await drain(rig)
+    assert rig.speaker.chirped == [GUILD]
+    assert rig.speaker.said == []
 
 
 async def test_wake_ack_none_is_silent() -> None:
-    app, _, _, speaker, _ = make_app(
-        roles=[PILOT_ROLE], transcriber=_Transcriber([]), wake_ack="none"
-    )
-    app._on_capture_start(USER, GUILD)
-    await _drain_voice_tasks(app)
-    assert speaker.said == []
-    assert speaker.chirped == []
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber([]), wake_ack="none")
+    wake_open(rig)
+    await drain(rig)
+    assert rig.speaker.said == []
+    assert rig.speaker.chirped == []
+
+
+async def test_window_open_never_double_chirps() -> None:
+    # The prompt WAS the ack: a capture opening via an armed window must not
+    # chirp again (the double-chirp complaint from the reopen era).
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["mumble static"]))
+    await utter_wake(rig)  # unframed → say-again window armed
+    chirps_before = list(rig.speaker.chirped)
+    assert rig.capture.armed
+    rig.dialog.on_capture_start(USER, GUILD, CaptureOrigin.WINDOW, rig.capture.armed[-1][2])
+    await drain(rig)
+    assert rig.speaker.chirped == chirps_before
 
 
 # ── @Pilot voice gate (GDD §11.1 layer 4, constraint 10 parity) ──────────────
 
 
 async def test_non_pilot_voice_report_is_rejected_before_the_engine() -> None:
-    app, engine, health, speaker, _ = make_app(
-        roles=[999], transcriber=_Transcriber(["aura command hostiles Otanuomi"])
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert engine.reports == []  # never reaches the shared engine
-    assert health.rejected == 1
-    assert speaker.said == [(GUILD, "Reporting requires the Pilot role.")]
+    rig = make_dialog(roles=[999], transcriber=_Transcriber(["aura command hostiles Otanuomi"]))
+    await utter_wake(rig)
+    assert rig.engine.reports == []  # never reaches the shared engine
+    assert rig.health.rejected == 1
+    assert (GUILD, "Reporting requires the Pilot role.") in rig.speaker.said
 
 
 async def test_pilot_voice_report_reaches_the_engine() -> None:
-    app, engine, _, _, _ = make_app(
+    rig = make_dialog(
         roles=[PILOT_ROLE], transcriber=_Transcriber(["aura command hostiles Otanuomi"])
     )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert len(engine.reports) == 1
-    assert engine.reports[0][2].intent is Intent.HOSTILE_SPOTTED
+    await utter_wake(rig)
+    assert len(rig.engine.reports) == 1
+    assert rig.engine.reports[0][2].intent is Intent.HOSTILE_SPOTTED
 
 
 async def test_non_mention_intents_stay_open_to_non_pilots() -> None:
-    app, engine, health, _, _ = make_app(
-        roles=[], transcriber=_Transcriber(["aura command status"])
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert len(engine.reports) == 1
-    assert engine.reports[0][2].intent is Intent.QUERY
-    assert health.rejected == 0
+    rig = make_dialog(roles=[], transcriber=_Transcriber(["aura command status"]))
+    await utter_wake(rig)
+    assert len(rig.engine.reports) == 1
+    assert rig.engine.reports[0][2].intent is Intent.QUERY
+    assert rig.health.rejected == 0
+
+
+# ── abandoned captures (GDD §5.4) ────────────────────────────────────────────
+
+
+async def test_zero_speech_capture_never_reaches_stt() -> None:
+    calls: list[bytes] = []
+
+    class _Counting(_Transcriber):
+        def transcribe(self, pcm: bytes, bias: str) -> TranscriptResult:
+            calls.append(pcm)
+            raise AssertionError("abandoned capture must not be decoded")
+
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Counting())
+    gen = wake_open(rig)
+    await drain(rig)
+    meta = CaptureMeta(CaptureOrigin.WAKE, gen, 0, "abandoned")
+    await rig.dialog.on_utterance(USER, GUILD, b"", meta)
+    assert calls == []
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
+    # Silent: no say-again, no retry spent.
+    assert rig.speaker.said == []
 
 
 # ── STT failure path (GDD §20 watchdog → "say again") ────────────────────────
 
 
-async def test_stt_timeout_reopens_capture_and_says_again() -> None:
-    app, engine, health, speaker, capture = make_app(
+async def test_stt_timeout_arms_retry_window_and_says_again() -> None:
+    rig = make_dialog(
         roles=[PILOT_ROLE], transcriber=_Transcriber(error=SttTimeoutError("watchdog"))
     )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert engine.reports == []
-    assert health.rejected == 1
-    assert capture.reopened == [(USER, GUILD)]
-    assert speaker.said == [(GUILD, "Say again the system.")]
+    await utter_wake(rig)
+    assert rig.engine.reports == []
+    assert rig.health.rejected == 1
+    assert len(rig.capture.armed) == 1
+    assert (GUILD, "Say again the system.") in rig.speaker.said
+
+
+async def test_stt_failure_loop_terminates_via_the_budget() -> None:
+    # The live incident: a wedged STT + ambient noise looped "say again"
+    # forever (the SttError path bypassed the loop guard). Every failure now
+    # drains ONE budget; exhaustion ends audibly with standing-down.
+    rig = make_dialog(
+        roles=[PILOT_ROLE], transcriber=_Transcriber(error=SttTimeoutError("watchdog"))
+    )
+    await utter_wake(rig)
+    for _ in range(10):  # noise keeps opening the armed windows
+        if not rig.capture.armed or rig.dialog.session_state(USER) is DialogState.IDLE:
+            break
+        await utter_window(rig)
+    # Windows armed exactly max_retries times (2), then the audible close:
+    assert len(rig.capture.armed) == 2
+    assert (GUILD, "Standing down. Wake me to retry.") in rig.speaker.said
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
 
 
 # ── LOW-tier retry re-bind (GDD §8.3) ────────────────────────────────────────
@@ -294,53 +433,439 @@ async def test_stt_timeout_reopens_capture_and_says_again() -> None:
 
 async def test_low_tier_retry_rebinds_bare_system_name() -> None:
     rejected = IncidentOutcome(Outcome.REJECTED, None, None, None)
-    app, engine, _, _, capture = make_app(
+    rig = make_dialog(
         roles=[PILOT_ROLE],
         transcriber=_Transcriber(["aura command hostiles zzzz qqqq", "Kisogo"]),
         outcome=rejected,
     )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert len(engine.reports) == 1
-    assert engine.reports[0][3].tier.value == "LOW"
-    assert capture.reopened == [(USER, GUILD)]  # window reopened
-    assert USER in app._pending_retry
+    await utter_wake(rig)
+    assert len(rig.engine.reports) == 1
+    assert rig.engine.reports[0][3].tier.value == "LOW"
+    assert len(rig.capture.armed) == 1  # retry window armed
+    assert rig.dialog.session_state(USER) is DialogState.AWAIT_RETRY_SYSTEM
 
-    # The bare name in the reopened window re-binds to the rejected intent.
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert len(engine.reports) == 2
-    retried = engine.reports[1][2]
+    # The bare name in the window re-binds to the rejected intent.
+    await utter_window(rig)
+    assert len(rig.engine.reports) == 2
+    retried = rig.engine.reports[1][2]
     assert retried.intent is Intent.HOSTILE_SPOTTED
     assert retried.system_text == "Kisogo"
     assert retried.raw == "Kisogo"
-    assert USER not in app._pending_retry  # consumed
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
+
+
+async def test_failed_rebind_does_not_rearm_forever() -> None:
+    # A rebind that ALSO scores LOW must not arm another window from the
+    # Report path (budget aside, the rebound_from guard breaks the cycle).
+    rejected = IncidentOutcome(Outcome.REJECTED, None, None, None)
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["aura command hostiles zzzz qqqq", "qqqq"]),
+        outcome=rejected,
+    )
+    await utter_wake(rig)
+    armed_after_first = len(rig.capture.armed)
+    await utter_window(rig)
+    assert len(rig.capture.armed) == armed_after_first  # no re-arm from the rebind
 
 
 async def test_bare_no_intent_utterance_is_relayed_in_open_mode() -> None:
     # relay_mode: open — the old catch-all: anything unmatched relays.
-    app, engine, _, _, _ = make_app(
-        roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]), relay_mode="open"
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]), relay_mode="open")
+    await utter_wake(rig)
+    assert rig.engine.reports == []
+    assert rig.engine.broadcasts == [(GUILD, USER, "Kisogo", False)]
+
+
+# ── spoken colour codes: dialogue + inline (GDD §6.4) ────────────────────────
+
+
+async def test_bare_code_opens_dialogue_and_next_report_inherits_severity() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey jarvis code orange", "hostiles Otanuomi"]),
     )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert engine.reports == []
-    assert engine.broadcasts == [(GUILD, USER, "Kisogo", False)]
+    await utter_wake(rig)
+    # Step 1: acknowledged, window armed, nothing posted yet.
+    assert (GUILD, "Code orange. Go ahead.") in rig.speaker.said
+    assert len(rig.capture.armed) == 1
+    assert rig.engine.reports == [] and rig.engine.broadcasts == []
+    assert rig.dialog.session_state(USER) is DialogState.AWAIT_SEVERITY_REPORT
+
+    await utter_window(rig)
+    # Step 2: the report inherits the pending severity.
+    assert len(rig.engine.reports) == 1
+    parsed = rig.engine.reports[0][2]
+    assert parsed.intent is Intent.HOSTILE_SPOTTED
+    assert parsed.severity is Severity.MEDIUM
 
 
-async def test_expired_pending_retry_falls_through_to_relay() -> None:
-    # An expired retry no longer re-binds; the utterance is relayed instead.
-    app, engine, _, _, _ = make_app(
-        roles=[PILOT_ROLE], transcriber=_Transcriber(["Kisogo"]), relay_mode="open"
+async def test_inline_code_red_rides_the_report() -> None:
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["code red hostiles Otanuomi"]))
+    await utter_wake(rig)
+    assert len(rig.engine.reports) == 1
+    assert rig.engine.reports[0][2].severity is Severity.HIGH
+
+
+async def test_severity_colours_a_framed_relay_but_noise_still_fails() -> None:
+    # NEW §6.4 semantics: inherited severity is severity-carrying but NOT
+    # framing — hallucinated noise after "code red" must never become a RED
+    # card (live channel-pollution incident). Framed speech still relays
+    # with the inherited colour.
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(
+            ["code red", "report blop fleet moving to Kisogo gate end report"]
+        ),
     )
-    stale = ParsedCommand(
-        intent=Intent.HOSTILE_SPOTTED, system_text="x", group_alias=None, detail=None, raw="x"
+    await utter_wake(rig)
+    await utter_window(rig)
+    assert len(rig.engine.broadcasts) == 1
+    assert rig.engine.broadcast_severities == [Severity.HIGH]
+
+    # And the noise variant: unframed continuation fails instead of posting.
+    rig2 = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["code red", "thank you thank you"]),
     )
-    app._pending_retry[USER] = (stale, asyncio.get_running_loop().time() - 1.0)
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert engine.reports == []
-    assert engine.broadcasts == [(GUILD, USER, "Kisogo", False)]
-    assert USER not in app._pending_retry
+    await utter_wake(rig2)
+    await utter_window(rig2)
+    assert rig2.engine.broadcasts == []
+    # Context survives into the retry window so a framed repeat still works:
+    assert rig2.dialog.session_state(USER) is DialogState.AWAIT_SEVERITY_REPORT
 
 
-# ── timer/reminder polls gated on Discord readiness ──────────────────────────
+# ── freeform relay confidence gate (GDD §8.6) ────────────────────────────────
+
+
+async def test_low_confidence_gibberish_is_not_relayed() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["Rens, Rens, Rens"], avg_logprob=-2.4),
+        relay_mode="open",  # open mode so the confidence gate itself is what fires
+    )
+    await utter_wake(rig)
+    assert rig.engine.broadcasts == []  # hallucinated noise never becomes a card
+    assert rig.health.rejected == 1
+    assert (GUILD, "Say again the system.") in rig.speaker.said
+
+
+async def test_confident_relay_posts_and_acks() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["blop fleet moving to Kisogo gate whatever"]),
+        outcome=IncidentOutcome(Outcome.POSTED, "Relayed.", None, None),
+        relay_mode="open",
+    )
+    await utter_wake(rig)
+    assert len(rig.engine.broadcasts) == 1
+    assert (GUILD, "Relayed.") in rig.speaker.said
+
+
+# ── relay framing (GDD §8.6, relay_mode) ─────────────────────────────────────
+
+
+async def test_unframed_speech_never_becomes_a_card_by_default() -> None:
+    # relay_mode: framed (default) — crosstalk and mishearings get "Say
+    # again?", never a card.
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["How's everybody else doing"]))
+    await utter_wake(rig)
+    assert rig.engine.broadcasts == []
+    assert rig.health.rejected == 1
+    assert (GUILD, "Say again?") in rig.speaker.said
+
+
+async def test_framed_report_relays_under_default_mode() -> None:
+    # A "report … end report" envelope is explicit framing: it relays.
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey jarvis report blop fleet on the Kisogo gate end report"]),
+        outcome=IncidentOutcome(Outcome.POSTED, "Relayed.", None, None),
+    )
+    await utter_wake(rig)
+    assert len(rig.engine.broadcasts) == 1
+    assert rig.engine.broadcasts[0][2] == "blop fleet on the Kisogo gate"
+    assert (GUILD, "Relayed.") in rig.speaker.said
+
+
+async def test_relay_off_drops_even_framed_speech() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["report blop fleet on the Kisogo gate end report"]),
+        relay_mode="off",
+    )
+    await utter_wake(rig)
+    assert rig.engine.broadcasts == []
+    assert rig.health.rejected == 1
+    assert (GUILD, "Say again?") in rig.speaker.said
+
+
+# ── the retry budget (GDD §5.4 — the say-again loop killer) ──────────────────
+
+
+async def test_say_again_budget_exhausts_audibly_and_wake_resets() -> None:
+    # Consecutive noise drains the budget (2), closes audibly, and never
+    # re-arms — then a fresh wake works normally again.
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(
+            ["mumble static", "thank you thank you", "more noise", "clear Otanuomi"]
+        ),
+    )
+    await utter_wake(rig)
+    assert (GUILD, "Say again?") in rig.speaker.said
+    assert len(rig.capture.armed) == 1
+
+    await utter_window(rig)  # retry 2 of 2
+    assert len(rig.capture.armed) == 2
+
+    await utter_window(rig)  # budget gone: audible close, NO new window
+    assert len(rig.capture.armed) == 2
+    assert (GUILD, "Standing down. Wake me to retry.") in rig.speaker.said
+    assert rig.engine.broadcasts == []
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
+
+    # A fresh wake with a real command still works normally.
+    await utter_wake(rig)
+    assert len(rig.engine.reports) == 1
+
+
+async def test_stale_gen_utterance_is_dropped() -> None:
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["hostiles Otanuomi"]))
+    gen = wake_open(rig)
+    await drain(rig)
+    stale = CaptureMeta(CaptureOrigin.WAKE, gen + 7, 5, "silence")
+    await rig.dialog.on_utterance(USER, GUILD, b"\x00\x00", stale)
+    assert rig.engine.reports == []  # never decoded, never reported
+
+
+# ── command override wiring (GDD §6.6) ───────────────────────────────────────
+
+
+async def test_override_routes_to_chat_and_speaks_reply() -> None:
+    chat = _Chat()
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey jarvis command override what's the weather in Chicago"]),
+        chat=chat,
+        chat_enabled=True,
+    )
+    await utter_wake(rig)
+    assert chat.asked == [(USER, "what's the weather in Chicago")]
+    assert (GUILD, "Sunny, 21 degrees.") in rig.speaker.said
+    assert rig.engine.reports == [] and rig.engine.broadcasts == []  # never touches intel
+
+
+async def test_override_failure_speaks_fixed_line() -> None:
+    from cortana.chat import ChatError
+
+    chat = _Chat(error=ChatError("boom"))
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["command override tell me a story"]),
+        chat=chat,
+        chat_enabled=True,
+    )
+    await utter_wake(rig)
+    assert (GUILD, "Override channel unavailable.") in rig.speaker.said
+    assert rig.engine.broadcasts == []
+
+
+async def test_override_while_disabled_speaks_unavailable() -> None:
+    # chat disabled: an explicit override request gets the fixed unavailable
+    # line — never a silent fall-through to the grammar.
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["command override what's the weather in Chicago"]),
+        relay_mode="open",
+        chat=None,
+    )
+    await utter_wake(rig)
+    assert rig.engine.broadcasts == [] and rig.engine.reports == []
+    assert (GUILD, "Override channel unavailable.") in rig.speaker.said
+
+
+async def test_bare_override_opens_dialogue_then_takes_the_question() -> None:
+    # "command override" alone (window closed on the pause) → ack + window;
+    # the NEXT utterance is the question verbatim, no prefix needed.
+    chat = _Chat()
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey jarvis command override", "what's the weather in Chicago"]),
+        chat=chat,
+        chat_enabled=True,
+    )
+    await utter_wake(rig)
+    assert chat.asked == []
+    assert (GUILD, "Go ahead.") in rig.speaker.said
+    assert len(rig.capture.armed) == 1
+    assert rig.dialog.session_state(USER) is DialogState.AWAIT_OVERRIDE_QUESTION
+
+    await utter_window(rig)
+    assert chat.asked == [(USER, "what's the weather in Chicago")]
+    assert rig.engine.broadcasts == [] and rig.engine.reports == []
+
+
+async def test_bare_override_while_disabled_speaks_unavailable() -> None:
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["command override"]), chat=None)
+    await utter_wake(rig)
+    assert (GUILD, "Override channel unavailable.") in rig.speaker.said
+    assert rig.capture.armed == []
+
+
+async def test_override_noise_never_burns_an_api_call() -> None:
+    chat = _Chat()
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["command override", "mmmm"], avg_logprob=-2.5),
+        chat=chat,
+        chat_enabled=True,
+    )
+    # Force only the SECOND utterance to be low-confidence:
+    rig2 = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber([]),
+        chat=chat,
+        chat_enabled=True,
+    )
+    del rig2  # (single-rig flow below)
+
+    class _TwoConf(_Transcriber):
+        def transcribe(self, pcm: bytes, bias: str) -> TranscriptResult:
+            text = self.texts.pop(0)
+            logprob = -0.1 if text == "command override" else -2.5
+            return TranscriptResult(text=text, avg_logprob=logprob)
+
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_TwoConf(["command override", "mmmm"]),
+        chat=chat,
+        chat_enabled=True,
+    )
+    await utter_wake(rig)
+    await utter_window(rig)
+    assert chat.asked == []  # noise decoded in the window: no paid call
+
+
+# ── dropped acks stay out of channels ────────────────────────────────────────
+
+
+async def test_unspoken_ack_is_dropped_not_posted() -> None:
+    # An ACK line that can't be spoken (muted/over-cap/synth fail) is logged
+    # and dropped — retry prompts pasted into the intel channel are noise.
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["mumble static"]))
+
+    async def silent_say(guild_id, text, priority=1, *, user_id=None):
+        rig.speaker.said.append((guild_id, text))
+        return False  # speech failed
+
+    rig.speaker.say = silent_say  # type: ignore[method-assign]
+    await utter_wake(rig)
+    assert rig.sent == []  # nothing posted to any channel
+
+
+# ── cleanup: reset_user / reset_all ──────────────────────────────────────────
+
+
+async def test_reset_user_purges_session_and_capture() -> None:
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["mumble static"]))
+    await utter_wake(rig)  # leaves an armed window + AWAIT state
+    assert rig.dialog.session_state(USER) is not DialogState.IDLE
+    rig.dialog.reset_user(USER)
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
+    assert USER in rig.capture.dropped
+
+
+async def test_reset_all_covers_every_tracked_user() -> None:
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["mumble static"] * 2))
+    await utter_wake(rig, user=USER)
+    await utter_wake(rig, user=USER + 1)
+    rig.dialog.reset_all()
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
+    assert rig.dialog.session_state(USER + 1) is DialogState.IDLE
+    assert {USER, USER + 1} <= set(rig.capture.dropped)
+
+
+# ── App-level wiring (composition root) ──────────────────────────────────────
+
+
+def make_app(*, roles: list[int]) -> tuple[App, Rig]:
+    holder = StubHolder(make_config())
+    app = App(holder)  # type: ignore[arg-type]
+    rig = make_dialog(roles=roles, transcriber=_Transcriber([]))
+    app.dialog = rig.dialog
+    app.capture = rig.capture  # type: ignore[assignment]
+    app.engine = rig.engine  # type: ignore[assignment]
+    app.health = rig.health  # type: ignore[assignment]
+    app.speaker = rig.speaker  # type: ignore[assignment]
+    app.bot = _Bot(roles)  # type: ignore[assignment]
+    app.conn = None
+    return app, rig
+
+
+async def test_left_control_purges_per_user_state() -> None:
+    # §19 posture: when a pilot leaves voice, every per-user trace goes.
+    app, rig = make_app(roles=[PILOT_ROLE])
+    wake_open(rig)
+    await drain(rig)
+    await app._on_control({"t": "left", "user_id": str(USER)})
+    assert USER in rig.capture.dropped
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
+
+
+async def test_hello_control_resets_every_dialog() -> None:
+    # Ears reconnect: every armed window it knew about is gone (GDD §5.4).
+    app, rig = make_app(roles=[PILOT_ROLE])
+    wake_open(rig)
+    await drain(rig)
+    await app._on_control({"t": "hello", "version": "test"})
+    assert rig.dialog.session_state(USER) is DialogState.IDLE
+
+
+class _StateRecordingGateway:
+    def __init__(self) -> None:
+        self.states: list[tuple[bool, int | None]] = []
+
+    async def on_ears_state(self, connected: bool, channel_id: int | None) -> None:
+        self.states.append((connected, channel_id))
+
+
+async def test_snapshot_control_feeds_connect_state_to_the_gateway() -> None:
+    """The snapshot's per-guild connected/channel fields must reach the
+    voice gateway (which owns the rejoin/adopt/leave judgement) — after an
+    unclean Brain death this is the only way a fresh Brain learns Ears is
+    still parked in a voice channel."""
+    app, _rig = make_app(roles=[PILOT_ROLE])
+    gateway = _StateRecordingGateway()
+    app.gateway = gateway  # type: ignore[assignment]
+
+    await app._on_control(
+        {
+            "t": "snapshot",
+            "guilds": [
+                {"guild_id": "999", "channel_id": "5", "connected": True, "users": []},
+                {"guild_id": str(GUILD), "channel_id": "9", "connected": True, "users": []},
+            ],
+        }
+    )
+
+    assert gateway.states == [(True, 9)]  # the CONFIGURED guild's state
+
+
+async def test_snapshot_without_the_guild_reports_disconnected() -> None:
+    app, _rig = make_app(roles=[PILOT_ROLE])
+    gateway = _StateRecordingGateway()
+    app.gateway = gateway  # type: ignore[assignment]
+
+    await app._on_control({"t": "snapshot", "guilds": []})
+    await app._on_control(
+        {
+            "t": "snapshot",
+            "guilds": [{"guild_id": str(GUILD), "channel_id": None, "connected": False}],
+        }
+    )
+
+    assert gateway.states == [(False, None), (False, None)]
 
 
 async def test_timer_and_reminder_polls_wait_for_bot_ready(
@@ -349,7 +874,7 @@ async def test_timer_and_reminder_polls_wait_for_bot_ready(
     """A due timer/reminder is never consumed (fired=1) before login: the poll
     body is skipped entirely while bot.is_ready() is False."""
     monkeypatch.setattr(app_main, "_TIMER_POLL_INTERVAL_S", 0.01)
-    app, engine, _, _, _ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+    app, rig = make_app(roles=[PILOT_ROLE])
     reminders = _Reminders()
     app.reminders = reminders  # type: ignore[assignment]
 
@@ -357,12 +882,12 @@ async def test_timer_and_reminder_polls_wait_for_bot_ready(
     reminder_task = asyncio.create_task(app._reminder_loop())
     try:
         await asyncio.sleep(0.08)
-        assert engine.fired == []  # nothing consumed pre-ready
+        assert rig.engine.fired == []  # nothing consumed pre-ready
         assert reminders.delivered == []
 
         app.bot.ready = True  # type: ignore[union-attr]
         await asyncio.sleep(0.08)
-        assert engine.fired  # polls resume once Discord is usable
+        assert rig.engine.fired  # polls resume once Discord is usable
         assert reminders.delivered
     finally:
         timer_task.cancel()
@@ -397,7 +922,7 @@ async def _returns_immediately() -> None:
 
 
 async def test_clean_task_exit_during_shutdown_does_not_alarm(monkeypatch) -> None:
-    app, *_ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+    app, _ = make_app(roles=[PILOT_ROLE])
     rec = _RecordingLog()
     monkeypatch.setattr(app_main, "log", rec)
     app._shutdown.set()  # process is already shutting down
@@ -409,7 +934,7 @@ async def test_clean_task_exit_during_shutdown_does_not_alarm(monkeypatch) -> No
 
 
 async def test_task_exit_while_running_alarms_and_triggers_shutdown(monkeypatch) -> None:
-    app, *_ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+    app, _ = make_app(roles=[PILOT_ROLE])
     rec = _RecordingLog()
     monkeypatch.setattr(app_main, "log", rec)
     assert not app._shutdown.is_set()
@@ -422,7 +947,7 @@ async def test_task_exit_while_running_alarms_and_triggers_shutdown(monkeypatch)
 
 
 async def test_graceful_shutdown_is_bounded(monkeypatch) -> None:
-    app, *_ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+    app, _ = make_app(roles=[PILOT_ROLE])
 
     async def _hang() -> None:
         await asyncio.sleep(100)
@@ -435,170 +960,12 @@ async def test_graceful_shutdown_is_bounded(monkeypatch) -> None:
     await asyncio.wait_for(app._graceful_shutdown(), timeout=2)
 
 
-# ── spoken colour codes: dialogue + inline (GDD §6.4) ────────────────────────
-
-
-async def test_bare_code_opens_dialogue_and_next_report_inherits_severity() -> None:
-    app, engine, _, speaker, capture = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["hey jarvis code orange", "hostiles Otanuomi"]),
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    # Step 1: acknowledged, window reopened, nothing posted yet.
-    assert speaker.said == [(GUILD, "Code orange. Go ahead.")]
-    assert capture.reopened == [(USER, GUILD)]
-    assert engine.reports == [] and engine.broadcasts == []
-
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    # Step 2: the report inherits the pending severity.
-    assert len(engine.reports) == 1
-    parsed = engine.reports[0][2]
-    assert parsed.intent is Intent.HOSTILE_SPOTTED
-    assert parsed.severity is Severity.MEDIUM
-
-
-async def test_inline_code_red_rides_the_report() -> None:
-    app, engine, _, _, _ = make_app(
-        roles=[PILOT_ROLE], transcriber=_Transcriber(["code red hostiles Otanuomi"])
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert len(engine.reports) == 1
-    assert engine.reports[0][2].severity is Severity.HIGH
-
-
-async def test_pending_severity_colours_a_freeform_relay() -> None:
-    app, engine, _, _, _ = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["code red", "blop fleet moving to Kisogo gate whatever"]),
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert len(engine.broadcasts) == 1
-    assert engine.broadcast_severities == [Severity.HIGH]
-
-
-# ── freeform relay confidence gate (GDD §8.6) ────────────────────────────────
-
-
-async def test_low_confidence_gibberish_is_not_relayed() -> None:
-    app, engine, health, speaker, _ = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["Rens, Rens, Rens"], avg_logprob=-2.4),
-        relay_mode="open",  # open mode so the confidence gate itself is what fires
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert engine.broadcasts == []  # hallucinated noise never becomes a card
-    assert health.rejected == 1
-    assert speaker.said == [(GUILD, "Say again the system.")]
-
-
-async def test_confident_relay_posts_and_acks() -> None:
-    app, engine, _, speaker, _ = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["blop fleet moving to Kisogo gate whatever"]),
-        outcome=IncidentOutcome(Outcome.POSTED, "Relayed.", None, None),
-        relay_mode="open",
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert len(engine.broadcasts) == 1
-    assert (GUILD, "Relayed.") in speaker.said
-
-
-# ── relay framing (GDD §8.6, relay_mode) ─────────────────────────────────────
-
-
-async def test_unframed_speech_never_becomes_a_card_by_default() -> None:
-    # relay_mode: framed (default) — crosstalk and mishearings get "Say
-    # again?", never a card. This is the fix for junk relays like a lone
-    # system name decoded from noise.
-    app, engine, health, speaker, _ = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["How's everybody else doing"]),
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert engine.broadcasts == []
-    assert health.rejected == 1
-    assert speaker.said == [(GUILD, "Say again?")]
-
-
-async def test_framed_report_relays_under_default_mode() -> None:
-    # A "report … end report" envelope is explicit framing: it relays.
-    app, engine, _, speaker, _ = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["hey jarvis report blop fleet on the Kisogo gate end report"]),
-        outcome=IncidentOutcome(Outcome.POSTED, "Relayed.", None, None),
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert len(engine.broadcasts) == 1
-    assert engine.broadcasts[0][2] == "blop fleet on the Kisogo gate"
-    assert (GUILD, "Relayed.") in speaker.said
-
-
-async def test_relay_off_drops_even_framed_speech() -> None:
-    app, engine, health, speaker, _ = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["report blop fleet on the Kisogo gate end report"]),
-        relay_mode="off",
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert engine.broadcasts == []
-    assert health.rejected == 1
-    assert speaker.said == [(GUILD, "Say again?")]
-
-
-# ── command override wiring (GDD §6.6) ───────────────────────────────────────
-
-
-class _Chat:
-    def __init__(self, reply: str | None = "Sunny, 21 degrees.", error: Exception | None = None):
-        self.reply = reply
-        self.error = error
-        self.asked: list[tuple[int, str]] = []
-
-    async def ask(self, user_id: int, query: str) -> str:
-        self.asked.append((user_id, query))
-        if self.error is not None:
-            raise self.error
-        assert self.reply is not None
-        return self.reply
-
-
-async def test_override_routes_to_chat_and_speaks_reply() -> None:
-    app, engine, _, speaker, _ = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["hey jarvis command override what's the weather in Chicago"]),
-    )
-    app.holder = StubHolder(make_config(chat_enabled=True))  # type: ignore[assignment]
-    app.discipline = Discipline(app.holder)  # type: ignore[arg-type]
-    chat = _Chat()
-    app.chat = chat  # type: ignore[assignment]
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert chat.asked == [(USER, "what's the weather in Chicago")]
-    assert speaker.said == [(GUILD, "Sunny, 21 degrees.")]
-    assert engine.reports == [] and engine.broadcasts == []  # never touches intel
-
-
-async def test_override_failure_speaks_fixed_line() -> None:
-    from cortana.chat import ChatError
-
-    app, engine, _, speaker, _ = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["command override tell me a story"]),
-    )
-    app.holder = StubHolder(make_config(chat_enabled=True))  # type: ignore[assignment]
-    app.discipline = Discipline(app.holder)  # type: ignore[arg-type]
-    app.chat = _Chat(error=ChatError("boom"))  # type: ignore[assignment]
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert speaker.said == [(GUILD, "Override channel unavailable.")]
-    assert engine.broadcasts == []
-
-
 async def test_refresh_chat_follows_config_and_key_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # SIGHUP path: flipping chat.enabled (or a key appearing) takes effect on
     # reload — it used to require a full restart, silently.
-    app, *_ = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
+    app, _ = make_app(roles=[PILOT_ROLE])
     app.holder = StubHolder(make_config(chat_enabled=True))  # type: ignore[assignment]
     monkeypatch.setattr(app_main, "read_api_key", lambda path: "sk-test")
     app._refresh_chat()
@@ -616,113 +983,21 @@ async def test_refresh_chat_follows_config_and_key_state(
     assert app._chat_status == "disabled"
 
 
-async def test_left_control_purges_per_user_state() -> None:
-    # §19 posture: when a pilot leaves voice, every per-user trace goes.
-    app, _, _, _, capture = make_app(roles=[PILOT_ROLE], transcriber=_Transcriber([]))
-    stale = ParsedCommand(
-        intent=Intent.HOSTILE_SPOTTED, system_text="x", group_alias=None, detail=None, raw="x"
-    )
-    app._pending_retry[USER] = (stale, 999.0)
-    app._pending_severity[USER] = (Severity.HIGH, 999.0)
-    app._last_audio_at[USER] = 1.0
-    await app._on_control({"t": "left", "user_id": str(USER)})
-    assert capture.dropped == [USER]
-    assert USER not in app._pending_retry
-    assert USER not in app._pending_severity
-    assert USER not in app._last_audio_at
+async def test_stale_arm_window_action_is_dropped() -> None:
+    # Regression (confirmed review finding): ArmWindow executes after the
+    # spoken prompt resolves; if the pilot re-woke in that gap the session
+    # gen has advanced and the stale arm must be a no-op — executing it
+    # would destroy the in-flight capture or strand an unowned window.
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=_Transcriber(["mumble static"]))
+    await utter_wake(rig)  # fails -> AWAIT with an armed window (gen N+1)
+    stale_session = rig.dialog._sessions[USER]
+    armed_before = len(rig.capture.armed)
 
+    # Pilot re-wakes: fresh dialog supersedes the AWAIT gen.
+    wake_open(rig)
+    await drain(rig)
 
-async def test_override_while_disabled_speaks_unavailable() -> None:
-    # chat.enabled false: an explicit override request gets the fixed
-    # unavailable line — never a silent fall-through to the grammar, which
-    # used to disguise a down channel as a mishearing/relay.
-    app, engine, _, speaker, _ = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["command override what's the weather in Chicago"]),
-        relay_mode="open",
-    )
-    app.chat = None  # type: ignore[assignment]
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert engine.broadcasts == [] and engine.reports == []
-    assert speaker.said == [(GUILD, "Override channel unavailable.")]
-
-
-async def test_bare_override_opens_dialogue_then_takes_the_question() -> None:
-    # "command override" alone (window closed on the pause) → ack + reopen;
-    # the NEXT utterance is the question verbatim, no prefix needed.
-    app, engine, _, speaker, capture = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["hey jarvis command override", "what's the weather in Chicago"]),
-    )
-    app.holder = StubHolder(make_config(chat_enabled=True))  # type: ignore[assignment]
-    app.discipline = Discipline(app.holder)  # type: ignore[arg-type]
-    chat = _Chat()
-    app.chat = chat  # type: ignore[assignment]
-
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert chat.asked == []
-    assert speaker.said == [(GUILD, "Go ahead.")]
-    assert capture.reopened == [(USER, GUILD)]
-
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert chat.asked == [(USER, "what's the weather in Chicago")]
-    assert engine.broadcasts == [] and engine.reports == []
-
-
-async def test_bare_override_while_disabled_speaks_unavailable() -> None:
-    app, _, _, speaker, capture = make_app(
-        roles=[PILOT_ROLE], transcriber=_Transcriber(["command override"])
-    )
-    app.chat = None  # type: ignore[assignment]
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert speaker.said == [(GUILD, "Override channel unavailable.")]
-    assert capture.reopened == []
-
-
-async def test_say_again_reopens_once_then_goes_silent() -> None:
-    # One wake gets ONE wake-free retry; a second unintelligible utterance
-    # drops silently — an unguarded reopen once turned ambient-noise
-    # hallucinations into an endless bratty "say again" loop (live incident).
-    app, engine, _, speaker, capture = make_app(
-        roles=[PILOT_ROLE],
-        transcriber=_Transcriber(["mumble static", "thank you thank you", "clear Otanuomi"]),
-    )
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert speaker.said == [(GUILD, "Say again?")]
-    assert capture.reopened == [(USER, GUILD)]
-
-    # The retry is ALSO noise: speak the closing line ONCE (the pilot must
-    # know a fresh wake is needed) but never reopen — no feedback loop.
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert speaker.said == [
-        (GUILD, "Say again?"),
-        (GUILD, "Standing down. Wake me to retry."),
-    ]
-    assert capture.reopened == [(USER, GUILD)]
-    assert engine.broadcasts == []
-
-    # A fresh wake with a real command still works normally.
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert len(engine.reports) == 1
-
-
-async def test_unspoken_ack_is_dropped_not_posted() -> None:
-    # An ACK line that can't be spoken (muted/over-cap/synth fail) is logged
-    # and dropped — retry prompts pasted into the intel channel are noise.
-    app, engine, _, speaker, _ = make_app(
-        roles=[PILOT_ROLE], transcriber=_Transcriber(["mumble static"])
-    )
-
-    async def silent_say(guild_id, text, priority=1, *, user_id=None):
-        speaker.said.append((guild_id, text))
-        return False  # speech failed
-
-    app.speaker.say = silent_say  # type: ignore[assignment]
-    sent: list[tuple[int, str]] = []
-
-    async def capture_send(channel_id, content, embed=None):
-        sent.append((channel_id, content))
-
-    app._send_channel = capture_send  # type: ignore[assignment]
-    await app._on_utterance(USER, GUILD, b"\x00\x00")
-    assert sent == []  # nothing posted to any channel
+    # The stale ArmWindow from the superseded dialog fires late:
+    rig.dialog._arm_window(stale_session, stale_session.gen)
+    assert len(rig.capture.armed) == armed_before  # dropped, not armed
+    assert USER not in rig.dialog._deadlines  # no unowned deadline created

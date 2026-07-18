@@ -446,10 +446,14 @@ class PollVoteButton(
         return cls(match.string)
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        from cortana.dsc.views import run_component_action
+
         parsed = parse_poll_custom_id(self.item.custom_id or "")
         if parsed is None:  # pragma: no cover — template guarantees a parse
             return
-        await dispatch_poll_vote(interaction, parsed[0], parsed[1])
+        await run_component_action(
+            interaction, "poll-vote", dispatch_poll_vote(interaction, parsed[0], parsed[1])
+        )
 
 
 # ── the cog ──────────────────────────────────────────────────────────────────

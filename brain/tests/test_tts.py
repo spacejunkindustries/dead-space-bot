@@ -178,11 +178,19 @@ class _FakeProc:
 
 
 class _FakeIpc:
-    def __init__(self) -> None:
-        self.sent: list[tuple[int, int, bytes]] = []
+    """send_tts mirrors IpcServer's v2 contract: True while a client is
+    attached, False when Ears is disconnected (Speaker must then report the
+    utterance as unspoken so the channel-text fallback engages)."""
 
-    async def send_tts(self, guild_id: int, priority: int, wav_bytes: bytes) -> None:
+    def __init__(self, *, connected: bool = True) -> None:
+        self.sent: list[tuple[int, int, bytes]] = []
+        self.connected = connected
+
+    async def send_tts(self, guild_id: int, priority: int, wav_bytes: bytes) -> bool:
+        if not self.connected:
+            return False
         self.sent.append((guild_id, priority, wav_bytes))
+        return True
 
 
 def _holder(tmp_path, *, enabled: bool = True, max_utterance_s: float = 3.0) -> Any:
@@ -395,6 +403,48 @@ async def test_per_guild_ordering(tmp_path, monkeypatch) -> None:
     await speaker.close()
 
 
+async def test_alert_jumps_ahead_of_queued_normals(tmp_path, monkeypatch) -> None:
+    """The per-guild queue is priority-ordered: an ALERT enqueued behind
+    NORMAL jobs plays before them (the in-flight synthesis is never
+    preempted), so a voice ack can't sit behind an uncached synthesis past
+    the dialog grace window. Equal priorities keep FIFO order, and every
+    job's completion future still resolves True."""
+    order: list[str] = []
+    first_started = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        class _P(_FakeProc):
+            async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+                text = (input or b"").decode().strip()
+                if text == "first":
+                    first_started.set()
+                    await gate.wait()  # hold the worker: the rest must queue
+                order.append(text)
+                return self._stdout, self._stderr
+
+        return _P(b"\x01\x00" * 100)
+
+    monkeypatch.setattr(tts.asyncio, "create_subprocess_exec", fake_exec)
+    ipc = _FakeIpc()
+    speaker = Speaker(_holder(tmp_path), ipc)  # type: ignore[arg-type]
+
+    t_first = asyncio.create_task(speaker.say(1, "first"))
+    await first_started.wait()  # in-flight NORMAL holds the worker
+    t_normal_a = asyncio.create_task(speaker.say(1, "normal a"))
+    t_normal_b = asyncio.create_task(speaker.say(1, "normal b"))
+    await asyncio.sleep(0)  # both NORMALs are queued...
+    t_alert = asyncio.create_task(speaker.say(1, "alert", PRIORITY_ALERT))
+    await asyncio.sleep(0)  # ...before the ALERT even arrives
+    gate.set()
+
+    results = await asyncio.gather(t_first, t_normal_a, t_normal_b, t_alert)
+    assert results == [True, True, True, True]
+    assert order == ["first", "alert", "normal a", "normal b"]
+    assert len(ipc.sent) == 4
+    await speaker.close()
+
+
 async def test_voice_swap_on_reload_refreshes_sample_rate(tmp_path, monkeypatch) -> None:
     """A SIGHUP that swaps tts.voice must rebuild WAV headers (and the
     duration check) with the NEW voice's native rate, not the boot-time one."""
@@ -414,6 +464,60 @@ async def test_voice_swap_on_reload_refreshes_sample_rate(tmp_path, monkeypatch)
     assert speaker.sample_rate == 16000
     with wave.open(io.BytesIO(ipc.sent[0][2])) as w:
         assert w.getframerate() == 16000  # header built with the new rate
+    await speaker.close()
+
+
+async def test_render_uses_one_config_snapshot_for_key_synthesis_and_rate(
+    tmp_path, monkeypatch
+) -> None:
+    """A SIGHUP voice swap landing between _render's config read and the
+    Piper invocation must not synthesise with the NEW voice while caching
+    under the OLD voice's key and wrapping in the OLD rate's header: one
+    snapshot flows through the whole render."""
+    voice_b = tmp_path / "voice_b.onnx"
+    (tmp_path / "voice_b.onnx.json").write_text(
+        json.dumps({"audio": {"sample_rate": 16000}}), encoding="utf-8"
+    )
+
+    class _SwapMidRender:
+        """holder.current returns voice A for a limited number of reads, then
+        voice B — simulating the reload swap landing mid-render."""
+
+        def __init__(self, cfg_a: Any, cfg_b: Any) -> None:
+            self.cfg_a, self.cfg_b = cfg_a, cfg_b
+            self.reads_of_a = 10**9
+
+        @property
+        def current(self) -> Any:
+            if self.reads_of_a > 0:
+                self.reads_of_a -= 1
+                return self.cfg_a
+            return self.cfg_b
+
+    cfg_a = _holder(tmp_path).current  # voice A: 22050 Hz
+    cfg_b = SimpleNamespace(
+        tts=SimpleNamespace(
+            enabled=True,
+            voice=str(voice_b),
+            binary="/nonexistent/piper",
+            max_utterance_s=3.0,
+            effect="none",
+        )
+    )
+    holder = _SwapMidRender(cfg_a, cfg_b)
+    pcm = b"\x01\x00" * 22050
+    calls = _patch_piper(monkeypatch, pcm)
+    speaker = Speaker(holder, _FakeIpc())  # type: ignore[arg-type]
+
+    # The NEXT holder read (_render's snapshot) sees voice A; every read
+    # after that — including any synthesize() re-read — would see voice B.
+    holder.reads_of_a = 1
+    rendered_pcm, rate = await speaker._render("Go ahead.")
+
+    model = calls[0][calls[0].index("--model") + 1]
+    assert model == cfg_a.tts.voice  # synthesised with the snapshot's voice…
+    assert rate == 22050  # …and reported at that voice's rate
+    assert speaker._line_cache[("Go ahead.", cfg_a.tts.voice, "none")] == rendered_pcm
     await speaker.close()
 
 
@@ -498,3 +602,26 @@ def test_bratty_personality_rotates_with_attitude() -> None:
         assert set(tts._GO_AHEAD_BRATTY) <= set(lines)
     finally:
         tts.set_personality("standard")
+
+
+async def test_say_returns_false_when_ears_disconnected(tmp_path, monkeypatch) -> None:
+    """IPC v2: send_tts is False with no Ears attached — the utterance was
+    never played, so say() must report unspoken (channel-text fallback)."""
+    pcm = b"\x01\x00" * 22050
+    _patch_piper(monkeypatch, pcm)
+    ipc = _FakeIpc(connected=False)
+    speaker = Speaker(_holder(tmp_path), ipc)  # type: ignore[arg-type]
+
+    assert await speaker.say(42, "Hostiles Otanuomi, pinged.", PRIORITY_ALERT) is False
+    assert ipc.sent == []
+    await speaker.close()
+
+
+async def test_chirp_returns_false_when_ears_disconnected(tmp_path) -> None:
+    ipc = _FakeIpc(connected=False)
+    speaker = Speaker(_holder(tmp_path), ipc)  # type: ignore[arg-type]
+    assert await speaker.chirp(42) is False
+    ipc.connected = True
+    assert await speaker.chirp(42) is True
+    assert len(ipc.sent) == 1
+    await speaker.close()

@@ -1,15 +1,23 @@
 """Subscription routing — GDD §10 rule evaluation and §11 escalation discipline.
 
-``evaluate`` is a pure function of its inputs: incident × rules × ``now``
-(quiet hours) × the gazetteer (region / jump-distance scope). Rule loading
-from ``routing.yaml`` is separate (:func:`load_rules`) so the evaluator stays
-trivially testable.
+:func:`decide_mentions` is **the single escalation authority**: every mention
+CORTANA ever sends — incident cards and freeform relays, voice- or
+slash-triggered — flows through this one pure function. It owns the
+constraint-11 intent clamp, quiet hours, ``escalate_at``, the ``@Pilot``
+caller gate, ``here_on_severity``, group aliases (``all_hands`` included),
+``mentions_enabled`` suppression, the personal-ping user allowlist, and the
+channel choice. Nothing downstream may add a mention the decision did not
+grant; the Poster builds its ``AllowedMentions`` allowlist verbatim from the
+returned :class:`MentionDecision`.
 
 Escalation discipline (CLAUDE.md constraint 11): ``@here`` fires ONLY when the
-incident type is ``UNDER_ATTACK`` or ``ASSIST_REQUEST`` *and* a matching rule
-escalates at exactly that type. A misconfigured ``escalate_at`` on any other
-type is clamped at load time and re-clamped at evaluation time — a sighting
-can never produce ``here=True`` through this module, full stop.
+incident type is ``UNDER_ATTACK`` or ``ASSIST_REQUEST``. A misconfigured
+``escalate_at`` is clamped at load time and re-clamped at evaluation time; a
+spoken/typed severity code and the ``all_hands`` alias pass through the same
+final clamp; a freeform relay has no escalatable intent at all. Nothing can
+produce ``here=True`` outside those two types, full stop — and because the
+channel is recomputed *after* the clamp, ``@here`` can never fire into
+``#intel-live`` either.
 
 Channel semantics: a decision with any mention carries ``AlertChannel.ALERTS``;
 ``#intel-alerts`` receives only mentioning incidents while ``#intel-live`` is
@@ -21,7 +29,7 @@ nothing is mirrored.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,19 +39,20 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import structlog
 import yaml
 
-from cortana.types import AlertChannel, Incident, Intent, RoutingDecision
+from cortana.types import AlertChannel, Incident, Intent, RoutingDecision, Severity
 
 if TYPE_CHECKING:  # pragma: no cover — real class lands with aura.nlu.gazetteer
     from cortana.nlu.gazetteer import Gazetteer
 
 __all__ = [
     "ESCALATABLE_TYPES",
+    "MentionDecision",
     "PersonalPing",
     "QuietHours",
     "RoutingConfigError",
     "RoutingRule",
     "RuleScope",
-    "apply_group_alias",
+    "decide_mentions",
     "evaluate",
     "load_group_aliases",
     "load_rules",
@@ -176,6 +185,10 @@ def evaluate(
     ``#intel-alerts``, otherwise ``#intel-live``. A rule inside its quiet
     hours contributes neither its role nor its escalation.
 
+    This is the rule-evaluation *step*; the escalation authority the engine
+    calls is :func:`decide_mentions`, which folds this result together with
+    group aliases, ``here_on_severity``, the caller gate, and silent mode.
+
     ``personal`` are the guild's personal ping subscriptions (GDD §10.3):
     matching subscribers are unioned into ``user_ids`` (each mentioned once),
     the incident's own reporter excluded. Personal pings count as mentions for
@@ -219,42 +232,148 @@ def evaluate(
     )
 
 
-def apply_group_alias(
-    decision: RoutingDecision,
-    group_alias: str | None,
-    rules: Sequence[RoutingRule],
-    alias_roles: dict[str, int],
-) -> RoutingDecision:
-    """Apply a spoken group alias to a rule-derived decision — GDD §6.2.
+@dataclass(frozen=True, slots=True)
+class MentionDecision:
+    """Output of :func:`decide_mentions` — the ONLY sanctioned mention grant.
 
-    - ``"all_hands"`` → ``@here`` plus every subscribed role, regardless of
-      severity (explicit human targeting overrides the escalation table).
-    - A key of ``alias_roles`` (``"miners"``, ``"defense"``) → restrict the
-      mention to that single role.
-    - ``None`` or an unknown alias → decision unchanged.
+    The Poster builds its ``AllowedMentions`` from these fields verbatim:
+    ``user_ids`` is an explicit user-id allowlist (never ``users=True``),
+    ``role_ids`` the role allowlist, and ``everyone`` is granted only when
+    ``here`` is True. Two structural invariants hold for every instance this
+    module produces: ``here`` implies the type was ``UNDER_ATTACK`` or
+    ``ASSIST_REQUEST`` (constraint 11), and ``here`` implies
+    ``channel is AlertChannel.ALERTS`` — ``@here`` can never fire into
+    ``#intel-live``.
     """
-    if group_alias is None:
-        return decision
+
+    role_ids: tuple[int, ...]
+    here: bool
+    channel: AlertChannel
+    user_ids: tuple[int, ...] = ()
+
+    @property
+    def wants_mentions(self) -> bool:
+        """True when anything at all would be pinged."""
+        return bool(self.role_ids or self.here or self.user_ids)
+
+    def suppressed(self) -> MentionDecision:
+        """Strip every mention (discipline suppression — GDD §11.1).
+
+        The card still posts, to ``#intel-live`` — the engine keeps logging
+        while the circuit breaker is open or a cooldown is running. Personal
+        pings ride the same discipline (GDD §10.3).
+        """
+        return MentionDecision(role_ids=(), here=False, channel=AlertChannel.LIVE, user_ids=())
+
+
+def _alias_roles_for(
+    group_alias: str,
+    rules: Sequence[RoutingRule],
+    alias_roles: Mapping[str, int],
+    base_role_ids: tuple[int, ...],
+) -> tuple[tuple[int, ...], bool]:
+    """Resolve a spoken/typed group alias — GDD §6.2.
+
+    Returns ``(role_ids, here_requested)``. ``all_hands`` targets every
+    subscribed role and *requests* ``@here`` — the request still passes the
+    constraint-11 clamp in :func:`decide_mentions`, so only UNDER_ATTACK /
+    ASSIST_REQUEST reports can actually get it. A named alias restricts the
+    mention to that single role; an unknown alias changes nothing.
+    """
     if group_alias == "all_hands":
         all_roles: list[int] = []
         for rule in rules:
             if rule.role_id not in all_roles:
                 all_roles.append(rule.role_id)
-        return RoutingDecision(
-            role_ids=tuple(all_roles),
-            here=True,
-            channel=AlertChannel.ALERTS,
-            user_ids=decision.user_ids,
-        )
+        return tuple(all_roles), True
     role_id = alias_roles.get(group_alias)
     if role_id is None:
         log.warning("group_alias_unmapped", alias=group_alias)
-        return decision
-    return RoutingDecision(
-        role_ids=(role_id,),
-        here=decision.here,
-        channel=AlertChannel.ALERTS,
-        user_ids=decision.user_ids,
+        return base_role_ids, False
+    return (role_id,), False
+
+
+def decide_mentions(
+    *,
+    intent: Intent | None,
+    severity: Severity,
+    now: datetime,
+    rules: Sequence[RoutingRule] = (),
+    incident: Incident | None = None,
+    gazetteer: Gazetteer | None = None,
+    personal: Sequence[PersonalPing] = (),
+    group_alias: str | None = None,
+    alias_roles: Mapping[str, int] | None = None,
+    here_on_severity: Sequence[str] = (),
+    mentions_enabled: bool = True,
+    caller_may_mention: bool = True,
+) -> MentionDecision:
+    """THE escalation authority — every mention decision flows through here.
+
+    Pure function of its inputs; the discipline layer (cooldown / breaker)
+    stays in the engine because it is stateful, and it may only *suppress*
+    this decision (:meth:`MentionDecision.suppressed`), never widen it.
+
+    - ``intent is None`` means a freeform relay (GDD §8.6): no rule
+      evaluation, and — because a relay is not an escalatable incident type —
+      structurally no ``@here``, whatever severity code was spoken.
+    - ``incident``/``gazetteer``/``personal`` drive rule evaluation
+      (:func:`evaluate`: role union, ``escalate_at``, quiet hours, personal
+      ping subscribers) when present.
+    - ``group_alias`` (``"miners"``/``"defense"``/``"all_hands"``) restricts
+      or widens the roles; ``all_hands``'s ``@here`` request passes the same
+      clamp as everything else.
+    - ``here_on_severity`` (ping-by-colour) can request ``@here`` on its own,
+      clamped to the two escalatable intents.
+    - ``caller_may_mention`` is the ``@Pilot`` gate (GDD §11.1 layer 4)
+      threaded to the point of decision: a caller who may not mention gets a
+      card, never a ping — a non-Pilot "code red" can never ``@here``.
+    - ``mentions_enabled`` False (silent mode) strips everything.
+    - The channel is recomputed from the FINAL mention set, so ``@here`` (or
+      any mention) can never land in ``#intel-live``.
+    """
+    if incident is not None and gazetteer is not None:
+        base = evaluate(incident, rules, now, gazetteer=gazetteer, personal=personal)
+        role_ids, here_requested, user_ids = base.role_ids, base.here, base.user_ids
+    else:
+        role_ids, here_requested, user_ids = (), False, ()
+
+    if group_alias is not None:
+        role_ids, alias_here = _alias_roles_for(group_alias, rules, alias_roles or {}, role_ids)
+        here_requested = here_requested or alias_here
+
+    # Ping-by-colour (GDD §6.4): a threat level in here_on_severity requests
+    # an @here on its own, so a corp gets CODE RED alerts without wiring up a
+    # single routing rule. It is a *request* — the clamp below still applies.
+    if str(severity) in here_on_severity:
+        here_requested = True
+
+    # Constraint 11 — the clamp. @here strictly for UNDER_ATTACK and
+    # ASSIST_REQUEST: severity codes, group aliases, and freeform relays
+    # (intent None) can never earn it.
+    here = here_requested and intent in ESCALATABLE_TYPES
+
+    # @Pilot gate (GDD §11.1 layer 4): a caller who may not trigger mentions
+    # gets no mention of any kind — the card still posts.
+    if not caller_may_mention:
+        role_ids, here, user_ids = (), False, ()
+
+    # Silent mode: post everything, ping nobody.
+    if not mentions_enabled:
+        role_ids, here, user_ids = (), False, ()
+
+    # Channel from the FINAL mention set (GDD §11.2): any mention goes to
+    # #intel-alerts; the mention-free feed is #intel-live. Recomputing here —
+    # after every escalation input — is what makes @here-in-#intel-live
+    # structurally impossible.
+    channel = AlertChannel.ALERTS if (role_ids or here or user_ids) else AlertChannel.LIVE
+
+    assert not here or intent in ESCALATABLE_TYPES, (
+        f"@here computed for non-escalatable {intent} — constraint 11"
+    )
+    assert not here or channel is AlertChannel.ALERTS, "@here may never fire into #intel-live"
+    return MentionDecision(
+        role_ids=tuple(role_ids), here=here, channel=channel, user_ids=tuple(user_ids)
     )
 
 

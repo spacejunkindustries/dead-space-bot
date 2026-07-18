@@ -1,11 +1,19 @@
 //! TTS playback: WAV bytes → Songbird input, with a priority queue,
 //! talk-over suppression, and volume ducking (GDD §4 Ears table, §12).
 //!
-//! Priorities mirror Brain's `aura/ipc.py` constants: 0 = low, 1 = normal,
+//! Priorities mirror Brain's `cortana/ipc.py` constants: 0 = low, 1 = normal,
 //! 2 = alert. An alert preempts whatever is playing; anything below alert
-//! waits (up to a cap) while a human is speaking. These are playback
-//! *mechanics*, fixed here on purpose — Ears carries no meaning-level config.
+//! waits while a human is speaking, and a non-alert utterance still blocked
+//! at [`HOLD_MAX`] is DROPPED, not played late — a 3-seconds-late "Go
+//! ahead." spoken over an FC mid-report is worse than none (GDD §12.2).
+//! These are playback *mechanics*, fixed here on purpose — Ears carries no
+//! meaning-level config.
+//!
+//! All playback state (queue, playing slot, hold timer) is **per guild**,
+//! and the speech clock that drives suppression/ducking is the per-guild
+//! clock in [`GuildVoice`] — speech in one voice call never gates another.
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +37,8 @@ const DUCK_TO: f32 = 0.6;
 /// How recently a tick must have carried human audio to count as
 /// "someone is speaking right now" (a handful of 20 ms ticks).
 const SPEECH_ACTIVE_WINDOW: Duration = Duration::from_millis(250);
-/// Longest a non-alert utterance is held back for human speech.
+/// Longest a non-alert utterance is held back for human speech before being
+/// dropped as stale (GDD §12.2).
 const HOLD_MAX: Duration = Duration::from_secs(3);
 /// Queue/track maintenance cadence.
 const TICK: Duration = Duration::from_millis(100);
@@ -55,6 +64,11 @@ struct Queued {
     /// FIFO ordering key within a priority class; requeued (preempted) jobs
     /// get a key below the current minimum so they replay first.
     seq: i64,
+    /// When this utterance was first held back for human speech while at the
+    /// head of the queue. Carried by the job itself — not the engine — so an
+    /// interleaving alert cannot reset the hold age of a blocked utterance
+    /// and defeat the [`HOLD_MAX`] drop-stale guarantee (GDD §12.2).
+    blocked_since: Option<Instant>,
 }
 
 impl TtsQueue {
@@ -62,6 +76,7 @@ impl TtsQueue {
         self.items.push(Queued {
             job,
             seq: self.next_seq,
+            blocked_since: None,
         });
         self.next_seq += 1;
     }
@@ -76,32 +91,59 @@ impl TtsQueue {
             .min()
             .unwrap_or(self.next_seq)
             - 1;
-        self.items.push(Queued { job, seq });
+        self.items.push(Queued {
+            job,
+            seq,
+            blocked_since: None,
+        });
     }
 
-    /// Highest priority, then oldest.
-    pub fn pop(&mut self) -> Option<TtsJob> {
-        let idx = self
-            .items
+    /// Index of the head: highest priority, then oldest.
+    fn head_idx(&self) -> Option<usize> {
+        self.items
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| {
                 (a.job.priority, std::cmp::Reverse(a.seq))
                     .cmp(&(b.job.priority, std::cmp::Reverse(b.seq)))
             })
-            .map(|(i, _)| i)?;
+            .map(|(i, _)| i)
+    }
+
+    /// Highest priority, then oldest.
+    pub fn pop(&mut self) -> Option<TtsJob> {
+        let idx = self.head_idx()?;
         Some(self.items.swap_remove(idx).job)
     }
 
     #[must_use]
     pub fn peek_priority(&self) -> Option<u8> {
-        self.items
-            .iter()
-            .max_by(|a, b| {
-                (a.job.priority, std::cmp::Reverse(a.seq))
-                    .cmp(&(b.job.priority, std::cmp::Reverse(b.seq)))
-            })
-            .map(|q| q.job.priority)
+        self.head_idx().map(|i| self.items[i].job.priority)
+    }
+
+    /// How long the head utterance has been held for human speech, as of
+    /// `now`. Zero if the queue is empty or the head has never been held.
+    #[must_use]
+    pub fn head_blocked_for(&self, now: Instant) -> Duration {
+        self.head_idx()
+            .and_then(|i| self.items[i].blocked_since)
+            .map(|since| now.saturating_duration_since(since))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Stamp the head utterance as blocked-from-`now` unless it already
+    /// carries a hold stamp. Returns `true` when the stamp was newly set
+    /// (i.e. this is the first tick the utterance is held).
+    pub fn mark_head_blocked(&mut self, now: Instant) -> bool {
+        let Some(idx) = self.head_idx() else {
+            return false;
+        };
+        let queued = &mut self.items[idx];
+        if queued.blocked_since.is_some() {
+            return false;
+        }
+        queued.blocked_since = Some(now);
+        true
     }
 
     #[must_use]
@@ -133,12 +175,30 @@ pub fn should_preempt(current_priority: u8, incoming_priority: u8) -> bool {
     incoming_priority >= PRIORITY_ALERT && incoming_priority > current_priority
 }
 
-/// Talk-over suppression (GDD §12.2): may the head-of-queue utterance start
-/// now? Alerts always start; anything else waits for silence, but never more
-/// than [`HOLD_MAX`].
+/// What to do with the head-of-queue utterance right now (GDD §12.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldOutcome {
+    /// Play it now.
+    Start,
+    /// A human is speaking; keep holding.
+    Hold,
+    /// Held past [`HOLD_MAX`] with a human still speaking: the utterance is
+    /// stale — drop it rather than talk over an FC mid-report.
+    Drop,
+}
+
+/// Talk-over suppression: alerts always start; anything else waits for
+/// silence, and a non-alert utterance still blocked at [`HOLD_MAX`] is
+/// dropped as stale.
 #[must_use]
-pub fn may_start(priority: u8, human_speaking: bool, blocked_for: Duration) -> bool {
-    priority >= PRIORITY_ALERT || !human_speaking || blocked_for >= HOLD_MAX
+pub fn hold_outcome(priority: u8, human_speaking: bool, blocked_for: Duration) -> HoldOutcome {
+    if priority >= PRIORITY_ALERT || !human_speaking {
+        HoldOutcome::Start
+    } else if blocked_for >= HOLD_MAX {
+        HoldOutcome::Drop
+    } else {
+        HoldOutcome::Hold
+    }
 }
 
 struct Playing {
@@ -147,15 +207,22 @@ struct Playing {
     ducked: bool,
 }
 
+/// Per-guild playback engine: queue and playing slot. Hold timers ride on
+/// the queued utterances themselves (see [`Queued::blocked_since`]); the
+/// speech clock lives in the per-guild [`crate::state::GuildVoice`].
+#[derive(Default)]
+struct GuildPlayback {
+    queue: TtsQueue,
+    playing: Option<Playing>,
+}
+
 /// Run the playback task until the TTS channel closes.
 pub async fn run_playback(
     manager: Arc<Songbird>,
     shared: Arc<Shared>,
     mut rx: mpsc::UnboundedReceiver<TtsJob>,
 ) {
-    let mut queue = TtsQueue::default();
-    let mut playing: Option<Playing> = None;
-    let mut blocked_since: Option<Instant> = None;
+    let mut engines: HashMap<u64, GuildPlayback> = HashMap::new();
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -167,12 +234,18 @@ pub async fn run_playback(
                     guild_id = job.guild_id,
                     priority = priority_name(job.priority),
                     wav_bytes = job.wav.len(),
-                    queued = queue.len(),
                     "tts job received"
                 );
-                if let Some(current) = playing.take() {
+                let engine = engines.entry(job.guild_id).or_default();
+                debug!(
+                    guild_id = job.guild_id,
+                    queued = engine.queue.len(),
+                    "guild playback engine selected"
+                );
+                if let Some(current) = engine.playing.take() {
                     if should_preempt(current.job.priority, job.priority) {
                         info!(
+                            guild_id = job.guild_id,
                             interrupted_priority = current.job.priority,
                             alert_priority = job.priority,
                             "alert preempts current utterance"
@@ -181,60 +254,86 @@ pub async fn run_playback(
                             debug!(error = %e, "stopping preempted track");
                         }
                         // Replay the interrupted utterance after the alert.
-                        queue.push_front(current.job);
+                        engine.queue.push_front(current.job);
                     } else {
-                        playing = Some(current);
+                        engine.playing = Some(current);
                     }
                 }
-                queue.push(job);
+                engine.queue.push(job);
             },
             _ = tick.tick() => {},
         }
 
-        // Reap the current track if it finished (or its handle died).
-        if let Some(current) = playing.take() {
-            match current.handle.get_info().await {
-                Ok(state) if state.playing.is_done() => {
-                    debug!("utterance finished");
-                },
-                Ok(_state) => {
-                    playing = Some(duck(current, &shared));
-                },
-                Err(_) => {
-                    debug!("track handle gone; treating utterance as finished");
-                },
-            }
-        }
-
-        // Start the next utterance if we are idle and allowed to speak.
-        if playing.is_none() {
-            if queue.is_empty() {
-                blocked_since = None;
-            } else if let Some(priority) = queue.peek_priority() {
-                let human = shared.speech_within(SPEECH_ACTIVE_WINDOW);
-                let blocked_for = blocked_since
-                    .map(|t| t.elapsed())
-                    .unwrap_or(Duration::ZERO);
-                if may_start(priority, human, blocked_for) {
-                    blocked_since = None;
-                    if let Some(job) = queue.pop() {
-                        playing = start(&manager, &shared, job).await;
-                    }
-                } else if blocked_since.is_none() {
-                    debug!(priority, "holding utterance for human speech");
-                    blocked_since = Some(Instant::now());
-                }
-            } else {
-                blocked_since = None;
-            }
+        for (&guild_id, engine) in &mut engines {
+            maintain_guild(&manager, &shared, guild_id, engine).await;
         }
     }
     debug!("tts channel closed");
 }
 
+/// One maintenance pass for one guild: reap the finished track, apply
+/// ducking, and start (or drop) the next utterance.
+async fn maintain_guild(
+    manager: &Arc<Songbird>,
+    shared: &Arc<Shared>,
+    guild_id: u64,
+    engine: &mut GuildPlayback,
+) {
+    let human = shared.guild(guild_id).speech_within(SPEECH_ACTIVE_WINDOW);
+
+    // Reap the current track if it finished (or its handle died).
+    if let Some(current) = engine.playing.take() {
+        match current.handle.get_info().await {
+            Ok(state) if state.playing.is_done() => {
+                debug!(guild_id, "utterance finished");
+            },
+            Ok(_state) => {
+                engine.playing = Some(duck(current, human));
+            },
+            Err(_) => {
+                debug!(guild_id, "track handle gone; treating utterance as finished");
+            },
+        }
+    }
+
+    // Start the next utterance if we are idle and allowed to speak.
+    if engine.playing.is_some() || engine.queue.is_empty() {
+        return;
+    }
+    let Some(priority) = engine.queue.peek_priority() else {
+        return;
+    };
+    // Hold age is per queued utterance, not per engine: an alert starting
+    // in between must not reset a blocked lower-priority utterance's clock
+    // (that would let it play far past HOLD_MAX, or never drop at all).
+    let now = Instant::now();
+    let blocked_for = engine.queue.head_blocked_for(now);
+    match hold_outcome(priority, human, blocked_for) {
+        HoldOutcome::Start => {
+            if let Some(job) = engine.queue.pop() {
+                engine.playing = start(manager, human, job).await;
+            }
+        },
+        HoldOutcome::Hold => {
+            if engine.queue.mark_head_blocked(now) {
+                debug!(guild_id, priority, "holding utterance for human speech");
+            }
+        },
+        HoldOutcome::Drop => {
+            if let Some(job) = engine.queue.pop() {
+                info!(
+                    guild_id,
+                    priority = priority_name(job.priority),
+                    held_ms = blocked_for.as_millis() as u64,
+                    "dropping stale utterance held past HOLD_MAX (human still speaking)"
+                );
+            }
+        },
+    }
+}
+
 /// Apply/release ducking on the playing track when human speech starts/stops.
-fn duck(mut current: Playing, shared: &Arc<Shared>) -> Playing {
-    let human = shared.speech_within(SPEECH_ACTIVE_WINDOW);
+fn duck(mut current: Playing, human: bool) -> Playing {
     if human != current.ducked {
         let target = if human { DUCK_TO } else { 1.0 };
         match current.handle.set_volume(target) {
@@ -246,11 +345,7 @@ fn duck(mut current: Playing, shared: &Arc<Shared>) -> Playing {
 }
 
 /// Hand the WAV bytes to Songbird on the guild's call.
-async fn start(
-    manager: &Arc<Songbird>,
-    shared: &Arc<Shared>,
-    job: TtsJob,
-) -> Option<Playing> {
+async fn start(manager: &Arc<Songbird>, human_speaking: bool, job: TtsJob) -> Option<Playing> {
     let Some(gid) = NonZeroU64::new(job.guild_id) else {
         warn!(guild_id = job.guild_id, "tts for zero guild id; dropping");
         return None;
@@ -276,7 +371,7 @@ async fn start(
 
     // If someone is already talking, start ducked.
     let mut ducked = false;
-    if shared.speech_within(SPEECH_ACTIVE_WINDOW) && handle.set_volume(DUCK_TO).is_ok() {
+    if human_speaking && handle.set_volume(DUCK_TO).is_ok() {
         ducked = true;
     }
 
@@ -348,6 +443,69 @@ mod tests {
     }
 
     #[test]
+    fn hold_age_survives_alert_interleaving() {
+        // The GDD §12.2 regression this guards: a NORMAL utterance is held
+        // for human speech, an ALERT interleaves and plays, and the NORMAL
+        // utterance must still be droppable at its original HOLD_MAX
+        // deadline — the alert must not reset its hold clock.
+        let mut q = TtsQueue::default();
+        q.push(job(PRIORITY_NORMAL, 1));
+        let t0 = Instant::now();
+        assert!(q.mark_head_blocked(t0));
+
+        // Alert arrives and becomes head; it carries no hold stamp itself.
+        q.push(job(PRIORITY_ALERT, 2));
+        assert_eq!(q.peek_priority(), Some(PRIORITY_ALERT));
+        assert_eq!(q.head_blocked_for(t0 + HOLD_MAX), Duration::ZERO);
+        assert_eq!(q.pop().map(|j| j.wav[0]), Some(2));
+
+        // Back at the NORMAL head: its hold age spans the alert playback.
+        let after_alert = t0 + HOLD_MAX;
+        assert!(q.head_blocked_for(after_alert) >= HOLD_MAX);
+        assert_eq!(
+            hold_outcome(PRIORITY_NORMAL, true, q.head_blocked_for(after_alert)),
+            HoldOutcome::Drop
+        );
+    }
+
+    #[test]
+    fn mark_head_blocked_stamps_once() {
+        let mut q = TtsQueue::default();
+        assert!(!q.mark_head_blocked(Instant::now())); // empty queue: no-op
+        q.push(job(PRIORITY_NORMAL, 1));
+        let t0 = Instant::now();
+        assert!(q.mark_head_blocked(t0));
+        // A later re-mark must not restart the clock.
+        assert!(!q.mark_head_blocked(t0 + Duration::from_secs(1)));
+        assert_eq!(q.head_blocked_for(t0 + Duration::from_secs(2)), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn head_blocked_for_defaults_to_zero() {
+        let mut q = TtsQueue::default();
+        assert_eq!(q.head_blocked_for(Instant::now()), Duration::ZERO);
+        q.push(job(PRIORITY_NORMAL, 1));
+        // Never held: zero, and a stamp earlier than `now` never underflows.
+        let now = Instant::now();
+        assert_eq!(q.head_blocked_for(now), Duration::ZERO);
+        assert!(q.mark_head_blocked(now));
+        assert_eq!(q.head_blocked_for(now), Duration::ZERO);
+    }
+
+    #[test]
+    fn pop_discards_hold_stamp_with_the_job() {
+        // Once an utterance leaves the queue its hold history goes with it;
+        // the next head starts a fresh clock.
+        let mut q = TtsQueue::default();
+        q.push(job(PRIORITY_NORMAL, 1));
+        q.push(job(PRIORITY_NORMAL, 2));
+        let t0 = Instant::now();
+        assert!(q.mark_head_blocked(t0));
+        assert_eq!(q.pop().map(|j| j.wav[0]), Some(1));
+        assert_eq!(q.head_blocked_for(t0 + HOLD_MAX), Duration::ZERO);
+    }
+
+    #[test]
     fn only_alerts_preempt() {
         assert!(should_preempt(PRIORITY_LOW, PRIORITY_ALERT));
         assert!(should_preempt(PRIORITY_NORMAL, PRIORITY_ALERT));
@@ -359,13 +517,36 @@ mod tests {
     #[test]
     fn talk_over_suppression_rules() {
         // Alerts never wait.
-        assert!(may_start(PRIORITY_ALERT, true, Duration::ZERO));
+        assert_eq!(
+            hold_outcome(PRIORITY_ALERT, true, Duration::ZERO),
+            HoldOutcome::Start
+        );
         // Non-urgent waits while a human is speaking...
-        assert!(!may_start(PRIORITY_NORMAL, true, Duration::from_secs(1)));
-        assert!(!may_start(PRIORITY_LOW, true, Duration::from_secs(2)));
-        // ...but not past the cap.
-        assert!(may_start(PRIORITY_NORMAL, true, HOLD_MAX));
+        assert_eq!(
+            hold_outcome(PRIORITY_NORMAL, true, Duration::from_secs(1)),
+            HoldOutcome::Hold
+        );
+        assert_eq!(
+            hold_outcome(PRIORITY_LOW, true, Duration::from_secs(2)),
+            HoldOutcome::Hold
+        );
+        // ...and past the cap the stale utterance is DROPPED, never played
+        // late over the ongoing report (GDD §12.2).
+        assert_eq!(
+            hold_outcome(PRIORITY_NORMAL, true, HOLD_MAX),
+            HoldOutcome::Drop
+        );
+        assert_eq!(hold_outcome(PRIORITY_LOW, true, HOLD_MAX), HoldOutcome::Drop);
         // Silence releases immediately.
-        assert!(may_start(PRIORITY_LOW, false, Duration::ZERO));
+        assert_eq!(
+            hold_outcome(PRIORITY_LOW, false, Duration::ZERO),
+            HoldOutcome::Start
+        );
+        // Silence after a long hold still plays (the pilot stopped talking
+        // before the cap): drop only fires while a human is speaking.
+        assert_eq!(
+            hold_outcome(PRIORITY_NORMAL, false, HOLD_MAX),
+            HoldOutcome::Start
+        );
     }
 }

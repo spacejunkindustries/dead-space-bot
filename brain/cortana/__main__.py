@@ -4,15 +4,15 @@
 
 Everything is built here, in the order INTERFACES.md prescribes:
 ConfigHolder → db → Gazetteer → Discipline → IpcServer → Speaker →
-Transcriber → CaptureManager → IncidentEngine → AuraBot, then the voice
-gateway and health reporter are wired around them. One asyncio event loop,
-owned by this module.
+Transcriber → CaptureManager → DialogEngine → IncidentEngine → AuraBot, then
+the voice gateway and health reporter are wired around them. One asyncio
+event loop, owned by this module.
 
-Voice pipeline wiring (GDD §5): IPC audio frames → ``CaptureManager.feed``
-(sync hot path) → wake/VAD/endpoint → ``on_utterance`` → STT in a thread →
-grammar parse → phonetic resolve → ``IncidentEngine.report`` → card posted by
-the bot + spoken confirmation via the Speaker (falling back to channel text
-when speech is suppressed or over the cap).
+Voice pipeline wiring (GDD §5): IPC audio frames → ``DialogEngine.on_audio``
+→ ``CaptureManager.feed`` (sync hot path) → wake/VAD → the dialog state
+machine (GDD §5.4) → STT → grammar → ``IncidentEngine`` → card posted by the
+bot + spoken confirmation via the Speaker. All dialog state and timing lives
+in :mod:`cortana.dialog` — this module only builds and connects.
 
 Signals: SIGHUP reloads config in place (a failed reload keeps the old
 config); SIGTERM/SIGINT run a graceful shutdown. Any crashed critical task
@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import dataclasses
 import logging
 import signal
 import sqlite3
@@ -37,32 +36,25 @@ from typing import Any
 import structlog
 
 from cortana import tts as tts_mod
-from cortana.audio.capture import CaptureManager
-from cortana.audio.stt import SttError, SttTimeoutError, Transcriber, make_transcriber
+from cortana.alarms import AlarmBus, AlarmCode, AlarmSeverity
+from cortana.audio.capture import CaptureManager, CaptureMeta, CaptureOrigin
+from cortana.audio.stt import Transcriber, make_transcriber
 from cortana.audio.vad import VadGate
 from cortana.audio.wake import OpenWakeWordDetector
-from cortana.chat import ChatClient, ChatCooldownError, read_api_key
+from cortana.chat import ChatClient, read_api_key
 from cortana.config import ConfigError, ConfigHolder
 from cortana.core import db
 from cortana.core.discipline import Discipline
 from cortana.core.incidents import IncidentEngine, Poster, TimerPing
-from cortana.dsc.bot import AuraBot, read_token
+from cortana.dialog import DialogEngine
+from cortana.dsc.bot import AuraBot, TokenError, read_token
 from cortana.dsc.cogs.utility import ReminderService
 from cortana.health import HealthReporter
-from cortana.ipc import PRIORITY_ALERT, PRIORITY_NORMAL, IpcServer
-from cortana.nlu import grammar, phonetics
+from cortana.ipc import PRIORITY_NORMAL, IpcServer
 from cortana.nlu.gazetteer import Gazetteer
+from cortana.reload import ReloadResult
 from cortana.tts import Speaker
-from cortana.types import (
-    INTENT_SEVERITY,
-    MENTION_INTENTS,
-    CardRender,
-    Intent,
-    Outcome,
-    ParsedCommand,
-    Severity,
-    Tier,
-)
+from cortana.types import INTENT_SEVERITY, CardRender, Severity
 from cortana.voice_gateway import VoiceGateway
 
 log = structlog.get_logger(__name__)
@@ -71,28 +63,15 @@ _SWEEP_INTERVAL_S = 60.0
 _TIMER_POLL_INTERVAL_S = 15.0
 _HEALTH_CHECK_INTERVAL_S = 5.0
 
+#: Upper bound on the startup STT model warm: enough for a cold model load on
+#: the droplet's disk, small enough that a stalled network download of
+#: ``stt.model`` cannot park setup() indefinitely behind a green unit status.
+_STT_WARM_TIMEOUT_S = 120.0
+
 #: Upper bound on graceful shutdown. Kept well under systemd's TimeoutStopSec
 #: so a hung close never escalates to SIGKILL (which slows restarts and forces
 #: Ears to re-negotiate DAVE on every rejoin).
 _SHUTDOWN_TIMEOUT_S = 8.0
-
-#: Wall-clock TTL for a pending LOW-tier retry (GDD §8.3). The reopened
-#: capture window is measured in fed frames and cannot expire while the user
-#: is not transmitting, so this TTL is deliberately generous relative to the
-#: 4s frame-fed window.
-_RETRY_TTL_S = 10.0
-
-#: How often the wall-clock silence sweep checks for pilots who stopped talking.
-_SILENCE_SWEEP_MS = 100
-
-#: Silence-sweep grace after a capture opens: covers "Go ahead." playback plus
-#: the pilot's reaction time, so waiting politely for the cue can never get a
-#: capture force-endpointed before the first word.
-_ACK_GRACE_S = 2.0
-
-#: Spoken/posted when a non-@Pilot member voice-triggers a mention-bearing
-#: intent — mirrors the slash twin's rejection (GDD §11.1 layer 4).
-_PILOT_REQUIRED_UTTERANCE = "Reporting requires the Pilot role."
 
 
 def configure_logging(level: int = logging.INFO) -> None:
@@ -133,12 +112,22 @@ class _LatePoster:
         return self._poster
 
     async def post(
-        self, guild_id: int, channel: Any, content: str, card: CardRender
+        self,
+        guild_id: int,
+        channel: Any,
+        content: str,
+        card: CardRender,
+        **kwargs: Any,
     ) -> tuple[int, int]:
-        return await self._target().post(guild_id, channel, content, card)
+        # **kwargs: forward every keyword (mentions=...) verbatim — this
+        # proxy must never lag the Poster protocol again (a missing kwarg
+        # here broke every production post while tests passed on fakes).
+        return await self._target().post(guild_id, channel, content, card, **kwargs)
 
-    async def edit(self, channel_id: int, message_id: int, content: str, card: CardRender) -> None:
-        await self._target().edit(channel_id, message_id, content, card)
+    async def edit(
+        self, channel_id: int, message_id: int, content: str, card: CardRender, **kwargs: Any
+    ) -> None:
+        await self._target().edit(channel_id, message_id, content, card, **kwargs)
 
 
 class App:
@@ -154,41 +143,24 @@ class App:
         self.speaker: Speaker | None = None
         self.transcriber: Transcriber | None = None
         self.capture: CaptureManager | None = None
+        self.dialog: DialogEngine | None = None
         self.engine: IncidentEngine | None = None
         self.bot: AuraBot | None = None
         self.health: HealthReporter | None = None
+        self.alarms: AlarmBus | None = None
         self.gateway: VoiceGateway | None = None
         self.reminders: ReminderService | None = None
         self.chat: ChatClient | None = None
         self._chat_status = "disabled"
-        self._feed_errors = 0
+        self._chat_key: str | None = None
+        self._reload_task: asyncio.Task[None] | None = None
+        # Config this PROCESS was built from: restart-pending detection diffs
+        # against this, not the last swap — otherwise a second no-op reload
+        # would resolve the alarm while the edit is still not live (review
+        # finding: the receipt lied after a /reload double-tap).
+        self._boot_cfg = holder.current
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
-        # Fire-and-forget spoken cues (the "go ahead" ack); kept referenced so
-        # they are not garbage-collected mid-flight.
-        self._voice_tasks: set[asyncio.Task[None]] = set()
-        # Last time each user sent an audio frame — drives the silence sweep.
-        self._last_audio_at: dict[int, float] = {}
-        # LOW-tier "say again" retry state (GDD §8.3): user_id → (the rejected
-        # command, wall-clock deadline). The next utterance from that user may
-        # be a bare system name that re-binds to the rejected intent.
-        self._pending_retry: dict[int, tuple[ParsedCommand, float]] = {}
-        # Spoken-colour dialogue state (GDD §6.4): a standalone "code orange"
-        # acknowledges, reopens a wake-free window, and the next utterance from
-        # that user inherits the severity. Same shape and TTL as the retry.
-        self._pending_severity: dict[int, tuple[Severity, float]] = {}
-        # Override dialogue state (GDD §6.6): a bare "command override" opens
-        # a wake-free window; the next utterance is the question verbatim.
-        self._pending_override: dict[int, float] = {}
-        # When each user's capture window opened — the silence sweep's ack
-        # grace reads this so the "Go ahead." gap can't endpoint a capture
-        # before the pilot has spoken a word.
-        self._capture_opened_at: dict[int, float] = {}
-        # Loop guard for the say-again reopen: a wake gets ONE wake-free
-        # retry; a second consecutive unintelligible utterance drops silently
-        # instead of re-reopening (ambient noise + Whisper hallucination
-        # otherwise turns the retry into an endless say-again loop).
-        self._say_again_reopen: dict[int, float] = {}
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -201,9 +173,19 @@ class App:
         applied = await asyncio.to_thread(db.migrate, self.conn)
         log.info("db_ready", path=cfg.database.path, migrations_applied=applied)
 
-        self.gazetteer = Gazetteer(self.conn, cfg.gazetteer)
+        # The gazetteer takes the HOLDER (not a config snapshot) so reloads
+        # see gazetteer.* edits — the holder-snapshot fix.
+        self.gazetteer = Gazetteer(self.conn, self.holder)
         await asyncio.to_thread(self.gazetteer.load)
         log.info("gazetteer_loaded", systems=len(self.gazetteer.systems))
+
+        # The operator alarm surface (GDD §11.3). Safe from here on even
+        # though Discord isn't up yet: cards queue dirty and flush from the
+        # health loop once the bot is ready.
+        self.alarms = AlarmBus(self.conn, send=self._alarm_send, edit=self._alarm_edit)
+        # This process IS the restart that applies any pending restart-class
+        # edits — resolve the card the previous lifetime raised.
+        await self.alarms.clear(AlarmCode.CONFIG_RESTART_PENDING)
 
         self.discipline = Discipline(self.holder)
         self.ipc = IpcServer(self.holder, self._on_audio, self._on_control)
@@ -216,31 +198,57 @@ class App:
         self.transcriber = await asyncio.to_thread(make_transcriber, cfg.stt)
         # Load the Whisper weights now, off the request path: the first real
         # utterance must not pay the model load inside the STT watchdog (that
-        # loop never produced a transcript on a 2-vCPU box).
+        # loop never produced a transcript on a 2-vCPU box). BOUNDED: stt.model
+        # can be a Hugging Face name that downloads on first load — a stalled
+        # download must not wedge setup forever (systemd would see a live
+        # process and never restart it). On timeout, log and continue: the
+        # lazy load plus the watchdog cover the cold path.
         warm = getattr(self.transcriber, "warm", None)
         if callable(warm):
-            await asyncio.to_thread(warm)
-            log.info("stt_model_warmed", model=cfg.stt.model)
+            try:
+                await asyncio.wait_for(asyncio.to_thread(warm), timeout=_STT_WARM_TIMEOUT_S)
+            except TimeoutError:
+                log.warning("stt_warm_timed_out", timeout_s=_STT_WARM_TIMEOUT_S)
+            else:
+                log.info("stt_model_warmed", model=cfg.stt.model)
         vad = VadGate(cfg.capture.vad_aggressiveness)
         # The detector reads holder.current at the point of use (config.py
         # contract) so SIGHUP retunes apply to it and CaptureManager alike.
         wake = await asyncio.to_thread(OpenWakeWordDetector, self.holder)
+        # CaptureManager ↔ DialogEngine are mutually referential: the manager
+        # reports into the engine, the engine arms windows on the manager.
+        # The lambdas defer attribute lookup until the first frame flows.
         self.capture = CaptureManager(
-            self.holder, vad, wake, self._on_utterance, self._on_capture_start
+            self.holder,
+            vad,
+            wake,
+            self._dialog_on_utterance,
+            self._dialog_on_capture_start,
         )
 
         # Health before the engine: the engine reports mentions into it.
         self.health = HealthReporter(self.holder, self._post_health)
+        self.health.set_alarm_bus(self.alarms)
+        # Audio-pipeline probes: the wake stage counters/fault latch and the
+        # STT watchdog latch become #bot-health alerts + report lines instead
+        # of silent deaths behind a green status.
+        self.health.set_wake_probe(wake.counters, lambda: wake.faulted)
+        transcriber = self.transcriber
+        self.health.set_stt_probe(lambda: bool(getattr(transcriber, "degraded", False)))
 
         late_poster = _LatePoster()
-        rules_path = self.holder.path.parent / "routing.yaml"
+        # A RESOLVER, not a resolved path: routing.file is ENGINE-reload
+        # class, so the effective routing.yaml location must be re-read from
+        # the live config on every rules (re)load — a path baked in here
+        # would pin /reload to the boot-time file until a restart.
+        holder = self.holder
         self.engine = IncidentEngine(
             self.conn,
             self.holder,
             self.gazetteer,
             self.discipline,
             late_poster,
-            rules_path,
+            lambda: holder.current.routing.resolve(holder.path),
             on_mention=self.health.record_mention,
         )
         self.bot = AuraBot(
@@ -249,7 +257,35 @@ class App:
         late_poster.bind(self.bot)
         self.bot.chat = self.chat  # /ask slash twin (GDD §6.6, constraint 10)
         self.bot.chat_status = self._chat_status
+        self.bot.alarms = self.alarms
+        # /reload is the slash twin of SIGHUP — the SAME transaction.
+        self.bot.request_reload = self._reload_transaction
+        self.bot.ipc_status = self._ipc_status
+        self.bot.dialog_sessions = lambda: (
+            self.dialog.sessions_active if self.dialog is not None else 0
+        )
         self.reminders = ReminderService(self.conn, self.bot)
+
+        # The voice dialog engine (GDD §5.4) — drives the same IncidentEngine
+        # the slash cogs call (constraint 10).
+        self.dialog = DialogEngine(
+            self.holder,
+            capture=self.capture,
+            transcriber=self.transcriber,
+            speaker=self.speaker,
+            incidents=self.engine,
+            discipline=self.discipline,
+            gazetteer=self.gazetteer,
+            conn=self.conn,
+            health=self.health,
+            chat_provider=lambda: (self.chat, self._chat_status),
+            member_role_ids=self._member_role_ids,
+            send_channel=self._send_channel,
+            shutdown=self._shutdown,
+        )
+        # Authoritative dialog cleanup, redundant with the IPC "left" event —
+        # survives Ears outages (GDD §5.4).
+        self.bot.on_user_left_voice = self.dialog.reset_user
 
         self.gateway = VoiceGateway(self.holder, self.ipc, self.conn, self.bot.announce_join)
         self.gateway.set_census_listener(self.health.set_humans_present)
@@ -276,7 +312,7 @@ class App:
 
     async def _run_async(self) -> None:
         await self.setup()
-        assert self.ipc and self.bot and self.engine and self.health  # narrow for typing
+        assert self.ipc and self.bot and self.engine and self.health and self.dialog
 
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGHUP, self._on_sighup)
@@ -291,7 +327,7 @@ class App:
         self._spawn("timer-poll", self._timer_loop())
         self._spawn("reminder-poll", self._reminder_loop())
         self._spawn("health-check", self._health_loop())
-        self._spawn("silence-sweep", self._silence_sweep())
+        self._spawn("dialog-wheel", self.dialog.run())
 
         # Pre-render the scripted acknowledgement lines once the app is fully
         # up (never during setup — see Speaker.start_priming).
@@ -326,23 +362,112 @@ class App:
         self._shutdown.set()
 
     def _on_sighup(self) -> None:
-        try:
-            self.holder.reload()
-        except ConfigError as exc:
-            log.error("config_reload_failed", error=str(exc))
-        else:
-            tts_mod.set_personality(self.holder.current.tts.personality)
-            # The override channel follows the reload: flipping chat.enabled
-            # (or dropping a key into place) now takes effect on SIGHUP —
-            # it used to require a full restart, silently.
-            self._refresh_chat()
+        # The transaction is async (engine reloads, health post); the signal
+        # handler only schedules it. One at a time — a second SIGHUP during a
+        # reload is dropped rather than interleaved.
+        if self._reload_task is not None and not self._reload_task.done():
+            log.warning("config_reload_already_running")
+            return
+        self._reload_task = asyncio.create_task(self._reload())
+
+    async def _reload(self) -> None:
+        await self._reload_transaction()
+
+    async def _reload_transaction(self) -> ReloadResult:
+        """The one reload transaction (GDD §16): validate everything, swap
+        all-or-nothing, apply by reload class, post the receipt, and drive
+        the CONFIG_RESTART_PENDING alarm. Backs BOTH doors — SIGHUP and the
+        ``/reload`` slash command (which needs the returned receipt)."""
+        from cortana.core.routing import load_group_aliases, load_rules
+        from cortana.doctor import _NullGazetteer
+        from cortana.nlu.gazetteer import _load_scope
+        from cortana.reload import reload_all
+
+        def _validate_gazetteer(cfg: Any) -> None:
+            _load_scope(Path(cfg.gazetteer.file))
+
+        def _validate_routing(cfg: Any) -> None:
+            # Structural validation with a dummy role resolver (doctor.py's
+            # check_routing_yaml pattern): a broken routing.yaml edit must
+            # REJECT the whole reload up front — the engine reloader path
+            # (bot._load_routing_rules) reports failures via alarm cards but
+            # deliberately does not raise, so without this gate the receipt
+            # would read "Engines reloaded: routing" over a rejected file.
+            path = cfg.routing.resolve(self.holder.path)
+            if not path.is_file():
+                if cfg.routing.file:
+                    raise ConfigError(f"routing.file points at {path}, which does not exist")
+                return  # optional default file absent: zero rules, alarmed at load
+            gazetteer = _NullGazetteer()
+            load_rules(path, gazetteer, lambda _name: 1)  # type: ignore[arg-type]
+            load_group_aliases(path, lambda _name: 1)
+
+        async def _reload_gazetteer(cfg: Any) -> None:
+            if self.gazetteer is not None:
+                await asyncio.to_thread(self.gazetteer.load)
+
+        async def _reload_routing(cfg: Any) -> None:
+            if self.bot is not None and self.bot.is_ready():
+                await self.bot._load_routing_rules()
+
+        result = await reload_all(
+            self.holder,
+            file_validators={
+                "gazetteer.yaml": _validate_gazetteer,
+                "routing.yaml": _validate_routing,
+            },
+            engine_reloaders={
+                "gazetteer": _reload_gazetteer,
+                "routing": _reload_routing,
+            },
+            appliers={
+                "tts.personality": lambda cfg: tts_mod.set_personality(cfg.tts.personality),
+            },
+        )
+        # Unconditional: catches a rotated on-disk API key even when no
+        # chat.* KEY changed (appliers only fire on key changes).
+        self._refresh_chat()
+        # A reload is the operator's sanctioned "try again" for the STT
+        # watchdog latch (stt.py: latched until /reload or restart).
+        reset_degraded = getattr(self.transcriber, "reset_degraded", None)
+        if callable(reset_degraded):
+            reset_degraded()
+        # Restart-bound edits are never silently absorbed. Pending-ness is
+        # CUMULATIVE against the config this process booted with — a later
+        # reload only resolves the card when the file has actually returned
+        # to the running values (or the process restarted).
+        from cortana.config import diff_configs
+        from cortana.config_schema import Reload
+
+        pending_since_boot = tuple(
+            diff_configs(self._boot_cfg, self.holder.current).get(Reload.RESTART, ())
+        )
+        if self.alarms is not None:
+            if pending_since_boot:
+                await self.alarms.raise_alarm(
+                    AlarmCode.CONFIG_RESTART_PENDING,
+                    AlarmSeverity.WARNING,
+                    "Restart-bound config keys differ from what this process "
+                    "is running: " + ", ".join(pending_since_boot),
+                    "`systemctl restart cortana-brain` to apply them",
+                )
+            elif result.swapped:
+                await self.alarms.clear(AlarmCode.CONFIG_RESTART_PENDING)
+        log.info("config_reload_result", summary=result.summary(), ok=result.ok)
+        # The receipt goes to #bot-health so the operator sees exactly what
+        # applied and what still needs a restart — never silently absorbed.
+        if self.bot is not None and self.bot.is_ready():
+            with contextlib.suppress(Exception):
+                await self._post_health(f"🔄 {result.summary()}", None)
+        return result
 
     def _refresh_chat(self) -> None:
         """(Re)build the §6.6 ChatClient from the current config + key state.
 
-        Called at setup and after every successful SIGHUP reload. Keeps a
-        status string alongside so /ask can tell an operator *why* the
-        channel is down ("disabled" vs "no key") instead of a generic line.
+        Called at setup and after every reload transaction. Rebuilds when the
+        ON-DISK key differs from the live client's (a rotated key used to be
+        ignored until restart). Keeps a status string alongside so /ask can
+        tell an operator *why* the channel is down ("disabled" vs "no key").
         """
         cfg = self.holder.current
         if not cfg.chat.enabled:
@@ -351,11 +476,13 @@ class App:
         else:
             key = read_api_key(cfg.chat.api_key_file)
             if key:
-                if self.chat is None:
+                if self.chat is None or self._chat_key != key:
                     self.chat = ChatClient(self.holder, key)
+                    self._chat_key = key
                 self._chat_status = "ready"
             else:
                 self.chat = None
+                self._chat_key = None
                 self._chat_status = "no_key"
         log.info("override_channel_status", status=self._chat_status, model=cfg.chat.model)
         if self.bot is not None:
@@ -379,6 +506,9 @@ class App:
         log.info("shutdown_complete")
 
     async def _shutdown_sequence(self) -> None:
+        # gateway.close() sends NO leave: Ears keeps its voice connection
+        # (and DAVE session) alive across a routine Brain restart, and the
+        # fresh Brain's hello replay re-syncs the join state (GDD §15.4).
         if self.gateway is not None:
             with contextlib.suppress(Exception):
                 await self.gateway.close()
@@ -396,84 +526,69 @@ class App:
     # ── voice pipeline wiring (GDD §5) ───────────────────────────────────────
 
     def _on_audio(self, user_id: int, guild_id: int, pcm: bytes) -> None:
-        """IPC audio hot path — sync, never blocks (constraint: thin + RAM only)."""
-        if self.health is not None:
-            self.health.note_audio()
-        # Wall-clock marker for the silence sweep: Discord stops sending packets
-        # when a pilot goes quiet (no silence frames), so "no audio for a while"
-        # is how we detect end-of-speech.
-        self._last_audio_at[user_id] = self._loop_time()
-        if self.capture is not None:
-            # An exception here would kill the IPC read loop — one bad frame
-            # (or a wake-model failure for one user) must never take down the
-            # whole audio path. Log sparsely: this fires every 20 ms.
-            try:
-                self.capture.feed(user_id, guild_id, pcm)
-            except Exception:
-                self._feed_errors += 1
-                if self._feed_errors == 1 or self._feed_errors % 500 == 0:
-                    log.exception("audio_feed_failed", user_id=user_id, count=self._feed_errors)
+        """IPC audio hot path → dialog engine. Sync, never blocks."""
+        if self.dialog is not None:
+            self.dialog.on_audio(user_id, guild_id, pcm)
 
-    @staticmethod
-    def _loop_time() -> float:
-        try:
-            return asyncio.get_running_loop().time()
-        except RuntimeError:  # pragma: no cover — only outside the loop (tests)
-            return 0.0
+    def _dialog_on_utterance(
+        self, user_id: int, guild_id: int, pcm: bytes, meta: CaptureMeta
+    ) -> Coroutine[Any, Any, None]:
+        assert self.dialog is not None
+        return self.dialog.on_utterance(user_id, guild_id, pcm, meta)
 
-    async def _silence_sweep(self) -> None:
-        """End captures once the pilot has stopped transmitting.
+    def _dialog_on_capture_start(
+        self, user_id: int, guild_id: int, origin: CaptureOrigin, armed_gen: int | None
+    ) -> int:
+        assert self.dialog is not None
+        return self.dialog.on_capture_start(user_id, guild_id, origin, armed_gen)
 
-        Runs every ``_SILENCE_SWEEP_MS``; a capturing user who has sent no audio
-        for ``endpoint_silence_ms`` (Discord's stream simply stopped) has their
-        utterance emitted. This is what makes a report end when you stop talking
-        instead of running to the hard cap."""
-        while not self._shutdown.is_set():
-            await asyncio.sleep(_SILENCE_SWEEP_MS / 1000)
-            if self.capture is None:
-                continue
-            now = self._loop_time()
-            # Floor at 700ms: Discord's DTX drops packets during brief pauses
-            # between words, so a too-eager gap would clip a pilot mid-sentence.
-            gap = max(self.holder.current.capture.endpoint_silence_ms / 1000, 0.7)
-            for user_id in self.capture.capturing_users():
-                # Ack grace: a pilot who politely waits for the "Go ahead."
-                # cue is packet-silent for cue playback + reaction — routinely
-                # past the gap. Without this they were endpointed before
-                # saying a single word, and the wake-tail fragment decoded to
-                # a junk "Say again?".
-                opened = self._capture_opened_at.get(user_id)
-                if opened is not None and now - opened < _ACK_GRACE_S:
-                    continue
-                last = self._last_audio_at.get(user_id)
-                if last is not None and now - last >= gap:
-                    self.capture.force_endpoint(user_id)
+    def _purge_user(self, uid: int) -> None:
+        """Drop every piece of per-user voice/dialog state Brain holds.
 
-    def _on_capture_start(self, user_id: int, guild_id: int) -> None:
-        """Wake fired — acknowledge so the pilot knows CORTANA is listening.
+        Called from the IPC ``left`` event and from snapshot reconciliation
+        (§19 posture). The dialog engine owns all per-user state (§5.4) —
+        session, armed windows, capture, timing — so this is one call."""
+        if self.dialog is not None:
+            self.dialog.reset_user(uid)
 
-        Sync hot-path callback: it only schedules the cue as a task, so the
-        audio thread never blocks. ALERT priority jumps the queue ahead of any
-        pending confirmations. CORTANA never captures its own playback, so the cue
-        cannot bleed into the utterance being recorded.
+    async def _reconcile_snapshot(self, msg: dict[str, Any]) -> None:
+        """Reconcile Brain's view against Ears' state snapshot.
 
-        The form of the cue is ``wake.ack``: "voice" speaks "Go ahead."
-        (Cortana talks back), "beep" plays an instant tone, "none" is silent.
-        A spoken cue costs one Piper synthesis; the tone is instant, which is
-        why "beep" stays the latency-safe default."""
-        self._capture_opened_at[user_id] = self._loop_time()
-        if self.speaker is None:
-            return
-        ack = self.holder.current.wake.ack
-        if ack == "none":
-            return
-        if ack == "voice":
-            coro = self.speaker.say(guild_id, tts_mod.go_ahead(), PRIORITY_ALERT, user_id=user_id)
-        else:
-            coro = self.speaker.chirp(guild_id, user_id=user_id)
-        task = asyncio.create_task(coro)
-        self._voice_tasks.add(task)
-        task.add_done_callback(self._voice_tasks.discard)
+        Ears sends a full snapshot (per-guild connected state + SSRC↔user
+        roster) right after every hello (GDD §15), replacing the lossy event
+        deltas an IPC outage would have eaten. Users Brain is still tracking
+        that Ears no longer sees (left during the outage) are purged exactly
+        as if their ``left`` event had arrived. The per-guild connect state
+        goes to the voice gateway, which owns the rejoin/adopt/leave
+        judgement — after an unclean Brain death (SIGKILL/OOM never runs the
+        graceful path) this is how a fresh Brain learns Ears is still parked
+        in a voice channel. State is reset only where the views actually
+        differ — the hello replay already handled the rest.
+        """
+        roster: set[int] = set()
+        connected = False
+        channel_id: int | None = None
+        want_guild = str(self.holder.current.discord.guild_id)
+        for guild in msg.get("guilds", []) or []:
+            for entry in guild.get("users", []) or []:
+                user_id = entry.get("user_id")
+                if user_id is not None:
+                    with contextlib.suppress(ValueError, TypeError):
+                        roster.add(int(user_id))
+            if str(guild.get("guild_id")) == want_guild:
+                connected = bool(guild.get("connected"))
+                raw_channel = guild.get("channel_id")
+                if raw_channel is not None:
+                    with contextlib.suppress(ValueError, TypeError):
+                        channel_id = int(raw_channel)
+        tracked: set[int] = self.dialog.tracked_users() if self.dialog is not None else set()
+        stale = tracked - roster
+        for uid in stale:
+            self._purge_user(uid)
+        if stale:
+            log.info("ears_snapshot_reconciled", purged_users=len(stale))
+        if self.gateway is not None:
+            await self.gateway.on_ears_state(connected, channel_id)
 
     async def _on_control(self, msg: dict[str, Any]) -> None:
         t = msg.get("t")
@@ -481,356 +596,50 @@ class App:
             if self.health is not None:
                 self.health.note_heartbeat(msg)
         elif t == "hello":
-            log.info("ears_connected", version=msg.get("version"))
+            log.info("ears_connected", version=msg.get("version"), proto=msg.get("proto"))
+            # Every armed window / SSRC mapping the previous Ears process knew
+            # is gone — dialog state must not outlive the audio path (§5.4).
+            # The snapshot that follows re-purges anything Ears still sees
+            # differently.
+            if self.dialog is not None:
+                self.dialog.reset_all()
+            # A hello IS Ears liveness — resolve the card immediately rather
+            # than waiting for the next heartbeat check cycle.
+            if self.alarms is not None:
+                await self.alarms.clear(AlarmCode.EARS_DOWN)
             if self.gateway is not None:
                 await self.gateway.on_ears_hello()
+        elif t == "snapshot":
+            await self._reconcile_snapshot(msg)
+        elif t == "join_ok":
+            if self.gateway is not None:
+                await self.gateway.on_join_ok(int(msg.get("channel_id") or 0))
+        elif t == "join_failed":
+            if self.gateway is not None:
+                await self.gateway.on_join_failed(
+                    int(msg.get("channel_id") or 0), str(msg.get("reason", ""))
+                )
+        elif t == "driver_disconnected":
+            # Voice session died under Ears (DAVE crash, 4014, channel gone).
+            # Ears reports; the rejoin judgement stays here. Loud log + health
+            # note so a silent voice absence becomes visible (GDD §20).
+            log.warning(
+                "ears_driver_disconnected",
+                guild_id=msg.get("guild_id"),
+                kind=msg.get("kind"),
+                reason=msg.get("reason"),
+            )
+            if self.health is not None:
+                self.health.note_driver_event(msg)
         elif t == "left":
             user_id = msg.get("user_id")
             if user_id is not None:
-                uid = int(user_id)
-                if self.capture is not None:
-                    self.capture.drop_user(uid)
-                # Purge the App-side per-user state too (§19 posture — and
-                # otherwise these dicts grow for every pilot ever heard).
-                self._last_audio_at.pop(uid, None)
-                self._pending_retry.pop(uid, None)
-                self._pending_severity.pop(uid, None)
-                self._pending_override.pop(uid, None)
-                self._capture_opened_at.pop(uid, None)
-                self._say_again_reopen.pop(uid, None)
+                # Purges capture state, armed windows, and the session (§19).
+                self._purge_user(int(user_id))
         elif t == "speaking":
             pass  # informational; talk-over suppression happens in Ears
         else:
             log.warning("ipc_unknown_control", t=t)
-
-    async def _on_utterance(self, user_id: int, guild_id: int, pcm: bytes) -> None:
-        """One wake-gated utterance: STT → grammar → resolve → engine → reply.
-
-        The pcm buffer is dropped the moment ``transcribe`` returns; only the
-        transcript is retained (constraint 5, GDD §19).
-        """
-        assert (
-            self.gazetteer and self.transcriber and self.engine and self.health and self.discipline
-        )
-        cfg = self.holder.current
-        if self.health is not None:
-            self.health.record_wake_hit()
-
-        if not self._may_voice_trigger(user_id):
-            log.info("voice_trigger_denied", user_id=user_id)
-            return
-
-        bias = self.gazetteer.prompt_bias_text() if cfg.stt.bias_with_gazetteer else ""
-        try:
-            result = await asyncio.to_thread(self.transcriber.transcribe, pcm, bias)
-        except SttError as exc:
-            del pcm  # constraint 5: audio dropped even on failure
-            self.health.record_rejected()
-            log.warning(
-                "stt_failed",
-                user_id=user_id,
-                timed_out=isinstance(exc, SttTimeoutError),
-                error=str(exc),
-            )
-            if self.capture is not None:
-                self.capture.reopen(user_id, guild_id)  # wake-free retry, GDD §8.3
-            await self._speak_or_post(guild_id, user_id, tts_mod.say_again())
-            return
-        del pcm  # transcript only from here on
-        log.info(
-            "utterance_transcribed",
-            user_id=user_id,
-            text=result.text,
-            avg_logprob=round(result.avg_logprob, 3),
-        )
-
-        # The pending contexts apply only to this user's very next utterance —
-        # pop unconditionally (a full command discards them).
-        loop = asyncio.get_running_loop()
-        pending = self._pending_retry.pop(user_id, None)
-        pend_sev = self._pending_severity.pop(user_id, None)
-        pend_override = self._pending_override.pop(user_id, None)
-        say_again_armed = self._say_again_reopen.pop(user_id, None)
-        inherited: Severity | None = None
-        if pend_sev is not None and loop.time() <= pend_sev[1]:
-            inherited = pend_sev[0]
-
-        # "Command override" — the explicitly-invoked out-of-band assistant
-        # (GDD §6.6). Checked before the grammar so a question containing
-        # command words ("what's the status of the war?") is never misread as
-        # a report; a non-override utterance passes through untouched.
-        # An override request while the channel is down gets the fixed
-        # unavailable line — falling through to the grammar used to turn it
-        # into a "Say again"/relay, masquerading as a mishearing.
-        query = grammar.override_query(result.text)
-        if query is None and pend_override is not None and loop.time() <= pend_override:
-            # Override dialogue continuation (GDD §6.6): the pilot said a bare
-            # "command override", we acknowledged and reopened — THIS whole
-            # utterance is the question, no prefix needed.
-            query = grammar.broadcast_text(result.text) or None
-        if query is not None:
-            if self.chat is not None and cfg.chat.enabled:
-                await self._command_override(guild_id, user_id, query)
-            else:
-                log.info(
-                    "override_requested_unavailable", user_id=user_id, status=self._chat_status
-                )
-                await self._speak_or_post(guild_id, user_id, tts_mod.override_unavailable())
-            return
-        if grammar.bare_override(result.text):
-            # "command override" alone — usually because the capture window
-            # closed on the pause before the question. Acknowledge, reopen a
-            # wake-free window, and take the next utterance as the question.
-            if self.chat is not None and cfg.chat.enabled:
-                self._pending_override[user_id] = loop.time() + _RETRY_TTL_S
-                if self.capture is not None:
-                    self.capture.reopen(user_id, guild_id)
-                log.info("override_dialogue_opened", user_id=user_id)
-                await self._speak_or_post(guild_id, user_id, tts_mod.go_ahead())
-            else:
-                await self._speak_or_post(guild_id, user_id, tts_mod.override_unavailable())
-            return
-
-        parsed = grammar.parse(result.text)
-        if parsed is None:
-            # Spoken-colour dialogue (GDD §6.4): a standalone "code orange"
-            # opens a two-step report — acknowledge, reopen a wake-free
-            # window, and let the next utterance inherit the severity.
-            code = grammar.bare_code(result.text)
-            if code is not None:
-                self._pending_severity[user_id] = (code, loop.time() + _RETRY_TTL_S)
-                if self.capture is not None:
-                    self.capture.reopen(user_id, guild_id)
-                log.info("code_dialogue_opened", user_id=user_id, severity=str(code))
-                await self._speak_or_post(guild_id, user_id, tts_mod.code_ack(code))
-                return
-            # §8.3 retry: a bare system name in the reopened window re-binds
-            # to the LOW-rejected command's intent.
-            if pending is not None and loop.time() <= pending[1]:
-                reply = grammar.system_reply(result.text)
-                if reply is not None:
-                    parsed = dataclasses.replace(pending[0], system_text=reply, raw=result.text)
-                    log.info("retry_rebound", user_id=user_id, intent=str(parsed.intent))
-            if parsed is None:
-                # Nothing matched the fixed grammar → freeform intel relay
-                # (GDD §8.6): post whatever was said to the intel channel rather
-                # than drop it. A nullsec corp's comms are lively and
-                # unstructured — fleet movements, region callsigns, sitreps.
-                # Under relay_mode "framed" (default) only *explicitly framed*
-                # speech qualifies — a "report …" opener, a spoken colour code
-                # (inline or inherited from a code dialogue), or an all-hands
-                # phrase. An unmatched, unframed transcript is far more likely
-                # a mishearing than intel; it gets "Say again", never a card.
-                framed = inherited is not None or grammar.relay_framed(result.text)
-                if cfg.stt.relay_mode == "off" or (cfg.stt.relay_mode == "framed" and not framed):
-                    self.health.record_rejected()
-                    log.info(
-                        "relay_unframed_dropped",
-                        user_id=user_id,
-                        relay_mode=cfg.stt.relay_mode,
-                        text=result.text,
-                    )
-                    # "Say again?" must be TRUE: reopen a wake-free window so
-                    # the repeat is actually heard. ONE retry per wake — the
-                    # reopened window swallows ambient mic noise, Whisper
-                    # hallucinates words from it, and an unguarded reopen
-                    # turned that into an infinite say-again loop with nobody
-                    # talking (live incident). Second failure drops silently;
-                    # the pilot re-wakes when they actually want to talk.
-                    if say_again_armed is not None and loop.time() <= say_again_armed:
-                        # Second failure: close the dialogue AUDIBLY so the
-                        # pilot knows a fresh wake word is needed. Safe from
-                        # re-looping — this path never reopens the window.
-                        log.info("say_again_loop_guard", user_id=user_id, text=result.text)
-                        await self._speak_or_post(guild_id, user_id, tts_mod.standing_down())
-                        return
-                    if self.capture is not None:
-                        self.capture.reopen(user_id, guild_id)
-                        self._say_again_reopen[user_id] = loop.time() + _RETRY_TTL_S
-                    await self._speak_or_post(guild_id, user_id, tts_mod.not_understood())
-                    return
-                # Gate on STT confidence: a hallucinated transcript
-                # ("Rens, Rens, Rens" decoded from noise) must not become a
-                # card. Recognised commands are never gated — this protects
-                # the relay path only.
-                if result.avg_logprob < cfg.stt.relay_min_logprob:
-                    self.health.record_rejected()
-                    log.info(
-                        "relay_low_confidence",
-                        user_id=user_id,
-                        avg_logprob=round(result.avg_logprob, 3),
-                        text=result.text,
-                    )
-                    if say_again_armed is not None and loop.time() <= say_again_armed:
-                        log.info("say_again_loop_guard", user_id=user_id, text=result.text)
-                        await self._speak_or_post(guild_id, user_id, tts_mod.standing_down())
-                        return
-                    if self.capture is not None:
-                        self.capture.reopen(user_id, guild_id)
-                        self._say_again_reopen[user_id] = loop.time() + _RETRY_TTL_S
-                    await self._speak_or_post(guild_id, user_id, tts_mod.say_again())
-                    return
-                text = grammar.broadcast_text(result.text)
-                if len(text) < 3:
-                    self.health.record_rejected()
-                    log.info("utterance_no_intent", user_id=user_id, text=result.text)
-                    return
-                here = grammar.wants_all_hands(result.text) and self.discipline.may_mention(
-                    self._member_role_ids(user_id)
-                )
-                relay_sev = (
-                    inherited if inherited is not None else grammar.broadcast_severity(result.text)
-                )
-                outcome = await self.engine.broadcast(
-                    guild_id,
-                    user_id,
-                    text,
-                    here=here,
-                    severity=relay_sev,
-                    confidence=result.avg_logprob,
-                )
-                self._count_outcome(outcome.outcome)
-                # "Relayed." — without an audible ack pilots repeat themselves,
-                # and every repeat is another card and another STT decode.
-                await self._reply(guild_id, user_id, relay_sev or Severity.NONE, outcome)
-                return
-
-        # A severity spoken in the opener ("code orange" → "go ahead" → the
-        # report) attaches to the report itself; an inline code on the report
-        # wins over the opener.
-        if inherited is not None and parsed.severity is None:
-            parsed = dataclasses.replace(parsed, severity=inherited)
-
-        # GDD §11.1 layer 4: only @Pilot may trigger mentions — reject the
-        # command outright, exactly like the slash twin (constraint 10). Lifted
-        # in silent mode: with pings off there is no mention to protect, so
-        # anyone may post (and no roles need wiring up first).
-        if (
-            cfg.discord.mentions_enabled
-            and parsed.intent in MENTION_INTENTS
-            and not self.discipline.may_mention(self._member_role_ids(user_id))
-        ):
-            self.health.record_rejected()
-            log.info("voice_pilot_denied", user_id=user_id)
-            await self._speak_or_post(guild_id, user_id, _PILOT_REQUIRED_UTTERANCE)
-            return
-
-        resolution = None
-        if parsed.system_text:
-            priors = await asyncio.to_thread(self.engine.build_prior_context, guild_id, user_id)
-            resolution = await asyncio.to_thread(
-                phonetics.resolve,
-                parsed.system_text,
-                self.gazetteer,
-                priors,
-                cfg.matching,
-                self.conn,
-            )
-            self.health.record_stt(
-                resolution.best.score if resolution.best else 0.0, resolution.tier
-            )
-
-        outcome = await self.engine.report(guild_id, user_id, parsed, resolution)
-        self._count_outcome(outcome.outcome)
-
-        # Voice "help" (GDD §6.1): the spoken line stays under the §12.2 cap,
-        # so the actual command list — the /help front page — is posted to the
-        # intel channel alongside it.
-        if parsed.intent is Intent.HELP and outcome.outcome is Outcome.POSTED:
-            from cortana.dsc.cogs.help import main_embed  # text-side import, lazy
-
-            await self._send_channel(
-                self.holder.current.discord.channels.intel_live, "", embed=main_embed()
-            )
-
-        # LOW tier: "say again" — reopen capture so the retry needs no wake
-        # word, and remember the rejected command so a bare system-name reply
-        # re-binds to its intent (GDD §8.3).
-        if (
-            outcome.outcome is Outcome.REJECTED
-            and (resolution is None or resolution.tier is Tier.LOW)
-            and self.capture is not None
-            and parsed.system_text
-        ):
-            self.capture.reopen(user_id, guild_id)
-            self._pending_retry[user_id] = (parsed, loop.time() + _RETRY_TTL_S)
-
-        effective = (
-            parsed.severity
-            if parsed.severity is not None
-            else parsed_intent_severity(parsed.intent)
-        )
-        await self._reply(guild_id, user_id, effective, outcome)
-
-    def _count_outcome(self, outcome: Outcome) -> None:
-        assert self.health
-        if outcome is Outcome.POSTED:
-            self.health.record_incident_posted()
-        elif outcome is Outcome.FOLDED:
-            self.health.record_incident_folded()
-        elif outcome is Outcome.REJECTED:
-            self.health.record_rejected()
-
-    async def _reply(self, guild_id: int, user_id: int, severity: Severity, outcome: Any) -> None:
-        """Speak the outcome utterance; fall back to channel text when speech
-        is disabled, muted, or over the §12.2 length cap."""
-        assert self.speaker and self.health
-        utterance = outcome.utterance
-        if not utterance:
-            return
-        if self.health.degraded:
-            utterance = f"{utterance} {tts_mod.degraded()}"
-        priority = PRIORITY_ALERT if severity is Severity.HIGH else PRIORITY_NORMAL
-        spoken = await self.speaker.say(guild_id, utterance, priority, user_id=user_id)
-        if not spoken:
-            await self._send_channel(
-                self.holder.current.discord.channels.intel_live, f"🔊 {utterance}"
-            )
-
-    async def _command_override(self, guild_id: int, user_id: int, query: str) -> None:
-        """One §6.6 override question: throttle → ask → speak or post.
-
-        The reply is spoken when it fits the §12.2 cap; longer answers post to
-        the intel channel and the pilot hears "Answer posted to Discord."
-        Failures never surface raw errors on comms — a fixed line only.
-        """
-        assert self.chat and self.speaker
-        cfg = self.holder.current
-        log.info("override_query", user_id=user_id, query=query)
-        try:
-            reply = await asyncio.wait_for(
-                self.chat.ask(user_id, query), timeout=cfg.chat.timeout_s
-            )
-        except ChatCooldownError:
-            await self._speak_or_post(guild_id, user_id, tts_mod.override_cooldown())
-            return
-        except Exception as exc:  # ChatError, TimeoutError — comms stay clean
-            log.warning("override_failed", user_id=user_id, error=str(exc))
-            await self._speak_or_post(guild_id, user_id, tts_mod.override_unavailable())
-            return
-        spoken = await self.speaker.say(guild_id, reply, PRIORITY_NORMAL, user_id=user_id)
-        if not spoken:
-            # Long answers post to chat.answer_channel when set — weather
-            # chit-chat in the intel channel annoys fast (live complaint);
-            # 0 falls back to intel_live for corps that don't care.
-            target = cfg.chat.answer_channel or cfg.discord.channels.intel_live
-            await self._send_channel(target, f"💬 **Override** · {reply}")
-            await self._speak_or_post(guild_id, user_id, tts_mod.override_posted())
-
-    async def _speak_or_post(self, guild_id: int, user_id: int, utterance: str) -> None:
-        """Speak a short acknowledgement/rejection, best-effort.
-
-        ACK-class lines ("Say again?", "Go ahead.", "Standing down…") are
-        ephemeral feedback for the pilot's ears ONLY — when speech fails
-        (muted, over the §12.2 cap, synth error) they are logged and DROPPED,
-        never posted: a retry prompt pasted into the intel channel is pure
-        noise (live complaint). Command OUTCOMES still fall back to channel
-        text via ``_reply`` — those carry real information.
-        """
-        assert self.speaker
-        spoken = await self.speaker.say(guild_id, utterance, PRIORITY_NORMAL, user_id=user_id)
-        if not spoken:
-            log.info("ack_unspoken_dropped", user_id=user_id, utterance=utterance)
 
     def _member_role_ids(self, user_id: int) -> list[int]:
         """This member's role ids from the guild cache (empty when unknown)."""
@@ -838,11 +647,6 @@ class App:
         guild = self.bot.get_guild(self.holder.current.discord.guild_id)
         member = guild.get_member(user_id) if guild is not None else None
         return [role.id for role in member.roles] if member is not None else []
-
-    def _may_voice_trigger(self, user_id: int) -> bool:
-        """Fleetmode gate (GDD §11.1): voice triggers may be FC-only."""
-        assert self.discipline
-        return self.discipline.may_voice_trigger(self._member_role_ids(user_id))
 
     # ── periodic tasks ───────────────────────────────────────────────────────
 
@@ -894,15 +698,37 @@ class App:
         assert self.health
         while True:
             await asyncio.sleep(_HEALTH_CHECK_INTERVAL_S)
-            await self.health.check()
+            # Per-iteration guard, same reasoning as the other loops: one
+            # failed hourly report must not shut the whole process down.
+            try:
+                await self.health.check()
+            except Exception:
+                log.exception("health_iteration_failed")
+            # Retry any alarm card that couldn't reach Discord when raised
+            # (pre-ready startup alarms land here once the bot is up).
+            if self.alarms is not None:
+                await self.alarms.flush()
 
     async def _announce_timer(self, ping: TimerPing) -> None:
         where = f" {ping.system_name}" if ping.system_name else ""
         note = f" — {ping.note}" if ping.note else ""
-        await self._send_channel(
+        delivered = await self._send_channel(
             self.holder.current.discord.channels.intel_alerts,
             f"⏰ **Timer{where}** is due{note} (set by <@{ping.created_by}>)",
         )
+        # A structure timer eaten by a 403 is exactly the loss the corp set
+        # the timer to avoid — degrade loudly (GDD §13 / §11.3).
+        if self.alarms is not None:
+            if not delivered:
+                await self.alarms.raise_alarm(
+                    AlarmCode.TIMER_UNDELIVERED,
+                    AlarmSeverity.CRITICAL,
+                    f"A timer ping{where or ''} fired but could not be posted to #intel-alerts.",
+                    "check CORTANA's permissions on #intel-alerts; the timer "
+                    "details are in the journal",
+                )
+            else:
+                await self.alarms.clear(AlarmCode.TIMER_UNDELIVERED)
         if self.speaker is not None and ping.system_name:
             await self.speaker.say(ping.guild_id, f"Timer {ping.system_name} due.", PRIORITY_NORMAL)
 
@@ -910,7 +736,10 @@ class App:
 
     async def _send_channel(
         self, channel_id: int, content: str, embed: dict[str, Any] | None = None
-    ) -> None:
+    ) -> bool:
+        """Send to a channel; True when the message landed. Failures raise
+        the CHANNEL_UNWRITABLE alarm (keyed by channel id) and successes
+        clear it — a broken channel id is visible without journal access."""
         assert self.bot
         import discord  # composition root: text-side discord.py only (constraint 2)
 
@@ -920,17 +749,104 @@ class App:
                 channel = await self.bot.fetch_channel(channel_id)
             except discord.DiscordException as exc:
                 log.error("channel_unavailable", channel_id=channel_id, error=str(exc))
-                return
-        kwargs: dict[str, Any] = {}
+                await self._channel_alarm(channel_id, str(exc))
+                return False
+        # Nothing sent through this helper may ping: override answers carry
+        # verbatim LLM output, and card mentions flow through the Poster's
+        # decide_mentions allowlist — never through here (review finding).
+        kwargs: dict[str, Any] = {"allowed_mentions": discord.AllowedMentions.none()}
         if embed is not None:
             kwargs["embed"] = discord.Embed.from_dict(embed)
         try:
             await channel.send(content or None, **kwargs)  # type: ignore[union-attr]
         except discord.DiscordException as exc:
             log.error("channel_send_failed", channel_id=channel_id, error=str(exc))
+            await self._channel_alarm(channel_id, str(exc))
+            return False
+        if self.alarms is not None:
+            await self.alarms.clear(AlarmCode.CHANNEL_UNWRITABLE, key=str(channel_id))
+        return True
+
+    async def _channel_alarm(self, channel_id: int, error: str) -> None:
+        if self.alarms is None:
+            return
+        await self.alarms.raise_alarm(
+            AlarmCode.CHANNEL_UNWRITABLE,
+            AlarmSeverity.CRITICAL,
+            f"Cannot post to channel {channel_id}: {error}",
+            "check the channel id in cortana.yaml and CORTANA's permissions "
+            "there (View Channel, Send Messages, Embed Links)",
+            key=str(channel_id),
+        )
 
     async def _post_health(self, content: str, embed: dict[str, Any] | None) -> None:
         await self._send_channel(self.holder.current.discord.channels.health, content, embed)
+
+    # ── AlarmBus plumbing (GDD §11.3) ────────────────────────────────────────
+
+    async def _alarm_send(
+        self, content: str, embed: dict[str, Any] | None
+    ) -> tuple[int, int] | None:
+        """AlarmBus send: post a card to #bot-health, returning its ids.
+
+        Deliberately NOT via ``_send_channel``: a failure here must only make
+        the card retry later (dirty + flush), never raise further alarms."""
+        bot = self.bot
+        if bot is None or not bot.is_ready():
+            return None
+        import discord
+
+        channel_id = self.holder.current.discord.channels.health
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            message = await channel.send(  # type: ignore[union-attr]
+                content or None,
+                embed=discord.Embed.from_dict(embed) if embed is not None else None,
+            )
+        except Exception as exc:  # noqa: BLE001 — the bus retries; never crash it
+            log.warning("alarm_card_post_failed", channel_id=channel_id, error=str(exc))
+            return None
+        return channel_id, message.id
+
+    async def _alarm_edit(
+        self, channel_id: int, message_id: int, content: str, embed: dict[str, Any] | None
+    ) -> bool | None:
+        """AlarmBus edit: True = landed, None = transient (retry the edit),
+        False = message deleted (the bus re-posts a fresh card)."""
+        bot = self.bot
+        if bot is None or not bot.is_ready():
+            return None
+        import discord
+
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            await channel.get_partial_message(message_id).edit(  # type: ignore[union-attr]
+                content=content or None,
+                embed=discord.Embed.from_dict(embed) if embed is not None else None,
+            )
+        except discord.NotFound:
+            return False
+        except Exception as exc:  # noqa: BLE001 — the bus retries; never crash it
+            log.warning(
+                "alarm_card_edit_failed",
+                channel_id=channel_id,
+                message_id=message_id,
+                error=str(exc),
+            )
+            return None
+        return True
+
+    def _ipc_status(self) -> tuple[bool, float | None]:
+        """Ears liveness for /botstatus: (alive, heartbeat age in seconds)."""
+        import time
+
+        from cortana.health import HEARTBEAT_TIMEOUT_S
+
+        if self.ipc is None:
+            return False, None
+        last = self.ipc.last_heartbeat
+        age = None if last is None else max(0.0, time.monotonic() - last)
+        return self.ipc.is_alive(HEARTBEAT_TIMEOUT_S), age
 
 
 def parsed_intent_severity(intent: Any) -> Severity:
@@ -953,12 +869,23 @@ def main(argv: list[str] | None = None) -> int:
         holder = ConfigHolder(Path(args.config))
     except ConfigError as exc:
         log.error("config_invalid", error=str(exc))
-        return 2
+        # 78 = EX_CONFIG: paired with RestartPreventExitStatus=78 in the
+        # unit so a bad config edit fails fast instead of crash-looping.
+        return 78
 
     app = build_app(holder)
     # Signal handlers normally shut down first; a stray ^C must still exit 0.
-    with contextlib.suppress(KeyboardInterrupt):
-        app.run()
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            app.run()
+    except TokenError:
+        log.error("token_missing")
+        return 69  # EX_NOAUTH-ish: paired with RestartPreventExitStatus=69
+    except Exception as exc:  # discord.LoginFailure without importing discord here
+        if type(exc).__name__ == "LoginFailure":
+            log.error("token_rejected", error=str(exc))
+            return 69
+        raise
     return 0
 
 
