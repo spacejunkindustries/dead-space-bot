@@ -419,22 +419,46 @@ stage_release() {
     # --- ears binary ---------------------------------------------------
     stage_ears
 
-    # --- fresh venv ----------------------------------------------------
-    # Always fresh: a release directory is immutable once complete, so pip
-    # never mutates a live environment and a failed install never leaves a
-    # half-upgraded venv behind anything the units point at.
-    note "fresh venv (this is the slow part)"
-    run python3.12 -m venv "${REL}/venv"
-    run "${REL}/venv/bin/pip" install --quiet --upgrade pip
-    run "${REL}/venv/bin/pip" install --quiet -r "${REL}/brain/requirements.txt"
-    # openwakeword pins tflite-runtime on Linux, which has no wheels for
-    # Python >=3.12. CORTANA only uses its ONNX path, so install it without
-    # deps; its real runtime deps are in requirements.txt.
-    run "${REL}/venv/bin/pip" install --quiet --no-deps "openwakeword>=0.6.0"
-    run "${REL}/venv/bin/pip" install --quiet -e "${REL}/brain"
+    # --- venv ----------------------------------------------------------
+    # A release directory is immutable once complete, so pip never mutates
+    # a live environment. Building a venv from scratch on the 2-vCPU
+    # droplet WHILE the old brain still holds Whisper in RAM once thrashed
+    # the whole box into a freeze (live incident) — so:
+    #   * when requirements are UNCHANGED from the previous complete
+    #     release, the venv is cloned with hardlinks (seconds, ~zero RAM);
+    #   * when pip must actually run, it runs under nice/ionice so the
+    #     live bot keeps the cores.
+    req_hash="$(sha256sum "${REL}/brain/requirements.txt" | cut -d' ' -f1)"
+    prev_venv=""
+    prev_rel="$(readlink -f "${CURRENT}" 2>/dev/null || true)"
+    if [[ -n "${prev_rel}" && -f "${prev_rel}/.req_hash" ]] \
+        && [[ "$(cat "${prev_rel}/.req_hash")" == "${req_hash}" ]] \
+        && [[ -x "${prev_rel}/venv/bin/python" ]]; then
+        prev_venv="${prev_rel}/venv"
+    fi
+    if [[ -n "${prev_venv}" ]]; then
+        note "venv: requirements unchanged — hardlink clone from $(basename "${prev_rel}")"
+        run cp -al "${prev_venv}" "${REL}/venv"
+        # A cloned venv still carries the OLD release's package path from
+        # `pip install -e` — repoint the editable install (cheap, no deps).
+        run nice -n 19 "${REL}/venv/bin/pip" install --quiet --no-deps -e "${REL}/brain"
+    else
+        note "venv: building fresh (this is the slow part)"
+        run nice -n 19 ionice -c3 python3.12 -m venv "${REL}/venv"
+        run nice -n 19 ionice -c3 "${REL}/venv/bin/pip" install --quiet --upgrade pip
+        run nice -n 19 ionice -c3 "${REL}/venv/bin/pip" install --quiet \
+            -r "${REL}/brain/requirements.txt"
+        # openwakeword pins tflite-runtime on Linux, which has no wheels for
+        # Python >=3.12. CORTANA only uses its ONNX path, so install it without
+        # deps; its real runtime deps are in requirements.txt.
+        run nice -n 19 ionice -c3 "${REL}/venv/bin/pip" install --quiet --no-deps \
+            "openwakeword>=0.6.0"
+        run nice -n 19 "${REL}/venv/bin/pip" install --quiet -e "${REL}/brain"
+    fi
+    printf '%s' "${req_hash}" > "${REL}/.req_hash"
     # ProtectSystem=strict makes /opt read-only for the service: precompile
     # bytecode now so the runtime never tries to write __pycache__.
-    run "${REL}/venv/bin/python" -m compileall -q "${REL}/brain/cortana"
+    run nice -n 19 "${REL}/venv/bin/python" -m compileall -q "${REL}/brain/cortana"
 
     # --- model prefetch (best-effort — a warning beats a runtime failure)
     if [[ "${DRYRUN}" == 1 ]]; then
