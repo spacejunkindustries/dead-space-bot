@@ -91,6 +91,7 @@ def make_config(
     cancel_window_s: int = 30,
     personal_pings_max: int = 10,
     mentions_enabled: bool = True,
+    wake_ack: str = "beep",
 ) -> AuraConfig:
     return AuraConfig(
         discord=DiscordConfig(
@@ -102,7 +103,7 @@ def make_config(
             auto_join=True,
             mentions_enabled=mentions_enabled,
         ),
-        wake=WakeConfig(model="wake.onnx", threshold=0.55, refractory_ms=2000),
+        wake=WakeConfig(model="wake.onnx", threshold=0.55, refractory_ms=2000, ack=wake_ack),
         capture=CaptureConfig(
             preroll_ms=300, endpoint_silence_ms=400, max_utterance_ms=6000, vad_aggressiveness=2
         ),

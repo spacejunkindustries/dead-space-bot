@@ -27,6 +27,11 @@ wake:
   model:  /opt/aura/models/wake/aura_command.onnx  # trained openWakeWord ONNX chain
   threshold: 0.55                      # wake score needed to open a capture window
   refractory_ms: 2000                  # per-user dead time after a wake hit
+  ack: beep                            # how AURA acknowledges the wake word:
+                                       #   voice = speak "Go ahead." (talks back)
+                                       #   beep  = instant tone (no synth latency)
+                                       #   none  = silent
+
 
 capture:
   preroll_ms: 300                      # RAM ring-buffer audio prepended to each capture

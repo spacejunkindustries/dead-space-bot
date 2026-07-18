@@ -106,9 +106,14 @@ class _Health:
 class _Speaker:
     def __init__(self) -> None:
         self.said: list[tuple[int, str]] = []
+        self.chirped: list[int] = []
 
     async def say(self, guild_id: int, text: str, priority: int = 1, *, user_id=None) -> bool:
         self.said.append((guild_id, text))
+        return True
+
+    async def chirp(self, guild_id: int, *, user_id=None) -> bool:
+        self.chirped.append(guild_id)
         return True
 
 
@@ -150,8 +155,9 @@ def make_app(
     roles: list[int],
     transcriber: _Transcriber,
     outcome: IncidentOutcome | None = None,
+    wake_ack: str = "beep",
 ) -> tuple[App, _Engine, _Health, _Speaker, _Capture]:
-    holder = StubHolder(make_config())
+    holder = StubHolder(make_config(wake_ack=wake_ack))
     app = App(holder)  # type: ignore[arg-type]
     app.gazetteer = _Gazetteer(  # type: ignore[assignment]
         entries={
@@ -174,6 +180,44 @@ def make_app(
     app.bot = _Bot(roles)  # type: ignore[assignment]
     app.conn = None
     return app, engine, health, speaker, capture
+
+
+# ── wake acknowledgement (wake.ack: voice | beep | none) ─────────────────────
+
+
+async def _drain_voice_tasks(app: App) -> None:
+    if app._voice_tasks:
+        await asyncio.gather(*app._voice_tasks)
+
+
+async def test_wake_ack_voice_speaks_go_ahead() -> None:
+    app, _, _, speaker, _ = make_app(
+        roles=[PILOT_ROLE], transcriber=_Transcriber([]), wake_ack="voice"
+    )
+    app._on_capture_start(USER, GUILD)
+    await _drain_voice_tasks(app)
+    assert speaker.said == [(GUILD, "Go ahead.")]
+    assert speaker.chirped == []
+
+
+async def test_wake_ack_beep_chirps() -> None:
+    app, _, _, speaker, _ = make_app(
+        roles=[PILOT_ROLE], transcriber=_Transcriber([]), wake_ack="beep"
+    )
+    app._on_capture_start(USER, GUILD)
+    await _drain_voice_tasks(app)
+    assert speaker.chirped == [GUILD]
+    assert speaker.said == []
+
+
+async def test_wake_ack_none_is_silent() -> None:
+    app, _, _, speaker, _ = make_app(
+        roles=[PILOT_ROLE], transcriber=_Transcriber([]), wake_ack="none"
+    )
+    app._on_capture_start(USER, GUILD)
+    await _drain_voice_tasks(app)
+    assert speaker.said == []
+    assert speaker.chirped == []
 
 
 # ── @Pilot voice gate (GDD §11.1 layer 4, constraint 10 parity) ──────────────

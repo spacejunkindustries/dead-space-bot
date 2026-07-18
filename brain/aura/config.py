@@ -75,6 +75,10 @@ class WakeConfig:
     model: str
     threshold: float
     refractory_ms: int
+    #: How AURA acknowledges the wake word to the pilot:
+    #: "voice" = speak "Go ahead." (Cortana talks back), "beep" = an instant
+    #: tone (fast, no synthesis latency), "none" = silent. Default "beep".
+    ack: str = "beep"
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,10 +287,14 @@ def _build_discord(data: dict[str, Any]) -> DiscordConfig:
 
 def _build_wake(data: dict[str, Any]) -> WakeConfig:
     s = _section(data, "wake")
+    ack = str(_get(s, "wake.ack", str, default="beep")).lower()
+    if ack not in ("voice", "beep", "none"):
+        raise ConfigError(f"wake.ack: must be one of voice|beep|none, got {ack!r}")
     return WakeConfig(
         model=_get(s, "wake.model", str),
         threshold=_in_range(_get(s, "wake.threshold", float), "wake.threshold", 0.0, 1.0),
         refractory_ms=_positive(_get(s, "wake.refractory_ms", int), "wake.refractory_ms"),
+        ack=ack,
     )
 
 
