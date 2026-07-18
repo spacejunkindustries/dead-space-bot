@@ -15,7 +15,7 @@ The ONNX chain deployed to `/opt/cortana/models/wake/` on the droplet
 |---|---|---|
 | `melspectrogram.onnx` | openWakeWord release (downloaded, not trained) | audio → mel spectrogram |
 | `embedding_model.onnx` | openWakeWord release (downloaded, not trained) | spectrogram → speech embedding |
-| `aura_command.onnx` | **trained here** | embedding → wake score, the phrase is baked in |
+| `hey_cortana.onnx` | **trained here** | embedding → wake score, the phrase is baked in |
 
 `cortana.yaml` points at the trained head, and the threshold comes from this
 pipeline's sweep output:
@@ -27,7 +27,7 @@ wake:
 ```
 
 Brain's `audio/wake.py` loads all three from the model's directory; the two
-base models must sit next to `aura_command.onnx` (`train.py --bundle`
+base models must sit next to `hey_cortana.onnx` (`train.py --bundle`
 assembles exactly this trio).
 
 ## Hardware expectations
@@ -52,14 +52,14 @@ the openWakeWord repo:
    speed and noise.
 2. `openwakeword/train.py --generate_clips` produces positive clips *and*
    adversarial negatives — auto-generated phonetically-close texts plus our
-   `custom_negative_phrases` list ("aura", "or a command", "commander",
+   `custom_negative_phrases` list ("hey katana", "hey cortina", "hey montana",
    "concord", "capsuleer", ... — the GDD §5.2 false-fire vocabulary).
 3. `--augment_clips` mixes in room impulse responses (MIT survey) and
    background noise/music (AudioSet, Free Music Archive), then computes
    input features.
 4. `--train_model` trains the classifier head against ~2000 h of pre-computed
    negative features, auto-tuning toward the configured false-accept target,
-   and emits `aura_command.onnx`.
+   and emits `hey_cortana.onnx`.
 
 `generate_samples.py` wraps steps 1–3 (plus all asset downloads);
 `train.py` wraps step 4 and adds the validation sweep.

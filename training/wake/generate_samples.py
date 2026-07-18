@@ -40,7 +40,7 @@ from typing import Any
 
 import yaml
 
-log = logging.getLogger("aura.wake.generate")
+log = logging.getLogger("cortana.wake.generate")
 
 STAGES: tuple[str, ...] = (
     "repos",
