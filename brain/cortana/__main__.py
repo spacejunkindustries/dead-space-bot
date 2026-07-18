@@ -134,6 +134,8 @@ class App:
         self.reminders: ReminderService | None = None
         self.chat: ChatClient | None = None
         self._chat_status = "disabled"
+        self._chat_key: str | None = None
+        self._reload_task: asyncio.Task[None] | None = None
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
 
@@ -187,7 +189,7 @@ class App:
         self.health = HealthReporter(self.holder, self._post_health)
 
         late_poster = _LatePoster()
-        rules_path = self.holder.path.parent / "routing.yaml"
+        rules_path = self.holder.current.routing.resolve(self.holder.path)
         self.engine = IncidentEngine(
             self.conn,
             self.holder,
@@ -301,23 +303,59 @@ class App:
         self._shutdown.set()
 
     def _on_sighup(self) -> None:
-        try:
-            self.holder.reload()
-        except ConfigError as exc:
-            log.error("config_reload_failed", error=str(exc))
-        else:
-            tts_mod.set_personality(self.holder.current.tts.personality)
-            # The override channel follows the reload: flipping chat.enabled
-            # (or dropping a key into place) now takes effect on SIGHUP —
-            # it used to require a full restart, silently.
-            self._refresh_chat()
+        # The transaction is async (engine reloads, health post); the signal
+        # handler only schedules it. One at a time — a second SIGHUP during a
+        # reload is dropped rather than interleaved.
+        if self._reload_task is not None and not self._reload_task.done():
+            log.warning("config_reload_already_running")
+            return
+        self._reload_task = asyncio.create_task(self._reload())
+
+    async def _reload(self) -> None:
+        """The reload transaction (GDD §16): validate everything, swap
+        all-or-nothing, apply by reload class, and post the receipt."""
+        from cortana.nlu.gazetteer import _load_scope
+        from cortana.reload import reload_all
+
+        def _validate_gazetteer(cfg: Any) -> None:
+            _load_scope(Path(cfg.gazetteer.file))
+
+        async def _reload_gazetteer(cfg: Any) -> None:
+            if self.gazetteer is not None:
+                await asyncio.to_thread(self.gazetteer.load)
+
+        async def _reload_routing(cfg: Any) -> None:
+            if self.bot is not None and self.bot.is_ready():
+                await self.bot._load_routing_rules()
+
+        result = await reload_all(
+            self.holder,
+            file_validators={"gazetteer.yaml": _validate_gazetteer},
+            engine_reloaders={
+                "gazetteer": _reload_gazetteer,
+                "routing": _reload_routing,
+            },
+            appliers={
+                "tts.personality": lambda cfg: tts_mod.set_personality(cfg.tts.personality),
+            },
+        )
+        # Unconditional: catches a rotated on-disk API key even when no
+        # chat.* KEY changed (appliers only fire on key changes).
+        self._refresh_chat()
+        log.info("config_reload_result", summary=result.summary(), ok=result.ok)
+        # The receipt goes to #bot-health so the operator sees exactly what
+        # applied and what still needs a restart — never silently absorbed.
+        if self.bot is not None and self.bot.is_ready():
+            with contextlib.suppress(Exception):
+                await self._post_health(f"🔄 {result.summary()}", None)
 
     def _refresh_chat(self) -> None:
         """(Re)build the §6.6 ChatClient from the current config + key state.
 
-        Called at setup and after every successful SIGHUP reload. Keeps a
-        status string alongside so /ask can tell an operator *why* the
-        channel is down ("disabled" vs "no key") instead of a generic line.
+        Called at setup and after every reload transaction. Rebuilds when the
+        ON-DISK key differs from the live client's (a rotated key used to be
+        ignored until restart). Keeps a status string alongside so /ask can
+        tell an operator *why* the channel is down ("disabled" vs "no key").
         """
         cfg = self.holder.current
         if not cfg.chat.enabled:
@@ -326,11 +364,13 @@ class App:
         else:
             key = read_api_key(cfg.chat.api_key_file)
             if key:
-                if self.chat is None:
+                if self.chat is None or self._chat_key != key:
                     self.chat = ChatClient(self.holder, key)
+                    self._chat_key = key
                 self._chat_status = "ready"
             else:
                 self.chat = None
+                self._chat_key = None
                 self._chat_status = "no_key"
         log.info("override_channel_status", status=self._chat_status, model=cfg.chat.model)
         if self.bot is not None:
@@ -526,7 +566,9 @@ def main(argv: list[str] | None = None) -> int:
         holder = ConfigHolder(Path(args.config))
     except ConfigError as exc:
         log.error("config_invalid", error=str(exc))
-        return 2
+        # 78 = EX_CONFIG: paired with RestartPreventExitStatus=78 in the
+        # unit so a bad config edit fails fast instead of crash-looping.
+        return 78
 
     app = build_app(holder)
     # Signal handlers normally shut down first; a stray ^C must still exit 0.
