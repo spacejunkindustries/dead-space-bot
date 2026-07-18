@@ -566,6 +566,13 @@ fi
 say "Creating directories (GDD §17.2)"
 run install -d -m 0755 "${OPT}" "${RELEASES}"
 run install -d -m 0755 "${OPT}/models/wake" "${OPT}/models/whisper" "${OPT}/models/piper"
+# Repo-bundled wake models (assets/wake/ — the community hey_cortahnah pair):
+# installed alongside the openWakeWord base models so a plain git pull +
+# install.sh delivers them; existing files are refreshed (they are versioned
+# by filename, and cortana.yaml's wake.model picks which one is live).
+if compgen -G "${REPO_ROOT}/assets/wake/"'*.onnx' > /dev/null; then
+    run install -m 0644 "${REPO_ROOT}/assets/wake/"*.onnx "${OPT}/models/wake/"
+fi
 run install -d -m 0750 -o root -g aura "${ETC}"
 run install -d -m 0750 -o aura -g aura "${VARLIB}"
 # Shared Hugging Face cache: the whisper prefetch (STAGE, runs as aura) and
