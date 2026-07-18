@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from collections.abc import Awaitable, Callable
 
 import structlog
@@ -52,6 +53,9 @@ ANNOUNCEMENT = (
 #: Wait this long after the first pilot arrives before joining, so a
 #: drive-by join/leave doesn't drag the bot around.
 JOIN_DEBOUNCE_S = 5.0
+
+#: "daily" join-announcement cadence: at most one §19 notice per this window.
+_ANNOUNCE_DAILY_S = 24 * 3600.0
 
 AnnounceFn = Callable[[int], Awaitable[None]]
 
@@ -222,12 +226,47 @@ class VoiceGateway:
         except Exception:
             # Never let a DB hiccup swallow the §19 consent announcement.
             log.exception("optouts_push_failed", channel_id=channel_id)
-        if announce:
-            # §19: the consent announcement goes out every single time.
+        if announce and await self._announcement_due():
             try:
                 await self._announce(channel_id)
             except Exception:
                 log.exception("join_announcement_failed", channel_id=channel_id)
+            else:
+                await self._mark_announced()
+
+    async def _announcement_due(self) -> bool:
+        """§19 consent-announcement cadence (``discord.join_announcement``).
+
+        "every" posts on each join; "daily" at most once per 24h — persisted
+        in ``app_state`` because restart churn (the exact source of the spam)
+        would reset an in-memory timestamp; "off" never posts.
+        """
+        mode = self._holder.current.discord.join_announcement
+        if mode == "off":
+            return False
+        if mode == "every":
+            return True
+        row = await asyncio.to_thread(
+            db.query_one,
+            self._conn,
+            "SELECT value FROM app_state WHERE key = 'last_join_announcement'",
+        )
+        if row is None:
+            return True
+        try:
+            last = float(row["value"])
+        except ValueError:
+            return True
+        return (time.time() - last) >= _ANNOUNCE_DAILY_S
+
+    async def _mark_announced(self) -> None:
+        await asyncio.to_thread(
+            db.execute,
+            self._conn,
+            "INSERT INTO app_state (key, value) VALUES ('last_join_announcement', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(time.time()),),
+        )
 
     async def _leave(self) -> None:
         cfg = self._holder.current.discord

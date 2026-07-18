@@ -28,11 +28,12 @@ class _FakeIpc:
 
 
 class _StubHolder:
-    def __init__(self, *, auto_join: bool = True) -> None:
+    def __init__(self, *, auto_join: bool = True, join_announcement: str = "daily") -> None:
         discord = SimpleNamespace(
             guild_id=GUILD,
             watch_voice_channels=(CHANNEL,),
             auto_join=auto_join,
+            join_announcement=join_announcement,
         )
         self.current = SimpleNamespace(discord=discord)
 
@@ -144,3 +145,59 @@ async def test_unmuted_defaults_to_present_when_omitted() -> None:
     await gw.on_voice_update(CHANNEL, 2)
 
     assert seen == [2]
+
+
+# ── §19 join-announcement cadence (discord.join_announcement) ────────────────
+
+
+class _CountingAnnounce:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, _channel_id: int) -> None:
+        self.calls += 1
+
+
+def _db_conn() -> Any:
+    from aura.core import db as dbmod
+
+    conn = dbmod.connect(":memory:")
+    dbmod.migrate(conn)
+    return conn
+
+
+async def test_join_announcement_daily_posts_once_and_survives_restart() -> None:
+    holder = _StubHolder(join_announcement="daily")
+    ipc = _FakeIpc()
+    announce = _CountingAnnounce()
+    conn = _db_conn()
+    gw = VoiceGateway(holder, ipc, conn, announce, join_debounce_s=999)
+
+    await gw._send_join(CHANNEL, announce=True)
+    await gw._send_join(CHANNEL, announce=True)  # rejoin churn
+    assert announce.calls == 1
+
+    # A fresh gateway on the same DB — i.e. a process restart, the exact
+    # source of the spam — still suppresses within the 24h window.
+    gw2 = VoiceGateway(holder, ipc, conn, announce, join_debounce_s=999)
+    await gw2._send_join(CHANNEL, announce=True)
+    assert announce.calls == 1
+
+
+async def test_join_announcement_off_never_posts() -> None:
+    holder = _StubHolder(join_announcement="off")
+    gw = VoiceGateway(
+        holder, _FakeIpc(), _db_conn(), (announce := _CountingAnnounce()), join_debounce_s=999
+    )
+    await gw._send_join(CHANNEL, announce=True)
+    assert announce.calls == 0
+
+
+async def test_join_announcement_every_posts_each_join() -> None:
+    holder = _StubHolder(join_announcement="every")
+    gw = VoiceGateway(
+        holder, _FakeIpc(), _db_conn(), (announce := _CountingAnnounce()), join_debounce_s=999
+    )
+    await gw._send_join(CHANNEL, announce=True)
+    await gw._send_join(CHANNEL, announce=True)
+    assert announce.calls == 2

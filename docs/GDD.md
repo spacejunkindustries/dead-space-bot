@@ -1206,7 +1206,7 @@ This is not only good manners. Laws on recording conversations vary by country a
 
 Additionally:
 
-- **Announcement on join.** AURA posts: *"🎙️ AURA is listening for commands. Audio is not recorded. `/optout` to exclude yourself."* — every single time it joins.
+- **Announcement on join.** AURA posts: *"🎙️ AURA is listening for commands. Audio is not recorded. `/optout` to exclude yourself."* Cadence is `discord.join_announcement`: `every` join, at most once per 24h (`daily`, the default — persisted in `app_state` so restart/rejoin churn cannot spam the channel), or `off` (the corp accepts that the consent posture is carried by `/optout` and the pinned docs instead).
 - **`/optout`** drops that user's stream **inside Ears, before any processing and before it crosses the IPC boundary**. An actual drop, not a downstream filter.
 - AURA reads Discord's `allow_voice_recording` voice flag as an additional consent signal.
 - Callsign registration (§6.1) is keyed on the Discord user id attached to each utterance — it stores a chosen display name, never a voiceprint or anything derived from audio.
