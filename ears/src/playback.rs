@@ -64,6 +64,11 @@ struct Queued {
     /// FIFO ordering key within a priority class; requeued (preempted) jobs
     /// get a key below the current minimum so they replay first.
     seq: i64,
+    /// When this utterance was first held back for human speech while at the
+    /// head of the queue. Carried by the job itself — not the engine — so an
+    /// interleaving alert cannot reset the hold age of a blocked utterance
+    /// and defeat the [`HOLD_MAX`] drop-stale guarantee (GDD §12.2).
+    blocked_since: Option<Instant>,
 }
 
 impl TtsQueue {
@@ -71,6 +76,7 @@ impl TtsQueue {
         self.items.push(Queued {
             job,
             seq: self.next_seq,
+            blocked_since: None,
         });
         self.next_seq += 1;
     }
@@ -85,32 +91,59 @@ impl TtsQueue {
             .min()
             .unwrap_or(self.next_seq)
             - 1;
-        self.items.push(Queued { job, seq });
+        self.items.push(Queued {
+            job,
+            seq,
+            blocked_since: None,
+        });
     }
 
-    /// Highest priority, then oldest.
-    pub fn pop(&mut self) -> Option<TtsJob> {
-        let idx = self
-            .items
+    /// Index of the head: highest priority, then oldest.
+    fn head_idx(&self) -> Option<usize> {
+        self.items
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| {
                 (a.job.priority, std::cmp::Reverse(a.seq))
                     .cmp(&(b.job.priority, std::cmp::Reverse(b.seq)))
             })
-            .map(|(i, _)| i)?;
+            .map(|(i, _)| i)
+    }
+
+    /// Highest priority, then oldest.
+    pub fn pop(&mut self) -> Option<TtsJob> {
+        let idx = self.head_idx()?;
         Some(self.items.swap_remove(idx).job)
     }
 
     #[must_use]
     pub fn peek_priority(&self) -> Option<u8> {
-        self.items
-            .iter()
-            .max_by(|a, b| {
-                (a.job.priority, std::cmp::Reverse(a.seq))
-                    .cmp(&(b.job.priority, std::cmp::Reverse(b.seq)))
-            })
-            .map(|q| q.job.priority)
+        self.head_idx().map(|i| self.items[i].job.priority)
+    }
+
+    /// How long the head utterance has been held for human speech, as of
+    /// `now`. Zero if the queue is empty or the head has never been held.
+    #[must_use]
+    pub fn head_blocked_for(&self, now: Instant) -> Duration {
+        self.head_idx()
+            .and_then(|i| self.items[i].blocked_since)
+            .map(|since| now.saturating_duration_since(since))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Stamp the head utterance as blocked-from-`now` unless it already
+    /// carries a hold stamp. Returns `true` when the stamp was newly set
+    /// (i.e. this is the first tick the utterance is held).
+    pub fn mark_head_blocked(&mut self, now: Instant) -> bool {
+        let Some(idx) = self.head_idx() else {
+            return false;
+        };
+        let queued = &mut self.items[idx];
+        if queued.blocked_since.is_some() {
+            return false;
+        }
+        queued.blocked_since = Some(now);
+        true
     }
 
     #[must_use]
@@ -174,13 +207,13 @@ struct Playing {
     ducked: bool,
 }
 
-/// Per-guild playback engine: queue, playing slot, and hold timer. The
+/// Per-guild playback engine: queue and playing slot. Hold timers ride on
+/// the queued utterances themselves (see [`Queued::blocked_since`]); the
 /// speech clock lives in the per-guild [`crate::state::GuildVoice`].
 #[derive(Default)]
 struct GuildPlayback {
     queue: TtsQueue,
     playing: Option<Playing>,
-    blocked_since: Option<Instant>,
 }
 
 /// Run the playback task until the TTS channel closes.
@@ -264,36 +297,29 @@ async fn maintain_guild(
     }
 
     // Start the next utterance if we are idle and allowed to speak.
-    if engine.playing.is_some() {
-        return;
-    }
-    if engine.queue.is_empty() {
-        engine.blocked_since = None;
+    if engine.playing.is_some() || engine.queue.is_empty() {
         return;
     }
     let Some(priority) = engine.queue.peek_priority() else {
-        engine.blocked_since = None;
         return;
     };
-    let blocked_for = engine
-        .blocked_since
-        .map(|t| t.elapsed())
-        .unwrap_or(Duration::ZERO);
+    // Hold age is per queued utterance, not per engine: an alert starting
+    // in between must not reset a blocked lower-priority utterance's clock
+    // (that would let it play far past HOLD_MAX, or never drop at all).
+    let now = Instant::now();
+    let blocked_for = engine.queue.head_blocked_for(now);
     match hold_outcome(priority, human, blocked_for) {
         HoldOutcome::Start => {
-            engine.blocked_since = None;
             if let Some(job) = engine.queue.pop() {
                 engine.playing = start(manager, human, job).await;
             }
         },
         HoldOutcome::Hold => {
-            if engine.blocked_since.is_none() {
+            if engine.queue.mark_head_blocked(now) {
                 debug!(guild_id, priority, "holding utterance for human speech");
-                engine.blocked_since = Some(Instant::now());
             }
         },
         HoldOutcome::Drop => {
-            engine.blocked_since = None;
             if let Some(job) = engine.queue.pop() {
                 info!(
                     guild_id,
@@ -414,6 +440,69 @@ mod tests {
         assert_eq!(q.len(), 1);
         let _ = q.pop();
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn hold_age_survives_alert_interleaving() {
+        // The GDD §12.2 regression this guards: a NORMAL utterance is held
+        // for human speech, an ALERT interleaves and plays, and the NORMAL
+        // utterance must still be droppable at its original HOLD_MAX
+        // deadline — the alert must not reset its hold clock.
+        let mut q = TtsQueue::default();
+        q.push(job(PRIORITY_NORMAL, 1));
+        let t0 = Instant::now();
+        assert!(q.mark_head_blocked(t0));
+
+        // Alert arrives and becomes head; it carries no hold stamp itself.
+        q.push(job(PRIORITY_ALERT, 2));
+        assert_eq!(q.peek_priority(), Some(PRIORITY_ALERT));
+        assert_eq!(q.head_blocked_for(t0 + HOLD_MAX), Duration::ZERO);
+        assert_eq!(q.pop().map(|j| j.wav[0]), Some(2));
+
+        // Back at the NORMAL head: its hold age spans the alert playback.
+        let after_alert = t0 + HOLD_MAX;
+        assert!(q.head_blocked_for(after_alert) >= HOLD_MAX);
+        assert_eq!(
+            hold_outcome(PRIORITY_NORMAL, true, q.head_blocked_for(after_alert)),
+            HoldOutcome::Drop
+        );
+    }
+
+    #[test]
+    fn mark_head_blocked_stamps_once() {
+        let mut q = TtsQueue::default();
+        assert!(!q.mark_head_blocked(Instant::now())); // empty queue: no-op
+        q.push(job(PRIORITY_NORMAL, 1));
+        let t0 = Instant::now();
+        assert!(q.mark_head_blocked(t0));
+        // A later re-mark must not restart the clock.
+        assert!(!q.mark_head_blocked(t0 + Duration::from_secs(1)));
+        assert_eq!(q.head_blocked_for(t0 + Duration::from_secs(2)), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn head_blocked_for_defaults_to_zero() {
+        let mut q = TtsQueue::default();
+        assert_eq!(q.head_blocked_for(Instant::now()), Duration::ZERO);
+        q.push(job(PRIORITY_NORMAL, 1));
+        // Never held: zero, and a stamp earlier than `now` never underflows.
+        let now = Instant::now();
+        assert_eq!(q.head_blocked_for(now), Duration::ZERO);
+        assert!(q.mark_head_blocked(now));
+        assert_eq!(q.head_blocked_for(now), Duration::ZERO);
+    }
+
+    #[test]
+    fn pop_discards_hold_stamp_with_the_job() {
+        // Once an utterance leaves the queue its hold history goes with it;
+        // the next head starts a fresh clock.
+        let mut q = TtsQueue::default();
+        q.push(job(PRIORITY_NORMAL, 1));
+        q.push(job(PRIORITY_NORMAL, 2));
+        let t0 = Instant::now();
+        assert!(q.mark_head_blocked(t0));
+        assert_eq!(q.pop().map(|j| j.wav[0]), Some(1));
+        assert_eq!(q.head_blocked_for(t0 + HOLD_MAX), Duration::ZERO);
     }
 
     #[test]
