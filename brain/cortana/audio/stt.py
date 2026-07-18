@@ -7,9 +7,16 @@ Three :class:`Transcriber` implementations behind one protocol:
   does not stall the event loop.
 - :class:`WhisperCppTranscriber` — posts a WAV built entirely in memory to a
   whisper.cpp HTTP server. No temp files, ever.
-- :class:`TimeoutTranscriber` — the §20 "STT worker hang" watchdog. Wraps
-  either backend; a call that exceeds the deadline is abandoned and the inner
-  transcriber is rebuilt so the next utterance gets a fresh worker.
+- :class:`TimeoutTranscriber` — the §20 "STT worker hang" watchdog *and* the
+  admission control in front of it: ONE decode at a time through a bounded
+  queue (five pilots reporting one gate camp produce queued decodes, never
+  five concurrent Whisper runs on 2 vCPUs). When the queue is full the OLDEST
+  queued job is dropped with :class:`SttError` — its pilot hears "say again"
+  through the dialog machine's normal failure door. The watchdog deadline
+  applies to **queue-head service time** only, so overload shows up as queue
+  time and can never masquerade as a hang and trigger a respawn cascade.
+  Consecutive respawns are capped; past the cap the wrapper latches
+  ``degraded`` and refuses work instead of burning CPU on a broken backend.
 
 Every class here is synchronous by design: callers run ``transcribe`` via
 ``asyncio.to_thread`` (docs/INTERFACES.md threading rules). Heavy dependencies
@@ -29,6 +36,7 @@ import urllib.error
 import urllib.request
 import uuid
 import wave
+from collections import deque
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -41,7 +49,9 @@ from cortana.types import TranscriptResult
 log = structlog.get_logger(__name__)
 
 __all__ = [
+    "DEFAULT_QUEUE_DEPTH",
     "DEFAULT_WATCHDOG_S",
+    "MAX_CONSECUTIVE_RESPAWNS",
     "FasterWhisperTranscriber",
     "SttError",
     "SttTimeoutError",
@@ -52,13 +62,27 @@ __all__ = [
     "pcm_to_wav_bytes",
 ]
 
-#: STT watchdog deadline — GDD §20 "STT worker hang". This is a *hang*
-#: backstop, not a latency target: the model is preloaded at startup (see
-#: ``warm``), so a real transcription of a few-second clip finishes in well
-#: under this even on a 2-vCPU box. Set generously so slow-but-progressing
-#: decoding is never mistaken for a hang and killed mid-flight (which, before
-#: preloading, spun a reload→timeout→reload loop that never produced a word).
+#: STT watchdog deadline — GDD §20 "STT worker hang"; the default for
+#: ``stt.watchdog_s`` (config.py). This is a *hang* backstop, not a latency
+#: target: the model is preloaded at startup (see ``warm``), so a real
+#: transcription of a few-second clip finishes in well under this even on a
+#: 2-vCPU box. Set generously so slow-but-progressing decoding is never
+#: mistaken for a hang and killed mid-flight (which, before preloading, spun
+#: a reload→timeout→reload loop that never produced a word). The deadline
+#: measures queue-head SERVICE time only — time spent waiting in the queue
+#: under load never counts against it.
 DEFAULT_WATCHDOG_S = 15.0
+
+#: Jobs allowed to WAIT behind the in-service decode. Depth 3 covers the
+#: headline five-pilots-one-gate-camp burst (one decoding + three queued);
+#: past that the oldest queued job is dropped with :class:`SttError` so its
+#: pilot is re-prompted instead of the whole fleet backing up.
+DEFAULT_QUEUE_DEPTH = 3
+
+#: Consecutive watchdog respawns before the wrapper latches ``degraded`` and
+#: stops feeding a provably broken backend. A completed decode (success or a
+#: clean backend error) resets the count — only back-to-back hangs latch.
+MAX_CONSECUTIVE_RESPAWNS = 2
 
 #: int16 full-scale divisor for the float32 conversion Whisper expects.
 _INT16_FULL_SCALE = 32768.0
@@ -275,30 +299,75 @@ def _encode_multipart(
     return buf.getvalue(), f"multipart/form-data; boundary={boundary}"
 
 
+class _Job:
+    """One queued transcription request; the caller blocks on ``done``."""
+
+    __slots__ = ("bias", "done", "error", "pcm", "result", "started")
+
+    def __init__(self, pcm: bytes, bias: str) -> None:
+        self.pcm = pcm
+        self.bias = bias
+        self.started = threading.Event()  # set when the worker begins THIS job
+        self.done = threading.Event()
+        self.result: TranscriptResult | None = None
+        self.error: BaseException | None = None
+
+    def fail(self, error: BaseException) -> None:
+        self.error = error
+        self.pcm = b""  # constraint 5: drop the audio the moment it is dead
+        self.done.set()
+        self.started.set()  # wake a caller still queued behind the head job
+
+
 class TimeoutTranscriber:
-    """Watchdog wrapper — GDD §20 "STT worker hang: 5s watchdog, kill, respawn".
+    """Bounded serialized STT worker with the §20 hang watchdog.
 
-    Each call runs the inner transcriber on a fresh *daemon* worker thread and
-    waits at most ``timeout_s``. On timeout the worker is abandoned (Python
-    cannot forcibly kill a thread) and the inner transcriber is rebuilt via
-    the injected factory, so the next utterance gets a clean worker and — for
-    faster-whisper — a freshly loaded model. :class:`SttTimeoutError`
-    propagates to the caller, which answers the pilot with "say again".
+    All calls funnel through ONE decode at a time (Whisper is the heaviest
+    workload on the droplet; Piper is already serialised in ``tts.py``).
+    Callers — each an ``asyncio.to_thread`` worker — enqueue a job and block
+    on its completion:
 
-    Daemon threads are deliberate: ``concurrent.futures`` workers are
-    non-daemon and joined at interpreter exit, so one truly hung C-level call
-    would wedge process shutdown. A daemon thread cannot — systemd's restart
-    (GDD §17.2) stays clean.
+    - **Bounded queue (drop-oldest).** At most ``queue_depth`` jobs wait
+      behind the in-service decode. Overflow drops the OLDEST queued job with
+      ``SttError("stt queue overflow")`` so its caller re-prompts through the
+      dialog machine's normal fail path; the freshest audio keeps its place.
+    - **Watchdog on queue-head service time.** The ``timeout_s`` deadline
+      starts when the worker picks the job up, never at enqueue — a decode
+      that waited out three predecessors is not a hang. On a genuine hang the
+      worker thread is abandoned (Python cannot kill a thread), the inner
+      backend is rebuilt via the factory, and :class:`SttTimeoutError`
+      propagates so the pilot hears "say again".
+    - **Respawn cap → degraded latch.** More than
+      :data:`MAX_CONSECUTIVE_RESPAWNS` back-to-back watchdog fires latch
+      ``degraded``: further calls raise :class:`SttError` immediately instead
+      of burning CPU on a provably broken backend, until
+      :meth:`reset_degraded` (a future ``/reload``) or a restart. The latch
+      is logged loudly exactly once.
+
+    Worker threads are daemons on purpose: a truly hung C-level call must not
+    wedge process shutdown — systemd's restart (GDD §17.2) stays clean.
     """
 
     def __init__(
-        self, factory: Callable[[], Transcriber], timeout_s: float = DEFAULT_WATCHDOG_S
+        self,
+        factory: Callable[[], Transcriber],
+        timeout_s: float = DEFAULT_WATCHDOG_S,
+        queue_depth: int = DEFAULT_QUEUE_DEPTH,
     ) -> None:
         self._factory = factory
         self._timeout_s = timeout_s
+        self._queue_depth = queue_depth
         self._lock = threading.Lock()
+        self._work_ready = threading.Condition(self._lock)
+        self._queue: deque[_Job] = deque()
+        self._inner: Transcriber = factory()
         self._generation = 0
-        self._inner = factory()
+        self._worker: threading.Thread | None = None
+        self._consecutive_timeouts = 0
+        self._degraded = False
+        self._closed = False
+
+    # ── state the rest of the system reads ───────────────────────────────────
 
     @property
     def inner(self) -> Transcriber:
@@ -306,62 +375,175 @@ class TimeoutTranscriber:
         with self._lock:
             return self._inner
 
+    @property
+    def degraded(self) -> bool:
+        """True once the respawn cap latched; cleared only by
+        :meth:`reset_degraded` or a process restart."""
+        with self._lock:
+            return self._degraded
+
+    def reset_degraded(self) -> None:
+        """Clear the degraded latch and stand up a fresh backend (``/reload``)."""
+        with self._work_ready:
+            if not self._degraded:
+                return
+            self._degraded = False
+            self._consecutive_timeouts = 0
+            self._generation += 1
+            self._worker = None
+            self._inner = self._factory()
+            fresh = self._inner
+        log.info("stt_degraded_cleared")
+        self._warm_off_path(fresh)
+
+    # ── public API (Transcriber protocol) ────────────────────────────────────
+
     def warm(self) -> None:
         """Preload the backend model, outside the per-call watchdog window."""
         inner_warm = getattr(self.inner, "warm", None)
         if callable(inner_warm):
             inner_warm()
 
-    def transcribe(self, pcm16k: bytes, bias: str) -> TranscriptResult:
-        with self._lock:
-            inner = self._inner
-            generation = self._generation
-        done = threading.Event()
-        box: dict[str, Any] = {}
-
-        def run() -> None:
-            try:
-                box["result"] = inner.transcribe(pcm16k, bias)
-            except BaseException as exc:  # noqa: BLE001 — re-raised on the caller thread
-                box["error"] = exc
-            finally:
-                done.set()
-
-        worker = threading.Thread(target=run, name="aura-stt-worker", daemon=True)
-        worker.start()
-        if not done.wait(self._timeout_s):
-            self._respawn(generation)
-            raise SttTimeoutError(
-                f"transcription exceeded the {self._timeout_s}s watchdog; worker respawned"
-            )
-        error = box.get("error")
-        if error is not None:
-            raise error
-        result: TranscriptResult = box["result"]
-        return result
-
-    def _respawn(self, stale_generation: int) -> None:
-        with self._lock:
-            if self._generation != stale_generation:
-                return  # a concurrent timeout already respawned
-            log.warning("stt_watchdog_fired", timeout_s=self._timeout_s)
+    def close(self) -> None:
+        """Stop accepting work, fail everything queued, release the backend."""
+        with self._work_ready:
+            self._closed = True
+            while self._queue:
+                self._queue.popleft().fail(SttError("transcriber closed"))
+            self._work_ready.notify_all()
             old = self._inner
-            self._inner = self._factory()
-            self._generation += 1
-            fresh = self._inner
-        # Close the wedged backend OUTSIDE self._lock and on its own thread:
-        # FasterWhisperTranscriber.close() takes the model lock, which the
-        # hung worker may hold for the duration of a stalled load — closing
-        # inline under self._lock would deadlock every future transcribe()
-        # at its lock acquisition, wedging all voice commands permanently.
+        # Off-thread for the same reason as _watchdog_fired: close() may block
+        # on the model lock a hung decode still holds.
         close = getattr(old, "close", None)
         if callable(close):
             threading.Thread(target=close, name="aura-stt-close", daemon=True).start()
-        # Re-warm the respawned backend OFF the request path: without this,
-        # the very next utterance pays the multi-second model reload inside
-        # its own watchdog window — the reload→timeout→reload spiral the
-        # startup warm() exists to prevent (GDD §20).
-        warm = getattr(fresh, "warm", None)
+
+    def transcribe(self, pcm16k: bytes, bias: str) -> TranscriptResult:
+        job = _Job(pcm16k, bias)
+        with self._work_ready:
+            if self._degraded:
+                raise SttError(
+                    "stt degraded: watchdog respawn cap reached; reload or restart to recover"
+                )
+            if self._closed:
+                raise SttError("transcriber closed")
+            if len(self._queue) >= self._queue_depth:
+                # Drop-oldest: the stalest audio is the least likely to still
+                # matter mid-fight, and its pilot gets re-prompted normally.
+                self._queue.popleft().fail(SttError("stt queue overflow"))
+                log.warning("stt_queue_overflow", depth=self._queue_depth)
+            self._queue.append(job)
+            self._ensure_worker_locked()
+            self._work_ready.notify_all()
+        # Queue wait — bounded by the PREDECESSORS' watchdogs (every in-service
+        # job has its own caller enforcing timeout_s on it), so overload shows
+        # up here, in queue time, and is never charged against this job's
+        # deadline. The failsafe below can only fire on an internal bug.
+        if not job.started.wait(self._timeout_s * (self._queue_depth + 1) + 5.0):
+            with self._work_ready:
+                if job in self._queue:
+                    self._queue.remove(job)
+            if not job.done.is_set():  # pragma: no cover — worker-loss failsafe
+                raise SttError("stt worker never picked the job up")
+        elif not job.done.wait(self._timeout_s) and self._watchdog_fired(job):
+            raise SttTimeoutError(
+                f"transcription exceeded the {self._timeout_s}s watchdog; worker respawned"
+            )
+        if job.error is not None:
+            raise job.error
+        result = job.result
+        assert result is not None  # done + no error ⇒ result was set
+        return result
+
+    # ── internals ────────────────────────────────────────────────────────────
+
+    def _ensure_worker_locked(self) -> None:
+        """Start the (single) worker thread if none is serving. Lock held."""
+        if self._worker is None or not self._worker.is_alive():
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                args=(self._generation, self._inner),
+                name="aura-stt-worker",
+                daemon=True,
+            )
+            self._worker.start()
+
+    def _worker_loop(self, generation: int, inner: Transcriber) -> None:
+        """Serve jobs one at a time until closed or abandoned by a respawn."""
+        while True:
+            with self._work_ready:
+                while generation == self._generation and not self._closed and not self._queue:
+                    self._work_ready.wait()
+                if generation != self._generation or self._closed:
+                    return
+                job = self._queue.popleft()
+            job.started.set()  # the caller's watchdog clock starts HERE
+            try:
+                job.result = inner.transcribe(job.pcm, job.bias)
+            except BaseException as exc:  # noqa: BLE001 — re-raised on the caller thread
+                job.error = exc
+            job.pcm = b""  # constraint 5: release the audio buffer immediately
+            job.done.set()
+            with self._lock:
+                if generation != self._generation:
+                    return  # abandoned mid-decode by a watchdog respawn
+                # A completed service — even a backend error — proves the
+                # worker is alive: only back-to-back HANGS may latch.
+                self._consecutive_timeouts = 0
+
+    def _watchdog_fired(self, job: _Job) -> bool:
+        """The caller's service deadline elapsed. Returns False when the
+        decode actually finished in the race window (result is used)."""
+        with self._work_ready:
+            if job.done.is_set():
+                return False
+            old = self._inner
+            self._generation += 1  # abandon the wedged worker thread
+            self._worker = None
+            self._consecutive_timeouts += 1
+            log.warning(
+                "stt_watchdog_fired",
+                timeout_s=self._timeout_s,
+                consecutive=self._consecutive_timeouts,
+            )
+            if self._consecutive_timeouts > MAX_CONSECUTIVE_RESPAWNS:
+                # The backend hangs faster than we can respawn it: latch and
+                # refuse work instead of reloading a ~GB model every deadline.
+                self._degraded = True
+                while self._queue:
+                    self._queue.popleft().fail(
+                        SttError("stt degraded: watchdog respawn cap reached")
+                    )
+                log.error(
+                    "stt_degraded_latched",
+                    respawns=MAX_CONSECUTIVE_RESPAWNS,
+                    detail="STT disabled until /reload or restart; "
+                    "voice commands will be rejected, slash commands unaffected",
+                )
+                fresh = None
+            else:
+                self._inner = self._factory()
+                fresh = self._inner
+                self._ensure_worker_locked()
+                self._work_ready.notify_all()
+        # Close the wedged backend OUTSIDE the lock and on its own thread:
+        # FasterWhisperTranscriber.close() takes the model lock, which the
+        # hung worker may hold for the duration of a stalled load — closing
+        # inline under the lock would deadlock every future transcribe().
+        close = getattr(old, "close", None)
+        if callable(close):
+            threading.Thread(target=close, name="aura-stt-close", daemon=True).start()
+        if fresh is not None:
+            self._warm_off_path(fresh)
+        return True
+
+    @staticmethod
+    def _warm_off_path(backend: Transcriber) -> None:
+        """Re-warm a fresh backend OFF the request path: without this, the
+        very next utterance pays the multi-second model reload inside its own
+        watchdog window — the reload→timeout→reload spiral the startup
+        ``warm()`` exists to prevent (GDD §20)."""
+        warm = getattr(backend, "warm", None)
         if callable(warm):
             threading.Thread(target=warm, name="aura-stt-rewarm", daemon=True).start()
 
@@ -374,14 +556,15 @@ _HTTP_TIMEOUT_FRACTION = 0.9
 
 
 def make_transcriber(cfg: SttConfig) -> Transcriber:
-    """Build the configured backend (GDD §16 ``stt.backend``) behind the watchdog.
-
-    The watchdog deadline comes from ``stt.watchdog_s`` (GDD §20) — a
-    restart-bound tunable, not a code constant."""
+    """Build the configured backend (GDD §16 ``stt.backend``) behind the
+    bounded queue + watchdog, with ``stt.watchdog_s`` threaded through."""
 
     def factory() -> Transcriber:
         if cfg.backend == "whisper-cpp":
-            return WhisperCppTranscriber(cfg, timeout_s=cfg.watchdog_s * _HTTP_TIMEOUT_FRACTION)
+            # The HTTP socket gives up slightly BEFORE the watchdog: a slow
+            # server surfaces as a clean SttError (no respawn burned) instead
+            # of racing the hang detector at exactly the same deadline.
+            return WhisperCppTranscriber(cfg, timeout_s=max(1.0, cfg.watchdog_s - 1.0))
         return FasterWhisperTranscriber(cfg)
 
     return TimeoutTranscriber(factory, timeout_s=cfg.watchdog_s)

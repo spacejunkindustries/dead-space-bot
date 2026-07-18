@@ -194,9 +194,9 @@ Every module in the finished system.
 | `config.py` | YAML load, schema validation, hot-reload on SIGHUP |
 | `ipc.py` | UDS server, frame codec, per-user stream demux, Ears liveness |
 | `audio/vad.py` | webrtcvad wrapper; utterance endpointing |
-| `audio/wake.py` | openWakeWord instances, per-user state, score thresholds |
+| `audio/wake.py` | openWakeWord instances, per-user state, score thresholds; off-loop spare-model pool, fault latch, stage counters |
 | `audio/capture.py` | Per-user capture state machine: pre-roll ring buffer → wake hit → capture → endpoint → emit; owns the wake refractory period |
-| `audio/stt.py` | `Transcriber` protocol; faster-whisper (default) and whisper.cpp HTTP backends; gazetteer prompt biasing |
+| `audio/stt.py` | `Transcriber` protocol; faster-whisper (default) and whisper.cpp HTTP backends; gazetteer prompt biasing; bounded serialized decode queue + `stt.watchdog_s` hang watchdog |
 | `nlu/grammar.py` | Intent extraction, group-alias extraction, detail capture |
 | `nlu/gazetteer.py` | System load, region pruning, adjacency graph, jump-distance BFS with memo |
 | `nlu/phonetics.py` | Double Metaphone + Levenshtein scoring, alias-table lookup, context priors, confidence tiers |
@@ -213,7 +213,7 @@ Every module in the finished system.
 | `dsc/cogs/ops.py` | `/timer`, `/formup`, `/rollcall`, `/jumps` |
 | `dsc/cogs/admin.py` | `/routing`, `/gazetteer`, `/health`, `/fleetmode` |
 | `dsc/cogs/help.py` | `/help` — interactive help topics; the slash twin of voice "help" |
-| `tts.py` | Piper subprocess, raw→WAV wrapping, utterance queue, length cap |
+| `tts.py` | Piper subprocess, raw→WAV wrapping, priority-ordered utterance queue (ALERT ahead of queued NORMAL), length cap |
 | `health.py` | Heartbeats, degradation detection, `#bot-health` reporting |
 | `voice_gateway.py` | Voice-state watch, auto-join/leave, Ears join/leave commands |
 
@@ -1278,8 +1278,9 @@ Because voice receive is undocumented and can break without warning (§2.2), COR
 | Discord breaks voice receive | No `VoiceTick` from anyone for 60s while ≥2 unmuted humans are in channel | Post **⚠️ Voice offline — use `/under-attack`, `/help-me` and `/hostiles`**; keep retrying. **Every slash command and the entire incident engine keep working.** |
 | Voice gateway 4017 | Close code on connect | Loud alert to `#bot-health` — the Songbird version needs updating |
 | DAVE session crash | Session exception | Rebuild, exponential backoff, cap retries, then degrade |
-| STT worker hang | 5s watchdog | Kill, respawn, speak *"say again"* |
+| STT worker hang | `stt.watchdog_s` (default 15s) watchdog on **queue-head service time** — decodes queue (depth 3, drop-oldest) behind one serialized worker, so overload shows up as queue time and never masquerades as a hang | Respawn (max 2 consecutive), speak *"say again"*; past the cap latch **STT degraded** (refuse decodes, alert `#bot-health`) until reload/restart |
 | Sustained low confidence | 10 consecutive low-tier results | Degrade and alert — something is wrong with the audio path |
+| Wake model build fails (bad `wake.model`, broken upgrade) | The model pool latches **faulted**; the wake stage counters (frames seen → scored → inferences → hits) reported to `#bot-health` show frames flowing with nothing scored | Score 0.0 with no per-chunk retry storm, alert `#bot-health`; a wake config change or restart clears the latch |
 | Brain down | Ears' socket write fails | Ears buffers 60s of frames, speaks *"system degraded"*, reconnects |
 | Ears down | Brain heartbeat miss | Post the degraded notice; text path unaffected |
 | Droplet down | External uptime check | `Restart=always` + a page |

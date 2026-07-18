@@ -201,6 +201,11 @@ class SttConfig:
     cpu_threads: int
     bias_with_gazetteer: bool
     whisper_cpp_url: str
+    #: STT watchdog deadline (GDD §20): seconds one decode may run once it
+    #: reaches the head of the serialized STT queue before the worker is
+    #: respawned. Queue WAIT time never counts — overload is not a hang.
+    #: After 2 consecutive respawns STT latches degraded until reload/restart.
+    watchdog_s: float = 15.0
     #: Minimum Whisper avg_logprob for a transcript that matched NO grammar
     #: intent to be posted as a freeform relay (GDD §8.6). Below this the
     #: transcript is treated as unintelligible — CORTANA says "Say again" instead
