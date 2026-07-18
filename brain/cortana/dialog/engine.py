@@ -399,7 +399,15 @@ class DialogEngine:
                 resolution.best.score if resolution.best else 0.0, resolution.tier
             )
 
-        outcome = await self._incidents.report(s.guild_id, s.user_id, parsed, resolution)
+        # Defence in depth: the gate also rides inside decide_mentions(), so
+        # no engine path can mint a mention for a caller the gate refuses.
+        outcome = await self._incidents.report(
+            s.guild_id,
+            s.user_id,
+            parsed,
+            resolution,
+            caller_may_mention=self._discipline.may_mention(self._member_role_ids(s.user_id)),
+        )
         self._count_outcome(outcome.outcome)
 
         # Voice "help" (GDD §6.1): the spoken line stays under the §12.2 cap,
@@ -431,14 +439,20 @@ class DialogEngine:
         await self._reply(s, effective, outcome)
 
     async def _relay(self, s: DialogSession, action: Relay) -> None:
-        """Freeform intel relay (GDD §8.6) through the broadcast path."""
+        """Freeform intel relay (GDD §8.6) through the broadcast path.
+
+        The pilot gate rides inside decide_mentions() — for non-Pilots the
+        relay still posts, mention-free, exactly like the slash twin."""
         text = action.text
-        here = grammar.wants_all_hands(text) and self._discipline.may_mention(
-            self._member_role_ids(s.user_id)
-        )
         severity = action.severity or grammar.broadcast_severity(text)
         outcome = await self._incidents.broadcast(
-            s.guild_id, s.user_id, text, here=here, severity=severity, confidence=0.0
+            s.guild_id,
+            s.user_id,
+            text,
+            group_alias="all_hands" if grammar.wants_all_hands(text) else None,
+            severity=severity,
+            confidence=0.0,
+            caller_may_mention=self._discipline.may_mention(self._member_role_ids(s.user_id)),
         )
         self._count_outcome(outcome.outcome)
         # "Relayed." — without an audible ack pilots repeat themselves, and

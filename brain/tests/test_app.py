@@ -75,8 +75,18 @@ class _Engine:
         self.broadcast_severities: list[Any] = []
         self.fired: list[datetime] = []
 
-    async def report(self, guild_id: int, user_id: int, parsed: Any, resolution: Any) -> Any:
+    async def report(
+        self,
+        guild_id: int,
+        user_id: int,
+        parsed: Any,
+        resolution: Any,
+        *,
+        caller_may_mention: bool = True,
+    ) -> Any:
         self.reports.append((guild_id, user_id, parsed, resolution))
+        self.report_gates = getattr(self, "report_gates", [])
+        self.report_gates.append(caller_may_mention)
         return self.outcome
 
     async def broadcast(
@@ -86,10 +96,12 @@ class _Engine:
         text: str,
         *,
         here: bool = False,
+        group_alias: str | None = None,
         severity: Any = None,
         confidence: Any = None,
+        caller_may_mention: bool = True,
     ) -> Any:
-        self.broadcasts.append((guild_id, user_id, text, here))
+        self.broadcasts.append((guild_id, user_id, text, group_alias == "all_hands"))
         self.broadcast_severities.append(severity)
         return self.outcome
 
