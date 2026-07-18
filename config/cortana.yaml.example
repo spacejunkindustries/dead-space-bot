@@ -1,12 +1,20 @@
 # CORTANA main configuration — GDD §16.
-# Production copy lives at /etc/cortana/cortana.yaml and is hot-reloaded on SIGHUP
-# (systemctl reload cortana-brain).
+# Production copy lives at /etc/cortana/cortana.yaml.
 #
-# HOT-RELOAD SCOPE: thresholds, weights, windows, channel/role ids, tts
-# lines/personality, and the whole chat: section apply on reload. Sections
-# that pick an ENGINE at startup need a full restart instead:
-#   stt: (backend/model/threads), capture.vad_aggressiveness,
-#   gazetteer: (file/scope), ipc.socket, database.path, discord.token_file.
+# RELOAD SCOPE: every key carries a reload class in the declarative schema
+# (brain/cortana/config_schema.py — the single source of truth):
+#   hot     — live on `systemctl reload cortana-brain` (most thresholds,
+#             weights, windows, channel/role ids, tts lines, chat knobs)
+#   sighup  — applied by an explicit reload step (tts.personality,
+#             chat.enabled / chat.api_key_file)
+#   engine  — rebuilds the gazetteer/routing engine on reload
+#   restart — bound at startup: stt.* (backend/model/threads/watchdog_s),
+#             capture.vad_aggressiveness, wake.model, wake.vad_threshold,
+#             ipc.socket, database.path, discord.token_file, discord.guild_id
+# Reload validates cortana.yaml + gazetteer.yaml + routing.yaml TOGETHER and
+# swaps all-or-nothing; restart-bound edits are reported as "restart
+# pending", never silently absorbed. Unknown/misspelled keys are REJECTED.
+# Validate an edit before restarting:  python -m cortana.doctor --config <file>
 #
 # Every tunable in the system lives here; code contains no magic numbers.
 # The numeric defaults below are starting values tuned from real fleet audio —
@@ -97,6 +105,10 @@ stt:
   cpu_threads: 2                       # inference threads (droplet has 2 dedicated vCPUs)
   bias_with_gazetteer: true            # pass system names as Whisper initial_prompt
   whisper_cpp_url: http://127.0.0.1:8080/inference  # used only when backend: whisper-cpp
+  watchdog_s: 15                       # GDD §20 "STT worker hang" deadline: a decode past
+                                       # this is abandoned and the worker respawned. The
+                                       # whisper-cpp HTTP timeout is derived slightly below
+                                       # it. Needs a restart to apply.
   relay_min_logprob: -0.9              # freeform relays below this Whisper confidence are
                                        # dropped with "Say again" instead of posted (GDD §8.6);
                                        # recognised commands are never gated by this.
@@ -176,6 +188,11 @@ gazetteer:
                                        # this is the nomadic-corp setting (GDD §8.1).
   include_all: false                   # nomadic override, mirrors gazetteer.yaml include_all —
                                        # either being true activates the entire seeded map.
+
+routing:
+  file: ""                             # routing.yaml location (GDD §10.1). "" (the default)
+                                       # = a file named routing.yaml in the same directory
+                                       # as this cortana.yaml.
 
 ipc:
   socket: /run/cortana/cortana.sock          # Brain binds; Ears connects (GDD §15)
