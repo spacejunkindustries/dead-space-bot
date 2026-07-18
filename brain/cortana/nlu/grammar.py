@@ -465,6 +465,52 @@ def _remove_intent_phrases(text: str) -> str:
     return text
 
 
+#: Continuation verbs that begin the REST of the sentence, not the name:
+#: "under attack M-TAC-O requiring heavy assistance" — the window must cut
+#: before "requiring" (live junk card: System "M-TAC-O requiring").
+_TRAILING_CUT = frozenset(
+    {
+        "requiring",
+        "require",
+        "requires",
+        "requesting",
+        "request",
+        "requests",
+        "needing",
+        "needs",
+        "need",
+        "send",
+        "sending",
+        "bring",
+        "bringing",
+        "over",
+        "out",
+    }
+)
+
+#: A window that is ONLY a pronoun is a fragment of the sentence ("point on
+#: me", "they're on us"), never a location (live junk card: System "me").
+_PRONOUN_ONLY = frozenset(
+    {"me", "us", "you", "them", "him", "her", "it", "here", "there", "everyone"}
+)
+
+
+def _finalize_window(tokens: list[str]) -> str | None:
+    """Trim a kept token window to the part that can actually be a name."""
+    cut = len(tokens)
+    for idx, tok in enumerate(tokens):
+        if idx > 0 and tok.lower() in _TRAILING_CUT:
+            cut = idx
+            break
+    kept = tokens[:cut]
+    while kept and kept[0].lower() in _TRAILING_CUT:
+        kept = kept[1:]
+    text = " ".join(kept)
+    if not text or all(tok.lower() in _PRONOUN_ONLY for tok in kept):
+        return None
+    return text
+
+
 def _extract_system(segment: str) -> str | None:
     """The system window of one segment (GDD §6.1 padding tolerance).
 
@@ -481,11 +527,10 @@ def _extract_system(segment: str) -> str | None:
         if tok.lower() in _ANCHOR_TOKENS:
             anchor = idx
     if anchor is not None:
-        tail = _keep_window_tokens(tokens[anchor + 1 :], _WINDOW_FILLER)
+        tail = _finalize_window(_keep_window_tokens(tokens[anchor + 1 :], _WINDOW_FILLER))
         if tail:
-            return " ".join(tail)
-    kept = _keep_window_tokens(tokens, _WINDOW_FILLER)
-    return " ".join(kept) or None
+            return tail
+    return _finalize_window(_keep_window_tokens(tokens, _WINDOW_FILLER))
 
 
 def _split_system_detail(remainder: str) -> tuple[str | None, str | None]:
