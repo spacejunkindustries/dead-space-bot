@@ -68,6 +68,7 @@ __all__ = [
     "responders",
     "say_again",
     "say_again_callsign",
+    "standing_down",
     "timer_set",
     "unregistered",
     "whoami",
@@ -187,6 +188,26 @@ def not_understood() -> str:
     """*"Say again?"* — the utterance matched no command and no relay frame
     (GDD §8.6 framed mode): CORTANA heard something but won't post it."""
     return _pick("Say again?", bratty=_NOT_UNDERSTOOD_BRATTY)
+
+
+_STANDING_DOWN_BRATTY = (
+    "Nope. Standing down. Wake me when you're ready.",
+    "I give up. Holler when it's words.",
+    "Can't parse that shit. Standing down.",
+    "I'm out. Say the magic words to retry.",
+    "Done guessing. Wake me and try again.",
+)
+
+
+def standing_down() -> str:
+    """*"Couldn't parse that. Standing down. Wake me to retry."* — the second
+    consecutive unintelligible utterance ends the dialogue: the pilot now
+    KNOWS the window is closed and a fresh wake word is needed (no dead air,
+    and — because this path never reopens — no feedback loop either)."""
+    return _pick(
+        "Couldn't parse that. Standing down. Wake me to retry.",
+        bratty=_STANDING_DOWN_BRATTY,
+    )
 
 
 def chase_updated(system: str) -> str:
@@ -422,6 +443,7 @@ def hot_lines() -> tuple[str, ...]:
     lines: list[str] = [
         "Go ahead.",
         "Say again?",
+        "Couldn't parse that. Standing down. Wake me to retry.",
         "Say again the system.",
         "Say again the callsign.",
         "Relayed.",
@@ -441,6 +463,7 @@ def hot_lines() -> tuple[str, ...]:
             lines += [f"Code {colour} logged. Go ahead.", f"Copy code {colour}. Send it."]
     if _personality == "bratty":
         lines += list(_GO_AHEAD_BRATTY) + list(_RELAYED_BRATTY) + list(_NOT_UNDERSTOOD_BRATTY)
+        lines += list(_STANDING_DOWN_BRATTY)
         for colour in _SEVERITY_SPOKEN.values():
             lines += [t.format(colour=colour) for t in _CODE_ACK_BRATTY]
     return tuple(dict.fromkeys(lines))

@@ -714,7 +714,8 @@ Short. Always short. CORTANA is talking over a fight.
 | Ping sent, scoped | *"Hostiles Otanuomi, pinged home defense."* |
 | Ambiguous system | *"Hostiles Otanuomi — say again to confirm."* |
 | Unresolved system | *"Say again the system."* |
-| No command, no relay frame (§8.6) | *"Say again?"* |
+| No command, no relay frame (§8.6) — reopens ONE wake-free retry | *"Say again?"* — reopens ONE wake-free retry |
+| Second consecutive parse failure | *"Couldn't parse that. Standing down. Wake me to retry."* — dialogue closed, fresh wake needed |
 | Card post failed (channel perms/REST) | *"Discord post failed."* — the report is rolled back, not recorded |
 | Chase updated (§13.1) | *"Chase updated, Kisogo."* |
 | Chase, nothing to retarget | *"No active incident to chase."* |
