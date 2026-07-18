@@ -61,6 +61,21 @@ wake:
                                        #   none  = silent
 
 
+dialog:                                # voice dialog engine (GDD §5.4) — OPTIONAL
+                                       # section; defaults are the tuned live values
+  window_ms: 4000                      # wall-clock lifetime of a wake-free window
+                                       # (say-again retry / "code <colour>" opener /
+                                       # bare "command override"); DTX-proof
+  ack_grace_ms: 2000                   # endpoint grace after a capture opens or a
+                                       # prompt is spoken — cue playback + reaction
+  endpoint_gap_floor_ms: 700           # floor under capture.endpoint_silence_ms:
+                                       # DTX drops packets between words, a
+                                       # too-eager gap clips pilots mid-sentence
+  max_retries: 2                       # wake-free windows per dialog TOTAL (subdialog
+                                       # openers and say-again retries share it);
+                                       # only a fresh wake refills the budget —
+                                       # exhaustion ends audibly with "standing down"
+
 capture:
   preroll_ms: 300                      # RAM ring-buffer audio prepended to each capture
   endpoint_silence_ms: 1000            # trailing silence that ends an utterance —

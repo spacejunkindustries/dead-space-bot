@@ -2,6 +2,10 @@
 synthetic PCM built in memory (stdlib only), time derived from frame count.
 No audio ever touches disk (CLAUDE.md constraint 5): every buffer here is
 ``bytes`` in RAM.
+
+Endpointing is the dialog engine's wall-clock job (GDD §5.4) — these tests
+drive :meth:`CaptureManager.force_endpoint` directly, exactly as the wheel
+does. The only frame-counted duration left in the manager is the hard cap.
 """
 
 from __future__ import annotations
@@ -9,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import struct
 
-from cortana.audio.capture import CaptureManager, Phase
+from cortana.audio.capture import CaptureManager, CaptureMeta, CaptureOrigin, Phase
 from cortana.audio.vad import FRAME_BYTES, FRAME_MS, SAMPLES_PER_FRAME
 from cortana.config import (
     AuraConfig,
@@ -36,10 +40,9 @@ GUILD = 42
 USER_A = 1001
 USER_B = 1002
 
-# Derived from the config used below: preroll 300ms, endpoint 400ms, cap 6s,
-# refractory 2s, at 20ms per frame.
+# Derived from the config used below: preroll 300ms, cap 6s, refractory 2s,
+# at 20ms per frame.
 PREROLL_FRAMES = 300 // FRAME_MS  # 15
-ENDPOINT_FRAMES = 400 // FRAME_MS  # 20
 CAP_FRAMES = 6000 // FRAME_MS  # 300
 REFRACTORY_FRAMES = 2000 // FRAME_MS  # 100
 
@@ -91,13 +94,24 @@ class FakeWake:
 
 
 class Recorder:
-    """Async on_utterance sink."""
+    """Async on_utterance sink + sync on_capture_start, like DialogEngine."""
 
     def __init__(self) -> None:
-        self.emitted: list[tuple[int, int, bytes]] = []
+        self.emitted: list[tuple[int, int, bytes, CaptureMeta]] = []
+        self.starts: list[tuple[int, int, CaptureOrigin, int | None]] = []
+        self._next_gen = 0
 
-    async def __call__(self, user_id: int, guild_id: int, pcm: bytes) -> None:
-        self.emitted.append((user_id, guild_id, pcm))
+    async def __call__(self, user_id: int, guild_id: int, pcm: bytes, meta: CaptureMeta) -> None:
+        self.emitted.append((user_id, guild_id, pcm, meta))
+
+    def on_capture_start(
+        self, user_id: int, guild_id: int, origin: CaptureOrigin, armed_gen: int | None
+    ) -> int:
+        self.starts.append((user_id, guild_id, origin, armed_gen))
+        if armed_gen is not None:
+            return armed_gen
+        self._next_gen += 1
+        return self._next_gen
 
 
 # ── config / manager plumbing ────────────────────────────────────────────────
@@ -171,6 +185,7 @@ def make_manager() -> tuple[CaptureManager, Recorder, FakeWake]:
         FakeVad(),  # type: ignore[arg-type]
         wake,
         recorder,
+        recorder.on_capture_start,
     )
     return manager, recorder, wake
 
@@ -199,47 +214,22 @@ async def test_preroll_included_in_emitted_utterance() -> None:
     feed_all(manager, USER_A, lead_in)
     manager.feed(USER_A, GUILD, MARKER)
     assert manager.is_capturing(USER_A)
+    assert recorder.starts == [(USER_A, GUILD, CaptureOrigin.WAKE, None)]
 
     tail = [speech(2000 + i) for i in range(5)]
     feed_all(manager, USER_A, tail)
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    manager.force_endpoint(USER_A)
     await settle()
 
     assert len(recorder.emitted) == 1
-    user_id, guild_id, pcm = recorder.emitted[0]
+    user_id, guild_id, pcm, meta = recorder.emitted[0]
     assert (user_id, guild_id) == (USER_A, GUILD)
-    # Exactly the 300ms before the wake hit, then the hit frame, the speech,
-    # and the trailing silence that endpointed it.
-    expected = b"".join(lead_in[-PREROLL_FRAMES:] + [MARKER] + tail + [SILENCE] * ENDPOINT_FRAMES)
-    assert pcm == expected
-
-
-async def test_endpoint_fires_at_exactly_400ms_of_silence() -> None:
-    manager, recorder, _ = make_manager()
-    manager.feed(USER_A, GUILD, MARKER)
-    feed_all(manager, USER_A, [speech(1500)] * 10)
-
-    feed_all(manager, USER_A, [SILENCE] * (ENDPOINT_FRAMES - 1))
-    await settle()
-    assert recorder.emitted == []  # 380ms of silence: not yet
-    assert manager.is_capturing(USER_A)
-
-    manager.feed(USER_A, GUILD, SILENCE)  # 400ms: endpoint
-    await settle()
-    assert len(recorder.emitted) == 1
-
-
-async def test_speech_resets_the_silence_endpoint() -> None:
-    manager, recorder, _ = make_manager()
-    manager.feed(USER_A, GUILD, MARKER)
-    feed_all(manager, USER_A, [SILENCE] * (ENDPOINT_FRAMES - 1))
-    manager.feed(USER_A, GUILD, speech(1500))  # run broken
-    feed_all(manager, USER_A, [SILENCE] * (ENDPOINT_FRAMES - 1))
-    await settle()
-    assert recorder.emitted == []
-    manager.feed(USER_A, GUILD, SILENCE)
-    await settle()
-    assert len(recorder.emitted) == 1
+    # Exactly the 300ms before the wake hit, then the hit frame and the speech.
+    assert pcm == b"".join(lead_in[-PREROLL_FRAMES:] + [MARKER] + tail)
+    assert meta.origin is CaptureOrigin.WAKE
+    assert meta.gen == 1
+    assert meta.speech_frames == len(tail)  # the trigger frame is not counted
+    assert meta.reason == "silence"
 
 
 async def test_hard_cap_at_6s_of_continuous_speech() -> None:
@@ -254,14 +244,15 @@ async def test_hard_cap_at_6s_of_continuous_speech() -> None:
     await settle()
     assert len(recorder.emitted) == 1
     assert len(recorder.emitted[0][2]) == CAP_FRAMES * FRAME_BYTES
+    assert recorder.emitted[0][3].reason == "hard_cap"
     assert manager.phase_of(USER_A) is Phase.IDLE
 
 
 async def test_refractory_blocks_immediate_retrigger() -> None:
     manager, recorder, _ = make_manager()
     manager.feed(USER_A, GUILD, MARKER)
-    manager.feed(USER_A, GUILD, speech(1500))  # the command; endpoint needs speech first
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    manager.feed(USER_A, GUILD, speech(1500))  # the command
+    manager.force_endpoint(USER_A)
     await settle()
     assert len(recorder.emitted) == 1
 
@@ -277,49 +268,70 @@ async def test_refractory_blocks_immediate_retrigger() -> None:
     assert manager.is_capturing(USER_A)
 
 
-async def test_reopen_captures_without_wake_word() -> None:
+async def test_armed_window_captures_without_wake_word() -> None:
     manager, recorder, _ = make_manager()
-    manager.reopen(USER_A, GUILD)
+    manager.arm_window(USER_A, GUILD, gen=7)
+    assert manager.phase_of(USER_A) is Phase.ARMED
     frames = [speech(1200 + i) for i in range(8)]
     feed_all(manager, USER_A, frames)
     assert manager.is_capturing(USER_A)
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    assert recorder.starts == [(USER_A, GUILD, CaptureOrigin.WINDOW, 7)]
+    manager.force_endpoint(USER_A)
     await settle()
 
     assert len(recorder.emitted) == 1
-    assert recorder.emitted[0] == (
-        USER_A,
-        GUILD,
-        b"".join(frames + [SILENCE] * ENDPOINT_FRAMES),
-    )
+    user_id, guild_id, pcm, meta = recorder.emitted[0]
+    assert pcm == b"".join(frames)
+    assert meta.origin is CaptureOrigin.WINDOW
+    assert meta.gen == 7  # the armed gen rides through to the emission
 
 
-async def test_reopen_clears_refractory_for_say_again() -> None:
+async def test_armed_window_clears_refractory_for_say_again() -> None:
     manager, recorder, _ = make_manager()
     manager.feed(USER_A, GUILD, MARKER)
-    manager.feed(USER_A, GUILD, speech(1500))  # the command; endpoint needs speech first
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    manager.feed(USER_A, GUILD, speech(1500))
+    manager.force_endpoint(USER_A)
     await settle()
     assert len(recorder.emitted) == 1
 
-    # LOW tier → "say again": the reopened window must not be refractory-gated.
-    manager.reopen(USER_A, GUILD)
+    # LOW tier → "say again": the armed window must not be refractory-gated.
+    manager.arm_window(USER_A, GUILD, gen=2)
     manager.feed(USER_A, GUILD, speech(1500))
     assert manager.is_capturing(USER_A)
 
 
-async def test_reopen_window_expires_without_speech() -> None:
+async def test_disarm_closes_window_without_capturing() -> None:
     manager, recorder, _ = make_manager()
-    window_ms = 400
-    manager.reopen(USER_A, GUILD, window_ms=window_ms)
-    feed_all(manager, USER_A, [SILENCE] * (window_ms // FRAME_MS))
+    manager.arm_window(USER_A, GUILD, gen=3)
+    # DTX: NO frames arrive while the pilot is silent — the window must be
+    # closable from outside regardless (the stuck-open incident).
+    manager.disarm(USER_A)
     assert manager.phase_of(USER_A) is Phase.IDLE
 
-    # After expiry, plain speech (no wake) must NOT open a capture.
+    # After disarm, plain speech (no wake) must NOT open a capture.
     feed_all(manager, USER_A, [speech(1500)] * 10)
     await settle()
     assert recorder.emitted == []
     assert not manager.is_capturing(USER_A)
+    # disarm is a no-op outside ARMED:
+    manager.disarm(USER_A)
+    manager.disarm(USER_B)
+
+
+async def test_abandoned_capture_emits_empty_pcm() -> None:
+    # A wake hit whose capture never sees another speech frame (the pilot
+    # said only the wake tail) is emitted as abandoned with NO audio: the
+    # buffer is dropped before dispatch (constraint 5).
+    manager, recorder, _ = make_manager()
+    manager.feed(USER_A, GUILD, MARKER)
+    assert manager.is_capturing(USER_A)
+    manager.force_endpoint(USER_A)
+    await settle()
+    assert len(recorder.emitted) == 1
+    _, _, pcm, meta = recorder.emitted[0]
+    assert pcm == b""
+    assert meta.reason == "abandoned"
+    assert meta.speech_frames == 0
 
 
 async def test_per_user_isolation_with_interleaved_frames() -> None:
@@ -332,15 +344,17 @@ async def test_per_user_isolation_with_interleaved_frames() -> None:
     for fa, fb in zip(a_frames, b_frames, strict=True):
         manager.feed(USER_A, GUILD, fa)
         manager.feed(USER_B, GUILD, fb)
-    for _ in range(ENDPOINT_FRAMES):
-        manager.feed(USER_A, GUILD, SILENCE)
-        manager.feed(USER_B, GUILD, SILENCE)
+    manager.force_endpoint(USER_A)
+    manager.force_endpoint(USER_B)
     await settle()
 
     assert len(recorder.emitted) == 2
-    by_user = {user: pcm for user, _, pcm in recorder.emitted}
-    assert by_user[USER_A] == b"".join([MARKER] + a_frames + [SILENCE] * ENDPOINT_FRAMES)
-    assert by_user[USER_B] == b"".join([MARKER] + b_frames + [SILENCE] * ENDPOINT_FRAMES)
+    by_user = {user: pcm for user, _, pcm, _ in recorder.emitted}
+    assert by_user[USER_A] == b"".join([MARKER] + a_frames)
+    assert by_user[USER_B] == b"".join([MARKER] + b_frames)
+    # Distinct gens per capture:
+    gens = {meta.gen for _, _, _, meta in recorder.emitted}
+    assert len(gens) == 2
 
 
 async def test_capture_buffer_freed_and_ring_keeps_rolling() -> None:
@@ -348,8 +362,8 @@ async def test_capture_buffer_freed_and_ring_keeps_rolling() -> None:
     first = [speech(1000 + i) for i in range(20)]
     feed_all(manager, USER_A, first)
     manager.feed(USER_A, GUILD, MARKER)
-    manager.feed(USER_A, GUILD, speech(1500))  # the command; endpoint needs speech first
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    manager.feed(USER_A, GUILD, speech(1500))
+    manager.force_endpoint(USER_A)
     await settle()
     assert len(recorder.emitted) == 1
     assert manager.phase_of(USER_A) is Phase.IDLE  # buffer freed, back to idle
@@ -360,14 +374,14 @@ async def test_capture_buffer_freed_and_ring_keeps_rolling() -> None:
     manager.feed(USER_A, GUILD, MARKER)
     cmd2 = speech(3500)
     manager.feed(USER_A, GUILD, cmd2)
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    manager.force_endpoint(USER_A)
     await settle()
 
     assert len(recorder.emitted) == 2
     pcm = recorder.emitted[1][2]
     # Pre-roll is exactly the fresh frames; nothing from the first utterance
     # (or the silence between) leaks in.
-    assert pcm == b"".join(second + [MARKER, cmd2] + [SILENCE] * ENDPOINT_FRAMES)
+    assert pcm == b"".join(second + [MARKER, cmd2])
     for frame in first:
         assert frame not in pcm
 
@@ -383,7 +397,7 @@ async def test_drop_user_purges_state_mid_capture() -> None:
     assert manager.tracked_users == 0
     assert USER_A in wake.resets
 
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    assert manager.force_endpoint(USER_A) is False
     await settle()
     assert recorder.emitted == []  # the aborted capture never emits
 
@@ -391,7 +405,6 @@ async def test_drop_user_purges_state_mid_capture() -> None:
 async def test_no_capture_without_wake_hit() -> None:
     manager, recorder, _ = make_manager()
     feed_all(manager, USER_A, [speech(1500)] * 100)
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
     await settle()
     assert recorder.emitted == []
     assert not manager.is_capturing(USER_A)
@@ -405,17 +418,27 @@ async def test_wake_scoring_is_gated_behind_vad() -> None:
     assert wake.scored == 1
 
 
+async def test_armed_window_never_scores_wake() -> None:
+    manager, _, wake = make_manager()
+    manager.arm_window(USER_A, GUILD, gen=1)
+    manager.feed(USER_A, GUILD, SILENCE)
+    assert wake.scored == 0
+    manager.feed(USER_A, GUILD, MARKER)  # speech: opens the window capture
+    assert wake.scored == 0
+    assert manager.is_capturing(USER_A)
+
+
 async def test_malformed_frame_is_dropped() -> None:
     manager, recorder, _ = make_manager()
     manager.feed(USER_A, GUILD, b"\x00" * 10)  # wrong size: dropped, no crash
     manager.feed(USER_A, GUILD, MARKER)
     assert manager.is_capturing(USER_A)
-    cmd = speech(1500)  # the command; endpoint needs speech first
+    cmd = speech(1500)
     manager.feed(USER_A, GUILD, cmd)
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    manager.force_endpoint(USER_A)
     await settle()
     assert len(recorder.emitted) == 1
-    assert recorder.emitted[0][2] == b"".join([MARKER, cmd] + [SILENCE] * ENDPOINT_FRAMES)
+    assert recorder.emitted[0][2] == b"".join([MARKER, cmd])
 
 
 async def test_single_refractory_window_with_real_detector() -> None:
@@ -434,13 +457,14 @@ async def test_single_refractory_window_with_real_detector() -> None:
         FakeVad(),  # type: ignore[arg-type]
         detector,
         recorder,
+        recorder.on_capture_start,
     )
 
     # First utterance: four speech frames form a chunk and hit; the two after
-    # the hit are the captured command (endpoint needs speech before silence).
+    # the hit are the captured command.
     feed_all(manager, USER_A, [speech(1500)] * 6)
     assert manager.is_capturing(USER_A)
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    manager.force_endpoint(USER_A)
     await settle()
     assert len(recorder.emitted) == 1
 
@@ -456,14 +480,14 @@ def test_emit_works_without_a_running_event_loop() -> None:
     # delivers the utterance (documented in CaptureManager._dispatch).
     manager, recorder, _ = make_manager()
     manager.feed(USER_A, GUILD, MARKER)
-    manager.feed(USER_A, GUILD, speech(1500))  # the command; endpoint needs speech first
-    feed_all(manager, USER_A, [SILENCE] * ENDPOINT_FRAMES)
+    manager.feed(USER_A, GUILD, speech(1500))
+    manager.force_endpoint(USER_A)
     assert len(recorder.emitted) == 1
 
 
 async def test_force_endpoint_emits_open_capture() -> None:
-    # The wall-clock silence sweep ends a capture when Discord stops sending
-    # packets (no silence frames ever arrive to endpoint on).
+    # The dialog wheel ends a capture when Discord stops sending packets
+    # (no silence frames ever arrive to endpoint on).
     manager, recorder, _ = make_manager()
     manager.feed(USER_A, GUILD, MARKER)
     cmd = speech(1500)

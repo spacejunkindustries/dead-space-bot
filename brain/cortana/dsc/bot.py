@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -131,6 +132,8 @@ class AuraBot(commands.Bot):
         # announce helper, so it cannot exist before the bot does).
         self.voice_gateway: VoiceGateway | None = None
         self.health_reporter: HealthReporter | None = None
+        #: Dialog-engine cleanup hook (GDD §5.4) — set by the composition root.
+        self.on_user_left_voice: Callable[[int], None] | None = None
         # The §6.6 out-of-band assistant; None = override channel disabled.
         self.chat: Any | None = None
         self.chat_status: str = "disabled"  # "ready" | "no_key" | "disabled" (§6.6)
@@ -260,6 +263,17 @@ class AuraBot(commands.Bot):
         Ears owns the actual voice connection; this is purely the census feed
         the gateway's join/leave judgement runs on.
         """
+        # Authoritative dialog cleanup (GDD §5.4): a pilot leaving/moving out
+        # of a watched channel purges their session + armed windows even when
+        # Ears is down and its IPC "left" event can never arrive.
+        if self.on_user_left_voice is not None:
+            left_watched = (
+                before.channel is not None
+                and before.channel.id in self.holder.current.discord.watch_voice_channels
+                and (after.channel is None or after.channel.id != before.channel.id)
+            )
+            if left_watched:
+                self.on_user_left_voice(member.id)
         if self.voice_gateway is None:
             return
         watched = set(self.holder.current.discord.watch_voice_channels)

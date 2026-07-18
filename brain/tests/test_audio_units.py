@@ -36,7 +36,6 @@ from cortana.audio.vad import (
     FRAME_MS,
     SAMPLE_RATE_HZ,
     SAMPLES_PER_FRAME,
-    EndpointTracker,
     VadGate,
 )
 from cortana.audio.wake import OWW_CHUNK_BYTES, OpenWakeWordDetector
@@ -93,56 +92,6 @@ def test_frame_constants_match_the_wire_format() -> None:
     assert FRAME_MS == 20
     assert SAMPLES_PER_FRAME == 320
     assert FRAME_BYTES == 640  # 20ms of 16kHz mono s16le
-
-
-# ── EndpointTracker ──────────────────────────────────────────────────────────
-
-
-def test_endpoint_reached_after_consecutive_silence() -> None:
-    tracker = EndpointTracker(silence_ms=400)
-    tracker.update(True)  # speech must be seen before silence can endpoint
-    for _ in range(19):
-        assert not tracker.update(False)
-    assert tracker.update(False)  # 20th silent frame = 400ms
-
-
-def test_leading_silence_never_endpoints() -> None:
-    # A pilot waiting for the "go ahead" cue opens the capture with silence;
-    # that must not endpoint before a word is spoken.
-    tracker = EndpointTracker(silence_ms=400)
-    for _ in range(200):  # 4s of pure leading silence
-        assert not tracker.update(False)
-    tracker.update(True)  # now they speak
-    for _ in range(19):
-        assert not tracker.update(False)
-    assert tracker.update(False)  # only now, after speech, does silence end it
-
-
-def test_speech_resets_the_silence_run() -> None:
-    tracker = EndpointTracker(silence_ms=400)
-    for _ in range(19):
-        tracker.update(False)
-    assert not tracker.update(True)  # speech: run broken
-    assert tracker.silence_ms == 0
-    for _ in range(19):
-        assert not tracker.update(False)
-    assert tracker.update(False)
-
-
-def test_tracker_reset_and_silence_ms() -> None:
-    tracker = EndpointTracker(silence_ms=400)
-    tracker.update(False)
-    tracker.update(False)
-    assert tracker.silence_ms == 2 * FRAME_MS
-    tracker.reset()
-    assert tracker.silence_ms == 0
-
-
-def test_tracker_rejects_nonpositive_configuration() -> None:
-    with pytest.raises(ValueError):
-        EndpointTracker(silence_ms=0)
-    with pytest.raises(ValueError):
-        EndpointTracker(silence_ms=400, frame_ms=0)
 
 
 # ── VadGate (webrtcvad faked at the import seam) ─────────────────────────────

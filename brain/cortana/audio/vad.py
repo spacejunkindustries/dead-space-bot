@@ -1,13 +1,15 @@
-"""Voice-activity detection and utterance endpointing — GDD §5, §16 (capture).
+"""Voice-activity detection — GDD §5, §16 (capture).
 
 :class:`VadGate` wraps webrtcvad for the 20 ms / 16 kHz / mono / s16le frames
-Ears emits (GDD §15 type 0x02). :class:`EndpointTracker` turns a per-frame
-speech/silence stream into an endpoint decision by counting consecutive
-silent frames — pure logic, no wall clock, no audio retained.
+Ears emits (GDD §15 type 0x02).
+
+Utterance endpointing is NOT here: a frame-counted silence tracker can never
+fire under Discord DTX (no packets flow while a pilot is silent), so all
+endpoint timing lives in the dialog engine's wall-clock wheel (GDD §5.4).
 
 webrtcvad is imported lazily inside :class:`VadGate` so that pure-logic unit
-tests (and any module that only needs the frame constants or the tracker) run
-without the native dependency installed.
+tests (and any module that only needs the frame constants) run without the
+native dependency installed.
 """
 
 from __future__ import annotations
@@ -22,7 +24,6 @@ __all__ = [
     "FRAME_MS",
     "SAMPLES_PER_FRAME",
     "SAMPLE_RATE_HZ",
-    "EndpointTracker",
     "VadGate",
 ]
 
@@ -59,51 +60,3 @@ class VadGate:
         if len(frame) != FRAME_BYTES:
             raise ValueError(f"expected one {FRAME_BYTES}-byte 20ms frame, got {len(frame)} bytes")
         return bool(self._vad.is_speech(frame, SAMPLE_RATE_HZ))
-
-
-class EndpointTracker:
-    """Tracks consecutive silence duration for utterance endpointing (GDD §5).
-
-    Feed one VAD verdict per 20 ms frame via :meth:`update`; it returns True
-    once ``silence_ms`` of *uninterrupted* silence has accumulated **after at
-    least one speech frame has been seen**. Any speech frame resets the run.
-    Time is derived purely from frame count — 20 ms per update — so the tracker
-    is fully deterministic.
-
-    The "speech seen first" rule is what makes the spoken "go ahead" cue safe:
-    a pilot who waits for the acknowledgement before talking opens the capture
-    with a stretch of leading silence, and without this guard that silence
-    would endpoint the utterance before a word was said (GDD §5).
-    """
-
-    def __init__(self, silence_ms: int, frame_ms: int = FRAME_MS) -> None:
-        if silence_ms <= 0:
-            raise ValueError(f"silence_ms must be > 0, got {silence_ms}")
-        if frame_ms <= 0:
-            raise ValueError(f"frame_ms must be > 0, got {frame_ms}")
-        self._limit_frames = max(1, silence_ms // frame_ms)
-        self._frame_ms = frame_ms
-        self._silent_frames = 0
-        self._speech_seen = False
-
-    @property
-    def silence_ms(self) -> int:
-        """Current consecutive-silence duration, in milliseconds."""
-        return self._silent_frames * self._frame_ms
-
-    def update(self, is_speech: bool) -> bool:
-        """Record one frame's verdict; True when the silence endpoint is reached.
-
-        Leading silence (before the pilot starts speaking) never endpoints —
-        only ``silence_ms`` of quiet *following* speech does.
-        """
-        if is_speech:
-            self._speech_seen = True
-            self._silent_frames = 0
-        else:
-            self._silent_frames += 1
-        return self._speech_seen and self._silent_frames >= self._limit_frames
-
-    def reset(self) -> None:
-        self._silent_frames = 0
-        self._speech_seen = False

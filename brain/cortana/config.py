@@ -144,6 +144,31 @@ class CaptureConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DialogConfig:
+    """Voice dialog engine timing and budgets (GDD §5.4).
+
+    The whole section is optional — the defaults are the tuned live values.
+    """
+
+    #: Wall-clock lifetime of a wake-free window (armed by a say-again retry,
+    #: a "code <colour>" opener, or a bare "command override"). DTX-proof:
+    #: the dialog wheel expires it in real time, frames or no frames.
+    window_ms: int = 4000
+    #: Endpoint grace after a capture opens / a prompt is spoken — covers cue
+    #: playback plus the pilot's reaction time, so waiting politely for
+    #: "Go ahead." can never get a capture endpointed before the first word.
+    ack_grace_ms: int = 2000
+    #: Floor under capture.endpoint_silence_ms for the wall-clock endpoint:
+    #: Discord DTX drops packets during brief pauses between words, so a
+    #: too-eager gap would clip a pilot mid-sentence.
+    endpoint_gap_floor_ms: int = 700
+    #: Wake-free windows per dialog, TOTAL — subdialog openers (code/override)
+    #: and say-again retries share this budget. Only a fresh wake refills it;
+    #: exhaustion always ends audibly with "standing down".
+    max_retries: int = 2
+
+
+@dataclass(frozen=True, slots=True)
 class SttConfig:
     backend: str  # "faster-whisper" | "whisper-cpp"
     model: str
@@ -270,6 +295,7 @@ class AuraConfig:
     health: HealthConfig
     database: DatabaseConfig
     chat: ChatConfig = field(default_factory=ChatConfig)
+    dialog: DialogConfig = field(default_factory=DialogConfig)
 
 
 # ── validation helpers ───────────────────────────────────────────────────────
@@ -408,6 +434,24 @@ def _build_wake(data: dict[str, Any]) -> WakeConfig:
             "wake.vad_threshold",
             0.0,
             1.0,
+        ),
+    )
+
+
+def _build_dialog(data: dict[str, Any]) -> DialogConfig:
+    # Optional section: the defaults ARE the tuned live values (GDD §5.4).
+    s = _optional_section(data, "dialog")
+    return DialogConfig(
+        window_ms=_positive(_get(s, "dialog.window_ms", int, default=4000), "dialog.window_ms"),
+        ack_grace_ms=int(
+            _non_negative(_get(s, "dialog.ack_grace_ms", int, default=2000), "dialog.ack_grace_ms")
+        ),
+        endpoint_gap_floor_ms=_positive(
+            _get(s, "dialog.endpoint_gap_floor_ms", int, default=700),
+            "dialog.endpoint_gap_floor_ms",
+        ),
+        max_retries=int(
+            _non_negative(_get(s, "dialog.max_retries", int, default=2), "dialog.max_retries")
         ),
     )
 
@@ -665,6 +709,7 @@ def load_config(path: str | Path) -> AuraConfig:
         health=_build_health(data),
         database=_build_database(data),
         chat=_build_chat(data),
+        dialog=_build_dialog(data),
     )
 
 
