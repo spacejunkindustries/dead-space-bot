@@ -9,9 +9,9 @@ from __future__ import annotations
 import asyncio
 import struct
 
-from aura.audio.capture import CaptureManager, Phase
-from aura.audio.vad import FRAME_BYTES, FRAME_MS, SAMPLES_PER_FRAME
-from aura.config import (
+from cortana.audio.capture import CaptureManager, Phase
+from cortana.audio.vad import FRAME_BYTES, FRAME_MS, SAMPLES_PER_FRAME
+from cortana.config import (
     AuraConfig,
     CaptureConfig,
     ChannelsConfig,
@@ -150,7 +150,7 @@ def make_config() -> AuraConfig:
             max_utterance_s=3.0,
         ),
         gazetteer=GazetteerConfig(file="gazetteer.yaml", home_system="Otanuomi"),
-        ipc=IpcConfig(socket="/run/aura/aura.sock"),
+        ipc=IpcConfig(socket="/run/cortana/cortana.sock"),
         health=HealthConfig(report_interval_min=60, voice_silence_alarm_s=60),
         database=DatabaseConfig(path=":memory:"),
     )
@@ -423,7 +423,7 @@ async def test_single_refractory_window_with_real_detector() -> None:
     OpenWakeWordDetector plugged in, a wake attempt succeeds on the first
     speech frames after ``burn_refractory`` — the detector must not stack a
     second refractory window on top of the capture layer's."""
-    from aura.audio.wake import OpenWakeWordDetector
+    from cortana.audio.wake import OpenWakeWordDetector
 
     recorder = Recorder()
     holder = StubHolder(make_config())

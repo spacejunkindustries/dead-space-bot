@@ -1,0 +1,46 @@
+# CORTANA Brain — Python: wake word, STT, grammar, gazetteer, incident engine,
+# routing, TTS synthesis. Binds the IPC socket; Ears connects to it (GDD §15).
+#
+# Install: /etc/systemd/system/cortana-brain.service (deploy/install.sh does this).
+# Token comes ONLY via LoadCredential= (GDD §18/§22, CLAUDE.md constraint 12);
+# the process reads $CREDENTIALS_DIRECTORY/token.
+
+[Unit]
+Description=CORTANA Brain (fleet intel engine)
+Documentation=file:/opt/cortana/brain/docs/GDD.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aura
+Group=aura
+ExecStart=/opt/cortana/brain/venv/bin/python -m cortana --config /etc/cortana/cortana.yaml
+# SIGHUP → ConfigHolder.reload() (hot-reload cortana.yaml, GDD §16/§18)
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+# Brain bounds its own graceful shutdown (~8s); this is the backstop so a wedged
+# close still restarts promptly instead of waiting the 90s default before SIGKILL.
+TimeoutStopSec=15
+
+# Secrets: token file 0600, surfaced read-only at $CREDENTIALS_DIRECTORY/token.
+LoadCredential=token:/etc/cortana/token
+# Anthropic API key for the chat override channel (constraint 12). Always
+# loaded: install.sh guarantees the source file exists (empty when the
+# channel is unused — an empty credential reads as "no key" and the channel
+# stays off). Kept unconditional so a re-run of install.sh can never
+# silently disable a configured override channel, which is exactly what
+# happened when this line shipped commented out and an install.sh re-run
+# clobbered a hand-edited unit.
+LoadCredential=anthropic:/etc/cortana/anthropic
+
+# Hardening (GDD §22)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/cortana /run/cortana
+
+[Install]
+WantedBy=multi-user.target

@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from aura.config import GazetteerConfig
-from aura.core import db
-from aura.nlu.gazetteer import Gazetteer, GazetteerError
+from cortana.config import GazetteerConfig
+from cortana.core import db
+from cortana.nlu.gazetteer import Gazetteer, GazetteerError
 
 # A small universe: two regions plus a far-away hub chain.
 #
@@ -146,9 +146,9 @@ def test_include_all_null_within_jumps_does_not_raise(
 
 
 def test_include_all_config_flag_also_activates(conn: sqlite3.Connection, tmp_path: Path) -> None:
-    # include_all can be switched on from aura.yaml (GazetteerConfig) too.
+    # include_all can be switched on from cortana.yaml (GazetteerConfig) too.
     path = write_scope(tmp_path, "regions:\n  - Home-Region\n")
-    from aura.config import GazetteerConfig
+    from cortana.config import GazetteerConfig
 
     gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system="Otanuomi", include_all=True))
     gaz.load()
@@ -160,7 +160,7 @@ def test_include_all_config_flag_also_activates(conn: sqlite3.Connection, tmp_pa
 
 def test_null_home_system_disables_bias(conn: sqlite3.Connection, tmp_path: Path) -> None:
     path = write_scope(tmp_path, "regions:\n  - Home-Region\n")
-    from aura.config import GazetteerConfig
+    from cortana.config import GazetteerConfig
 
     gaz = Gazetteer(conn, GazetteerConfig(file=str(path), home_system=None))
     gaz.load()
@@ -176,14 +176,14 @@ def test_empty_systems_table_actionable_error(tmp_path: Path) -> None:
     empty = db.connect(":memory:")
     db.migrate(empty)  # schema present, but no systems rows seeded
     path = write_scope(tmp_path, "regions:\n  - Home-Region\n")
-    from aura.config import GazetteerConfig
+    from cortana.config import GazetteerConfig
 
     gaz = Gazetteer(empty, GazetteerConfig(file=str(path), home_system="Otanuomi"))
     with pytest.raises(GazetteerError) as excinfo:
         gaz.load()
     assert str(excinfo.value) == (
         "systems table is empty — seed it with: "
-        "/opt/aura/brain/venv/bin/python -m aura.nlu.seed --db /var/lib/aura/aura.db"
+        "/opt/cortana/brain/venv/bin/python -m cortana.nlu.seed --db /var/lib/cortana/cortana.db"
     )
 
 

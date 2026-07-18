@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from aura.ipc import (
+from cortana.ipc import (
     MAX_FRAME_BYTES,
     PRIORITY_ALERT,
     PRIORITY_NORMAL,
@@ -259,7 +259,7 @@ async def _eventually(predicate, timeout: float = 2.0) -> None:
 
 @pytest.fixture
 async def harness(tmp_path):
-    h = _Harness(str(tmp_path / "aura.sock"))
+    h = _Harness(str(tmp_path / "cortana.sock"))
     await h.server.start()
     yield h
     await h.server.stop()
@@ -353,7 +353,7 @@ async def test_send_without_client_is_dropped_not_raised(harness: _Harness) -> N
 
 
 async def test_socket_file_created_and_removed(tmp_path) -> None:
-    path = tmp_path / "sub" / "dir" / "aura.sock"
+    path = tmp_path / "sub" / "dir" / "cortana.sock"
     h = _Harness(str(path))
     await h.server.start()
     assert path.exists()  # parent dirs were created too

@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
-from aura.dsc.bot import AuraBot
-from aura.voice_gateway import VoiceGateway
+from cortana.dsc.bot import AuraBot
+from cortana.voice_gateway import VoiceGateway
 
 GUILD = 4200
 CHANNEL = 9
@@ -159,7 +159,7 @@ class _CountingAnnounce:
 
 
 def _db_conn() -> Any:
-    from aura.core import db as dbmod
+    from cortana.core import db as dbmod
 
     conn = dbmod.connect(":memory:")
     dbmod.migrate(conn)

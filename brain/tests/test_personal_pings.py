@@ -7,11 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from aura.core import db
-from aura.core.personal_pings import PersonalPingRegistry, types_from_detail
-from aura.core.routing import PersonalPing
-from aura.nlu.grammar import PING_TYPE_ORDER, encode_ping_types
-from aura.types import Intent
+from cortana.core import db
+from cortana.core.personal_pings import PersonalPingRegistry, types_from_detail
+from cortana.core.routing import PersonalPing
+from cortana.nlu.grammar import PING_TYPE_ORDER, encode_ping_types
+from cortana.types import Intent
 
 GUILD = 1
 

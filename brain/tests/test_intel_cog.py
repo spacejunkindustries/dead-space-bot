@@ -11,8 +11,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-from aura.dsc.cogs.intel import IntelCog
-from aura.types import IncidentOutcome, Intent, Outcome
+from cortana.dsc.cogs.intel import IntelCog
+from cortana.types import IncidentOutcome, Intent, Outcome
 
 
 class _Response:

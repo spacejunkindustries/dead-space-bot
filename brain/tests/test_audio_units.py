@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from aura.audio.stt import (
+from cortana.audio.stt import (
     DEFAULT_WATCHDOG_S,
     FasterWhisperTranscriber,
     SttError,
@@ -31,7 +31,7 @@ from aura.audio.stt import (
     make_transcriber,
     pcm_to_wav_bytes,
 )
-from aura.audio.vad import (
+from cortana.audio.vad import (
     FRAME_BYTES,
     FRAME_MS,
     SAMPLE_RATE_HZ,
@@ -39,9 +39,9 @@ from aura.audio.vad import (
     EndpointTracker,
     VadGate,
 )
-from aura.audio.wake import OWW_CHUNK_BYTES, OpenWakeWordDetector
-from aura.config import SttConfig, WakeConfig
-from aura.types import TranscriptResult
+from cortana.audio.wake import OWW_CHUNK_BYTES, OpenWakeWordDetector
+from cortana.config import SttConfig, WakeConfig
+from cortana.types import TranscriptResult
 
 # ── shared fixtures ──────────────────────────────────────────────────────────
 
@@ -64,7 +64,7 @@ class _StubHolder:
 
 def make_wake_config(threshold: float = 0.5, refractory_ms: int = 200) -> WakeConfig:
     return WakeConfig(
-        model="/opt/aura/models/wake/aura_command.onnx",
+        model="/opt/cortana/models/wake/aura_command.onnx",
         threshold=threshold,
         refractory_ms=refractory_ms,
     )
@@ -296,7 +296,7 @@ def _emit_one_chunk(detector: OpenWakeWordDetector) -> None:
 
 
 def test_near_miss_above_floor_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
-    import aura.audio.wake as wake_mod
+    import cortana.audio.wake as wake_mod
 
     events: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
@@ -312,7 +312,7 @@ def test_near_miss_above_floor_is_logged(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_quiet_audio_below_floor_logs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    import aura.audio.wake as wake_mod
+    import cortana.audio.wake as wake_mod
 
     events: list[str] = []
     monkeypatch.setattr(

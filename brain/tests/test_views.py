@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from aura.dsc.views import (
+from cortana.dsc.views import (
     ComponentAction,
     incident_button_rows,
     incident_custom_id,
@@ -16,7 +16,7 @@ from aura.dsc.views import (
     subscription_buttons,
     subscription_custom_id,
 )
-from aura.types import ButtonSpec, ResponderState
+from cortana.types import ButtonSpec, ResponderState
 
 # ── custom_id building ────────────────────────────────────────────────────────
 

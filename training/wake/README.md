@@ -8,7 +8,7 @@ part — **the run itself needs a human**, a GPU, and several hours.
 
 ## What this produces
 
-The ONNX chain deployed to `/opt/aura/models/wake/` on the droplet
+The ONNX chain deployed to `/opt/cortana/models/wake/` on the droplet
 (GDD §4 assets table — melspec → embedding → wakeword):
 
 | File | Origin | Role |
@@ -17,12 +17,12 @@ The ONNX chain deployed to `/opt/aura/models/wake/` on the droplet
 | `embedding_model.onnx` | openWakeWord release (downloaded, not trained) | spectrogram → speech embedding |
 | `aura_command.onnx` | **trained here** | embedding → wake score, the phrase is baked in |
 
-`aura.yaml` points at the trained head, and the threshold comes from this
+`cortana.yaml` points at the trained head, and the threshold comes from this
 pipeline's sweep output:
 
 ```yaml
 wake:
-  model:  /opt/aura/models/wake/hey_cortana.onnx
+  model:  /opt/cortana/models/wake/hey_cortana.onnx
   threshold: 0.55        # replace with the value picked from the sweep table
 ```
 
@@ -130,13 +130,13 @@ the phrase list). Both scripts are idempotent about downloads.
 ```
 threshold  false-reject  adversarial-FA   FA/hour
      0.40          1.8%            4.1%      0.61
-     0.55          3.0%            1.2%      0.17   <- e.g. picked for aura.yaml
+     0.55          3.0%            1.2%      0.17   <- e.g. picked for cortana.yaml
      0.70          6.9%            0.3%      0.04
 ```
 
 Pick the lowest threshold whose FA/hour you can live with (the table flags
 the first one under `validation.max_false_accepts_per_hour`), set it as
-`wake.threshold` in `/etc/aura/aura.yaml`, and treat it as a starting value:
+`wake.threshold` in `/etc/cortana/cortana.yaml`, and treat it as a starting value:
 GDD §16 thresholds are tuned from real fleet audio, and the wake phrase's
 true false-accept rate is only measurable against real comms
 (`CLAUDE.md`, "Things that need a human"). `#bot-health` reports a running
@@ -148,9 +148,9 @@ TTS actually says "hey cortana" the way pilots will.
 ## Deploying
 
 ```bash
-scp work/deploy_bundle/*.onnx aura@droplet:/opt/aura/models/wake/
-# edit /etc/aura/aura.yaml: wake.threshold from the sweep table
-systemctl restart aura-brain
+scp work/deploy_bundle/*.onnx aura@droplet:/opt/cortana/models/wake/
+# edit /etc/cortana/cortana.yaml: wake.threshold from the sweep table
+systemctl restart cortana-brain
 ```
 
 ## Alternate phrases

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from aura.core.routing import (
+from cortana.core.routing import (
     PersonalPing,
     QuietHours,
     RoutingConfigError,
@@ -20,7 +20,7 @@ from aura.core.routing import (
     load_rules,
     suppress,
 )
-from aura.types import (
+from cortana.types import (
     INTENT_SEVERITY,
     AlertChannel,
     Incident,

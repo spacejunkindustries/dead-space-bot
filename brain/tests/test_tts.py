@@ -17,9 +17,9 @@ from typing import Any
 
 import pytest
 
-from aura import tts
-from aura.ipc import PRIORITY_ALERT
-from aura.tts import (
+from cortana import tts
+from cortana.ipc import PRIORITY_ALERT
+from cortana.tts import (
     DEFAULT_SAMPLE_RATE,
     Speaker,
     SynthesisError,
@@ -131,7 +131,7 @@ def test_personal_ping_catalogue_strings() -> None:
 
 
 def test_ping_types_phrase_pluralizes_naturally() -> None:
-    from aura.types import Intent
+    from cortana.types import Intent
 
     assert tts.ping_types_phrase(frozenset({Intent.HOSTILE_SPOTTED})) == "hostiles"
     assert tts.ping_types_phrase(frozenset({Intent.UNDER_ATTACK})) == "attacks"
@@ -429,7 +429,7 @@ def test_build_chirp_is_valid_wav() -> None:
     import io
     import wave
 
-    from aura.tts import build_chirp
+    from cortana.tts import build_chirp
 
     data = build_chirp(22050)
     with wave.open(io.BytesIO(data)) as r:
@@ -442,7 +442,7 @@ def test_holographic_effect_preserves_format() -> None:
     pytest.importorskip("numpy")  # lazy audio dep; skip in the light CI env
     import struct
 
-    from aura.tts import holographic
+    from cortana.tts import holographic
 
     # 200ms of a 220Hz tone at 22050Hz, s16le.
     rate = 22050
@@ -480,7 +480,7 @@ def test_cortana_personality_rotates_ack_lines_only() -> None:
 
 
 def test_bratty_personality_rotates_with_attitude() -> None:
-    from aura.types import Severity
+    from cortana.types import Severity
 
     tts.set_personality("bratty")
     try:

@@ -109,7 +109,7 @@ def clean_callsign(text: str) -> str | None
 #   sanitize_callsign, then title-cased (STT emits lowercase).
 
 # gazetteer.py — GDD §8.1. Loads scope rules from gazetteer.yaml, systems +
-# adjacency from the db (SDE-seeded by `python -m aura.nlu.seed`). Rebuildable
+# adjacency from the db (SDE-seeded by `python -m cortana.nlu.seed`). Rebuildable
 # at runtime via /gazetteer. Two modes: scoped (default, regions/
 # within_jumps_of/always_include narrow, exclude removes) and include_all
 # (nomadic — entire seeded map active; regions/within_jumps_of ignored, exclude
@@ -151,7 +151,7 @@ def resolve(text: str, gazetteer: Gazetteer, priors: PriorContext,
 # tables from the EVE SDE. Stdlib + aura package only; standalone (does NOT
 # require the service running); reuses db.connect()/db.migrate() so pragmas and
 # schema match the service. Human-readable stdout, not JSON.
-#   python -m aura.nlu.seed --db PATH [--source fuzzwork]
+#   python -m cortana.nlu.seed --db PATH [--source fuzzwork]
 #       [--systems-csv F --jumps-csv F --regions-csv F]  # local files (all 3 together)
 #       [--include-wormholes]                            # keep regionID >= 11000000
 def main(argv: list[str] | None = None) -> int

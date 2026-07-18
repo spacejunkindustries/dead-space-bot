@@ -6,8 +6,8 @@ import sqlite3
 
 import pytest
 
-from aura.core import db
-from aura.core.callsigns import CallsignRegistry
+from cortana.core import db
+from cortana.core.callsigns import CallsignRegistry
 
 
 @pytest.fixture()

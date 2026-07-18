@@ -60,7 +60,7 @@ STT errors are phonetic, not typographic. Whisper writes *"oh tan you oh me"* �
 
 **8. The gazetteer stays small by default — but nomadic mode is a sanctioned exception.**
 Scoped mode (~100–500 systems scoped to the corp's operational region, not all of New Eden) is the **default and the recommended path for home-region corps**. It is the core accuracy decision, not a shortcut: matching against 300 entries beats matching against 5,000. Do not silently widen a scoped gazetteer.
-There is one supported exception: **`include_all` mode** (`gazetteer.yaml`). Some corps are **nomadic** — no fixed home, they relocate and must report *any* k-space system — and for them scoping to a region that changes weekly is worse than a wide gazetteer. `include_all: true` activates the entire seeded (k-space) map as a first-class mode, with `gazetteer.home_system: null` disabling the home-bias prior. The accuracy tradeoff is real (more homophones in a 5,000-entry set) and is absorbed by the confirm-flow (§8.3), context priors (§8.4), and alias learning (§8.5) — not by pretending it isn't there. `python -m aura.nlu.seed` loads k-space wide precisely so both modes work off one seed. GDD §8.1.
+There is one supported exception: **`include_all` mode** (`gazetteer.yaml`). Some corps are **nomadic** — no fixed home, they relocate and must report *any* k-space system — and for them scoping to a region that changes weekly is worse than a wide gazetteer. `include_all: true` activates the entire seeded (k-space) map as a first-class mode, with `gazetteer.home_system: null` disabling the home-bias prior. The accuracy tradeoff is real (more homophones in a 5,000-entry set) and is absorbed by the confirm-flow (§8.3), context priors (§8.4), and alias learning (§8.5) — not by pretending it isn't there. `python -m cortana.nlu.seed` loads k-space wide precisely so both modes work off one seed. GDD §8.1.
 
 **9. Incident cards are edited in place.**
 One incident = one message, updated. Never post a second message for the same incident. Five pilots reporting one gate camp produce one card reading "reported by 5". GDD §9.1.
@@ -87,14 +87,14 @@ ears/                 Rust — voice socket
     ipc.rs            framed UDS client, reconnect backoff, 60s ring buffer
     playback.rs       WAV → Songbird input, priority queue, talk-over suppression
 brain/                Python — everything else
-  aura/
+  cortana/
     audio/            vad, wake, capture, stt
     nlu/              grammar, gazetteer, phonetics
     core/             incidents, routing, discipline, db
     dsc/              bot, views, cogs/
     tts.py health.py ipc.py config.py voice_gateway.py
   schema.sql
-config/               aura.yaml, gazetteer.yaml, routing.yaml (examples)
+config/               cortana.yaml, gazetteer.yaml, routing.yaml (examples)
 deploy/               systemd units, install.sh
 docs/GDD.md           ← the spec
 reference/songbird/   vendored @ v0.6.0 — read before touching voice
@@ -117,7 +117,7 @@ cargo test
 cd brain
 ruff check . && ruff format --check .
 pytest
-python -m aura --config ../config/aura.dev.yaml
+python -m cortana --config ../config/cortana.dev.yaml
 ```
 
 CI runs all of the above on every PR. **CI also builds the release binary** — the droplet is 2 vCPU and will thrash compiling Songbird with LTO, so it downloads the artifact instead of building.
@@ -150,7 +150,7 @@ Frame: [4-byte BE length][1-byte type][body]
 - **Rust:** `anyhow` at boundaries, `thiserror` for library errors. `tracing`, not `println!`. No `unwrap()` outside tests.
 - **Python:** 3.12, full type hints, `ruff` clean. `structlog`-style JSON logging. Blocking work (STT, Piper) goes in a thread pool — never on the event loop.
 - **SQL:** migrations in `brain/migrations/`, never edit `schema.sql` in place for a live change.
-- **Config:** every tunable lives in `aura.yaml` with the default in the example file. No magic numbers in code. The thresholds in GDD §16 are starting values, tuned from real fleet audio — expect them to move.
+- **Config:** every tunable lives in `cortana.yaml` with the default in the example file. No magic numbers in code. The thresholds in GDD §16 are starting values, tuned from real fleet audio — expect them to move.
 - **Tests:** the phonetic matcher, grammar parser, dedupe logic, and routing evaluator are pure functions. Test them properly. The audio path is tested with synthetic PCM fixtures generated in-memory (see constraint 5).
 
 ### Language
@@ -166,7 +166,7 @@ A module is done when:
 1. It matches its row in GDD §4 and its detailed section.
 2. `cargo clippy -- -D warnings` / `ruff check` are clean.
 3. Pure logic has tests.
-4. Its config surface is in `config/aura.yaml.example` with defaults.
+4. Its config surface is in `config/cortana.yaml.example` with defaults.
 5. If it's a voice command, its slash twin exists and shares the engine (constraint 10).
 6. If behaviour diverged from the GDD, **the GDD is updated in the same PR.** The doc is the spec; a stale spec is worse than none.
 

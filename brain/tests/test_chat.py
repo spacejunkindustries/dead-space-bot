@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from aura.chat import ChatClient, ChatCooldownError, ChatError, read_api_key
-from aura.config import ChatConfig
+from cortana.chat import ChatClient, ChatCooldownError, ChatError, read_api_key
+from cortana.config import ChatConfig
 
 
 class _Holder:
