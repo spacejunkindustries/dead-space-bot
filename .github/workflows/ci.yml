@@ -11,6 +11,8 @@ on:
       # config-only change must run CI too or a breaking example edit
       # surfaces later on some unrelated brain PR.
       - "config/**"
+      - "docs/GDD.md"
+      - "scripts/**"
       # The deploy scripts get a cheap bash syntax gate here — an unparseable
       # install.sh otherwise ships straight to the droplet.
       - "deploy/**"
@@ -19,6 +21,8 @@ on:
     paths:
       - "brain/**"
       - "config/**"
+      - "docs/GDD.md"
+      - "scripts/**"
       - "deploy/**"
       - ".github/workflows/ci.yml"
 
@@ -68,3 +72,9 @@ jobs:
 
       - name: Pytest
         run: pytest
+
+      # The GDD §16 table is generated from the config schema — a schema
+      # change without the regenerated table is spec drift and fails here.
+      - name: GDD config table in sync
+        working-directory: .
+        run: python scripts/gen_config_docs.py --check

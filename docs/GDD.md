@@ -1040,106 +1040,105 @@ control task.
 
 ## 16. Configuration reference
 
-`/etc/cortana/cortana.yaml` — hot-reloaded on `SIGHUP`.
+`/etc/cortana/cortana.yaml`. The annotated example (`config/cortana.yaml.example`) is the operator-facing copy; the table below is **generated from the declarative schema** (`brain/cortana/config_schema.py`) by `scripts/gen_config_docs.py`, and CI fails when it drifts — the schema, the example, and this table cannot disagree silently.
 
-```yaml
-discord:
-  token_file: /etc/cortana/token          # 0600, root:aura
-  guild_id: 000000000000000000
-  channels:
-    intel_alerts: 000000000000000000
-    intel_live:   000000000000000000
-    health:       000000000000000000
-  roles:
-    pilot: 000000000000000000          # gate: may trigger mentions
-    fc:    000000000000000000          # gate under fleetmode
-  watch_voice_channels: [000000000000000000]
-  auto_join: true                       # join when a pilot enters, leave when empty
+**Reload classes** (what it takes for an edit to reach live behaviour): `hot` — live on `systemctl reload cortana-brain`; `sighup` — applied by an explicit step in the reload transaction; `engine` — rebuilds the gazetteer/routing engine on reload; `restart` — bound at startup, reported as "restart pending" by the reload receipt, never silently absorbed. Validate any edit before restarting with `python -m cortana.doctor --config <file>`.
 
-wake:
-  model:  /opt/cortana/models/wake/hey_cortana.onnx   # the phrase is baked into the model
-  threshold: 0.55
-  refractory_ms: 2000
-  ack: beep                             # voice = speak "Go ahead." | beep = tone | none
+<!-- BEGIN GENERATED CONFIG TABLE (scripts/gen_config_docs.py) -->
 
-capture:
-  preroll_ms: 300
-  endpoint_silence_ms: 400
-  max_utterance_ms: 6000
-  vad_aggressiveness: 2                 # webrtcvad 0–3
+| Key | Type | Default | Reload | Purpose |
+|---|---|---|---|---|
+| **`discord:`** | | | | *Guild, channels, role gates, mention policy.* |
+| `discord.token_file` | str | **required** | restart | Dev-fallback token path (0600). Production reads $CREDENTIALS_DIRECTORY/token via systemd LoadCredential= (constraint 12) — the token is never in YAML. |
+| `discord.guild_id` | int | **required** | restart | The corp's guild snowflake. |
+| `discord.channels.intel_alerts` | int | **required** | hot | Channel for incidents that mention a role (GDD §11.2). |
+| `discord.channels.intel_live` | int | **required** | hot | Channel for every incident, no mentions — the firehose. |
+| `discord.channels.health` | int | **required** | hot | Channel for self-reports and degradation alerts. |
+| `discord.roles.pilot` | int | `0` | hot | Only members with this role may trigger mentions. 0 = gate off. |
+| `discord.roles.fc` | int | `0` | hot | Only this role voice-triggers under fleetmode / uses admin commands without Manage Guild. 0 = gate off. |
+| `discord.watch_voice_channels` | int_list | **required** | hot | Voice channels CORTANA watches / auto-joins. |
+| `discord.auto_join` | bool | `True` | hot | Join when a pilot enters, leave when empty. |
+| `discord.mentions_enabled` | bool | `True` | hot | false = silent mode: post cards, ping nobody. |
+| `discord.here_on_severity` | str_list | `('high',)` | hot | Threat colours that fire @here: high=RED, medium=ORANGE, none=YELLOW (never fires). One of: `high`, `medium`, `none`. |
+| `discord.join_announcement` | str | `'daily'` | hot | §19 consent notice cadence on voice join. One of: `every`, `daily`, `off`. |
+| **`wake:`** | | | | *openWakeWord model and trigger thresholds.* |
+| `wake.model` | str | **required** | restart | Trained openWakeWord ONNX chain; per-user models are built from it at speaker onset and cached for the process lifetime. |
+| `wake.threshold` | float | **required** | hot | Wake score needed to open a capture window. |
+| `wake.refractory_ms` | int | **required** | hot | Per-user dead time after a wake hit. |
+| `wake.ack` | str | `'beep'` | hot | Wake acknowledgement: spoken, tone, or silent. One of: `voice`, `beep`, `none`. |
+| `wake.vad_threshold` | float | `0.0` | restart | OPT-IN Silero VAD gate inside openWakeWord (0.0 = off). Applied at model build. |
+| **`capture:`** | | | | *Utterance capture windows and VAD mode.* |
+| `capture.preroll_ms` | int | **required** | hot | Ring-buffer audio prepended to each capture. Must fit inside the fixed 1500 ms privacy ring (cross-checked). |
+| `capture.endpoint_silence_ms` | int | **required** | hot | Trailing silence that ends an utterance (wall-clock under DTX). |
+| `capture.max_utterance_ms` | int | **required** | hot | Hard cap on a single capture window. |
+| `capture.vad_aggressiveness` | int | **required** | restart | webrtcvad mode 0 (permissive) – 3 (aggressive); the VadGate is built once at startup. |
+| **`dialog:`** | | | | *OPTIONAL voice dialog engine timing/budgets (GDD §5.4); defaults are the tuned live values.* |
+| `dialog.window_ms` | int | `4000` | hot | Wall-clock lifetime of a wake-free window (say-again retry, code-colour opener, bare command override). DTX-proof: the dialog wheel expires it in real time, frames or no frames. |
+| `dialog.ack_grace_ms` | int | `2000` | hot | Endpoint grace after a capture opens or a prompt is spoken — cue playback plus pilot reaction time. |
+| `dialog.endpoint_gap_floor_ms` | int | `700` | hot | Floor under capture.endpoint_silence_ms for the wall-clock endpoint: DTX drops packets between words; a too-eager gap clips pilots mid-sentence. |
+| `dialog.max_retries` | int | `2` | hot | Wake-free windows per dialog TOTAL (subdialog openers and say-again retries share the budget). Only a fresh wake refills it; exhaustion ends audibly with standing-down. |
+| **`stt:`** | | | | *Speech-to-text backend and relay gates.* |
+| `stt.backend` | str | **required** | restart | Which Transcriber engine to build at startup. One of: `faster-whisper`, `whisper-cpp`. |
+| `stt.model` | str | **required** | restart | Whisper model size or path. |
+| `stt.compute_type` | str | **required** | restart | CTranslate2 quantization. |
+| `stt.cpu_threads` | int | **required** | restart | Inference threads (the droplet has 2 dedicated vCPUs). |
+| `stt.bias_with_gazetteer` | bool | `True` | restart | Pass system names as the Whisper initial_prompt. |
+| `stt.whisper_cpp_url` | str | `'http://127.0.0.1:8080/inference'` | restart | whisper.cpp server endpoint; required (non-empty) only when stt.backend is whisper-cpp (cross-checked). |
+| `stt.watchdog_s` | float | `15.0` | restart | GDD §20 "STT worker hang" watchdog deadline. The whisper-cpp HTTP timeout is derived slightly below it so the socket gives up before the watchdog abandons the worker. |
+| `stt.relay_min_logprob` | float | `-0.9` | hot | Freeform relays below this Whisper confidence are dropped with "Say again" (GDD §8.6); recognised commands are never gated. |
+| `stt.relay_mode` | str | `'framed'` | hot | What unmatched speech may become a relay card (GDD §8.6). One of: `framed`, `open`, `off`. |
+| **`matching:`** | | | | *Phonetic system-name matcher weights (constraint 7).* |
+| `matching.phonetic_weight` | float | **required** | hot | Weight of metaphone similarity (constraint 7). Must sum to 1.0 with text_weight (cross-checked). |
+| `matching.text_weight` | float | **required** | hot | Weight of raw-text Levenshtein similarity. |
+| `matching.tiers.high_min` | float | **required** | hot | top1 >= this (and margin) → post immediately. |
+| `matching.tiers.high_margin` | float | **required** | hot | top1 - top2 must also clear this for HIGH tier. |
+| `matching.tiers.medium_min` | float | **required** | hot | top1 >= this → post flagged uncertain, with buttons. Must be <= high_min (cross-checked). |
+| `matching.priors.recency_weight` | float | **required** | hot | Boost for systems with recent incidents. |
+| `matching.priors.recency_window_min` | int | **required** | hot | How recent counts as recent. |
+| `matching.priors.proximity_weight` | float | **required** | hot | Boost for systems near an active incident. |
+| `matching.priors.proximity_max_jumps` | int | **required** | hot | Beyond this many jumps, no proximity boost. |
+| `matching.priors.reporter_history_weight` | float | **required** | hot | Boost for systems this pilot reports from often. |
+| `matching.priors.home_weight` | float | **required** | hot | Standing boost for home and adjacent systems. |
+| **`incidents:`** | | | | *Dedupe / staleness / cancel windows.* |
+| `incidents.dedupe_window_s` | int | **required** | hot | Same system + type within this window → fold (GDD §9.2). |
+| `incidents.stale_after_min` | int | **required** | hot | No updates for this long → auto-STALE, silently. |
+| `incidents.cancel_window_s` | int | **required** | hot | "hey cortana, cancel" kills the user's last incident inside this. |
+| **`discipline:`** | | | | *Mention cooldowns and the flood breaker.* |
+| `discipline.user_cooldown_s` | int | **required** | hot | Min seconds between mentions from the same pilot. |
+| `discipline.circuit_breaker.max_mentions` | int | **required** | hot | More than this many mentions in window_min → flood control. |
+| `discipline.circuit_breaker.window_min` | int | **required** | hot | The flood-control sliding window, in minutes. |
+| `discipline.personal_pings_max` | int | `10` | hot | Max personal /pingme subscriptions per pilot (GDD §10.3). |
+| **`tts:`** | | | | *Piper synthesis and spoken-line personality.* |
+| `tts.enabled` | bool | `True` | hot | Spoken back-channel on/off. |
+| `tts.voice` | str | **required** | hot | Piper voice model; the sample rate is re-read on config swap. |
+| `tts.binary` | str | **required** | hot | Piper invoked as a subprocess per synthesis (GDD §12). |
+| `tts.max_utterance_s` | float | **required** | hot | Hard cap; longer text goes to the channel instead. |
+| `tts.effect` | str | `'none'` | hot | Post-synthesis effect: chorus+reverb "ship AI" sheen or none. One of: `none`, `holographic`. |
+| `tts.personality` | str | `'standard'` | sighup | Spoken-line flavour; applied by set_personality() in the reload transaction. One of: `standard`, `cortana`, `bratty`. |
+| **`chat:`** | | | | *OPTIONAL "command override" assistant (GDD §6.6); absent = off.* |
+| `chat.enabled` | bool | `False` | sighup | Pilots can say "command override, <question>" (/ask twin). Costs real money per question. |
+| `chat.model` | str | `'claude-haiku-4-5'` | hot | Claude model for override replies. |
+| `chat.api_key_file` | str | `'/etc/cortana/anthropic'` | sighup | Dev fallback ONLY (0600); production reads $CREDENTIALS_DIRECTORY/anthropic via LoadCredential= (constraint 12). The client is rebuilt when the on-disk key changes. |
+| `chat.max_tokens` | int | `300` | hot | Hard cap per answer. |
+| `chat.user_cooldown_s` | int | `10` | hot | Per-pilot throttle — the cost control. |
+| `chat.timeout_s` | float | `25.0` | hot | Wall-clock cap per answer incl. web search. |
+| `chat.web_search` | bool | `True` | hot | Allow one live web search per question. |
+| `chat.answer_channel` | int | `0` | hot | Channel for answers too long to speak. 0 = intel_live. |
+| **`gazetteer:`** | | | | *Active system-set scoping — GDD §8.1.* |
+| `gazetteer.file` | str | **required** | engine | Scope rules file (regions/within_jumps_of/include_all, GDD §8.1). |
+| `gazetteer.home_system` | opt_str | `None` | engine | Anchor for the home-bias prior (§8.4). null/empty = no home system → prior off (nomadic corps, GDD §8.1). |
+| `gazetteer.include_all` | bool | `False` | engine | Nomadic override, mirrors gazetteer.yaml include_all — either being true activates the entire seeded map. |
+| **`routing:`** | | | | *OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.* |
+| `routing.file` | str | `''` | engine | routing.yaml location. Empty (the default) = routing.yaml in the same directory as cortana.yaml. |
+| **`ipc:`** | | | | *The Brain⇄Ears unix socket (GDD §15).* |
+| `ipc.socket` | str | **required** | restart | Brain binds; Ears connects (GDD §15). Bound once at startup. |
+| **`health:`** | | | | *Self-report cadence and degradation alarms.* |
+| `health.report_interval_min` | int | **required** | hot | Cadence of #bot-health self-reports. |
+| `health.voice_silence_alarm_s` | int | **required** | hot | No VoiceTick this long with >= 2 humans present → degraded. |
+| **`database:`** | | | | *SQLite location.* |
+| `database.path` | str | **required** | restart | SQLite (WAL) location; opened once at startup. |
 
-stt:
-  backend: faster-whisper               # or: whisper-cpp
-  model: small
-  compute_type: int8
-  cpu_threads: 2
-  bias_with_gazetteer: true
-  whisper_cpp_url: http://127.0.0.1:8080/inference
-  relay_min_logprob: -0.9               # freeform-relay confidence gate (§8.6)
-  relay_mode: framed                    # framed | open | off (§8.6)
-
-matching:
-  phonetic_weight: 0.6
-  text_weight: 0.4
-  tiers:
-    high_min: 0.80
-    high_margin: 0.12
-    medium_min: 0.55
-  priors:
-    recency_weight: 0.35
-    recency_window_min: 10
-    proximity_weight: 0.25
-    proximity_max_jumps: 5
-    reporter_history_weight: 0.15
-    home_weight: 0.10
-
-incidents:
-  dedupe_window_s: 90
-  stale_after_min: 20
-  cancel_window_s: 30
-
-discipline:
-  user_cooldown_s: 30
-  circuit_breaker:
-    max_mentions: 12
-    window_min: 10
-  personal_pings_max: 10       # per-user cap on /pingme subscriptions (§10.3)
-
-tts:
-  enabled: true
-  voice: /opt/cortana/models/piper/en_US-amy-medium.onnx
-  binary: /usr/local/bin/piper
-  max_utterance_s: 3
-  # Ducking (60%) and talk-over suppression are fixed playback mechanics in
-  # Ears (§12.2) — deliberately not tunables here.
-
-chat:                                   # §6.6 override assistant — off by default
-  enabled: false
-  model: claude-haiku-4-5
-  api_key_file: /etc/cortana/anthropic     # dev fallback; production = LoadCredential
-  max_tokens: 300
-  user_cooldown_s: 10
-  timeout_s: 25
-  web_search: true
-
-gazetteer:
-  file: /etc/cortana/gazetteer.yaml
-  home_system: Otanuomi        # null/empty = no home system → home-bias prior
-                               # off (nomadic corps, §8.1/§8.4)
-  include_all: false           # nomadic override, mirrors gazetteer.yaml's flag;
-                               # either being true activates the whole seeded map
-
-ipc:
-  socket: /run/cortana/cortana.sock
-  # Ears' outbound ring size (buffer_seconds) lives in Ears' own config,
-  # /etc/cortana/ears.yaml (token_file, socket_path, buffer_seconds — see
-  # ears/ears.yaml.example): the ring must survive Brain restarts, so Brain
-  # cannot own that knob.
-
-health:
-  report_interval_min: 60
-  voice_silence_alarm_s: 60
-```
+<!-- END GENERATED CONFIG TABLE -->
 
 `/etc/cortana/gazetteer.yaml` — scope rules over the SDE-seeded tables (§8.1). The
 tables themselves are filled by `python -m cortana.nlu.seed` (k-space New Eden),
