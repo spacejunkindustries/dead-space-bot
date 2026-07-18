@@ -32,6 +32,7 @@ from aura.types import Intent, ParsedCommand, Severity
 __all__ = [
     "PING_TYPE_ORDER",
     "bare_code",
+    "bare_override",
     "broadcast_severity",
     "clean_callsign",
     "encode_ping_types",
@@ -476,6 +477,26 @@ def override_query(transcript: str) -> str | None:
         return None
     rest = _SIGNOFF_RE.sub("", work[m.end() :]).strip(" ,.;:!?-")
     return rest or None
+
+
+def bare_override(transcript: str) -> bool:
+    """True for a *standalone* "command override" — the doorway spoken with
+    no question attached (GDD §6.6 dialogue opener).
+
+    Happens constantly in practice: the capture window closes on the pause
+    after "command override," before the pilot asks their question. The App
+    acknowledges and reopens a wake-free window; the next utterance is the
+    question itself, no prefix needed.
+    """
+    if not transcript or not transcript.strip():
+        return False
+    work = _BROADCAST_WAKE_RE.sub("", transcript, count=1)
+    work = _WAKE_RE.sub("", work, count=1)
+    m = _OVERRIDE_RE.match(work)
+    if m is None:
+        return False
+    rest = _SIGNOFF_RE.sub("", work[m.end() :]).strip(" ,.;:!?-")
+    return not rest
 
 
 def bare_code(transcript: str) -> Severity | None:

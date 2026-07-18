@@ -56,8 +56,16 @@ wake:
 
 capture:
   preroll_ms: 300                      # RAM ring-buffer audio prepended to each capture
-  endpoint_silence_ms: 400             # trailing silence that ends an utterance
-  max_utterance_ms: 6000               # hard cap on a single capture window
+  endpoint_silence_ms: 1000            # trailing silence that ends an utterance —
+                                       # ALSO the wall-clock gap for Discord's DTX
+                                       # (packets stop during pauses; floor 700ms).
+                                       # 400 clipped pilots at natural thinking
+                                       # pauses; 1000 costs ~+0.3s per command and
+                                       # lets mid-question pauses survive.
+  max_utterance_ms: 12000              # hard cap on a single capture window.
+                                       # 6000 truncated long override questions;
+                                       # reports still end early at the silence
+                                       # endpoint, so short commands stay fast.
   vad_aggressiveness: 2                # webrtcvad mode, 0 (permissive) – 3 (aggressive)
 
 stt:
@@ -114,6 +122,10 @@ tts:
                                        # cortana = acknowledgement lines rotate
                                        # ("Go ahead." / "Listening." / "Send it.")
                                        # so CORTANA feels alive; info lines never vary.
+                                       # bratty = the rotation with attitude and
+                                       # sailor vocabulary ("Ugh, fine. Go." /
+                                       # "That was gibberish. Again.") — profanity
+                                       # in ACK lines only, an adult corp's choice.
   # Ducking (60%) and talk-over suppression are fixed playback mechanics in
   # Ears (ears/src/playback.rs, GDD §12.2) — not tunables.
 

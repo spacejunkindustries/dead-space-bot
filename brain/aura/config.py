@@ -208,7 +208,9 @@ class TtsConfig:
     effect: str = "none"
     #: Spoken-line flavour: "standard" keeps the exact GDD §12.1 catalogue;
     #: "cortana" rotates acknowledgement lines ("Go ahead." / "Listening." /
-    #: "Send it.") so CORTANA feels alive. Info-carrying lines never vary.
+    #: "Send it.") so CORTANA feels alive; "bratty" is the cortana rotation
+    #: with attitude and sailor vocabulary (an adult corp's explicit choice —
+    #: profanity in the ACK lines only). Info-carrying lines never vary.
     personality: str = "standard"
     # Ducking level and talk-over suppression are fixed playback mechanics in
     # Ears (ears/src/playback.rs) — deliberately not tunables here.
@@ -522,8 +524,8 @@ def _build_tts(data: dict[str, Any]) -> TtsConfig:
 
 def _personality(value: str) -> str:
     v = value.lower()
-    if v not in ("standard", "cortana"):
-        raise ConfigError(f"tts.personality: must be standard or cortana, got {value!r}")
+    if v not in ("standard", "cortana", "bratty"):
+        raise ConfigError(f"tts.personality: must be standard, cortana or bratty, got {value!r}")
     return v
 
 
