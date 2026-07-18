@@ -2,24 +2,50 @@
 # routing, TTS synthesis. Binds the IPC socket; Ears connects to it (GDD §15).
 #
 # Install: /etc/systemd/system/cortana-brain.service (deploy/install.sh does this).
+# Code runs from the /opt/cortana/current symlink, which install.sh flips
+# atomically between staged releases (GDD §17) — a restart is all it takes to
+# pick up a new release, and --rollback is a flip plus this same restart.
 # Token comes ONLY via LoadCredential= (GDD §18/§22, CLAUDE.md constraint 12);
 # the process reads $CREDENTIALS_DIRECTORY/token.
 
 [Unit]
 Description=CORTANA Brain (fleet intel engine)
-Documentation=file:/opt/cortana/brain/docs/GDD.md
+Documentation=file:/opt/cortana/current/brain/docs/GDD.md
 After=network-online.target
 Wants=network-online.target
+# A genuinely broken brain must stop and alert, not crash-loop invisibly
+# forever: five failed starts inside five minutes stops the unit, which
+# lands it in failed state and fires OnFailure=.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# On failure (start limit hit, config-error exit, crash the restart policy
+# refuses) run the alert hook: appends to /var/lib/cortana/alerts.log and
+# posts the journal tail to the ops webhook when /etc/cortana/alert_webhook
+# exists. The alarm that works precisely when the bot cannot start.
+OnFailure=cortana-alert@%n.service
 
 [Service]
 Type=simple
+# --- Type=notify, ready when the brain actually is -----------------------
+# The brain does not call sd_notify yet (that lands with the supervision
+# work in brain/). Once it sends READY=1 only after gateway-ready + IPC
+# socket bind + engine load, and the health loop pings WATCHDOG=1, replace
+# Type=simple above with:
+#   Type=notify-reload
+#   NotifyAccess=main
+#   WatchdogSec=90
+# -------------------------------------------------------------------------
 User=aura
 Group=aura
-ExecStart=/opt/cortana/brain/venv/bin/python -m cortana --config /etc/cortana/cortana.yaml
+ExecStart=/opt/cortana/current/venv/bin/python -m cortana --config /etc/cortana/cortana.yaml
 # SIGHUP → ConfigHolder.reload() (hot-reload cortana.yaml, GDD §16/§18)
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
+# Exit 78 (EX_CONFIG: invalid config/gazetteer/routing) and 69
+# (EX_UNAVAILABLE: auth) are operator problems a restart cannot fix — stop
+# cleanly with the reason in the journal instead of looping every 5s.
+RestartPreventExitStatus=78 69
 # Brain bounds its own graceful shutdown (~8s); this is the backstop so a wedged
 # close still restarts promptly instead of waiting the 90s default before SIGKILL.
 TimeoutStopSec=15
