@@ -124,6 +124,11 @@ class OpenWakeWordDetector:
         # busy comms can no longer false-fire on its own. 0.0 disables.
         if cfg.vad_threshold > 0.0:
             kwargs["vad_threshold"] = cfg.vad_threshold
+            try:
+                return Model(**kwargs)
+            except Exception as exc:  # noqa: BLE001 — degrade, never kill wake
+                log.warning("wake_vad_gate_unavailable", error=str(exc))
+                del kwargs["vad_threshold"]
         return Model(**kwargs)
 
     def score(self, user_id: int, frame: bytes) -> float:

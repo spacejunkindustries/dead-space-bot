@@ -44,10 +44,13 @@ wake:
                                        # ~0.45 ambient chatter false-fires constantly, and
                                        # every false wake is an STT decode + a junk relay.
   refractory_ms: 2000                  # per-user dead time after a wake hit
-  vad_threshold: 0.5                   # Silero VAD gate inside openWakeWord: a wake
-                                       # trigger only counts when speech is detected
-                                       # simultaneously — cuts false fires from music/
-                                       # game audio on busy comms. 0.0 = off.
+  vad_threshold: 0.0                   # OPT-IN Silero VAD gate inside openWakeWord:
+                                       # >0 means a wake trigger only counts when
+                                       # speech is detected simultaneously (cuts
+                                       # false fires from music/game audio). It once
+                                       # silently killed the wake word when enabled
+                                       # by default — try ~0.3-0.5 and VERIFY wake
+                                       # still fires. Needs a restart to apply.
   ack: beep                            # how CORTANA acknowledges the wake word:
                                        #   voice = speak "Go ahead." (talks back)
                                        #   beep  = instant tone (no synth latency)
