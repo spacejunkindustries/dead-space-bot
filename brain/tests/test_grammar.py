@@ -941,3 +941,27 @@ def test_confirm_reply_negatives(heard: str) -> None:
 )
 def test_confirm_reply_other_content_is_neither(heard: str) -> None:
     assert confirm_reply(heard) is None
+
+
+# ── field report: junk system windows (System "me", "M-TAC-O requiring") ─────
+
+
+def test_pronoun_only_window_never_becomes_a_system() -> None:
+    # Live card: System "me" from "…point on me…" phrasing.
+    cmd = parse("under attack point on me send help")
+    assert cmd is not None
+    assert cmd.intent is Intent.UNDER_ATTACK
+    assert cmd.system_text is None
+
+
+def test_trailing_continuation_verb_is_cut_from_the_window() -> None:
+    # Live card: System "M-TAC-O requiring" — the verb belongs to the
+    # sentence, not the name.
+    cmd = parse("under attack m tack o requiring heavy assistance")
+    assert cmd is not None
+    assert cmd.intent is Intent.UNDER_ATTACK
+    assert cmd.system_text is not None
+    assert "requiring" not in cmd.system_text
+    cmd2 = parse("hostiles M-TAC-O requiring backup")
+    assert cmd2 is not None and cmd2.system_text is not None
+    assert "requiring" not in cmd2.system_text

@@ -1110,3 +1110,26 @@ async def test_stale_arm_window_action_is_dropped() -> None:
     rig.dialog._arm_window(stale_session, stale_session.gen)
     assert len(rig.capture.armed) == armed_before  # dropped, not armed
     assert USER not in rig.dialog._deadlines  # no unowned deadline created
+
+
+async def test_capped_confirmation_still_speaks_a_short_posted() -> None:
+    """Field report: a long verbatim system name pushed the confirmation
+    line over the §12.2 cap — the speaker refused it, the fallback went to
+    channel TEXT, and the pilot heard silence and assumed the report was
+    swallowed. The reply path now speaks the minimal 'Posted.' instead."""
+    long_line = "Under attack M-TAC-O requiring, posted."
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["under attack hostiles Otanuomi"]),
+        outcome=IncidentOutcome(Outcome.POSTED, long_line, None, 1),
+    )
+
+    async def capped_say(guild_id, text, priority=1, *, user_id=None):
+        rig.speaker.said.append((guild_id, text))
+        return len(text) <= 12  # only short lines fit the cap
+
+    rig.speaker.say = capped_say  # type: ignore[method-assign]
+    await utter_wake(rig)
+    assert (GUILD, long_line) in rig.speaker.said  # tried the full line
+    assert (GUILD, "Posted.") in rig.speaker.said  # then the audible short ack
+    assert rig.sent == []  # no channel-text dump needed

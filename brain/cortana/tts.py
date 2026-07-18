@@ -200,6 +200,19 @@ _STANDING_DOWN_BRATTY = (
 )
 
 
+def posted_short() -> str:
+    """Minimal spoken confirmation when the full outcome line exceeds the
+    §12.2 cap (long verbatim system names): the pilot must still HEAR that
+    the report landed — silence-plus-channel-text read as a swallowed
+    report (live complaint). Info-carrying, so it never varies."""
+    return "Posted."
+
+
+def updated_short() -> str:
+    """Short spoken confirmation for a folded/updated card (see posted_short)."""
+    return "Updated."
+
+
 def standing_down() -> str:
     """*"Standing down. Wake me to retry."* — the second consecutive
     unintelligible utterance ends the dialogue: the pilot now KNOWS the

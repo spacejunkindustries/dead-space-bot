@@ -629,6 +629,18 @@ class DialogEngine:
         priority = PRIORITY_ALERT if severity is Severity.HIGH else PRIORITY_NORMAL
         spoken = await self._speaker.say(s.guild_id, utterance, priority, user_id=s.user_id)
         if not spoken:
+            # A long verbatim system name can push the confirmation over the
+            # §12.2 cap — the pilot still needs to HEAR that the report
+            # landed (a silent post read as a swallowed report, live
+            # complaint). Speak the minimal form; the card is the record.
+            short = None
+            if outcome.outcome is Outcome.POSTED:
+                short = tts_mod.posted_short()
+            elif outcome.outcome is Outcome.FOLDED:
+                short = tts_mod.updated_short()
+            if short is not None:
+                spoken = await self._speaker.say(s.guild_id, short, priority, user_id=s.user_id)
+        if not spoken:
             await self._send_channel(
                 self._holder.current.discord.channels.intel_live, f"🔊 {utterance}"
             )
