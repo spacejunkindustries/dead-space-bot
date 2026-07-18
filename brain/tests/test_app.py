@@ -645,3 +645,35 @@ async def test_override_while_disabled_speaks_unavailable() -> None:
     await app._on_utterance(USER, GUILD, b"\x00\x00")
     assert engine.broadcasts == [] and engine.reports == []
     assert speaker.said == [(GUILD, "Override channel unavailable.")]
+
+
+async def test_bare_override_opens_dialogue_then_takes_the_question() -> None:
+    # "command override" alone (window closed on the pause) → ack + reopen;
+    # the NEXT utterance is the question verbatim, no prefix needed.
+    app, engine, _, speaker, capture = make_app(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey jarvis command override", "what's the weather in Chicago"]),
+    )
+    app.holder = StubHolder(make_config(chat_enabled=True))  # type: ignore[assignment]
+    app.discipline = Discipline(app.holder)  # type: ignore[arg-type]
+    chat = _Chat()
+    app.chat = chat  # type: ignore[assignment]
+
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert chat.asked == []
+    assert speaker.said == [(GUILD, "Go ahead.")]
+    assert capture.reopened == [(USER, GUILD)]
+
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert chat.asked == [(USER, "what's the weather in Chicago")]
+    assert engine.broadcasts == [] and engine.reports == []
+
+
+async def test_bare_override_while_disabled_speaks_unavailable() -> None:
+    app, _, _, speaker, capture = make_app(
+        roles=[PILOT_ROLE], transcriber=_Transcriber(["command override"])
+    )
+    app.chat = None  # type: ignore[assignment]
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert speaker.said == [(GUILD, "Override channel unavailable.")]
+    assert capture.reopened == []

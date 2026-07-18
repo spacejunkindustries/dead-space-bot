@@ -755,7 +755,7 @@ Piper reloads its voice model on every subprocess spawn (~1s on the droplet), so
 
 ### 12.4 Personality
 
-`tts.personality` selects the spoken-line flavour. `standard` keeps the exact §12.1 catalogue. `cortana` rotates **acknowledgement lines only** through short variants — *"Go ahead." / "Listening." / "Send it." / "Copy code orange. Send it." / "On the wire."* — so CORTANA feels alive rather than canned. Information-carrying lines (system names, counts, timers, callsigns) never vary: a pilot mid-fight must never parse a surprise phrasing for facts. This is scripted variation, not generation — no model is involved (constraint 6), and no real person's voice is imitated.
+`tts.personality` selects the spoken-line flavour. `standard` keeps the exact §12.1 catalogue. `cortana` rotates **acknowledgement lines only** through short variants — *"Go ahead." / "Listening." / "Send it." / "Copy code orange. Send it." / "On the wire."* — so CORTANA feels alive rather than canned. Information-carrying lines (system names, counts, timers, callsigns) never vary: a pilot mid-fight must never parse a surprise phrasing for facts. `bratty` is the cortana rotation with attitude and sailor vocabulary — *"Ugh, fine. Go." / "Posted. You're welcome." / "That was gibberish. Again."* — profanity confined to acknowledgement lines, chosen explicitly by the corp for an adult server. This is scripted variation, not generation — no model is involved (constraint 6), and no real person's voice is imitated.
 
 ---
 

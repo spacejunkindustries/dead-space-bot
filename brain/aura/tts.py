@@ -111,15 +111,26 @@ _personality = "standard"
 
 
 def set_personality(style: str) -> None:
-    """Select the spoken-line flavour ("standard" | "cortana"). Called by the
-    App at startup and after each SIGHUP config reload."""
+    """Select the spoken-line flavour ("standard" | "cortana" | "bratty").
+    Called by the App at startup and after each SIGHUP config reload."""
     global _personality
     _personality = style
 
 
-def _pick(standard: str, variants: tuple[str, ...]) -> str:
-    if _personality == "cortana":
-        return random.choice(variants)
+def _pick(standard: str, cortana: tuple[str, ...] = (), bratty: tuple[str, ...] = ()) -> str:
+    """One line from the active personality's pool.
+
+    "standard" is always the exact §12.1 string. "bratty" (GDD §12.4 — the
+    corp's explicit sailor-vocabulary choice) falls back to the cortana pool
+    for lines without a bratty variant. Only ACK-class lines ever vary;
+    information-carrying lines are fixed regardless of personality.
+    """
+    if _personality == "cortana" and cortana:
+        return random.choice(cortana)
+    if _personality == "bratty":
+        pool = bratty or cortana
+        if pool:
+            return random.choice(pool)
     return standard
 
 
@@ -160,10 +171,22 @@ def say_again() -> str:
     return "Say again the system."
 
 
+_NOT_UNDERSTOOD_BRATTY = (
+    "That was gibberish. Again.",
+    "What the hell was that? Repeat.",
+    "Nope, didn't catch that. Try words.",
+    "Again, slower, like I'm five.",
+    "Static and vibes. Say it again.",
+    "My ears work. Your mouth doesn't. Again.",
+    "Zero idea what that was. Once more.",
+    "Come again? That meant nothing.",
+)
+
+
 def not_understood() -> str:
     """*"Say again?"* — the utterance matched no command and no relay frame
     (GDD §8.6 framed mode): CORTANA heard something but won't post it."""
-    return "Say again?"
+    return _pick("Say again?", bratty=_NOT_UNDERSTOOD_BRATTY)
 
 
 def chase_updated(system: str) -> str:
@@ -189,12 +212,27 @@ def post_failed() -> str:
     return "Discord post failed."
 
 
+_GO_AHEAD_BRATTY = (
+    "What. I'm listening.",
+    "Yeah, yeah. Talk.",
+    "Ugh, fine. Go.",
+    "I'm up. What do you want?",
+    "This better be fucking important.",
+    "Listening. Make it quick.",
+    "Oh great, it's you. Go ahead.",
+    "You rang? Spit it out.",
+    "Hell, I was napping. Talk.",
+    "Speak. I haven't got all day.",
+)
+
+
 def go_ahead() -> str:
     """*"Go ahead."* — spoken the instant the wake word fires, so the pilot
     knows CORTANA is listening before they start their report (§5 capture)."""
     return _pick(
         "Go ahead.",
-        ("Go ahead.", "Listening.", "I'm here. Go ahead.", "Send it.", "Copy. Go ahead."),
+        cortana=("Go ahead.", "Listening.", "I'm here. Go ahead.", "Send it.", "Copy. Go ahead."),
+        bratty=_GO_AHEAD_BRATTY,
     )
 
 
@@ -237,14 +275,37 @@ _SEVERITY_SPOKEN: dict[Severity, str] = {
 }
 
 
+_RELAYED_BRATTY = (
+    "Posted. You're welcome.",
+    "Sent it. Miracles happen daily.",
+    "Relayed. Don't make me regret it.",
+    "Fine, it's posted. Happy?",
+    "Done. Absolutely riveting stuff.",
+    "Your words, immortalized. God help us.",
+    "Shipped it. Now stop fucking around.",
+    "Posted. Somebody had to.",
+)
+
+
 def relayed() -> str:
     """*"Relayed."* — spoken after a freeform relay posts, so the pilot knows
     it landed and stops repeating themselves (each repeat is another card and
     another STT decode)."""
     return _pick(
         "Relayed.",
-        ("Relayed.", "Copy that. Relayed.", "On the wire.", "Sent it up the chain."),
+        cortana=("Relayed.", "Copy that. Relayed.", "On the wire.", "Sent it up the chain."),
+        bratty=_RELAYED_BRATTY,
     )
+
+
+_CODE_ACK_BRATTY = (
+    "Code {colour}. Shit. Talk to me.",
+    "Code {colour}? Fun. Details, now.",
+    "Copy code {colour}. Spill it.",
+    "Code {colour}, great. What's on fire?",
+    "Code {colour}. Go, I'm listening.",
+    "Ooh, code {colour}. Report, hotshot.",
+)
 
 
 def code_ack(severity: Severity) -> str:
@@ -254,11 +315,12 @@ def code_ack(severity: Severity) -> str:
     colour = _SEVERITY_SPOKEN[severity]
     return _pick(
         f"Code {colour}. Go ahead.",
-        (
+        cortana=(
             f"Code {colour}. Go ahead.",
             f"Code {colour} logged. Go ahead.",
             f"Copy code {colour}. Send it.",
         ),
+        bratty=tuple(t.format(colour=colour) for t in _CODE_ACK_BRATTY),
     )
 
 
@@ -377,6 +439,10 @@ def hot_lines() -> tuple[str, ...]:
         lines += ["Copy that. Relayed.", "On the wire.", "Sent it up the chain."]
         for colour in _SEVERITY_SPOKEN.values():
             lines += [f"Code {colour} logged. Go ahead.", f"Copy code {colour}. Send it."]
+    if _personality == "bratty":
+        lines += list(_GO_AHEAD_BRATTY) + list(_RELAYED_BRATTY) + list(_NOT_UNDERSTOOD_BRATTY)
+        for colour in _SEVERITY_SPOKEN.values():
+            lines += [t.format(colour=colour) for t in _CODE_ACK_BRATTY]
     return tuple(dict.fromkeys(lines))
 
 

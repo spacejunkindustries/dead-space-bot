@@ -477,3 +477,24 @@ def test_cortana_personality_rotates_ack_lines_only() -> None:
         assert tts.responders(2, "Otanuomi") == "Two responding to Otanuomi."
     finally:
         tts.set_personality("standard")
+
+
+def test_bratty_personality_rotates_with_attitude() -> None:
+    from aura.types import Severity
+
+    tts.set_personality("bratty")
+    try:
+        seen = {tts.go_ahead() for _ in range(60)}
+        assert len(seen) > 3  # rotates
+        assert seen <= set(tts._GO_AHEAD_BRATTY)
+        # Info-carrying lines never vary, whatever the personality.
+        assert tts.chase_updated("Kisogo") == "Chase updated, Kisogo."
+        assert tts.ping_sent("Otanuomi") == "Hostiles Otanuomi, pinged."
+        # code_ack keeps the colour word intact in every variant.
+        for _ in range(20):
+            assert "red" in tts.code_ack(Severity.HIGH)
+        # hot_lines covers the bratty pool so acks stay cached/instant.
+        lines = tts.hot_lines()
+        assert set(tts._GO_AHEAD_BRATTY) <= set(lines)
+    finally:
+        tts.set_personality("standard")

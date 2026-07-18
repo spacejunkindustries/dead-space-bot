@@ -85,6 +85,11 @@ _RETRY_TTL_S = 10.0
 #: How often the wall-clock silence sweep checks for pilots who stopped talking.
 _SILENCE_SWEEP_MS = 100
 
+#: Silence-sweep grace after a capture opens: covers "Go ahead." playback plus
+#: the pilot's reaction time, so waiting politely for the cue can never get a
+#: capture force-endpointed before the first word.
+_ACK_GRACE_S = 2.0
+
 #: Spoken/posted when a non-@Pilot member voice-triggers a mention-bearing
 #: intent — mirrors the slash twin's rejection (GDD §11.1 layer 4).
 _PILOT_REQUIRED_UTTERANCE = "Reporting requires the Pilot role."
@@ -172,6 +177,13 @@ class App:
         # acknowledges, reopens a wake-free window, and the next utterance from
         # that user inherits the severity. Same shape and TTL as the retry.
         self._pending_severity: dict[int, tuple[Severity, float]] = {}
+        # Override dialogue state (GDD §6.6): a bare "command override" opens
+        # a wake-free window; the next utterance is the question verbatim.
+        self._pending_override: dict[int, float] = {}
+        # When each user's capture window opened — the silence sweep's ack
+        # grace reads this so the "Go ahead." gap can't endpoint a capture
+        # before the pilot has spoken a word.
+        self._capture_opened_at: dict[int, float] = {}
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -420,6 +432,14 @@ class App:
             # between words, so a too-eager gap would clip a pilot mid-sentence.
             gap = max(self.holder.current.capture.endpoint_silence_ms / 1000, 0.7)
             for user_id in self.capture.capturing_users():
+                # Ack grace: a pilot who politely waits for the "Go ahead."
+                # cue is packet-silent for cue playback + reaction — routinely
+                # past the gap. Without this they were endpointed before
+                # saying a single word, and the wake-tail fragment decoded to
+                # a junk "Say again?".
+                opened = self._capture_opened_at.get(user_id)
+                if opened is not None and now - opened < _ACK_GRACE_S:
+                    continue
                 last = self._last_audio_at.get(user_id)
                 if last is not None and now - last >= gap:
                     self.capture.force_endpoint(user_id)
@@ -436,6 +456,7 @@ class App:
         (Cortana talks back), "beep" plays an instant tone, "none" is silent.
         A spoken cue costs one Piper synthesis; the tone is instant, which is
         why "beep" stays the latency-safe default."""
+        self._capture_opened_at[user_id] = self._loop_time()
         if self.speaker is None:
             return
         ack = self.holder.current.wake.ack
@@ -469,6 +490,8 @@ class App:
                 self._last_audio_at.pop(uid, None)
                 self._pending_retry.pop(uid, None)
                 self._pending_severity.pop(uid, None)
+                self._pending_override.pop(uid, None)
+                self._capture_opened_at.pop(uid, None)
         elif t == "speaking":
             pass  # informational; talk-over suppression happens in Ears
         else:
@@ -520,6 +543,7 @@ class App:
         loop = asyncio.get_running_loop()
         pending = self._pending_retry.pop(user_id, None)
         pend_sev = self._pending_severity.pop(user_id, None)
+        pend_override = self._pending_override.pop(user_id, None)
         inherited: Severity | None = None
         if pend_sev is not None and loop.time() <= pend_sev[1]:
             inherited = pend_sev[0]
@@ -532,6 +556,11 @@ class App:
         # unavailable line — falling through to the grammar used to turn it
         # into a "Say again"/relay, masquerading as a mishearing.
         query = grammar.override_query(result.text)
+        if query is None and pend_override is not None and loop.time() <= pend_override:
+            # Override dialogue continuation (GDD §6.6): the pilot said a bare
+            # "command override", we acknowledged and reopened — THIS whole
+            # utterance is the question, no prefix needed.
+            query = grammar.broadcast_text(result.text) or None
         if query is not None:
             if self.chat is not None and cfg.chat.enabled:
                 await self._command_override(guild_id, user_id, query)
@@ -539,6 +568,19 @@ class App:
                 log.info(
                     "override_requested_unavailable", user_id=user_id, status=self._chat_status
                 )
+                await self._speak_or_post(guild_id, user_id, tts_mod.override_unavailable())
+            return
+        if grammar.bare_override(result.text):
+            # "command override" alone — usually because the capture window
+            # closed on the pause before the question. Acknowledge, reopen a
+            # wake-free window, and take the next utterance as the question.
+            if self.chat is not None and cfg.chat.enabled:
+                self._pending_override[user_id] = loop.time() + _RETRY_TTL_S
+                if self.capture is not None:
+                    self.capture.reopen(user_id, guild_id)
+                log.info("override_dialogue_opened", user_id=user_id)
+                await self._speak_or_post(guild_id, user_id, tts_mod.go_ahead())
+            else:
                 await self._speak_or_post(guild_id, user_id, tts_mod.override_unavailable())
             return
 
@@ -581,6 +623,11 @@ class App:
                         relay_mode=cfg.stt.relay_mode,
                         text=result.text,
                     )
+                    # "Say again?" must be TRUE: reopen a wake-free window so
+                    # the repeat is actually heard (it used to be ignored
+                    # until the pilot re-woke).
+                    if self.capture is not None:
+                        self.capture.reopen(user_id, guild_id)
                     await self._speak_or_post(guild_id, user_id, tts_mod.not_understood())
                     return
                 # Gate on STT confidence: a hallucinated transcript
@@ -595,6 +642,8 @@ class App:
                         avg_logprob=round(result.avg_logprob, 3),
                         text=result.text,
                     )
+                    if self.capture is not None:
+                        self.capture.reopen(user_id, guild_id)
                     await self._speak_or_post(guild_id, user_id, tts_mod.say_again())
                     return
                 text = grammar.broadcast_text(result.text)

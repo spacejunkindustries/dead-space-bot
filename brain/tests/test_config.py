@@ -62,3 +62,11 @@ def test_wake_vad_threshold_default_and_bounds() -> None:
     assert _build_wake(_wake({"vad_threshold": 0.0})).vad_threshold == 0.0
     with pytest.raises(ConfigError, match="wake.vad_threshold"):
         _build_wake(_wake({"vad_threshold": 1.5}))
+
+
+def test_personality_accepts_bratty() -> None:
+    from aura.config import _personality
+
+    assert _personality("bratty") == "bratty"
+    with pytest.raises(ConfigError, match="tts.personality"):
+        _personality("feral")
