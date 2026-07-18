@@ -31,6 +31,7 @@ from discord.ext import commands
 from cortana.config import ConfigHolder, DiscordConfig
 from cortana.core.discipline import Discipline
 from cortana.core.incidents import IncidentEngine
+from cortana.core.routing import MentionDecision
 from cortana.types import AlertChannel, CardRender, MatchCandidate, PostError, Resolution, Tier
 from cortana.voice_gateway import ANNOUNCEMENT
 
@@ -326,13 +327,22 @@ class AuraBot(commands.Bot):
             reporter.record_post_failure()
 
     async def post(
-        self, guild_id: int, channel: AlertChannel, content: str, card: CardRender
+        self,
+        guild_id: int,
+        channel: AlertChannel,
+        content: str,
+        card: CardRender,
+        *,
+        mentions: MentionDecision | None = None,
     ) -> tuple[int, int]:
         """Post an incident card; returns ``(channel_id, message_id)``.
 
-        ``content`` carries the mentions the routing/discipline stack already
-        approved — ``@here`` can only reach this point for UNDER_ATTACK /
-        ASSIST_REQUEST (constraint 11 is enforced upstream in routing).
+        ``mentions`` is the ``decide_mentions`` grant (the single escalation
+        authority, constraint 11): ``AllowedMentions`` is built from it as an
+        explicit allowlist — the listed user ids (never ``users=True``, so
+        verbatim detail text can't ping arbitrary users), the listed role
+        ids, and ``everyone`` only when ``decision.here``. ``mentions=None``
+        means nothing in the content may notify anyone.
 
         Raises :class:`PostError` on any Discord failure (403 on the channel,
         deleted channel, REST error) so the engine rolls the incident back —
@@ -343,13 +353,17 @@ class AuraBot(commands.Bot):
 
         try:
             target = await self._alert_channel(channel)
-            # Silent mode hard-stop: even if a stray "@here" reached the
-            # content, Discord suppresses the actual notification when
-            # mentions are disabled.
-            if self.holder.current.discord.mentions_enabled:
-                allowed = discord.AllowedMentions(everyone=True, roles=True, users=False)
-            else:
+            # Silent mode hard-stop (belt for decide_mentions' braces): even
+            # if a stray "@here" reached the content, Discord suppresses the
+            # actual notification when mentions are disabled.
+            if mentions is None or not self.holder.current.discord.mentions_enabled:
                 allowed = discord.AllowedMentions.none()
+            else:
+                allowed = discord.AllowedMentions(
+                    everyone=mentions.here,
+                    roles=[discord.Object(id=r) for r in mentions.role_ids],
+                    users=[discord.Object(id=u) for u in mentions.user_ids],
+                )
             message = await target.send(
                 content=content or None,
                 embed=discord.Embed.from_dict(card.embed),

@@ -70,6 +70,7 @@ Non-negotiable invariant. Voice receive is undocumented and can break without no
 
 **11. `@here` only for `UNDER_ATTACK` and `ASSIST_REQUEST`.**
 Never for sightings. Ever. Notification fatigue kills this bot faster than any bug. GDD §11.
+The enforcement point is `decide_mentions()` in `brain/cortana/core/routing.py` — the single escalation authority every mention flows through; never add an `@here` (or any mention) decision anywhere else.
 
 **12. Secrets via systemd `LoadCredential=` only.**
 Never `.env`, never YAML, never `os.environ` in committed code, never a default in `config.py`.

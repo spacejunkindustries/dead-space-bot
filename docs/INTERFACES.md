@@ -175,7 +175,12 @@ def main(argv: list[str] | None = None) -> int
 # injected Poster. All methods async; db work via to_thread inside.
 class Poster(Protocol):
     async def post(self, guild_id: int, channel: AlertChannel, content: str,
-                   card: CardRender) -> tuple[int, int]     # -> (channel_id, message_id)
+                   card: CardRender, *,
+                   mentions: MentionDecision | None = None) -> tuple[int, int]
+    #   -> (channel_id, message_id). `mentions` is the decide_mentions grant;
+    #   AllowedMentions is built from it as an explicit allowlist (listed role
+    #   ids, listed user ids — never users=True, everyone only when .here).
+    #   None = nothing in the content may ping.
     async def edit(self, channel_id: int, message_id: int, content: str,
                    card: CardRender) -> None
 
@@ -184,10 +189,15 @@ class IncidentEngine:
                  gazetteer: Gazetteer, discipline: Discipline, poster: Poster,
                  rules_path: str | Path) -> None            # rules_path = routing.yaml
     async def report(self, guild_id: int, reporter_id: int, parsed: ParsedCommand,
-                     resolution: Resolution | None) -> IncidentOutcome
+                     resolution: Resolution | None, *,
+                     caller_may_mention: bool = True) -> IncidentOutcome
     #   The single entry point for BOTH voice and slash paths (constraint 10).
     #   Handles tiers (§8.3), dedupe folding (§9.2), routing, discipline,
-    #   command_log write. resolution=None for QUERY/HELP/CANCEL and the callsign
+    #   command_log write. caller_may_mention = the @Pilot gate result,
+    #   threaded into decide_mentions (defence in depth behind the surface
+    #   rejection). RESOLVE/TIMER/FORMUP require a HIGH-tier resolution;
+    #   MEDIUM returns ASKED ("Heard X — say again to confirm") and acts on
+    #   nothing. resolution=None for QUERY/HELP/CANCEL and the callsign
     #   intents REGISTER/UNREGISTER/WHOAMI, which dispatch to the CallsignRegistry
     #   below (no card, no mentions — spoken/ephemeral reply + command_log only).
     #   PING_ME/PING_ME_CLEAR (GDD §10.3) dispatch to the PersonalPingRegistry
@@ -283,8 +293,19 @@ def evaluate(incident: Incident, rules: Sequence[RoutingRule], now: datetime,
 #   exactly ONE channel — never mirrored (constraint 9).
 
 ESCALATABLE_TYPES: frozenset[Intent]     # {UNDER_ATTACK, ASSIST_REQUEST}
-def apply_group_alias(decision, group_alias, rules, alias_roles) -> RoutingDecision
-#   Preserves decision.user_ids — group targeting narrows roles, not people.
+@dataclass MentionDecision(role_ids: tuple[int, ...], here: bool,
+                           channel: AlertChannel, user_ids: tuple[int, ...])
+#   .wants_mentions property; .suppressed() -> MentionDecision (all stripped, LIVE).
+def decide_mentions(*, intent: Intent | None, severity: Severity, now: datetime,
+                    rules=(), incident=None, gazetteer=None, personal=(),
+                    group_alias=None, alias_roles=None, here_on_severity=(),
+                    mentions_enabled=True, caller_may_mention=True) -> MentionDecision
+#   THE single escalation authority (GDD §11.1): folds evaluate() + group
+#   aliases (all_hands included) + here_on_severity + the @Pilot gate +
+#   silent mode, clamps @here to ESCALATABLE_TYPES (intent None = freeform
+#   relay = never @here), and recomputes the channel from the FINAL mention
+#   set so @here can never land in #intel-live. The engine calls this once
+#   per post; discipline may only suppress the result, never widen it.
 def suppress(decision) -> RoutingDecision
 #   Discipline suppression: RoutingDecision has no `suppressed` flag — a
 #   suppressed report becomes RoutingDecision((), False, LIVE, ()): still

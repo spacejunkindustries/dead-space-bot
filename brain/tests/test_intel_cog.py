@@ -1,9 +1,11 @@
 """Slash-twin dispatch tests for IntelCog — constraint 10 (GDD §7, §20).
 
 The cog is a thin adapter; these tests pin the wiring: /under-attack drives
-Intent.UNDER_ATTACK through the shared ``_report`` path, and /cancel drives
+Intent.UNDER_ATTACK through the shared ``_report`` path, /cancel drives
 Intent.CANCEL through ``IncidentEngine.report`` (never ``cancel()`` directly),
-so both twins share the one engine entry point with the voice path.
+and /relay drives ``IncidentEngine.broadcast`` — every twin shares the one
+engine entry point with the voice path, including the severity (``code:``)
+and audience parity fields.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from cortana.dsc.cogs.intel import IntelCog
-from cortana.types import IncidentOutcome, Intent, Outcome
+from cortana.types import IncidentOutcome, Intent, Outcome, Severity
 
 
 class _Response:
@@ -58,12 +60,23 @@ async def test_under_attack_dispatches_through_shared_report_path() -> None:
     cog = IntelCog(SimpleNamespace())  # type: ignore[arg-type]
     recorded: list[tuple[Any, ...]] = []
 
-    async def fake_report(interaction: Any, intent: Any, system: str, detail: Any, name: str):
-        recorded.append((intent, system, detail, name))
+    async def fake_report(
+        interaction: Any,
+        intent: Any,
+        system: str,
+        detail: Any,
+        name: str,
+        *,
+        code: Any = None,
+        audience: Any = None,
+    ) -> None:
+        recorded.append((intent, system, detail, name, code, audience))
 
     cog._report = fake_report  # type: ignore[method-assign]
     await IntelCog.under_attack.callback(cog, make_interaction(), "Otanuomi", "pointed on gate")
-    assert recorded == [(Intent.UNDER_ATTACK, "Otanuomi", "pointed on gate", "under-attack")]
+    assert recorded == [
+        (Intent.UNDER_ATTACK, "Otanuomi", "pointed on gate", "under-attack", None, None)
+    ]
 
 
 async def test_cancel_reports_intent_cancel_through_the_engine() -> None:
@@ -98,4 +111,80 @@ async def test_cancel_is_guild_only() -> None:
     interaction = make_interaction(guild_id=None)
     await IntelCog.cancel.callback(cog, interaction)
     assert engine.reports == []
+    assert interaction.response.messages == ["Guild only."]
+
+
+# ── /relay: the freeform relay's slash twin (constraint 10, GDD §8.6/§20) ────
+
+
+class _BroadcastEngine:
+    def __init__(self, outcome: IncidentOutcome) -> None:
+        self.outcome = outcome
+        self.calls: list[dict[str, Any]] = []
+
+    async def broadcast(
+        self,
+        guild_id: int,
+        reporter_id: int,
+        text: str,
+        **kwargs: Any,
+    ) -> IncidentOutcome:
+        self.calls.append(
+            {"guild_id": guild_id, "reporter_id": reporter_id, "text": text, **kwargs}
+        )
+        return self.outcome
+
+
+class _Discipline:
+    def __init__(self, may: bool) -> None:
+        self.may = may
+
+    def may_mention(self, role_ids: Any) -> bool:
+        list(role_ids)  # consume the generator like the real gate does
+        return self.may
+
+
+async def test_relay_dispatches_through_engine_broadcast() -> None:
+    engine = _BroadcastEngine(IncidentOutcome(Outcome.POSTED, "Relayed.", None, None))
+    bot = SimpleNamespace(engine=engine, discipline=_Discipline(True))
+    cog = IntelCog(bot)  # type: ignore[arg-type]
+    interaction = make_interaction(guild_id=1, user_id=42)
+    interaction.user.roles = [SimpleNamespace(id=111)]
+
+    await IntelCog.relay.callback(cog, interaction, "blop fleet moving to Moe 8 gate")
+
+    assert interaction.response.deferred
+    assert len(engine.calls) == 1
+    call = engine.calls[0]
+    assert (call["guild_id"], call["reporter_id"]) == (1, 42)
+    assert call["text"] == "blop fleet moving to Moe 8 gate"
+    assert call["severity"] is None
+    assert call["group_alias"] is None
+    assert call["caller_may_mention"] is True
+    assert interaction.followup.messages == ["✅ Relayed."]
+
+
+async def test_relay_maps_code_and_audience_to_voice_fields() -> None:
+    # code:red → Severity.HIGH, audience:all-hands → group_alias "all_hands" —
+    # exactly the parsed fields the voice grammar produces (constraint 10).
+    engine = _BroadcastEngine(IncidentOutcome(Outcome.POSTED, "Relayed.", None, None))
+    bot = SimpleNamespace(engine=engine, discipline=_Discipline(False))
+    cog = IntelCog(bot)  # type: ignore[arg-type]
+    interaction = make_interaction(guild_id=1, user_id=42)
+    interaction.user.roles = []
+
+    await IntelCog.relay.callback(cog, interaction, "cyno up", code="red", audience="all-hands")
+
+    call = engine.calls[0]
+    assert call["severity"] is Severity.HIGH
+    assert call["group_alias"] == "all_hands"
+    assert call["caller_may_mention"] is False  # the @Pilot gate rides along
+
+
+async def test_relay_is_guild_only() -> None:
+    engine = _BroadcastEngine(IncidentOutcome(Outcome.POSTED, None, None, None))
+    cog = IntelCog(SimpleNamespace(engine=engine))  # type: ignore[arg-type]
+    interaction = make_interaction(guild_id=None)
+    await IntelCog.relay.callback(cog, interaction, "some intel")
+    assert engine.calls == []
     assert interaction.response.messages == ["Guild only."]
