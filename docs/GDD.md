@@ -715,7 +715,7 @@ Short. Always short. CORTANA is talking over a fight.
 | Ambiguous system | *"Hostiles Otanuomi — say again to confirm."* |
 | Unresolved system | *"Say again the system."* |
 | No command, no relay frame (§8.6) — reopens ONE wake-free retry | *"Say again?"* — reopens ONE wake-free retry |
-| Second consecutive parse failure | *"Couldn't parse that. Standing down. Wake me to retry."* — dialogue closed, fresh wake needed |
+| Second consecutive parse failure | *"Standing down. Wake me to retry."* — dialogue closed, fresh wake needed |
 | Card post failed (channel perms/REST) | *"Discord post failed."* — the report is rolled back, not recorded |
 | Chase updated (§13.1) | *"Chase updated, Kisogo."* |
 | Chase, nothing to retarget | *"No active incident to chase."* |
@@ -745,7 +745,7 @@ Personal-ping type words pluralize naturally: *hostiles*, *attacks*, *assist req
 
 - **Never speak over a high-severity report in progress.** If VAD reports active speech, queue.
 - Duck to 60% volume. CORTANA is not the FC. The duck level and talk-over suppression are fixed playback mechanics in Ears (`ears/src/playback.rs`), not config knobs.
-- Hard cap **3 seconds** per utterance. If it does not fit, it goes to the channel instead.
+- Hard cap **3 seconds** per utterance. Information-carrying replies that do not fit go to the channel instead; **acknowledgement lines never do** — an unspoken ack ("Say again?", "Standing down…") is logged and dropped, because a retry prompt pasted into the intel channel is noise.
 - `/mute-voice` per user. Some pilots will hate this. They can silence it without leaving.
 
 ### 12.3 Audio path

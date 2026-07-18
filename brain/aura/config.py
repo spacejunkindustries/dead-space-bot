@@ -123,6 +123,10 @@ class ChatConfig:
     #: Chicago"). Each search bills separately (~a cent) — the cooldown above
     #: is what keeps that bounded.
     web_search: bool = True
+    #: Channel for override answers too long to speak (§12.2 cap). 0 = the
+    #: intel_live channel — but chit-chat in an intel channel annoys fast;
+    #: point this at a general/bot channel instead.
+    answer_channel: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,6 +567,7 @@ def _build_chat(data: dict[str, Any]) -> ChatConfig:
             float(_get(s, "chat.timeout_s", float, default=25.0)), "chat.timeout_s"
         ),
         web_search=_get(s, "chat.web_search", bool, default=True),
+        answer_channel=int(_get(s, "chat.answer_channel", int, default=0)),
     )
 
 

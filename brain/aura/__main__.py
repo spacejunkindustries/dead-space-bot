@@ -810,17 +810,27 @@ class App:
             return
         spoken = await self.speaker.say(guild_id, reply, PRIORITY_NORMAL, user_id=user_id)
         if not spoken:
-            await self._send_channel(cfg.discord.channels.intel_live, f"💬 **Override** · {reply}")
+            # Long answers post to chat.answer_channel when set — weather
+            # chit-chat in the intel channel annoys fast (live complaint);
+            # 0 falls back to intel_live for corps that don't care.
+            target = cfg.chat.answer_channel or cfg.discord.channels.intel_live
+            await self._send_channel(target, f"💬 **Override** · {reply}")
             await self._speak_or_post(guild_id, user_id, tts_mod.override_posted())
 
     async def _speak_or_post(self, guild_id: int, user_id: int, utterance: str) -> None:
-        """Speak a short rejection/reply; fall back to channel text when muted."""
+        """Speak a short acknowledgement/rejection, best-effort.
+
+        ACK-class lines ("Say again?", "Go ahead.", "Standing down…") are
+        ephemeral feedback for the pilot's ears ONLY — when speech fails
+        (muted, over the §12.2 cap, synth error) they are logged and DROPPED,
+        never posted: a retry prompt pasted into the intel channel is pure
+        noise (live complaint). Command OUTCOMES still fall back to channel
+        text via ``_reply`` — those carry real information.
+        """
         assert self.speaker
         spoken = await self.speaker.say(guild_id, utterance, PRIORITY_NORMAL, user_id=user_id)
         if not spoken:
-            await self._send_channel(
-                self.holder.current.discord.channels.intel_live, f"🔊 {utterance}"
-            )
+            log.info("ack_unspoken_dropped", user_id=user_id, utterance=utterance)
 
     def _member_role_ids(self, user_id: int) -> list[int]:
         """This member's role ids from the guild cache (empty when unknown)."""

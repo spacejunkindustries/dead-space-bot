@@ -696,7 +696,7 @@ async def test_say_again_reopens_once_then_goes_silent() -> None:
     await app._on_utterance(USER, GUILD, b"\x00\x00")
     assert speaker.said == [
         (GUILD, "Say again?"),
-        (GUILD, "Couldn't parse that. Standing down. Wake me to retry."),
+        (GUILD, "Standing down. Wake me to retry."),
     ]
     assert capture.reopened == [(USER, GUILD)]
     assert engine.broadcasts == []
@@ -704,3 +704,25 @@ async def test_say_again_reopens_once_then_goes_silent() -> None:
     # A fresh wake with a real command still works normally.
     await app._on_utterance(USER, GUILD, b"\x00\x00")
     assert len(engine.reports) == 1
+
+
+async def test_unspoken_ack_is_dropped_not_posted() -> None:
+    # An ACK line that can't be spoken (muted/over-cap/synth fail) is logged
+    # and dropped — retry prompts pasted into the intel channel are noise.
+    app, engine, _, speaker, _ = make_app(
+        roles=[PILOT_ROLE], transcriber=_Transcriber(["mumble static"])
+    )
+
+    async def silent_say(guild_id, text, priority=1, *, user_id=None):
+        speaker.said.append((guild_id, text))
+        return False  # speech failed
+
+    app.speaker.say = silent_say  # type: ignore[assignment]
+    sent: list[tuple[int, str]] = []
+
+    async def capture_send(channel_id, content, embed=None):
+        sent.append((channel_id, content))
+
+    app._send_channel = capture_send  # type: ignore[assignment]
+    await app._on_utterance(USER, GUILD, b"\x00\x00")
+    assert sent == []  # nothing posted to any channel
