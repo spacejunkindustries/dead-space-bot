@@ -39,6 +39,18 @@ pub enum VoiceCmd {
     Leave { guild_id: u64 },
 }
 
+/// How long packets may flow with ZERO successful decodes before the DAVE
+/// session is presumed wedged (GDD §20; live incident: `status: PENDING`
+/// forever). Well above the few hundred ms of benign all-`None` churn around
+/// session transitions, well below a human noticing she has gone mute.
+const DECODE_WEDGE_MS: u64 = 30_000;
+
+/// Exit code for the wedge restart. Not in the unit's
+/// `RestartPreventExitStatus` (78 69), so `Restart=always` brings the
+/// process straight back — a fresh join and a fresh DAVE handshake, which is
+/// exactly the manual fix that cleared the live incident.
+const EXIT_DECODE_WEDGE: i32 = 70;
+
 /// Per-call receiver registered for Songbird core events. Stateless apart
 /// from log latches: all attribution state lives in [`GuildVoice`].
 #[derive(Clone)]
@@ -107,6 +119,39 @@ impl Receiver {
             self.inner.guild.note_speech();
         }
 
+        // DAVE-wedge watchdog (GDD §20): a stuck E2EE session shows up as
+        // packets flowing with nothing decoding — every speaker's
+        // `decoded_voice` is `None`, tick after tick, indefinitely (live
+        // incident: `status: PENDING` forever, deaf-and-mute until a manual
+        // restart). Runs BEFORE the opt-out gate: this is transport health,
+        // and no audio leaves the process here.
+        let any_packets = !tick.speaking.is_empty();
+        let any_decoded = tick
+            .speaking
+            .values()
+            .any(|data| data.decoded_voice.is_some());
+        let bad_ms = self
+            .inner
+            .guild
+            .decode_watchdog
+            .observe(epoch_ms(), any_packets, any_decoded);
+        if bad_ms >= DECODE_WEDGE_MS {
+            error!(
+                guild_id = self.inner.guild.guild_id,
+                bad_ms,
+                "sustained decode failure — DAVE session presumed wedged; \
+                 exiting for a clean systemd restart and fresh handshake"
+            );
+            // Best-effort heads-up so Brain's journal shows WHY the socket
+            // dropped; the exit itself is the recovery.
+            self.send_control(json!({
+                "t": "ears_restarting",
+                "guild_id": self.inner.guild.guild_id.to_string(),
+                "reason": "decode_wedge",
+            }));
+            std::process::exit(EXIT_DECODE_WEDGE);
+        }
+
         // Opt-out fails closed (§19): until Brain's first `optouts` frame of
         // THIS process lifetime has been applied, we cannot know who opted
         // out — so nothing crosses the IPC boundary.
@@ -123,7 +168,10 @@ impl Receiver {
         let captured_ms = epoch_ms();
         for (&ssrc, data) in &tick.speaking {
             let Some(pcm48k) = data.decoded_voice.as_deref() else {
-                // Should not happen under DecodeMode::Decode; nothing to pump.
+                // Happens for real under DecodeMode::Decode when the DAVE
+                // session is wedged (packets arrive still-E2EE-encrypted and
+                // fail opus decode) — the watchdog above owns that case;
+                // here there is simply nothing to pump.
                 continue;
             };
 
@@ -197,6 +245,8 @@ impl Receiver {
         // A genuine (re)connect is the ONLY event allowed to clear SSRC
         // attribution: the voice session changed, so the SSRCs really are new.
         self.inner.guild.reset_ssrc_state();
+        // Fresh session, fresh DAVE handshake — the wedge clock restarts.
+        self.inner.guild.decode_watchdog.reset();
         self.inner.guild.set_connected(true);
         self.inner
             .shared

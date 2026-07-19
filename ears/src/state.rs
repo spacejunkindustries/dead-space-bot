@@ -26,6 +26,55 @@ pub struct VoiceStats {
     pub connected: AtomicBool,
 }
 
+/// Sustained decode-failure detector — the DAVE-wedge watchdog (GDD §20).
+///
+/// Live incident: the DAVE E2EE session stuck at `status: PENDING` after a
+/// voice-server transition. Packets kept arriving but NONE decoded — every
+/// 20 ms tick carried speakers whose `decoded_voice` was `None`, and outgoing
+/// TTS was keyed against a session nobody had agreed on: she could hear
+/// everyone and nobody could hear her, indefinitely, until a manual Ears
+/// restart forced a fresh join + DAVE handshake.
+///
+/// The signature is "packets present, zero successful decodes, sustained":
+/// one healthy decode from ANY speaker resets the run; a silent tick (no
+/// packets) is no evidence either way — it neither extends nor resets, so a
+/// quiet channel can never trip the watchdog and a mid-wedge pause cannot
+/// hide the wedge. All-`None` runs also occur benignly for a few hundred ms
+/// around session churn, which is why the trigger threshold lives in the
+/// caller and is measured in tens of seconds.
+#[derive(Debug, Default)]
+pub struct DecodeWatchdog {
+    /// Epoch-ms when the current all-bad run started; 0 = no run.
+    bad_since_ms: AtomicU64,
+}
+
+impl DecodeWatchdog {
+    /// Observe one tick; returns the current all-bad run length in ms
+    /// (0 when healthy, silent, or the run just started).
+    pub fn observe(&self, now_ms: u64, any_packets: bool, any_decoded: bool) -> u64 {
+        if any_decoded {
+            self.bad_since_ms.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        if !any_packets {
+            return 0;
+        }
+        let now = now_ms.max(1); // never store the "no run" sentinel
+        let start = self.bad_since_ms.load(Ordering::Relaxed);
+        if start == 0 {
+            self.bad_since_ms.store(now, Ordering::Relaxed);
+            return 0;
+        }
+        now.saturating_sub(start)
+    }
+
+    /// Forget any in-progress run (a fresh driver session gets fresh runway
+    /// to negotiate DAVE before the clock starts).
+    pub fn reset(&self) {
+        self.bad_since_ms.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Per-guild voice state. Survives Songbird handler re-registration; only a
 /// real driver (re)connect clears the SSRC attribution maps.
 #[derive(Debug)]
@@ -46,6 +95,8 @@ pub struct GuildVoice {
     /// human audio in this guild. `0` = never. Drives talk-over suppression
     /// and ducking — per guild, so speech in one call never gates another.
     last_speech_ms: AtomicU64,
+    /// The DAVE-wedge detector (GDD §20): packets flowing, nothing decoding.
+    pub decode_watchdog: DecodeWatchdog,
     epoch: Instant,
 }
 
@@ -60,6 +111,7 @@ impl GuildVoice {
             ssrc_users: RwLock::new(HashMap::new()),
             decimators: Mutex::new(HashMap::new()),
             last_speech_ms: AtomicU64::new(0),
+            decode_watchdog: DecodeWatchdog::default(),
             epoch: Instant::now(),
         }
     }
@@ -301,6 +353,43 @@ mod tests {
         assert_eq!(g.roster(), vec![(10, 100), (30, 300)]);
         g.reset_ssrc_state();
         assert!(g.roster().is_empty());
+    }
+
+    #[test]
+    fn decode_watchdog_tracks_sustained_all_bad_runs() {
+        let w = DecodeWatchdog::default();
+        assert_eq!(w.observe(1_000, true, false), 0, "run starts on first bad tick");
+        assert_eq!(w.observe(11_000, true, false), 10_000, "run length measured");
+        assert_eq!(w.observe(41_000, true, false), 40_000);
+    }
+
+    #[test]
+    fn decode_watchdog_one_good_decode_resets() {
+        let w = DecodeWatchdog::default();
+        w.observe(1_000, true, false);
+        assert_eq!(w.observe(20_000, true, true), 0, "any healthy decode heals");
+        assert_eq!(w.observe(21_000, true, false), 0, "next bad run starts fresh");
+        assert_eq!(w.observe(31_000, true, false), 10_000);
+    }
+
+    #[test]
+    fn decode_watchdog_silence_is_no_evidence() {
+        let w = DecodeWatchdog::default();
+        w.observe(1_000, true, false);
+        assert_eq!(w.observe(5_000, false, false), 0, "silent tick reports nothing");
+        // …but the run survives the pause: still wedged when packets resume.
+        assert_eq!(w.observe(31_000, true, false), 30_000);
+        // A quiet channel alone can never start a run.
+        let idle = DecodeWatchdog::default();
+        assert_eq!(idle.observe(9_999_999, false, false), 0);
+    }
+
+    #[test]
+    fn decode_watchdog_reset_clears_the_run() {
+        let w = DecodeWatchdog::default();
+        w.observe(1_000, true, false);
+        w.reset();
+        assert_eq!(w.observe(50_000, true, false), 0, "fresh session, fresh runway");
     }
 
     #[test]

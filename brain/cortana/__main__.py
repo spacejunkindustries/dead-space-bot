@@ -701,6 +701,16 @@ class App:
             )
             if self.health is not None:
                 self.health.note_driver_event(msg)
+        elif t == "ears_restarting":
+            # Ears' DAVE-wedge watchdog fired (GDD §20): packets flowed with
+            # zero successful decodes for 30s, so it is exiting for a clean
+            # systemd restart + fresh handshake. Loud log — the imminent
+            # socket drop and EARS_DOWN/recovery cycle now has a stated why.
+            log.warning(
+                "ears_self_restart",
+                guild_id=msg.get("guild_id"),
+                reason=msg.get("reason"),
+            )
         elif t == "left":
             user_id = msg.get("user_id")
             if user_id is not None:

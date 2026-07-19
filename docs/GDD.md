@@ -1144,6 +1144,9 @@ Ears stamps every 0x02 frame with the wall-clock capture time at receipt (`captu
 { "t": "join_failed", "guild_id": "…", "channel_id": "…", "reason": "…" }
 { "t": "driver_disconnected", "guild_id": "…",
   "kind": "connect" /* | "reconnect" | "runtime" */, "reason": "…" }
+{ "t": "ears_restarting", "guild_id": "…", "reason": "decode_wedge" }
+                                             // best-effort heads-up before
+                                             // the wedge watchdog exits (§20)
 { "t": "heartbeat", "ticks": 15021, "active_ssrcs": 4, "connected": true }
 
 // Brain → Ears
@@ -1453,6 +1456,7 @@ Because voice receive is undocumented and can break without warning (§2.2), COR
 | Discord breaks voice receive | No `VoiceTick` from anyone for 60s while ≥2 unmuted humans are in channel | Post **⚠️ Voice offline — use `/under-attack`, `/help-me` and `/hostiles`**; keep retrying. **Every slash command and the entire incident engine keep working.** |
 | Voice gateway 4017 | Close code on connect | Loud alert to `#bot-health` — the Songbird version needs updating |
 | DAVE session crash | Session exception | Rebuild, exponential backoff, cap retries, then degrade |
+| DAVE session **wedged** (stuck `PENDING` — no exception, live incident: deaf-and-mute indefinitely, receive path looked healthy) | Ears-side decode watchdog: packets flowing with ZERO successful decodes for 30s (`VoiceTick` speakers all `decoded_voice: None`) — one healthy decode resets, silence is no evidence, a fresh driver session restarts the clock | Ears sends `ears_restarting(decode_wedge)` best-effort and exits 70 → systemd `Restart=always` brings it back in seconds with a fresh join + DAVE handshake (exactly the manual fix from the incident). Brain logs `ears_self_restart`, buffers nothing (the wedged audio was garbage), and replays the join |
 | STT worker hang | `stt.watchdog_s` (default 15s) watchdog on **queue-head service time** — decodes queue (depth 3, drop-oldest) behind one serialized worker, so overload shows up as queue time and never masquerades as a hang | Respawn (max 2 consecutive), speak *"say again"*; past the cap latch **STT degraded** (refuse decodes, alert `#bot-health`) until reload/restart |
 | Sustained low confidence | 10 consecutive low-tier results | Degrade and alert — something is wrong with the audio path |
 | Wake model build fails (bad `wake.model`, broken upgrade) | The model pool latches **faulted**; the wake stage counters (frames seen → scored → inferences → hits) reported to `#bot-health` show frames flowing with nothing scored | Score 0.0 with no per-chunk retry storm, alert `#bot-health`; a wake config change or restart clears the latch |
