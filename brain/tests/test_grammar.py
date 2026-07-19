@@ -1025,3 +1025,25 @@ def test_fact_never_claims_a_ping_me() -> None:
     cmd = parse("ping me for gate camps in Otanuomi")
     assert cmd is not None
     assert cmd.intent is Intent.PING_ME
+
+
+# ── field report: STT mangles the fun trigger words ──────────────────────────
+
+
+def test_insalt_is_an_insult() -> None:
+    # Live transcript: "hey cortana, insult Space Monkey, please" arrived as
+    # ", Nihanna, Insalt Space Monkey, please." and matched no intent.
+    cmd = parse(", Nihanna, Insalt Space Monkey, please.")
+    assert cmd is not None
+    assert cmd.intent is Intent.INSULT
+    assert cmd.detail is not None and "Space Monkey" in cmd.detail
+
+
+def test_woust_is_a_roast() -> None:
+    # Live transcript: "roast Space Monkey" arrived as
+    # ", Rara, Woust, Space Monkey," — the gazetteer-only bias prompt had
+    # dragged "roast" system-shaped.
+    cmd = parse(", Rara, Woust, Space Monkey,")
+    assert cmd is not None
+    assert cmd.intent is Intent.INSULT
+    assert cmd.detail is not None and "Space Monkey" in cmd.detail
