@@ -588,6 +588,17 @@ def resolve(
     callers run this via ``asyncio.to_thread``. Pass ``conn=None`` in pure
     scoring tests to skip the alias table.
     """
+    # FC-authored custom names (GDD §8.5) win first — the corp's own vocabulary
+    # for a place is explicit configuration, so it resolves at full confidence
+    # before both the learned-alias table and any phonetic matching.
+    config_hit = gazetteer.config_alias(text)
+    if config_hit is not None:
+        log.info("config_alias_hit", raw=text.strip().lower(), system=config_hit.name)
+        return Resolution(
+            tier=Tier.HIGH,
+            candidates=(MatchCandidate(config_hit.id, config_hit.name, 1.0),),
+        )
+
     if conn is not None:
         hit = _alias_lookup(conn, text, gazetteer)
         if hit is not None:

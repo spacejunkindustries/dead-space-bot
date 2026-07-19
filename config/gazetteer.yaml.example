@@ -12,10 +12,28 @@
 #    (§8.3), context priors (§8.4), and alias learning (§8.5) rather than a
 #    narrow candidate set. Turn it on when the corp has no fixed home.
 
-# Nomadic mode. false (default) = scoped by the rules below. true = entire
-# seeded map active; regions/within_jumps_of are then ignored, exclude still
-# removes, and within_jumps_of/home may be omitted without error.
+# All-systems / nomadic mode. false (default) = scoped by the rules below.
+# true = the ENTIRE seeded k-space map (~5,300 systems) is active, so ANY real
+# system resolves — set this if your corp roams and reports from anywhere.
+# regions/within_jumps_of are then ignored, exclude still removes, and
+# within_jumps_of/home may be omitted. When you turn this on, also set
+# `home_system:` to blank in cortana.yaml (no home-region bias for a roaming
+# corp), and (re)seed the full map once:
+#   /opt/cortana/current/venv/bin/python -m cortana.nlu.seed \
+#     --db /var/lib/cortana/cortana.db
 include_all: false
+
+# ── Custom names (aliases) — call places whatever your corp calls them ───────
+# A map of "what a pilot says" -> "the real system name". Case-insensitive.
+# Resolved at FULL confidence BEFORE any phonetic matching, so your corp's own
+# vocabulary — branch names, staging nicknames, a region's home system — just
+# works. The target must be a real system name (any k-space system, even one
+# outside your scope). A typo in a target is logged and skipped, never fatal.
+aliases: {}
+#   "the branch":     M-OEE8         # your staging in the branch
+#   "tribute staging": 5ZXX-K        # what you call your Tribute foothold
+#   "home":           Otanuomi
+#   "the pipe":       Ahbazon
 
 # Regions whose systems are included wholesale. (scoped mode only)
 regions:

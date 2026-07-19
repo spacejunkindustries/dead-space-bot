@@ -71,6 +71,25 @@ def _str_list(data: dict[str, Any], key: str) -> list[str]:
     return value
 
 
+def _alias_map(data: dict[str, Any]) -> dict[str, str]:
+    """Parse the optional ``aliases:`` map — a corp's own names for systems
+    (GDD §8.5): ``{"the branch": "M-OEE8", "tribute staging": "5ZXX-K"}``.
+
+    Case-insensitive keys (a spoken phrase), values are real system names. Unlike
+    the *learned* alias table (corrections over time), these are FC-authored and
+    stable — CORTANA resolves them at full confidence before any phonetic
+    matching, so the corp can call a place whatever it actually calls it on
+    comms. Empty/missing = no custom names."""
+    value = data.get("aliases") or {}
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        raise GazetteerError("gazetteer.yaml: aliases must be a mapping of phrase -> system name")
+    # Normalise keys the same way resolve() normalises a heard phrase, so an
+    # alias entered "The Branch" matches a pilot saying "the branch".
+    return {k.strip().lower(): v for k, v in value.items() if k.strip()}
+
+
 def _load_scope(path: Path) -> dict[str, Any]:
     try:
         text = path.read_text(encoding="utf-8")
@@ -95,6 +114,7 @@ def _load_scope(path: Path) -> dict[str, Any]:
         "exclude": _str_list(data, "exclude"),
         "within_jumps_of": None,
         "include_all": include_all,
+        "aliases": _alias_map(data),
     }
     wjo = data.get("within_jumps_of")
     if wjo is not None:
@@ -141,6 +161,10 @@ class Gazetteer:
         self._all_by_name: dict[str, SystemEntry] = {}
         self._home_system_id: int | None = None
         self._prompt_bias: str = ""
+        #: FC-authored custom names (GDD §8.5), normalised phrase -> system_id.
+        #: The corp's own words for a place ("the branch", "tribute staging"),
+        #: resolved at full confidence before phonetic matching.
+        self._config_aliases: dict[str, int] = {}
 
     # ── loading (blocking — call via asyncio.to_thread) ──────────────────────
 
@@ -261,11 +285,23 @@ class Gazetteer:
         self._all_by_name = all_by_name
         self._home_system_id = home.id if home is not None else None
         self._systems = systems
+        # FC custom names → system_ids (GDD §8.5). Resolved against the FULL
+        # seeded map, not the active set: a corp can name a place it isn't
+        # currently scoped to. Unknown targets are logged and skipped, never
+        # fatal — a typo in one alias must not take the gazetteer down.
+        config_aliases: dict[str, int] = {}
+        for phrase, target in scope["aliases"].items():
+            entry = all_by_name.get(target.lower())
+            if entry is None:
+                log.warning("gazetteer_alias_target_unknown", phrase=phrase, target=target)
+                continue
+            config_aliases[phrase] = entry.id
+        self._config_aliases = config_aliases
         self._prompt_bias = _build_prompt_bias(
             systems,
             self._home_system_id,
             hub_names=scope["always_include"],
-            alias_ids=self._alias_system_ids(),
+            alias_ids=self._alias_system_ids() | frozenset(config_aliases.values()),
         )
         log.info(
             "gazetteer_loaded",
@@ -338,6 +374,16 @@ class Gazetteer:
         the scoped set (the "manual report only offered 8 systems" fix)."""
         key = name.strip().lower()
         return self._by_name.get(key) or self._all_by_name.get(key)
+
+    def config_alias(self, text: str) -> SystemEntry | None:
+        """FC-authored custom name → system (GDD §8.5), or ``None``.
+
+        Exact match on the normalised phrase, resolved over the FULL seeded map
+        so a corp's name for a place resolves even when that place is outside
+        the current scope. This is the corp's own vocabulary ("the branch",
+        "tribute staging") and is consulted before any phonetic matching."""
+        system_id = self._config_aliases.get(text.strip().lower())
+        return self.entry_any(system_id) if system_id is not None else None
 
     def jumps(self, a_id: int, b_id: int) -> int | None:
         """Jump distance over the full adjacency graph; None if disconnected.

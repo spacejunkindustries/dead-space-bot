@@ -98,6 +98,12 @@ class FakeGazetteer:
     def by_name_any(self, name: str) -> SystemEntry | None:
         return next((e for e in self.all_systems if e.name.lower() == name.lower()), None)
 
+    def config_alias(self, text: str) -> SystemEntry | None:
+        # Optional FC custom names: tests set ``config_aliases`` (phrase -> id).
+        aliases: dict[str, int] = getattr(self, "config_aliases", {})
+        sid = aliases.get(text.strip().lower())
+        return self.entry_any(sid) if sid is not None else None
+
     def jumps(self, a: int, b: int) -> int | None:
         if a == b:
             return 0
@@ -219,6 +225,17 @@ def test_resolve_stt_mangled_name() -> None:
 def test_resolve_gibberish_is_low() -> None:
     r = resolve("banana bread recipe", GAZ, NO_PRIORS, CFG)
     assert r.tier is Tier.LOW
+
+
+def test_resolve_config_alias_wins_at_high_tier() -> None:
+    # The corp's own name for a place resolves at full confidence, before any
+    # phonetic scoring — "the branch" is not phonetically near "Kisogo".
+    gaz = FakeGazetteer()
+    gaz.config_aliases = {"the branch": 2}  # -> Kisogo
+    r = resolve("the branch", gaz, NO_PRIORS, CFG)
+    assert r.tier is Tier.HIGH
+    assert r.best is not None and r.best.name == "Kisogo"
+    assert r.best.score == pytest.approx(1.0)
 
 
 def test_resolve_empty_input() -> None:
