@@ -45,10 +45,13 @@ __all__ = [
     "Speaker",
     "SynthesisError",
     "ambiguous",
+    "area_learned",
+    "area_limit",
     "build_wav",
     "chase_hint",
     "chase_no_incident",
     "chase_updated",
+    "confirm_area",
     "confirm_report",
     "degraded",
     "flood_control",
@@ -336,6 +339,26 @@ def confirm_report(name: str, *, intent: Intent | None = None, detail: str | Non
         if trimmed and len(trimmed) <= _CONFIRM_DETAIL_MAX:
             phrase = f"{phrase}, {trimmed}"
     return f"{phrase}. Confirm?"
+
+
+def confirm_area(word: str) -> str:
+    """*"Did you say the branch?"* — the §8.5a learn-a-word confirm: the place
+    resolved to no system, so CORTANA asks once whether to remember it as a
+    custom area. Info-carrying; never varies."""
+    return f"Did you say {word}?"
+
+
+def area_learned(word: str) -> str:
+    """*"Learned the branch."* — spoken when a confirmed place is saved (§8.5a),
+    so the pilot hears it stuck. Info-carrying; never varies."""
+    return f"Learned {word}."
+
+
+def area_limit() -> str:
+    """*"Area limit reached."* — the per-guild ``areas.max_per_guild`` cap: a
+    new place can't be learned until an FC prunes with /areas-forget, but the
+    report still posts. Info-carrying; never varies."""
+    return "Area limit reached."
 
 
 _FUN_COOLDOWN_BRATTY = (

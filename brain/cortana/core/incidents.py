@@ -30,7 +30,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -1109,13 +1109,20 @@ class IncidentEngine:
                     (guild_id, best.system_id, str(parsed.intent), _iso(now - window)),
                 )
             else:
+                # A confirmed custom AREA (GDD §8.5a) posts under its canonical
+                # learned name and SKIPS the swallowed-sentence guard below — it
+                # already passed confirm-and-learn, so it is a real place, not a
+                # mis-parsed sentence.
+                area_name = resolution.area_name if resolution is not None else None
+                if area_name is not None:
+                    parsed = replace(parsed, system_text=area_name)
                 # Unmatched location: post it verbatim. Dedupe on the raw text
                 # so repeats of the same spoken location still fold to one card.
                 # BUT a "location" longer than a few words is a swallowed
                 # sentence, not a system (live junk card: an assist request
                 # whose System field read "Please list all available
                 # commands") — ask for the system instead of posting it.
-                if parsed.system_text and len(parsed.system_text.split()) > 3:
+                elif parsed.system_text and len(parsed.system_text.split()) > 3:
                     return IncidentOutcome(Outcome.REJECTED, tts.say_again(), None, None)
                 system_name = parsed.system_text or _UNKNOWN_LOCATION
                 existing_id = await asyncio.to_thread(

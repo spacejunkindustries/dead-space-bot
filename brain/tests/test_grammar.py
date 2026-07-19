@@ -10,6 +10,7 @@ from cortana.nlu.grammar import (
     broadcast_text,
     clean_callsign,
     confirm_reply,
+    correction_reply,
     parse,
     sanitize_callsign,
     system_reply,
@@ -1022,6 +1023,32 @@ def test_confirm_reply_affirmatives(heard: str) -> None:
 )
 def test_confirm_reply_negatives(heard: str) -> None:
     assert confirm_reply(heard) == "no"
+
+
+# ── learn-a-word corrections (GDD §8.5a) ─────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("heard", "expected"),
+    [
+        ("no it's Kisogo", "Kisogo"),
+        ("no, it's Kisogo", "Kisogo"),
+        ("nope it is Otanuomi", "Otanuomi"),
+        # The article is stripped exactly as grammar.parse strips it from a
+        # system window, so "the branch" learns and looks up consistently.
+        ("no, the pipe", "pipe"),
+        ("actually the branch", "branch"),
+        ("no that's wildlands", "wildlands"),
+        ("hey cortana no it's Taisy over", "Taisy"),  # wake/signoff residue stripped
+    ],
+)
+def test_correction_reply_extracts_the_place(heard: str, expected: str) -> None:
+    assert correction_reply(heard) == expected
+
+
+@pytest.mark.parametrize("heard", ["no", "nope", "nah", "negative", "", "   "])
+def test_correction_reply_bare_no_is_none(heard: str) -> None:
+    assert correction_reply(heard) is None
 
 
 @pytest.mark.parametrize(

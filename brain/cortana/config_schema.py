@@ -175,6 +175,11 @@ SECTIONS: Final[tuple[Section, ...]] = (
     ),
     Section("gazetteer", "Active system-set scoping — GDD §8.1."),
     Section(
+        "areas",
+        "OPTIONAL custom-area learning (GDD §8.5a); absent = defaults (on).",
+        optional=True,
+    ),
+    Section(
         "routing",
         "OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.",
         optional=True,
@@ -914,6 +919,28 @@ KEYS: Final[tuple[Key, ...]] = (
         "Nomadic override, mirrors gazetteer.yaml include_all — either "
         "being true activates the entire seeded map.",
         default=False,
+    ),
+    # areas (optional section)
+    Key(
+        "areas.learn",
+        "bool",
+        Reload.HOT,
+        "Custom-area learning (GDD §8.5a): when a report names a place that "
+        "resolves to no system, CORTANA asks once ('Did you say <word>?') and "
+        "on an explicit yes remembers it as a custom area, resolving it for "
+        "good. false = post unknown places verbatim without ever learning.",
+        default=True,
+    ),
+    Key(
+        "areas.max_per_guild",
+        "int",
+        Reload.HOT,
+        "Per-guild cap on learned areas (GDD §8.5a). At the cap learning "
+        "pauses (reports still post) until an FC prunes with /areas-forget — "
+        "the guard against a stuck mishearing filling the table.",
+        default=200,
+        minimum=0,
+        exclusive_minimum=True,
     ),
     # routing (optional section)
     Key(

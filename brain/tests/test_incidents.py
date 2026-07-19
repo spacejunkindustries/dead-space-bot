@@ -543,6 +543,46 @@ async def test_non_report_intent_still_rejects_on_low(make_env: Callable[..., En
     assert env.poster.posts == []
 
 
+async def test_report_custom_area_posts_verbatim_and_folds(
+    make_env: Callable[..., Env],
+) -> None:
+    # A confirmed custom AREA (GDD §8.5a) posts under its learned name,
+    # systemless, and skips the >3-word swallowed-sentence guard.
+    env = make_env()
+    long_place = ParsedCommand(
+        intent=Intent.HOSTILE_SPOTTED,
+        system_text="the northern branch staging",  # >3 words — would normally reject
+        group_alias=None,
+        detail=None,
+        raw="reds the northern branch staging",
+    )
+    area = Resolution(tier=Tier.HIGH, candidates=(), area_name="the northern branch staging")
+    out1 = await env.engine.report(GUILD, 42, long_place, area)
+    assert out1.outcome is Outcome.POSTED
+    row = db.query_one(
+        env.conn,
+        "SELECT system_id, raw_system_text FROM incidents WHERE id = ?",
+        (out1.incident_id,),
+    )
+    assert row["system_id"] is None
+    assert row["raw_system_text"] == "the northern branch staging"
+    # A second report of the same area folds onto the one card (reported by 2).
+    out2 = await env.engine.report(GUILD, 43, long_place, area)
+    assert out2.outcome is Outcome.FOLDED
+    assert len(env.poster.posts) == 1
+
+
+async def test_non_report_intent_with_area_still_rejects(
+    make_env: Callable[..., Env],
+) -> None:
+    # RESOLVE/TIMER/FORMUP need a real system: an area (best is None) can't
+    # clear an incident, so it still asks for the system.
+    env = make_env()
+    area = Resolution(tier=Tier.HIGH, candidates=(), area_name="the branch")
+    out = await env.engine.report(GUILD, 42, cmd(Intent.RESOLVE), area)
+    assert out.outcome is Outcome.REJECTED
+
+
 # ── resolve / cancel ─────────────────────────────────────────────────────────
 
 

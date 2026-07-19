@@ -22,9 +22,17 @@ import structlog
 from discord import app_commands
 from discord.ext import commands
 
-from cortana.core import db
+from cortana.core import areas, db
 from cortana.dsc.bot import resolve_typed_system
-from cortana.types import MENTION_INTENTS, Intent, Outcome, ParsedCommand, Severity
+from cortana.types import (
+    MENTION_INTENTS,
+    Intent,
+    Outcome,
+    ParsedCommand,
+    Resolution,
+    Severity,
+    Tier,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from cortana.dsc.bot import AuraBot
@@ -147,12 +155,20 @@ class IntelCog(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         resolution = resolve_typed_system(self.bot.gazetteer, system)
         if resolution is None:
-            await interaction.followup.send(
-                f"Unknown system `{system}` — pick one from the autocomplete "
-                "(the gazetteer is scoped to our operational region).",
-                ephemeral=True,
+            # Constraint 10 parity: a learned custom area (GDD §8.5a) resolves
+            # for a typed report exactly as it does by voice — posts verbatim.
+            area = await asyncio.to_thread(
+                areas.lookup_area, self.bot.conn, interaction.guild_id, system
             )
-            return
+            if area is not None:
+                resolution = Resolution(tier=Tier.HIGH, candidates=(), area_name=area)
+            else:
+                await interaction.followup.send(
+                    f"Unknown system `{system}` — pick one from the autocomplete "
+                    "(the gazetteer is scoped to our operational region).",
+                    ephemeral=True,
+                )
+                return
 
         raw = f"/{command_name} {system}" + (f" {detail}" if detail else "")
         if code:

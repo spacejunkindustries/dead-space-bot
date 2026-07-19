@@ -202,6 +202,12 @@ def test_confirm_report_falls_back_to_bare_form() -> None:
     assert tts.confirm_report("Taisy", intent=Intent.TIMER) == "Heard Taisy. Confirm?"
 
 
+def test_custom_area_lines() -> None:
+    assert tts.confirm_area("the branch") == "Did you say the branch?"
+    assert tts.area_learned("the branch") == "Learned the branch."
+    assert tts.area_limit() == "Area limit reached."
+
+
 # ── Speaker with a fake piper subprocess ──────────────────────────────────────
 
 

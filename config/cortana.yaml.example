@@ -270,6 +270,14 @@ gazetteer:
   include_all: false                   # nomadic override, mirrors gazetteer.yaml include_all —
                                        # either being true activates the entire seeded map.
 
+areas:                                 # learned custom areas (GDD §8.5a) — OPTIONAL section, on by default
+  learn: true                          # when a report names a place that resolves to no system,
+                                       # CORTANA asks once ("Did you say <word>?") and, on an explicit
+                                       # yes, remembers it — the corp's own place words, learned by
+                                       # talking. false = post unknown places verbatim, never learn.
+  max_per_guild: 200                   # cap on learned areas; at the cap learning pauses (reports
+                                       # still post) until an FC prunes with /areas-forget.
+
 routing:
   file: ""                             # routing.yaml location (GDD §10.1). "" (the default)
                                        # = a file named routing.yaml in the same directory

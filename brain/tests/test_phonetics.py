@@ -238,6 +238,46 @@ def test_resolve_config_alias_wins_at_high_tier() -> None:
     assert r.best.score == pytest.approx(1.0)
 
 
+# ── learned custom areas (GDD §8.5a) ─────────────────────────────────────────
+
+
+def test_resolve_custom_area_is_high_systemless() -> None:
+    from cortana.core import areas, db
+
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    areas.save_area(conn, 99, "the branch", 1, "t0", max_areas=200)
+    r = resolve("the branch", GAZ, NO_PRIORS, CFG, conn, guild_id=99)
+    assert r.tier is Tier.HIGH
+    assert r.area_name == "the branch"
+    assert r.best is None  # an area has no system candidate
+
+
+def test_resolve_area_needs_conn_and_guild() -> None:
+    from cortana.core import areas, db
+
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    areas.save_area(conn, 99, "the branch", 1, "t0", max_areas=200)
+    # No guild_id → the area table is never consulted (LOW, no area).
+    assert resolve("the branch", GAZ, NO_PRIORS, CFG, conn).area_name is None
+    # Wrong guild → not found.
+    assert resolve("the branch", GAZ, NO_PRIORS, CFG, conn, guild_id=7).area_name is None
+
+
+def test_resolve_real_system_beats_area_of_same_name() -> None:
+    from cortana.core import areas, db
+
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    areas.save_area(conn, 99, "otanuomi", 1, "t0", max_areas=200)
+    # A phrase that IS a real system resolves to the system (checked first),
+    # never the area — the system-bearing lookup is ordered ahead.
+    r = resolve("Otanuomi", GAZ, NO_PRIORS, CFG, conn, guild_id=99)
+    assert r.area_name is None
+    assert r.best is not None and r.best.name == "Otanuomi"
+
+
 def test_resolve_empty_input() -> None:
     r = resolve("", GAZ, NO_PRIORS, CFG)
     assert r.tier is Tier.LOW

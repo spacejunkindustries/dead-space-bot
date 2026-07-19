@@ -37,6 +37,7 @@ __all__ = [
     "broadcast_severity",
     "clean_callsign",
     "confirm_reply",
+    "correction_reply",
     "dismissal",
     "encode_ping_types",
     "override_query",
@@ -648,6 +649,33 @@ def system_reply(transcript: str) -> str | None:
         return None
     work = _WAKE_RE.sub("", transcript, count=1)
     work = _SIGNOFF_RE.sub("", work)
+    cleaned = _strip_filler(work.strip(" ,.;:!?-"))
+    return cleaned or None
+
+
+#: The leading negation/copula run of a "no, it's X" correction ("no", "nope",
+#: "not", "it's", "that's", "actually", "i said/meant") — stripped so the place
+#: X survives. Matches the whole leading run, so "no it's Kisogo" -> "Kisogo".
+_CORRECTION_PREFIX_RE = re.compile(
+    r"^(?:\s*(?:no|nope|nah|negative|not|it'?s|it\s+is|that'?s|that\s+is|"
+    r"actually|i\s+said|i\s+meant)\b[\s,]*)+",
+    re.I,
+)
+
+
+def correction_reply(transcript: str) -> str | None:
+    """The corrected place from a "no, it's X" reply in a learn-a-word confirm
+    (GDD §8.5a), or ``None`` for a bare "no".
+
+    Consulted only when :func:`confirm_reply` already classified the reply as
+    ``"no"``. Strips wake/sign-off residue, then the leading negation/copula
+    run, then filler — leaving X ("no, it's Kisogo" -> "Kisogo"; "no, the pipe"
+    -> "the pipe"; a bare "no"/"nope" -> ``None``)."""
+    if not transcript or not transcript.strip():
+        return None
+    work = _WAKE_RE.sub("", transcript, count=1)
+    work = _SIGNOFF_RE.sub("", work)
+    work = _CORRECTION_PREFIX_RE.sub("", work.strip(), count=1)
     cleaned = _strip_filler(work.strip(" ,.;:!?-"))
     return cleaned or None
 

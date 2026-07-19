@@ -217,6 +217,11 @@ class Resolution:
 
     tier: Tier
     candidates: tuple[MatchCandidate, ...]
+    #: A learned custom AREA (GDD §8.5a) — a confirmed place word that maps to
+    #: no system. When set, this resolution is HIGH tier with ``candidates=()``
+    #: and the report posts verbatim under this name (system_id NULL, §8.6).
+    #: Mutually exclusive with ``candidates`` — ``best`` stays None for an area.
+    area_name: str | None = None
 
     @property
     def best(self) -> MatchCandidate | None:

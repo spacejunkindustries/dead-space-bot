@@ -35,6 +35,19 @@ CREATE TABLE aliases (
     PRIMARY KEY (raw_text, system_id)
 );
 
+-- ── learned custom areas (GDD §8.5a) ────────────────────────
+-- Systemless twin of aliases: phrase -> display_name, no system_id. A place
+-- word the pilot confirmed ("the branch", "wildlands"), posted verbatim.
+CREATE TABLE custom_areas (
+    guild_id      INTEGER NOT NULL,
+    phrase        TEXT    NOT NULL,
+    display_name  TEXT    NOT NULL,
+    learned_by    INTEGER NOT NULL,
+    learned_at    TEXT    NOT NULL,
+    uses          INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (guild_id, phrase)
+);
+
 -- ── incidents ────────────────────────────────────────────────
 CREATE TABLE incidents (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,

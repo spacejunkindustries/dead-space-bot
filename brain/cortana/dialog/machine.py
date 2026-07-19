@@ -28,6 +28,7 @@ from cortana.dialog.types import (
     DialogState,
     DisarmWindow,
     Ev,
+    LearnArea,
     Line,
     NoteRejected,
     PendingConfirm,
@@ -165,6 +166,8 @@ def _classified(s: DialogSession, c: Classified) -> TransitionResult:
     #    command + candidate — complete it, decline it, or close. It never
     #    re-asks, so the ask-loop the old flow dead-ended in cannot form.
     if s.pending is PendingKind.CONFIRM and s.ctx_confirm is not None:
+        if s.ctx_confirm.learn_word is not None:
+            return _learn_confirm_continuation(s, s.ctx_confirm, c)
         return _confirm_continuation(s, s.ctx_confirm, c)
 
     # 1. Override continuation: the whole utterance IS the question.
@@ -196,10 +199,15 @@ def _classified(s: DialogSession, c: Classified) -> TransitionResult:
             return TransitionResult(s.idle(), (Speak(Line.OVERRIDE_UNAVAILABLE),))
         return _open_subdialog(s, PendingKind.OVERRIDE, Speak(Line.GO_AHEAD))
 
-    # 4. A full grammar command.
+    # 4. A full grammar command. The garbage-gate verdict rides along so the
+    #    engine's learn-a-word gate (GDD §8.5a) never offers to remember a
+    #    place from a chatter-quality transcript.
     if c.parsed is not None:
         inherited = s.ctx_severity if s.pending is PendingKind.SEVERITY else None
-        return TransitionResult(s.idle(), (Report(c.parsed, inherited=inherited),))
+        return TransitionResult(
+            s.idle(),
+            (Report(c.parsed, inherited=inherited, source_confident=not c.garbage),),
+        )
 
     # 5. LOW-retry continuation: a bare system name re-binds to the
     #    rejected command's intent (GDD §8.3).
@@ -287,6 +295,40 @@ def _confirm_continuation(s: DialogSession, ctx: PendingConfirm, c: Classified) 
     if ctx.commit_on_timeout:
         return TransitionResult(s.idle(), (ConfirmPending(ctx),))
     return TransitionResult(s.idle(), (NoteRejected("confirm_unmatched"),))
+
+
+def _learn_confirm_continuation(
+    s: DialogSession, ctx: PendingConfirm, c: Classified
+) -> TransitionResult:
+    """One utterance into a "Did you say <word>?" learn confirm (GDD §8.5a).
+
+    Learning happens ONLY on a confident explicit yes (via ``LearnArea``);
+    every other exit posts the report verbatim and remembers nothing, so a
+    distress call is never lost and a mishearing never becomes a saved place:
+
+    - **"yes"** (confident): learn the word, then post under it.
+    - **"no, it's X"** (confident, non-garbage correction): rebind the report
+      to X — a real system is used and the misheard word discarded; an unknown
+      X re-enters the learn flow. The rebind carries no ``rebound_from`` so X
+      can itself be learned (unlike a §8.3 LOW rebind, which must not teach).
+    - **bare "no"**: open the say-again system retry, learning nothing.
+    - **timeout / unmatched / low-confidence "yes"**: commit the report
+      verbatim (``ConfirmPending``) — never learn (an unconfirmed word is not a
+      place). ``commit_on_timeout`` is always True here.
+    """
+    if c.confirm_reply == "yes" and c.confident:
+        return TransitionResult(s.idle(), (LearnArea(ctx.parsed, ctx.learn_word or ""),))
+    if c.confirm_reply == "no":
+        if c.correction_text and c.confident and not c.garbage:
+            rebound = dataclasses.replace(ctx.parsed, system_text=c.correction_text, raw=c.text)
+            return TransitionResult(s.idle(), (Report(rebound),))
+        retry = dataclasses.replace(
+            s, pending=PendingKind.RETRY_SYSTEM, ctx_retry=ctx.parsed, ctx_confirm=None
+        )
+        return _fail(retry, Line.SAY_AGAIN, keep_ctx=True)
+    if ctx.commit_on_timeout:
+        return TransitionResult(s.idle(), (ConfirmPending(ctx),))
+    return TransitionResult(s.idle(), (NoteRejected("learn_unmatched"),))
 
 
 def _rejected_fail(

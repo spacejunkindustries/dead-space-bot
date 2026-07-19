@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from cortana.config import MatchingConfig, PriorsConfig, TiersConfig
-from cortana.core import db
+from cortana.core import areas, db
 from cortana.types import MatchCandidate, PriorContext, Resolution, SystemEntry, Tier
 
 if TYPE_CHECKING:  # pragma: no cover — import cycle guard only
@@ -581,12 +581,15 @@ def resolve(
     priors: PriorContext,
     cfg: MatchingConfig,
     conn: sqlite3.Connection | None = None,
+    *,
+    guild_id: int | None = None,
 ) -> Resolution:
     """Resolve a spoken system reference against the gazetteer — GDD §8.2.
 
     Blocking (sqlite alias lookup, O(windows·systems) scoring): production
     callers run this via ``asyncio.to_thread``. Pass ``conn=None`` in pure
-    scoring tests to skip the alias table.
+    scoring tests to skip the alias table; ``guild_id`` is needed only to
+    consult the per-guild custom-area table (§8.5a).
     """
     # FC-authored custom names (GDD §8.5) win first — the corp's own vocabulary
     # for a place is explicit configuration, so it resolves at full confidence
@@ -607,7 +610,7 @@ def resolve(
 
     tokens = normalize(text)
     if not tokens:
-        return Resolution(tier=Tier.LOW, candidates=())
+        return _area_or_low(conn, guild_id, text)
     windows = _windows(tokens)
 
     # Tier 1: the scoped active set, WITH context priors (home bias, proximity,
@@ -630,7 +633,29 @@ def resolve(
         if full.tier is not Tier.LOW:
             log.info("full_map_fallback_hit", raw=text.strip().lower(), tier=str(full.tier))
             return full
+    # Only when NO system resolves (LOW) does a learned custom area apply — it is
+    # the systemless twin for genuinely-unknown places (GDD §8.5a). Ordered last
+    # so a real system, phonetic match included, always wins over an area of the
+    # same name; the learn gate only ever creates areas for LOW words anyway.
+    if scoped.tier is Tier.LOW:
+        return _area_or_low(conn, guild_id, text, scoped)
     return scoped
+
+
+def _area_or_low(
+    conn: sqlite3.Connection | None,
+    guild_id: int | None,
+    text: str,
+    low: Resolution | None = None,
+) -> Resolution:
+    """A learned custom area (GDD §8.5a) if one matches, else the LOW result.
+    The systemless fallback consulted only when phonetic resolution failed."""
+    if conn is not None and guild_id is not None:
+        area = areas.lookup_area(conn, guild_id, text)
+        if area is not None:
+            log.info("custom_area_hit", raw=text.strip().lower(), area=area)
+            return Resolution(tier=Tier.HIGH, candidates=(), area_name=area)
+    return low if low is not None else Resolution(tier=Tier.LOW, candidates=())
 
 
 def _score_pool(
