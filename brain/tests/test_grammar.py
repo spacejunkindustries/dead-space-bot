@@ -866,6 +866,93 @@ def test_tackled_outranks_request_assistance() -> None:
     assert cmd.intent is Intent.UNDER_ATTACK
 
 
+# ── expanded distress / sighting vocabulary (GDD §6.1) ───────────────────────
+# Pilots describe the same situation a dozen ways and can't enumerate them;
+# the EWAR/tackle verbs all mean "in a fight, come now" regardless of who holds
+# tackle. New verbs come from the transcript channel, not from guessing.
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "I'm bubbled in Kisogo",
+        "we're scrambled",
+        "they scrammed me",
+        "I am scrambling them",
+        "point on me",
+        "I'm pointed",
+        "got them webbed",
+        "I'm webbed in Otanuomi",
+        "we're jammed",
+        "getting neuted",
+        "I'm pinned down",
+        "we are engaged",
+        "taking fire in Taisy",
+        "being attacked",
+        "getting attacked right now",
+        "tackle on me",
+        "they're tackling me in Kisogo",  # -ing form: being tackled
+        "we're bubbling them on the gate",  # -ing form: holding tackle
+    ],
+)
+def test_expanded_threat_vocab_is_under_attack(heard: str) -> None:
+    cmd = parse(heard)
+    assert cmd is not None
+    assert cmd.intent is Intent.UNDER_ATTACK
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "enemies in Kisogo",
+        "enemy in Otanuomi",
+        "war target in Taisy",
+        "war targets on the gate",
+        "gankers in Kisogo",
+        "bad guys in Otanuomi",
+    ],
+)
+def test_expanded_sighting_vocab_is_hostile_spotted(heard: str) -> None:
+    cmd = parse(heard)
+    assert cmd is not None
+    assert cmd.intent is Intent.HOSTILE_SPOTTED
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "help me in Kisogo",
+        "send help",
+        "send backup to Otanuomi",
+        "send the fleet",
+        "send the cavalry",
+        "get over here",
+        "come quick",
+        "need dps",
+    ],
+)
+def test_help_me_and_send_help_are_assist(heard: str) -> None:
+    cmd = parse(heard)
+    assert cmd is not None
+    assert cmd.intent is Intent.ASSIST_REQUEST
+
+
+def test_bare_help_is_still_the_manual_not_a_distress_call() -> None:
+    # "help me"/"send help" escalate; a lone "help" reaches the /help manual.
+    cmd = parse("help")
+    assert cmd is not None
+    assert cmd.intent is Intent.HELP
+
+
+def test_scrambled_by_enemies_stays_under_attack() -> None:
+    # A distress verb outranks the sighting noun in the same breath.
+    cmd = parse("scrambled by enemies in Kisogo")
+    assert cmd is not None
+    assert cmd.intent is Intent.UNDER_ATTACK
+    assert cmd.system_text is not None
+    assert cmd.system_text.lower() == "kisogo"
+
+
 def test_courtesy_chatter_without_intent_still_drops() -> None:
     assert parse("please kindly thank you") is None
 
@@ -903,6 +990,16 @@ def test_spelled_article_a_survives_the_window() -> None:
         "roger",  # radio ack — would vanish under the sign-off strip
         "copy that",
         "hey cortana yes",  # wake residue survives into the window transcript
+        # Flexible affirmations pilots actually say to a readback (live request).
+        "ok",
+        "okay",
+        "post it",
+        "send it",
+        "go for it",
+        "good",
+        "sure",
+        "perfect",
+        "yeah post it, over",
     ],
 )
 def test_confirm_reply_affirmatives(heard: str) -> None:

@@ -56,6 +56,7 @@ from cortana.types import (
     MENTION_INTENTS,
     Intent,
     Outcome,
+    ParsedCommand,
     Resolution,
     Severity,
     Tier,
@@ -77,6 +78,35 @@ log = structlog.get_logger(__name__)
 __all__ = ["DialogEngine"]
 
 _WHEEL_TICK_S = 0.1
+
+#: Max transcript length echoed into the review log (GDD §8.7) — a full
+#: sentence, never a paragraph. A long STT hallucination is truncated, not
+#: wrapped, so one utterance stays one scannable line.
+_TRANSCRIPT_LOG_MAX = 200
+
+
+def transcript_line(text: str, avg_logprob: float, parsed: ParsedCommand | None) -> str:
+    """One human-scannable review line for the STT transcript channel (GDD §8.7).
+
+    Pure function — the exact text posted for one heard utterance: what CORTANA
+    thinks it heard, how it parsed, and the decoder confidence, so the phrasing
+    that misses can be spotted at a glance instead of trawling the JSON journal
+    (live request: "the stt log from what it thinks it hears all in one
+    sentence … so i can analyze the outcomes"). Transcript only — no audio, no
+    user id (constraint 5)."""
+    heard = " ".join(text.split()) if text and text.strip() else "(silence)"
+    if len(heard) > _TRANSCRIPT_LOG_MAX:
+        heard = heard[: _TRANSCRIPT_LOG_MAX - 1].rstrip() + "…"
+    conf = f"{avg_logprob:.2f}"
+    if parsed is None:
+        return f'🎧 "{heard}" → no command · {conf}'
+    parts = [parsed.intent.value]
+    if parsed.system_text:
+        parts.append(f'sys "{parsed.system_text}"')
+    if parsed.severity is not None:
+        parts.append(f"code {parsed.severity.value}")
+    return f'🎧 "{heard}" → {" · ".join(parts)} · {conf}'
+
 
 #: Spoken/posted when a non-@Pilot member voice-triggers a mention-bearing
 #: intent — mirrors the slash twin's rejection (GDD §11.1 layer 4).
@@ -267,10 +297,39 @@ class DialogEngine:
             avg_logprob=round(result.avg_logprob, 3),
         )
         classified = self._classify(result.text, result.avg_logprob)
+        # STT review log (GDD §8.7): fire-and-forget so the Discord round-trip
+        # never sits between hearing and acting. Off unless a channel is set.
+        self._emit_transcript(s.guild_id, result.text, result.avg_logprob, classified.parsed)
         await self._apply(
             self._session(s.user_id, s.guild_id),
             DialogEvent(Ev.CLASSIFIED, gen=gen, classified=classified),
         )
+
+    def _emit_transcript(
+        self, guild_id: int, text: str, avg_logprob: float, parsed: ParsedCommand | None
+    ) -> None:
+        """Post one review line to ``discord.channels.transcript`` if configured.
+
+        Fire-and-forget: a failed or slow post must never delay the dialog or
+        crash the utterance task, so it rides its own tracked task and swallows
+        errors (the log is a convenience, not a guarantee)."""
+        channel_id = self._holder.current.discord.channels.transcript
+        if not channel_id:
+            return
+        line = transcript_line(text, avg_logprob, parsed)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover — only outside the loop (tests)
+            return
+        task = loop.create_task(self._post_transcript(channel_id, line))
+        self._voice_tasks.add(task)
+        task.add_done_callback(self._voice_tasks.discard)
+
+    async def _post_transcript(self, channel_id: int, line: str) -> None:
+        try:
+            await self._send_channel(channel_id, line)
+        except Exception:  # noqa: BLE001 — the review log is best-effort
+            log.debug("transcript_log_post_failed", channel_id=channel_id)
 
     def _classify(self, text: str, avg_logprob: float) -> Classified:
         """All grammar/config lookups for one transcript, in one place —
@@ -488,7 +547,10 @@ class DialogEngine:
                 candidate = resolution.best if (certain and resolution is not None) else None
                 heard = candidate.name if candidate is not None else parsed.system_text
                 log.info("report_confirm_first", user_id=s.user_id, heard=heard, tier=str(tier))
-                await self._speak_or_post(s, tts_mod.confirm_report(heard))
+                await self._speak_or_post(
+                    s,
+                    tts_mod.confirm_report(heard, intent=parsed.intent, detail=parsed.detail),
+                )
                 await self._apply(
                     self._session(s.user_id, s.guild_id),
                     DialogEvent(

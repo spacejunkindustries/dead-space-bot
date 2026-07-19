@@ -68,6 +68,9 @@ class ChannelsConfig:
     intel_alerts: int
     intel_live: int
     health: int
+    #: Optional STT review log (GDD §8.7). 0 = off. When set, one line per
+    #: heard utterance posts here: the transcript plus its parse outcome.
+    transcript: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,6 +624,7 @@ def _assemble_discord(v: dict[str, Any]) -> DiscordConfig:
             intel_alerts=v["discord.channels.intel_alerts"],
             intel_live=v["discord.channels.intel_live"],
             health=v["discord.channels.health"],
+            transcript=v["discord.channels.transcript"],
         ),
         roles=RolesConfig(
             pilot=v["discord.roles.pilot"],

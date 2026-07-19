@@ -355,9 +355,9 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 
 | Spoken | Intent | Severity | Default notification |
 |---|---|---|---|
-| "hostiles \<system\>" / "reds \<system\>" / "neuts \<system\>" | `HOSTILE_SPOTTED` | medium | role mention |
-| "under attack \<system\>" / "tackled \<system\>" / "point on me \<system\>" | `UNDER_ATTACK` | **high** | role mention + `@here` |
-| "need help \<system\>" / "need backup \<system\>" / "request(ing) [heavy] assistance\|backup\|reinforcements\|support \<system\>" | `ASSIST_REQUEST` | **high** | role mention + `@here` |
+| "hostiles \<system\>" / "reds \<system\>" / "neuts \<system\>" / "enemies \<system\>" / "war target(s) \<system\>" / "gankers \<system\>" | `HOSTILE_SPOTTED` | medium | role mention |
+| "under attack \<system\>" / "tackled \<system\>" / "bubbled \<system\>" / "scrambled\|scrammed \<system\>" / "pointed\|pinned \<system\>" / "webbed \<system\>" / "jammed\|neuted \<system\>" / "engaged \<system\>" / "taking fire \<system\>" / "point on me \<system\>" | `UNDER_ATTACK` | **high** | role mention + `@here` |
+| "need help \<system\>" / "help me \<system\>" / "send help\|backup\|reinforcements\|the fleet \<system\>" / "request(ing) [heavy] assistance\|backup\|reinforcements\|support \<system\>" | `ASSIST_REQUEST` | **high** | role mention + `@here` |
 | "gate camp \<system\>" | `GATE_CAMP` | medium | role mention |
 | "clear \<system\>" | `RESOLVE` | none | edits card, no mention |
 | "timer \<system\> \<duration\>" | `TIMER` | none | schedules a future ping |
@@ -374,6 +374,8 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 Higher-severity patterns are matched first, so *"tackled, need help in Kisogo"* resolves to `UNDER_ATTACK`, not a sighting. The personal-ping intents are the one exception: their utterances *contain* type words ("ping me for gate camps"), so `PING_ME`/`PING_ME_CLEAR` are matched before the type words can claim the utterance — a genuine distress call never contains "ping me".
 
 **Padding tolerance.** Stressed pilots narrate: *"please report that I am tackled by enemies in system M tack O and request heavy assistance please"* must parse exactly like *"tackled M-OEE8"* (and it does: `UNDER_ATTACK` — tackled outranks the assist phrasing — with the spelled system intact). Two mechanisms, still fixed grammar (constraint 6): intent keywords are matched on the **raw text first**, so no courtesy word can ever break recognition; and the **system window** is then cleaned aggressively — a finite courtesy vocabulary (*please, kindly, that, by enemies/hostiles, request(ing), heavy, immediate(ly), send, right now, …* plus the phrase forms *I am / we are / I've been / be advised / thank you*) is stripped, and when the pilot anchors the name with a preposition (*"in system X"*, *"in X"*, *"at X"*), everything before the **last** anchor is treated as narrative and discarded. The stripping applies to the system window only — `detail` stays verbatim (§6.3) and callsigns keep their words. The article *"a"* survives inside a spelling (*"one d q one tack a"* → 1DQ1-A, §8.2) but is stripped everywhere else. Note *assistance/backup/reinforcements/support* are `ASSIST_REQUEST` **type words** when prefixed by *need/request* — they are matched (and removed from the window) as whole intent phrases before the courtesy set touches anything.
+
+**Situation vocabulary.** Pilots describe the *same* situation a dozen ways and cannot enumerate them up front, so the distress pattern covers the EWAR/tackle verbs that all mean "I'm in a fight, come now" — *bubbled, scrambled/scrammed, pointed, pinned, webbed, jammed, neuted, engaged, taking fire, being/getting attacked* — whether the pilot is the one held (*"I'm scrambled"*) or holding tackle on a target (*"I've got them webbed"*). Either reading calls for the same fleet response, so both land on `UNDER_ATTACK`; all of them outrank the sighting nouns, so *"scrambled by reds"* is a distress call, never demoted. The sighting set likewise widens beyond *hostiles/reds/neuts* to *enemies/enemy*, *war target(s)* (EVE's term for a shootable pilot), and *gankers/bad guys*; and the assist set adds *help me* and *send help/backup/the fleet/the cavalry* alongside the *need/request* phrasings (a lone *"help"* still reaches the `/help` manual — only *"help me"* escalates). This is still fixed grammar (constraint 6): a small, auditable table, extended from the STT transcript log (§8.7) when a real phrasing slips through — never a model guessing intent. `STT_VOCAB_BIAS` carries the new words so Whisper decodes them.
 
 `PING_ME` (§10.3) reuses the type vocabulary above: *hostiles/reds/neuts* → `HOSTILE_SPOTTED`, *gate camp(s)* → `GATE_CAMP`, *under attack/attacks/tackled* → `UNDER_ATTACK`, *need help/need backup/assist request(s)* → `ASSIST_REQUEST`, and *"anything"/"everything"/"all"* (or no type word at all) → all four. The optional system window resolves through the same phonetic pipeline as reports (§8.2); anything below HIGH tier is treated as unresolved — a subscription silently scoped to the wrong system would never fire, so CORTANA answers *"Say again the system."* instead of guessing. No system means the subscription covers all systems. The recognised types travel to the engine encoded in `detail` (comma-separated `Intent` values), shared by the `/pingme` twin.
 
@@ -583,7 +585,7 @@ Hyphenated names are also matched by their **spoken short form** — the pre-hyp
 |---|---|---|
 | **High** | `top1 ≥ 0.80` and `top1 − top2 ≥ 0.12` | Post immediately. Speak *"Hostiles Otanuomi, pinged."* |
 | **Medium** | `top1 ≥ 0.55` | **Post anyway**, flagged uncertain, with buttons `[Otanuomi] [Kisogo] [Wrong — fix]`. Speak *"Hostiles Otanuomi — say again to confirm."* and arm the wake-free confirm window (below). Speed beats certainty when a pilot is in structure; get the ping out and let humans correct it. |
-| **Low** | below | **Confirm-first** (`dialog.confirm_reports: low`, the default): speak *"Heard \<name\>. Confirm?"* and hold the report in the confirm window. *Yes* — **or silence, or unmatched speech** — posts it with the heard name verbatim (§8.6: a distress call is never lost to an unanswered question); *no* opens the say-again retry that re-binds a bare system name; a dismissal retracts it. With `confirm_reports: off`, posts verbatim immediately (readback only). `always` extends the ask to HIGH-tier reports too. |
+| **Low** | below | **Confirm-first** (`dialog.confirm_reports: low`, the default): read the *situation* back naturally — *"Under attack in Otanuomi, by two cruisers. Confirm?"* (the intent, the system, and a short verbatim detail; a long detail is dropped from speech but kept on the card) — and hold the report in the confirm window. Naming the intent, not just the system, makes a misheard **intent** as catchable as a misheard system. Intents without a readback template fall back to *"Heard \<name\>. Confirm?"*. *Yes* — **or silence, or unmatched speech** — posts it with the heard name verbatim (§8.6: a distress call is never lost to an unanswered question); *no* opens the say-again retry that re-binds a bare system name; a dismissal retracts it. With `confirm_reports: off`, posts verbatim immediately (readback only). `always` extends the ask to HIGH-tier reports too. |
 
 **Destructive and scheduling commands need HIGH.** The tier table above governs *reports*, which post-anyway because speed beats certainty. `clear`, `timer`, and `form up` act irreversibly on a *specific* system — resolving the wrong system's incidents or scheduling a rally in the wrong place has no undo — so they act only on a High-tier match. A Medium match answers *"Heard Otanuomi — say again to confirm."* (the same ASKED outcome as an uncertain report) and holds the command pending in the confirm window. Low still gets *"Say again the system."*
 
@@ -629,6 +631,20 @@ Pilots use phone mics, in noisy rooms, with a game running, stressed and talking
 **The relay is also confidence-gated.** Whatever the mode, a relay posts only when Whisper's `avg_logprob` clears `stt.relay_min_logprob`. Below that, the transcript is treated as decoded noise ("Rens, Rens, Rens" hallucinated from silence) and CORTANA says *"Say again the system."* instead of posting garbage. Recognised commands are **never** gated — a distress call always posts. Stuttered three-plus word repeats in relay text collapse to one word, and every relay logs its confidence to `command_log` so the threshold is tuned from data.
 
 **Relays dedupe like incidents.** Identical relay text (case-insensitive) within `incidents.dedupe_window_s` folds — the pilot hears *"Relayed."* again, but no second card posts. Pilots repeat when they miss the ack; a repeat is not fresh intel. A successful relay is acknowledged with a spoken *"Relayed."* — without the ack, pilots repeat themselves, and every repeat is another card and another STT decode.
+
+### 8.7 The STT transcript log — the phrasing-analysis surface
+
+Recognition is only as good as the vocabulary, and the vocabulary only grows from seeing what pilots *actually say* — including the phrasings that match nothing yet. The JSON journal records every `utterance_transcribed`, but it is 100k lines of debug noise, not something a corp admin scans.
+
+`discord.channels.transcript` (optional, `0` = off) is the human-readable surface for exactly this. When set, **every heard utterance posts one clean line** to that channel: what CORTANA thinks it heard, how the grammar parsed it, and the decoder confidence —
+
+```
+🎧 "tackled by two cruisers in taisy" → UNDER_ATTACK · sys "taisy" · -0.21
+🎧 "we're getting bubbled on the gate" → UNDER_ATTACK · -0.34
+🎧 "they've got us scrammed"           → no command · -0.52
+```
+
+Unmatched utterances are logged too — that is the point: the *"no command"* lines are the backlog of phrasings the fixed grammar (§6.1) should learn next. An admin skims the channel after a fight, spots the misses, and the situation vocabulary is extended from real audio instead of guesswork. The line is a transcript only — no audio, no user id (constraint 5) — and the post is fire-and-forget, so it never sits between hearing and acting. Off by default; a corp that wants it points it at a private channel.
 
 ---
 
@@ -1199,6 +1215,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `discord.channels.intel_alerts` | int | **required** | hot | Channel for incidents that mention a role (GDD §11.2). |
 | `discord.channels.intel_live` | int | **required** | hot | Channel for every incident, no mentions — the firehose. |
 | `discord.channels.health` | int | **required** | hot | Channel for self-reports and degradation alerts. |
+| `discord.channels.transcript` | int | `0` | hot | Optional STT review log (GDD §8.7). When set, one clean line per heard utterance posts here — what CORTANA thinks it heard plus how it parsed — for reviewing phrasing and misfires. 0 = off. |
 | `discord.roles.pilot` | int | `0` | hot | Only members with this role may trigger mentions. 0 = gate off. |
 | `discord.roles.fc` | int | `0` | hot | Only this role voice-triggers under fleetmode / uses admin commands without Manage Guild. 0 = gate off. |
 | `discord.watch_voice_channels` | int_list | **required** | hot | Voice channels CORTANA watches / auto-joins. |
@@ -1223,7 +1240,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `dialog.ack_grace_ms` | int | `2000` | hot | Endpoint grace after a capture opens or a prompt is spoken — cue playback plus pilot reaction time. |
 | `dialog.endpoint_gap_floor_ms` | int | `700` | hot | Floor under capture.endpoint_silence_ms for the wall-clock endpoint: DTX drops packets between words; a too-eager gap clips pilots mid-sentence. |
 | `dialog.max_retries` | int | `2` | hot | Wake-free windows per dialog TOTAL (subdialog openers and say-again retries share the budget). Only a fresh wake refills it; exhaustion ends audibly with standing-down. |
-| `dialog.confirm_reports` | str | `'low'` | hot | Confirm-first for voice reports (GDD §8.3): off = commit immediately (readback only); low = uncertain system matches ask "Heard X — confirm?" first; always = every voice report asks. Yes commits, no opens a say-again retry, silence/unmatched commits anyway — a distress call is never lost. One of: `off`, `low`, `always`. |
+| `dialog.confirm_reports` | str | `'low'` | hot | Confirm-first for voice reports (GDD §8.3): off = commit immediately (readback only); low = uncertain system matches read the situation back ("Under attack in X, confirm?") first; always = every voice report asks. Yes commits (flexibly: yes/confirm/ok/post it/send it/…), no opens a say-again retry, silence/unmatched commits anyway — a distress call is never lost. One of: `off`, `low`, `always`. |
 | `dialog.retry_min_logprob` | float | `-1.3` | hot | Transcripts below this Whisper confidence are chatter/noise: they never earn a say-again retry — the dialog closes silently instead of re-prompting into an open mic. Recognised commands are never gated by this. |
 | **`stt:`** | | | | *Speech-to-text backend and relay gates.* |
 | `stt.backend` | str | **required** | restart | Which Transcriber engine to build at startup. One of: `faster-whisper`, `whisper-cpp`. |

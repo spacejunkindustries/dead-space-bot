@@ -30,6 +30,9 @@ discord:
     intel_alerts: 000000000000000000   # only incidents that mention a role (GDD §11.2)
     intel_live:   000000000000000000   # every incident, no mentions — the firehose
     health:       000000000000000000   # hourly self-reports and degradation alerts
+    transcript:   0                    # OPTIONAL STT review log (GDD §8.7): one line per
+                                       # heard utterance — what she thinks she heard + how
+                                       # it parsed — for reviewing phrasing/misfires. 0 = off
   roles:                               # OPTIONAL — leave keys out (or the whole
                                        # section) to run without role gates
     pilot: 000000000000000000          # gate: only members with this role may trigger

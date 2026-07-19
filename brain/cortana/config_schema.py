@@ -228,6 +228,16 @@ KEYS: Final[tuple[Key, ...]] = (
         minimum=0,
     ),
     Key(
+        "discord.channels.transcript",
+        "int",
+        Reload.HOT,
+        "Optional. When set, every heard utterance posts one clean line — "
+        "what CORTANA thinks it heard plus how it parsed — so phrasing and "
+        "misfires can be reviewed at a glance (GDD §8.7). 0 = off.",
+        default=0,
+        minimum=0,
+    ),
+    Key(
         "discord.roles.pilot",
         "int",
         Reload.HOT,

@@ -251,6 +251,7 @@ def make_dialog(
     chat_enabled: bool = False,
     fun: Any | None = None,
     confirm_reports: str = "off",
+    transcript_channel: int = 0,
 ) -> Rig:
     import dataclasses as _dc
 
@@ -258,6 +259,9 @@ def make_dialog(
 
     cfg = make_config(wake_ack=wake_ack, relay_mode=relay_mode, chat_enabled=chat_enabled)
     cfg = _dc.replace(cfg, dialog=DialogConfig(confirm_reports=confirm_reports))
+    if transcript_channel:
+        channels = _dc.replace(cfg.discord.channels, transcript=transcript_channel)
+        cfg = _dc.replace(cfg, discord=_dc.replace(cfg.discord, channels=channels))
     holder = StubHolder(cfg)
     gaz = _Gazetteer(
         entries={
@@ -1276,7 +1280,11 @@ async def test_confirm_first_low_report_asks_then_yes_commits() -> None:
         confirm_reports="low",
     )
     await utter_wake(rig)
-    assert any("Heard" in t and "Confirm" in t for _, t in rig.speaker.said)
+    # Natural readback: the situation, not just the system ("Under attack in
+    # zanzibar. Confirm?") so a wrong intent is as catchable as a wrong system.
+    assert any(
+        "Under attack" in t and "zanzibar" in t and "Confirm" in t for _, t in rig.speaker.said
+    )
     assert rig.engine.reports == []  # nothing committed yet
     assert rig.capture.armed  # confirm window armed
     await utter_window(rig)  # "yes"
@@ -1328,11 +1336,52 @@ async def test_confirm_first_always_gates_high_tier_and_yes_forces_candidate() -
     )
     await utter_wake(rig)
     assert rig.engine.reports == []
-    assert any("Heard Otanuomi" in t for _, t in rig.speaker.said)
+    # "Hostiles in Otanuomi. Confirm?" — intent-aware readback (GDD §8.3).
+    assert any("Hostiles in Otanuomi" in t and "Confirm" in t for _, t in rig.speaker.said)
     await utter_window(rig)
     assert len(rig.engine.reports) == 1
     _, _, _parsed, resolution = rig.engine.reports[0]
     assert resolution is not None and resolution.tier is Tier.HIGH  # forced candidate
+
+
+async def test_transcript_channel_off_posts_nothing() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, hostiles Otanuomi"]),
+    )
+    await utter_wake(rig)
+    await drain(rig)
+    assert rig.sent == []  # no transcript channel configured → no review post
+
+
+async def test_transcript_channel_logs_one_line_per_utterance() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, hostiles Otanuomi"]),
+        transcript_channel=777,
+    )
+    await utter_wake(rig)
+    await drain(rig)
+    posts = [(cid, text) for cid, text in rig.sent if cid == 777]
+    assert len(posts) == 1
+    _, line = posts[0]
+    assert "hostiles Otanuomi" in line
+    assert Intent.HOSTILE_SPOTTED.value in line
+
+
+async def test_transcript_channel_logs_unmatched_utterances_too() -> None:
+    # The whole point: see the phrasings that DON'T match yet (live request).
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, some gibberish here"]),
+        transcript_channel=777,
+        relay_mode="framed",
+    )
+    await utter_wake(rig)
+    await drain(rig)
+    posts = [text for cid, text in rig.sent if cid == 777]
+    assert len(posts) == 1
+    assert "no command" in posts[0]
 
 
 async def test_restart_via_slash_trips_the_shutdown_event() -> None:

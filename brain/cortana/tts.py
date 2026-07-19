@@ -297,10 +297,45 @@ def degraded() -> str:
     return "Voice offline, use slash commands."
 
 
-def confirm_report(name: str) -> str:
-    """*"Heard <name>. Confirm?"* — the §8.3 confirm-first readback
-    (``dialog.confirm_reports``). Info-carrying; never varies."""
-    return f"Heard {name}. Confirm?"
+#: The natural readback template per report intent (GDD §8.3 confirm-first).
+#: A pilot mid-fight parses "Under attack in Taisy, confirm?" far faster than
+#: a bare "Heard Taisy, confirm?" — the readback names the SITUATION it's about
+#: to post, not just the system, so a wrong intent is as catchable as a wrong
+#: system (live request: "go ok i got you tackled in taisy … confirm please").
+_CONFIRM_INTENT_PHRASE: dict[Intent, str] = {
+    Intent.UNDER_ATTACK: "Under attack in {system}",
+    Intent.ASSIST_REQUEST: "Assistance needed in {system}",
+    Intent.HOSTILE_SPOTTED: "Hostiles in {system}",
+    Intent.GATE_CAMP: "Gate camp in {system}",
+}
+
+#: Cap on the verbatim detail folded into a spoken readback. Detail is captured
+#: verbatim and can be a whole sentence ("by three battleships and two cruisers
+#: and a bunch of frigates …"); past this length it is dropped from SPEECH only
+#: (the card still carries it in full) so the readback never blows the §12.2
+#: 3-second cap and vanishes, leaving the confirm window with no audible prompt.
+_CONFIRM_DETAIL_MAX = 48
+
+
+def confirm_report(name: str, *, intent: Intent | None = None, detail: str | None = None) -> str:
+    """The §8.3 confirm-first readback (``dialog.confirm_reports``).
+
+    With an ``intent`` it reads back the whole situation naturally — *"Under
+    attack in Taisy, by two cruisers. Confirm?"* — so a mishearing of either
+    the intent or the system gets one audible veto point. A short verbatim
+    ``detail`` rides along; a long one is dropped from speech (the card keeps
+    it). Falls back to the bare *"Heard <name>. Confirm?"* for intents without
+    a readback template. Info-carrying; the wording never varies by
+    personality."""
+    template = _CONFIRM_INTENT_PHRASE.get(intent) if intent is not None else None
+    if template is None:
+        return f"Heard {name}. Confirm?"
+    phrase = template.format(system=name)
+    if detail:
+        trimmed = " ".join(detail.split())
+        if trimmed and len(trimmed) <= _CONFIRM_DETAIL_MAX:
+            phrase = f"{phrase}, {trimmed}"
+    return f"{phrase}. Confirm?"
 
 
 _FUN_COOLDOWN_BRATTY = (

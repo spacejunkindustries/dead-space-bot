@@ -156,6 +156,52 @@ def test_ping_types_phrase_pluralizes_naturally() -> None:
     )
 
 
+# ── §8.3 confirm-first readback ──────────────────────────────────────────────
+
+
+def test_confirm_report_reads_back_the_situation() -> None:
+    from cortana.types import Intent
+
+    assert (
+        tts.confirm_report("Taisy", intent=Intent.UNDER_ATTACK) == "Under attack in Taisy. Confirm?"
+    )
+    assert (
+        tts.confirm_report("Otanuomi", intent=Intent.HOSTILE_SPOTTED)
+        == "Hostiles in Otanuomi. Confirm?"
+    )
+    assert (
+        tts.confirm_report("Kisogo", intent=Intent.ASSIST_REQUEST)
+        == "Assistance needed in Kisogo. Confirm?"
+    )
+    assert tts.confirm_report("Kisogo", intent=Intent.GATE_CAMP) == "Gate camp in Kisogo. Confirm?"
+
+
+def test_confirm_report_folds_in_short_detail() -> None:
+    from cortana.types import Intent
+
+    assert (
+        tts.confirm_report("Taisy", intent=Intent.UNDER_ATTACK, detail="by two cruisers")
+        == "Under attack in Taisy, by two cruisers. Confirm?"
+    )
+
+
+def test_confirm_report_drops_long_detail_from_speech() -> None:
+    from cortana.types import Intent
+
+    long_detail = "by three battleships and two cruisers and a whole swarm of frigates on the gate"
+    spoken = tts.confirm_report("Taisy", intent=Intent.UNDER_ATTACK, detail=long_detail)
+    # The card keeps the detail; the spoken line must not blow the §12.2 cap.
+    assert spoken == "Under attack in Taisy. Confirm?"
+
+
+def test_confirm_report_falls_back_to_bare_form() -> None:
+    from cortana.types import Intent
+
+    # No intent, or an intent without a readback template → the bare form.
+    assert tts.confirm_report("Taisy") == "Heard Taisy. Confirm?"
+    assert tts.confirm_report("Taisy", intent=Intent.TIMER) == "Heard Taisy. Confirm?"
+
+
 # ── Speaker with a fake piper subprocess ──────────────────────────────────────
 
 
