@@ -149,9 +149,13 @@ class _Speaker:
     def __init__(self) -> None:
         self.said: list[tuple[int, str]] = []
         self.chirped: list[int] = []
+        self.caps: list[float | None] = []  # the max_s override per say()
 
-    async def say(self, guild_id: int, text: str, priority: int = 1, *, user_id=None) -> bool:
+    async def say(
+        self, guild_id: int, text: str, priority: int = 1, *, user_id=None, max_s=None
+    ) -> bool:
         self.said.append((guild_id, text))
+        self.caps.append(max_s)
         return True
 
     async def chirp(self, guild_id: int, *, user_id=None) -> bool:
@@ -243,6 +247,7 @@ def make_dialog(
     relay_mode: str = "framed",
     chat: _Chat | None = None,
     chat_enabled: bool = False,
+    fun: Any | None = None,
 ) -> Rig:
     holder = StubHolder(
         make_config(wake_ack=wake_ack, relay_mode=relay_mode, chat_enabled=chat_enabled)
@@ -278,6 +283,7 @@ def make_dialog(
         member_role_ids=lambda uid: roles,
         send_channel=send_channel,
         shutdown=asyncio.Event(),
+        fun=fun,
     )
     return Rig(dialog, engine, health, speaker, capture, sent, chat)
 
@@ -1133,3 +1139,79 @@ async def test_capped_confirmation_still_speaks_a_short_posted() -> None:
     assert (GUILD, long_line) in rig.speaker.said  # tried the full line
     assert (GUILD, "Posted.") in rig.speaker.said  # then the audible short ack
     assert rig.sent == []  # no channel-text dump needed
+
+
+# ── fun commands (GDD §13.2): voice in, voice out — never a channel post ─────
+
+
+def _fun_engine(tmp_path, *, fact_cooldown_s: int = 0, insult_cooldown_s: int = 0):
+    import dataclasses
+    import json
+
+    from cortana.config import FunConfig
+    from cortana.core.fun import FunEngine, load_library
+
+    base = tmp_path / "facts"
+    base.mkdir(exist_ok=True)
+    (base / "astronomy.json").write_text(
+        json.dumps(["Saturn is so light it would float in a big enough bathtub."])
+    )
+    (base / "insults_test.json").write_text(
+        json.dumps([{"text": "You fly like a shuttle with no capacitor.", "spicy": False}])
+    )
+    holder = StubHolder(
+        dataclasses.replace(
+            make_config(),
+            fun=FunConfig(fact_cooldown_s=fact_cooldown_s, insult_cooldown_s=insult_cooldown_s),
+        )
+    )
+    return FunEngine(holder, load_library(base))  # type: ignore[arg-type]
+
+
+async def test_voice_fact_speaks_and_posts_nothing(tmp_path) -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, tell me a fact"]),
+        fun=_fun_engine(tmp_path),
+    )
+    await utter_wake(rig)
+    texts = [t for _, t in rig.speaker.said]
+    assert "Saturn is so light it would float in a big enough bathtub." in texts
+    assert rig.engine.reports == []  # never reaches the incident engine
+    assert rig.sent == []  # voice in, voice out — no channel post
+    assert 20.0 in rig.speaker.caps  # spoken under the fun cap, not §12.2's
+
+
+async def test_voice_insult_addresses_the_spoken_target(tmp_path) -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, roast dave"]),
+        fun=_fun_engine(tmp_path),
+    )
+    await utter_wake(rig)
+    texts = [t for _, t in rig.speaker.said]
+    assert "Dave. You fly like a shuttle with no capacitor." in texts
+    assert rig.engine.reports == [] and rig.sent == []
+
+
+async def test_voice_fact_without_engine_says_off() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, tell me a fact"]),
+        fun=None,
+    )
+    await utter_wake(rig)
+    assert (GUILD, "Fun commands are off.") in rig.speaker.said
+    assert rig.sent == []
+
+
+async def test_voice_fact_cooldown_speaks_the_throttle_line(tmp_path) -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, tell me a fact"] * 2),
+        fun=_fun_engine(tmp_path, fact_cooldown_s=60),
+    )
+    await utter_wake(rig)
+    await utter_wake(rig)
+    assert (GUILD, "Cooling down.") in rig.speaker.said
+    assert rig.sent == []

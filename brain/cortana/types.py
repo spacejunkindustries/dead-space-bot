@@ -78,6 +78,11 @@ class Intent(StrEnum):
     WHOAMI = "WHOAMI"
     PING_ME = "PING_ME"
     PING_ME_CLEAR = "PING_ME_CLEAR"
+    # Fun commands (GDD §13.2). Never stored in ``incidents.type`` — the
+    # dialog engine and the fun cog route these to the FunEngine before the
+    # incident engine is ever involved.
+    FACT = "FACT"
+    INSULT = "INSULT"
 
 
 class Severity(StrEnum):
@@ -108,6 +113,8 @@ INTENT_SEVERITY: Mapping[Intent, Severity] = MappingProxyType(
         Intent.WHOAMI: Severity.NONE,
         Intent.PING_ME: Severity.NONE,
         Intent.PING_ME_CLEAR: Severity.NONE,
+        Intent.FACT: Severity.NONE,
+        Intent.INSULT: Severity.NONE,
     }
 )
 

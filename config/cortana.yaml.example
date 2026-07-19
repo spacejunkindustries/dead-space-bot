@@ -175,6 +175,14 @@ tts:
   # Ducking (60%) and talk-over suppression are fixed playback mechanics in
   # Ears (ears/src/playback.rs, GDD §12.2) — not tunables.
 
+fun:                                   # fact library / insult maker (GDD §13.2) — OPTIONAL section
+  enabled: true                        # /fact //insult + the voice "tell me a fact" / "insult"
+  fact_cooldown_s: 10                  # per-guild seconds between served facts
+  insult_cooldown_s: 10                # per-guild seconds between served insults
+  insults_spicy: true                  # true = full sailor-mouth pool; false = clean burns only
+  max_speak_s: 20                      # spoken cap for fun lines (a whole fact outruns the
+                                       # tts.max_utterance_s command-reply cap)
+
 chat:                                  # "command override" assistant (GDD §6.6) — OFF by default
   enabled: false                       # true = pilots can say "command override, <question>"
                                        # (slash twin: /ask). Costs real money per question.

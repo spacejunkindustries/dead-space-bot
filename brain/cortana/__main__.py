@@ -45,6 +45,7 @@ from cortana.chat import ChatClient, read_api_key
 from cortana.config import ConfigError, ConfigHolder
 from cortana.core import db
 from cortana.core.discipline import Discipline
+from cortana.core.fun import FunEngine
 from cortana.core.incidents import IncidentEngine, Poster, TimerPing
 from cortana.dialog import DialogEngine
 from cortana.dsc.bot import AuraBot, TokenError, read_token
@@ -156,6 +157,7 @@ class App:
         self.gateway: VoiceGateway | None = None
         self.reminders: ReminderService | None = None
         self.chat: ChatClient | None = None
+        self.fun: FunEngine | None = None
         self._chat_status = "disabled"
         self._chat_key: str | None = None
         self._reload_task: asyncio.Task[None] | None = None
@@ -280,6 +282,11 @@ class App:
             self.holder, self.engine, self.gazetteer, self.discipline, self.speaker, self.conn
         )
         late_poster.bind(self.bot)
+        # The fact library / insult maker (GDD §13.2) — ONE engine for the
+        # voice intents and the /fact //insult twins (constraint 10). Loading
+        # parses the bundled JSON off the event loop.
+        self.fun = await asyncio.to_thread(FunEngine, self.holder)
+        self.bot.fun = self.fun
         self.bot.chat = self.chat  # /ask slash twin (GDD §6.6, constraint 10)
         self.bot.chat_status = self._chat_status
         self.bot.alarms = self.alarms
@@ -307,6 +314,7 @@ class App:
             member_role_ids=self._member_role_ids,
             send_channel=self._send_channel,
             shutdown=self._shutdown,
+            fun=self.fun,
         )
         # Authoritative dialog cleanup, redundant with the IPC "left" event —
         # survives Ears outages (GDD §5.4).
