@@ -1236,7 +1236,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `discord.channels.intel_alerts` | int | **required** | hot | Channel for incidents that mention a role (GDD §11.2). |
 | `discord.channels.intel_live` | int | **required** | hot | Channel for every incident, no mentions — the firehose. |
 | `discord.channels.health` | int | **required** | hot | Channel for self-reports and degradation alerts. |
-| `discord.channels.transcript` | int | `0` | hot | Optional STT review log (GDD §8.7). When set, one clean line per heard utterance posts here — what CORTANA thinks it heard plus how it parsed — for reviewing phrasing and misfires. 0 = off. |
+| `discord.channels.transcript` | int | `0` | hot | Optional. When set, every heard utterance posts one clean line — what CORTANA thinks it heard plus how it parsed — so phrasing and misfires can be reviewed at a glance (GDD §8.7). 0 = off. |
 | `discord.roles.pilot` | int | `0` | hot | Only members with this role may trigger mentions. 0 = gate off. |
 | `discord.roles.fc` | int | `0` | hot | Only this role voice-triggers under fleetmode / uses admin commands without Manage Guild. 0 = gate off. |
 | `discord.watch_voice_channels` | int_list | **required** | hot | Voice channels CORTANA watches / auto-joins. |
@@ -1256,10 +1256,10 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `capture.endpoint_silence_ms` | int | **required** | hot | Trailing silence that ends an utterance (wall-clock under DTX). |
 | `capture.max_utterance_ms` | int | **required** | hot | Hard cap on a single capture window. |
 | `capture.vad_aggressiveness` | int | **required** | restart | webrtcvad mode 0 (permissive) – 3 (aggressive); the VadGate is built once at startup. |
-| `capture.streaming` | bool | `true` | hot | Live recognition (GDD §5.5): decode the growing capture while the pilot is still talking and commit the instant a complete, confident command is present, instead of waiting for silence/the hard cap. The fix for the 'keep talking and it drags' latency. Each incremental decode is a real Whisper run — sized for a dedicated ≥4-vCPU box; set false on a 2-vCPU droplet. |
-| `capture.partial_decode_ms` | int | `1200` | hot | Minimum new speech between incremental decodes (GDD §5.5) — the rate limiter. Lower = snappier + more CPU. |
+| `capture.streaming` | bool | `True` | hot | Live recognition (GDD §5.5): decode the growing capture while the pilot is still talking and commit the instant a complete, confident command is present, instead of waiting for silence/the hard cap. The fix for the 'keep talking and it drags' latency. Needs CPU headroom (each incremental decode is a real Whisper run) — sized for a dedicated >=4-vCPU box. false = decode-on-endpoint only. |
+| `capture.partial_decode_ms` | int | `1200` | hot | Minimum new speech between incremental decodes (GDD §5.5) — the incremental-decode rate limiter. Lower = snappier + more CPU. |
 | `capture.partial_min_speech_ms` | int | `900` | hot | Don't attempt an incremental decode until at least this much speech has accrued (GDD §5.5): a sub-second fragment can't carry a command. |
-| `capture.early_commit_min_logprob` | float | `-1.0` | hot | Confidence floor for an incremental decode to commit early (GDD §5.5). Below it the partial keeps listening rather than clipping the pilot; the normal endpoint still catches it. |
+| `capture.early_commit_min_logprob` | float | `-1.0` | hot | Confidence floor for an incremental decode to commit early (GDD §5.5). An uncertain partial keeps listening rather than clipping the pilot; the normal endpoint still catches it. |
 | **`dialog:`** | | | | *OPTIONAL voice dialog engine timing/budgets (GDD §5.4); defaults are the tuned live values.* |
 | `dialog.window_ms` | int | `4000` | hot | Wall-clock lifetime of a wake-free window (say-again retry, code-colour opener, bare command override). DTX-proof: the dialog wheel expires it in real time, frames or no frames. |
 | `dialog.ack_grace_ms` | int | `2000` | hot | Endpoint grace after a capture opens or a prompt is spoken — cue playback plus pilot reaction time. |
@@ -1271,7 +1271,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `stt.backend` | str | **required** | restart | Which Transcriber engine to build at startup. One of: `faster-whisper`, `whisper-cpp`. |
 | `stt.model` | str | **required** | restart | Whisper model size or path. |
 | `stt.compute_type` | str | **required** | restart | CTranslate2 quantization. |
-| `stt.cpu_threads` | int | `1` | restart | Whisper inference threads. On the 2-vCPU droplet use 1 — ON PURPOSE: a decode using BOTH cores starves the Ears real-time Opus mixer, which is exactly the 'her voice is choppy / drops out' symptom (the mixer misses its 20ms frame deadline). On a dedicated ≥4-vCPU box set 2: decodes (including streaming's incremental ones, §5.5) run snappier while the high-CPUWeight mixer keeps its cores. The example config ships 2 for that box; drop to 1 if you run on 2 vCPUs. |
+| `stt.cpu_threads` | int | `1` | restart | Whisper inference threads. On a 2-vCPU droplet use 1 — ON PURPOSE: a decode using BOTH cores starves the Ears real-time Opus mixer, which is exactly the 'her voice is choppy / drops out' symptom (the mixer misses its 20ms frame deadline). On a dedicated >=4-vCPU box set 2: decodes (including streaming's incremental ones, §5.5) run snappier while the high-CPUWeight mixer keeps its cores. The example config ships 2 for that box; drop to 1 on 2 vCPUs. |
 | `stt.bias_with_gazetteer` | bool | `True` | restart | Pass system names as the Whisper initial_prompt. |
 | `stt.whisper_cpp_url` | str | `'http://127.0.0.1:8080/inference'` | restart | whisper.cpp server endpoint; required (non-empty) only when stt.backend is whisper-cpp (cross-checked). |
 | `stt.watchdog_s` | float | `15.0` | restart | GDD §20 "STT worker hang" watchdog deadline. The whisper-cpp HTTP timeout is derived slightly below it so the socket gives up before the watchdog abandons the worker. |
@@ -1314,10 +1314,10 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `fun.insults_spicy` | bool | `True` | hot | true = the full sailor-mouth pool; false = clean burns only. |
 | `fun.max_speak_s` | float | `20.0` | hot | Spoken-length cap for facts/insults, overriding tts.max_utterance_s — a whole fact runs longer than a command reply. |
 | **`chat:`** | | | | *OPTIONAL "command override" assistant (GDD §6.6); absent = off.* |
-| `chat.enabled` | bool | `False` | sighup | Pilots can say "command override, <question>" (/ask twin). |
-| `chat.backend` | str | `'anthropic'` | sighup | Who answers override questions: `anthropic` = cloud Claude (needs a key, costs per question); `local` = an on-box OpenAI-compatible server at `chat.local_url` (no API, no key, no per-question cost) — the SLM lane. Still OFF the command path (constraint 6). One of: `anthropic`, `local`. |
-| `chat.local_url` | str | `''` | sighup | OpenAI-compatible chat-completions endpoint for `backend='local'` (e.g. `http://127.0.0.1:8081/v1/chat/completions` from llama.cpp/Ollama). Empty = unset. Deploy the model + server yourself. |
-| `chat.model` | str | `'claude-haiku-4-5'` | hot | Model for override replies. `anthropic`: a Claude model id. `local`: the model name the local server expects. |
+| `chat.enabled` | bool | `False` | sighup | Pilots can say "command override, <question>" (/ask twin). Costs real money per question. |
+| `chat.backend` | str | `'anthropic'` | sighup | Who answers override questions: 'anthropic' = the cloud Claude API (needs a key, costs per question); 'local' = an on-box OpenAI-compatible server at chat.local_url (no API, no key, no per-question cost) — the SLM lane for conversational back-and-forth on the droplet. Still OFF the command path (constraint 6). One of: `anthropic`, `local`. |
+| `chat.local_url` | str | `''` | sighup | OpenAI-compatible chat-completions endpoint for backend='local' (e.g. http://127.0.0.1:8081/v1/chat/completions from llama.cpp's server or Ollama). Empty = not configured. |
+| `chat.model` | str | `'claude-haiku-4-5'` | hot | Model for override replies. For backend='anthropic' a Claude model id; for backend='local' the model name the local server expects. |
 | `chat.api_key_file` | str | `'/etc/cortana/anthropic'` | sighup | Dev fallback ONLY (0600); production reads $CREDENTIALS_DIRECTORY/anthropic via LoadCredential= (constraint 12). The client is rebuilt when the on-disk key changes. |
 | `chat.max_tokens` | int | `300` | hot | Hard cap per answer. |
 | `chat.user_cooldown_s` | int | `10` | hot | Per-pilot throttle — the cost control. |

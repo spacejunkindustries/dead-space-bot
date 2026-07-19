@@ -465,9 +465,10 @@ KEYS: Final[tuple[Key, ...]] = (
         "str",
         Reload.HOT,
         "Confirm-first for voice reports (GDD §8.3): off = commit "
-        "immediately (readback only); low = uncertain system matches ask "
-        '"Heard X — confirm?" first; always = every voice report asks. '
-        "Yes commits, no opens a say-again retry, silence/unmatched commits "
+        "immediately (readback only); low = uncertain system matches read "
+        'the situation back ("Under attack in X, confirm?") first; always = '
+        "every voice report asks. Yes commits (flexibly: yes/confirm/ok/post "
+        "it/send it/…), no opens a say-again retry, silence/unmatched commits "
         "anyway — a distress call is never lost.",
         default="low",
         choices=("off", "low", "always"),
@@ -495,13 +496,13 @@ KEYS: Final[tuple[Key, ...]] = (
         "stt.cpu_threads",
         "int",
         Reload.RESTART,
-        "Whisper inference threads. Default 1 on the 2-vCPU droplet — ON "
-        "PURPOSE: a decode using BOTH cores starves the Ears real-time Opus "
-        "mixer, which is exactly the 'her voice is choppy / drops out' "
-        "symptom (the mixer misses its 20ms frame deadline). One thread "
-        "leaves a core free for the mixer and the event loop; decodes run a "
-        "little slower but the voice stays smooth. Raise only on a box with "
-        "cores to spare.",
+        "Whisper inference threads. On a 2-vCPU droplet use 1 — ON PURPOSE: a "
+        "decode using BOTH cores starves the Ears real-time Opus mixer, which "
+        "is exactly the 'her voice is choppy / drops out' symptom (the mixer "
+        "misses its 20ms frame deadline). On a dedicated >=4-vCPU box set 2: "
+        "decodes (including streaming's incremental ones, §5.5) run snappier "
+        "while the high-CPUWeight mixer keeps its cores. The example config "
+        "ships 2 for that box; drop to 1 on 2 vCPUs.",
         default=1,
         minimum=0,
         exclusive_minimum=True,
