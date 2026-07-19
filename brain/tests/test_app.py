@@ -65,6 +65,8 @@ class _Transcriber:
     def transcribe(self, pcm: bytes, bias: str) -> TranscriptResult:
         if self.error is not None:
             raise self.error
+        self.biases = getattr(self, "biases", [])
+        self.biases.append(bias)
         return TranscriptResult(text=self.texts.pop(0), avg_logprob=self.avg_logprob)
 
 
@@ -1215,3 +1217,15 @@ async def test_voice_fact_cooldown_speaks_the_throttle_line(tmp_path) -> None:
     await utter_wake(rig)
     assert (GUILD, "Cooling down.") in rig.speaker.said
     assert rig.sent == []
+
+
+async def test_stt_bias_carries_the_command_vocabulary(tmp_path) -> None:
+    # Live incident: the gazetteer-only bias prompt dragged casual command
+    # words toward system names ("roast" -> "Woust"). The grammar's trigger
+    # vocabulary now rides at the tail of the bias text.
+    transcriber = _Transcriber(["hey cortana, tell me a fact"])
+    rig = make_dialog(roles=[PILOT_ROLE], transcriber=transcriber, fun=_fun_engine(tmp_path))
+    await utter_wake(rig)
+    assert transcriber.biases, "transcribe was never called"
+    assert "insult, roast" in transcriber.biases[0]
+    assert "tackled" in transcriber.biases[0]

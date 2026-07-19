@@ -31,6 +31,7 @@ from cortana.types import Intent, ParsedCommand, Severity
 
 __all__ = [
     "PING_TYPE_ORDER",
+    "STT_VOCAB_BIAS",
     "bare_code",
     "bare_override",
     "broadcast_severity",
@@ -83,6 +84,25 @@ _JARGON_NORMALIZE: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"\b(?:regester|registar|redgister|rejister|regiser|regista)\b", re.I),
         "register",
     ),
+    # Fun-command trigger words (GDD §13.2), from live transcripts: "insult
+    # Space Monkey" came back "Insalt Space Monkey"; "roast Space Monkey"
+    # came back "Rara, Woust, Space Monkey".
+    (re.compile(r"\b(?:insalts?|in[\s-]salts?|ensalts?|insaults?)\b", re.I), "insult"),
+    (re.compile(r"\b(?:woust|roust|wrost|rosts?)\b", re.I), "roast"),
+)
+
+#: Spoken command vocabulary for the Whisper bias prompt (GDD §5.3). The
+#: gazetteer-only prompt biased the decoder so hard toward system names that
+#: casual command words came back system-shaped (live incident: "roast" →
+#: "Woust") — listing the grammar's own trigger words alongside the system
+#: names keeps both vocabularies decodable. Appended AFTER the system names:
+#: Whisper truncates an over-long initial_prompt from the front, so the tail
+#: is the part guaranteed to survive.
+STT_VOCAB_BIAS = (
+    "Commands: hostiles, reds, neuts, tackled, under attack, need backup, "
+    "gate camp, code red, code orange, clear, status, timer, form up, "
+    "cancel, register, ping me, who am I, update chase, report, "
+    "command override, tell me a fact, trivia, insult, roast, over."
 )
 
 # Radio sign-off at the tail of an utterance ("...three battleships, over").

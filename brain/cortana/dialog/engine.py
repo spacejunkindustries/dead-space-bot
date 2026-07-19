@@ -232,7 +232,13 @@ class DialogEngine:
 
     async def _run_stt(self, s: DialogSession, gen: int, pcm: bytes) -> None:
         cfg = self._holder.current
-        bias = self._gazetteer.prompt_bias_text() if cfg.stt.bias_with_gazetteer else ""
+        bias = ""
+        if cfg.stt.bias_with_gazetteer:
+            # System names + the grammar's own trigger words (GDD §5.3): a
+            # names-only prompt dragged casual command words system-shaped
+            # ("roast" → "Woust", live incident). Vocab rides at the tail —
+            # the part of an over-long prompt Whisper keeps.
+            bias = f"{self._gazetteer.prompt_bias_text()} {grammar.STT_VOCAB_BIAS}".strip()
         try:
             result = await asyncio.to_thread(self._transcriber.transcribe, pcm, bias)
         except Exception as exc:
