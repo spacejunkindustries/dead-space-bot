@@ -244,6 +244,37 @@ class StatusCog(commands.Cog):
         log.info("reload_via_slash", user_id=interaction.user.id, ok=result.ok)
         await interaction.followup.send(f"🔄 {result.summary()}", ephemeral=True)
 
+    # ── /restart ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="restart",
+        description="(admin) Restart the CORTANA brain process (systemd brings it back)",
+    )
+    @app_commands.check(_is_admin)
+    async def restart(self, interaction: discord.Interaction) -> None:
+        """The remote kick for a wedged brain (GDD §18): graceful shutdown,
+        `Restart=always` brings the process back in seconds. Ears is NOT
+        restarted — it stays connected and buffers audio through the gap, so
+        no DAVE renegotiation. Wake models, STT, and the IPC handshake all
+        rebuild fresh, which clears most "she went deaf" states without SSH.
+        """
+        request_restart = self.bot.request_restart
+        if request_restart is None:
+            await interaction.response.send_message(
+                "Restart isn't wired in this process — `systemctl restart "
+                "cortana-brain` from the droplet instead.",
+                ephemeral=True,
+            )
+            return
+        # Answer FIRST — after the shutdown starts, this interaction dies.
+        await interaction.response.send_message(
+            "🔄 Restarting the brain — back in ~15s. Ears stays connected and "
+            "buffers audio through the gap. `/botstatus` to check on her after.",
+            ephemeral=True,
+        )
+        log.info("restart_via_slash", user_id=interaction.user.id)
+        await request_restart()
+
 
 def _chunk(text: str, size: int) -> list[str]:
     """Split on line boundaries into <= size chunks (never mid-row)."""

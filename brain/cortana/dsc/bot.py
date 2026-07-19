@@ -242,6 +242,9 @@ class AuraBot(commands.Bot):
         self.alarms: AlarmBus | None = None
         #: The one reload transaction (SIGHUP == /reload) — set by __main__.
         self.request_reload: Callable[[], Awaitable[ReloadResult]] | None = None
+        #: Graceful process restart (/restart → shutdown → systemd
+        #: Restart=always) — set by __main__.
+        self.request_restart: Callable[[], Awaitable[None]] | None = None
         #: Ears IPC liveness probe: ``() -> (alive, heartbeat_age_s | None)``.
         self.ipc_status: Callable[[], tuple[bool, float | None]] | None = None
         #: Voice dialog sessions currently in flight (``/botstatus``).

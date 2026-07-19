@@ -292,6 +292,10 @@ class App:
         self.bot.alarms = self.alarms
         # /reload is the slash twin of SIGHUP — the SAME transaction.
         self.bot.request_reload = self._reload_transaction
+        # /restart trips the same graceful shutdown as SIGTERM; exit 0 is
+        # restartable (only 78/69 park the unit), so systemd's
+        # Restart=always brings the process straight back.
+        self.bot.request_restart = self._request_restart
         self.bot.ipc_status = self._ipc_status
         self.bot.dialog_sessions = lambda: (
             self.dialog.sessions_active if self.dialog is not None else 0
@@ -420,6 +424,12 @@ class App:
     def _request_shutdown(self, reason: str) -> None:
         log.info("shutdown_requested", reason=reason)
         self._shutdown.set()
+
+    async def _request_restart(self) -> None:
+        """/restart (GDD §18): the remote kick for a wedged brain. Trips the
+        same graceful-shutdown path as SIGTERM — Ears stays up and buffers —
+        and systemd ``Restart=always`` brings the process back in seconds."""
+        self._request_shutdown("restart_via_slash")
 
     def _on_sighup(self) -> None:
         # The transaction is async (engine reloads, health post); the signal

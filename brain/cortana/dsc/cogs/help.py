@@ -398,6 +398,8 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "(hourly self-reports also land in #bot-health)\n"
                 "• `/botstatus` · `/doctor` · `/reload` — one-screen ops status, "
                 "offline preflight checks, and the SIGHUP-equivalent config reload\n"
+                "• `/restart` — restart the brain process remotely (back in ~15s; "
+                "voice connection survives) — the kick for a wedged bot\n"
                 "• `/clearall` — resolve EVERY active incident card at once (the "
                 "board-wipe after an op or a test session)",
             ),
