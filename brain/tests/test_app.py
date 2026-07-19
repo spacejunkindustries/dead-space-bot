@@ -1333,3 +1333,10 @@ async def test_confirm_first_always_gates_high_tier_and_yes_forces_candidate() -
     assert len(rig.engine.reports) == 1
     _, _, _parsed, resolution = rig.engine.reports[0]
     assert resolution is not None and resolution.tier is Tier.HIGH  # forced candidate
+
+
+async def test_restart_via_slash_trips_the_shutdown_event() -> None:
+    app = App.__new__(App)  # only the shutdown event is touched
+    app._shutdown = asyncio.Event()
+    await app._request_restart()
+    assert app._shutdown.is_set()
