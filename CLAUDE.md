@@ -90,15 +90,21 @@ ears/                 Rust — voice socket
 brain/                Python — everything else
   cortana/
     audio/            vad, wake, capture, stt
-    nlu/              grammar, gazetteer, phonetics
-    core/             incidents, routing, discipline, db
+    nlu/              grammar, gazetteer, phonetics, seed
+    dialog/           voice dialog: pure state machine + engine, one 100ms clock (GDD §5.4)
+    core/             incidents, routing, discipline, callsigns, personal_pings, fun, db
     dsc/              bot, views, cogs/
-    tts.py health.py ipc.py config.py voice_gateway.py
-  schema.sql
+    data/facts/       bundled fact/insult library (generated + accuracy-gated offline, §13.2)
+    tts.py health.py ipc.py config.py config_schema.py voice_gateway.py
+    alarms.py chat.py doctor.py reload.py
+  schema.sql  migrations/
 config/               cortana.yaml, gazetteer.yaml, routing.yaml (examples)
-deploy/               systemd units, install.sh
+deploy/               systemd units + staged converge-and-verify install.sh (GDD §17.5)
+assets/wake/          community "hey cortahnah" ONNX wake models (installer deploys them)
 docs/GDD.md           ← the spec
+docs/WAKE_WORDS.md    wake-word options + what is deployed now
 reference/songbird/   vendored @ v0.6.0 — read before touching voice
+training/wake/        offline wake-word training pipeline (GPU box/Colab, never the droplet)
 ```
 
 The module table in **GDD §4** lists every file and its responsibility. Match it.

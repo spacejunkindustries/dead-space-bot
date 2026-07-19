@@ -1,4 +1,14 @@
-# CORTANA Brain — phase-1 interface contract
+# CORTANA Brain — phase-1 interface contract (historical)
+
+> **Status: superseded.** This is the contract the original Brain modules were
+> *built* against, preserved for archaeology — module paths still read
+> `aura/`, and it predates the rebuild (the dialog engine `cortana/dialog/`,
+> the declarative config schema `config_schema.py`, IPC protocol v2, the
+> AlarmBus, the reload transaction, the fun engine `core/fun.py`, and the
+> `FACT`/`INSULT` intents). **The living contract is `docs/GDD.md`** — §4 for
+> module responsibilities, §5.4 for the dialog machine, §15 for the IPC wire
+> format, §16 (generated) for every config key — plus the module docstrings,
+> which are kept normative by review. Do not build new code against this file.
 
 This document is the contract the Brain modules are built against. Signatures
 here are normative; if an implementation must diverge, update this file in the
