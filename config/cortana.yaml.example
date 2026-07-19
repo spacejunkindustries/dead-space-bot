@@ -124,13 +124,31 @@ capture:
                                        # reports still end early at the silence
                                        # endpoint, so short commands stay fast.
   vad_aggressiveness: 2                # webrtcvad mode, 0 (permissive) – 3 (aggressive)
+  streaming: true                      # LIVE RECOGNITION (GDD §5.5): decode the growing
+                                       # capture WHILE the pilot is still talking and commit
+                                       # the instant a complete, confident command is present
+                                       # — instead of waiting for them to stop before the
+                                       # first decode. This is the fix for the "keep talking
+                                       # and it drags 10-20s" latency. Each incremental decode
+                                       # is a real Whisper run, so it needs a dedicated
+                                       # >=4-vCPU box; set false on a 2-vCPU droplet.
+  partial_decode_ms: 1200              # minimum new speech between incremental decodes
+                                       # (the rate limiter). Lower = snappier + more CPU.
+  partial_min_speech_ms: 900           # don't decode a fragment shorter than this — it can't
+                                       # carry a whole command, and decoding it risks a clip.
+  early_commit_min_logprob: -1.0       # an incremental decode below this confidence keeps
+                                       # listening rather than clipping the pilot; the normal
+                                       # silence endpoint still catches it.
 
 stt:
   backend: faster-whisper              # or: whisper-cpp (same Transcriber protocol)
   model: small                         # Whisper model size
   compute_type: int8                   # CTranslate2 quantization
-  cpu_threads: 1                       # ONE Whisper thread: 2 starves the Ears real-time
-                                       # mixer and makes her voice choppy (GDD §12/§17).
+  cpu_threads: 2                       # Whisper decode threads. On a dedicated >=4-vCPU box, 2
+                                       # gives snappy decodes (incl. streaming's incremental
+                                       # ones) while the high-CPUWeight Ears mixer keeps its
+                                       # cores. On a 2-vCPU box use 1: there, 2 starves the
+                                       # real-time mixer and her voice goes choppy (GDD §12/§17).
   bias_with_gazetteer: true            # pass system names as Whisper initial_prompt
   whisper_cpp_url: http://127.0.0.1:8080/inference  # used only when backend: whisper-cpp
   watchdog_s: 15                       # hang watchdog (GDD §20): seconds one decode may run

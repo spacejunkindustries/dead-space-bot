@@ -177,6 +177,29 @@ class CaptureConfig:
     endpoint_silence_ms: int
     max_utterance_ms: int
     vad_aggressiveness: int  # webrtcvad 0–3
+    #: Live recognition (GDD §5.5): decode the growing capture buffer while the
+    #: pilot is still talking and commit the instant a complete, confident
+    #: command is present — instead of waiting for them to stop (or the hard
+    #: cap) before the first decode. This is the fix for the "keep talking and
+    #: it drags 10-20s" latency: a distress call lands mid-sentence, not after
+    #: the channel goes quiet. Purely an endpointing optimization — the final
+    #: decode on emit stays authoritative, so it can never mis-route. Needs
+    #: CPU headroom (the incremental decodes are real Whisper runs): sized for
+    #: a dedicated ≥4-vCPU box. Set false to fall back to decode-on-endpoint.
+    streaming: bool = True
+    #: Minimum NEW speech between incremental decodes — the incremental-decode
+    #: rate limiter. Lower = snappier + more CPU; higher = calmer + a touch
+    #: more lag. Each fires one Whisper decode of the buffer-so-far.
+    partial_decode_ms: int = 1200
+    #: Don't attempt an incremental decode until at least this much speech has
+    #: accrued: a sub-second fragment cannot carry a whole command, so decoding
+    #: it just burns CPU and risks an early clip on a half-heard word.
+    partial_min_speech_ms: int = 900
+    #: Confidence floor for an incremental decode to commit early. An uncertain
+    #: partial keeps listening rather than clipping the pilot; the normal
+    #: endpoint (silence or cap) still catches it, and the final decode's
+    #: confirm-first flow (§8.3) owns the uncertainty from there.
+    early_commit_min_logprob: float = -1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -655,6 +678,10 @@ def _assemble_capture(v: dict[str, Any]) -> CaptureConfig:
         endpoint_silence_ms=v["capture.endpoint_silence_ms"],
         max_utterance_ms=v["capture.max_utterance_ms"],
         vad_aggressiveness=v["capture.vad_aggressiveness"],
+        streaming=v["capture.streaming"],
+        partial_decode_ms=v["capture.partial_decode_ms"],
+        partial_min_speech_ms=v["capture.partial_min_speech_ms"],
+        early_commit_min_logprob=v["capture.early_commit_min_logprob"],
     )
 
 

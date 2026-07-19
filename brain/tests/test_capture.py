@@ -526,3 +526,50 @@ async def test_arm_window_refused_while_capturing() -> None:
     await settle()
     assert len(recorder.emitted) == 1
     assert recorder.emitted[0][2] == b"".join([MARKER, cmd])
+
+
+# ── live recognition snapshot + gen-guarded endpoint (GDD §5.5) ──────────────
+
+
+async def test_capture_progress_snapshots_without_ending_the_capture() -> None:
+    manager, recorder, _ = make_manager()
+    manager.feed(USER_A, GUILD, MARKER)
+    frames = [speech(1500 + i) for i in range(4)]
+    feed_all(manager, USER_A, frames)
+
+    progress = manager.capture_progress(USER_A)
+    assert progress is not None
+    pcm, speech_frames, gen = progress
+    assert pcm == b"".join([MARKER, *frames])  # buffer-so-far, RAM copy
+    assert speech_frames == len(frames)  # trigger frame not counted
+    assert gen == 1
+    # The capture is untouched — the pilot keeps talking and it still emits.
+    assert manager.is_capturing(USER_A)
+    more = speech(2000)
+    manager.feed(USER_A, GUILD, more)
+    assert manager.force_endpoint(USER_A) is True
+    await settle()
+    assert recorder.emitted[0][2] == b"".join([MARKER, *frames, more])
+
+
+async def test_capture_progress_none_when_idle_or_silent() -> None:
+    manager, _, _ = make_manager()
+    assert manager.capture_progress(USER_A) is None  # never spoke
+    manager.feed(USER_A, GUILD, MARKER)  # capturing, but zero post-wake speech
+    assert manager.capture_progress(USER_A) is None
+
+
+async def test_force_endpoint_gen_guard_ignores_a_superseded_capture() -> None:
+    manager, recorder, _ = make_manager()
+    manager.feed(USER_A, GUILD, MARKER)  # gen 1
+    manager.feed(USER_A, GUILD, speech(1500))
+    # An early-commit decision made against gen 2 must not end this gen-1 capture.
+    assert manager.force_endpoint(USER_A, "early_command", expected_gen=2) is False
+    assert manager.is_capturing(USER_A)
+    await settle()
+    assert recorder.emitted == []
+    # The matching gen commits it.
+    assert manager.force_endpoint(USER_A, "early_command", expected_gen=1) is True
+    await settle()
+    assert len(recorder.emitted) == 1
+    assert recorder.emitted[0][3].reason == "early_command"

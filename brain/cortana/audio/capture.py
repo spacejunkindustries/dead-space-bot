@@ -220,15 +220,44 @@ class CaptureManager:
         """User ids with an open capture — for the dialog engine's wheel."""
         return [uid for uid, st in self._states.items() if st.phase is Phase.CAPTURING]
 
-    def force_endpoint(self, user_id: int, reason: str = "silence") -> bool:
+    def capture_progress(self, user_id: int) -> tuple[bytes, int, int] | None:
+        """A RAM-only snapshot of an open capture for incremental decoding
+        (GDD §5.5): ``(pcm_so_far, speech_frames, capture_gen)``.
+
+        The bytes are a fresh copy of the buffer as it stands right now — the
+        capture keeps growing, and the buffer is still released on emit, so
+        this never extends audio's lifetime beyond the capture itself
+        (constraint 5). ``None`` unless the user is capturing with real speech;
+        a zero-speech capture has nothing worth decoding."""
+        state = self._states.get(user_id)
+        if (
+            state is None
+            or state.phase is not Phase.CAPTURING
+            or state.capture is None
+            or state.speech_frames == 0
+        ):
+            return None
+        return b"".join(state.capture), state.speech_frames, state.capture_gen
+
+    def force_endpoint(
+        self, user_id: int, reason: str = "silence", *, expected_gen: int | None = None
+    ) -> bool:
         """End an open capture now and emit it (GDD §5).
 
         Discord sends no packets while a pilot is silent — it stops the stream
         rather than sending silence frames — so a frame-counted endpoint can
         never fire on a real pause. The dialog engine's wall-clock wheel
-        drives this instead. No-op unless the user is actually capturing."""
+        drives this instead. No-op unless the user is actually capturing.
+
+        ``expected_gen`` guards the incremental-decode path (GDD §5.5): an
+        early-commit decision made against a snapshot must not end a *different*
+        capture that opened in the meantime (the pilot endpointed and re-woke
+        while the partial decode was in flight). When set and the live capture's
+        generation differs, this is a no-op."""
         state = self._states.get(user_id)
         if state is None or state.phase is not Phase.CAPTURING or state.capture is None:
+            return False
+        if expected_gen is not None and state.capture_gen != expected_gen:
             return False
         self._emit(user_id, state, self._holder.current, reason=reason)
         return True

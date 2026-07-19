@@ -25,6 +25,8 @@ capture:
   endpoint_silence_ms: 400
   max_utterance_ms: 6000
   vad_aggressiveness: 2
+  streaming: false                     # off for local dev (light 2-core boxes); the
+                                       # droplet enables it (GDD §5.5)
 
 stt:
   backend: faster-whisper

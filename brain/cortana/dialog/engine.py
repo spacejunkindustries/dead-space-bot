@@ -28,6 +28,7 @@ import structlog
 from cortana import tts as tts_mod
 from cortana.audio.capture import CaptureManager, CaptureMeta, CaptureOrigin
 from cortana.audio.stt import SttError, SttTimeoutError
+from cortana.audio.vad import FRAME_MS
 from cortana.chat import ChatClient, ChatCooldownError
 from cortana.dialog.machine import transition
 from cortana.dialog.types import (
@@ -108,6 +109,38 @@ def transcript_line(text: str, avg_logprob: float, parsed: ParsedCommand | None)
     return f'🎧 "{heard}" → {" · ".join(parts)} · {conf}'
 
 
+#: Intents whose early-commit (GDD §5.5) must wait for a system name to be
+#: present in the partial. A report that resolves against the gazetteer isn't
+#: "complete" until its system has been spoken — committing on the bare intent
+#: ("under attack …" before "… in Taisy") would clip the pilot mid-command.
+#: Systemless/fun/register/ping intents carry no system, so they commit as soon
+#: as they parse.
+_EARLY_NEEDS_SYSTEM: frozenset[Intent] = frozenset(
+    {
+        Intent.HOSTILE_SPOTTED,
+        Intent.UNDER_ATTACK,
+        Intent.ASSIST_REQUEST,
+        Intent.GATE_CAMP,
+        Intent.RESOLVE,
+        Intent.TIMER,
+        Intent.FORMUP,
+        Intent.CHASE_UPDATE,
+    }
+)
+
+
+def _early_committable(parsed: ParsedCommand | None) -> bool:
+    """True when a partial transcript already carries a *complete* command that
+    can be committed early (GDD §5.5) — a recognised intent, plus a system name
+    for the intents that need one. This is purely an endpointing decision: the
+    final decode on emit re-parses and owns routing, so a false positive only
+    ends the capture a little early, never mis-routes."""
+    if parsed is None:
+        return False
+    # A report intent isn't "complete" until its system has been spoken.
+    return not (parsed.intent in _EARLY_NEEDS_SYSTEM and not parsed.system_text)
+
+
 #: Spoken/posted when a non-@Pilot member voice-triggers a mention-bearing
 #: intent — mirrors the slash twin's rejection (GDD §11.1 layer 4).
 _PILOT_REQUIRED_UTTERANCE = "Reporting requires the Pilot role."
@@ -164,6 +197,13 @@ class DialogEngine:
         self._last_audio_at: dict[int, float] = {}
         # Fire-and-forget spoken cues; referenced so they aren't GC'd mid-flight.
         self._voice_tasks: set[asyncio.Task[None]] = set()
+        #: Live recognition (GDD §5.5). ``_partial_inflight`` holds users with
+        #: an incremental decode running (at most one at a time per user);
+        #: ``_partial_at_frames`` records the speech-frame count at the last
+        #: incremental decode so the next one waits for partial_decode_ms of
+        #: fresh speech. Both reset per capture.
+        self._partial_inflight: set[int] = set()
+        self._partial_at_frames: dict[int, int] = {}
 
     # ── session plumbing ─────────────────────────────────────────────────────
 
@@ -190,6 +230,8 @@ class DialogEngine:
         self._deadlines.pop(user_id, None)
         self._grace_until.pop(user_id, None)
         self._last_audio_at.pop(user_id, None)
+        self._partial_inflight.discard(user_id)
+        self._partial_at_frames.pop(user_id, None)
         if self._capture is not None:
             self._capture.drop_user(user_id)
 
@@ -238,6 +280,12 @@ class DialogEngine:
             ev = DialogEvent(Ev.WINDOW_OPENED, gen=armed_gen)
         self._grace_until[user_id] = self._now() + self._dcfg().ack_grace_ms / 1000
         self._deadlines.pop(user_id, None)  # the window did its job
+        # A fresh capture supersedes any prior one's incremental-decode state
+        # (GDD §5.5): reset the per-capture partial cadence. An in-flight
+        # partial from the previous capture is harmless — its force_endpoint is
+        # gen-guarded — but its cadence marker must not carry over.
+        self._partial_at_frames[user_id] = 0
+        self._partial_inflight.discard(user_id)
         return self._apply_sync(s, ev)
 
     # ── utterance path ───────────────────────────────────────────────────────
@@ -260,15 +308,18 @@ class DialogEngine:
             return
         await self._apply(s, DialogEvent(Ev.CAPTURE_EMITTED, gen=meta.gen), pcm=pcm)
 
+    def _stt_bias(self) -> str:
+        """Whisper prompt bias: system names + the grammar's own trigger words
+        (GDD §5.3). A names-only prompt dragged casual command words
+        system-shaped ("roast" → "Woust", live incident); the vocab rides at
+        the tail — the part of an over-long prompt Whisper keeps. Shared by the
+        final decode and the incremental decodes (GDD §5.5)."""
+        if not self._holder.current.stt.bias_with_gazetteer:
+            return ""
+        return f"{self._gazetteer.prompt_bias_text()} {grammar.STT_VOCAB_BIAS}".strip()
+
     async def _run_stt(self, s: DialogSession, gen: int, pcm: bytes) -> None:
-        cfg = self._holder.current
-        bias = ""
-        if cfg.stt.bias_with_gazetteer:
-            # System names + the grammar's own trigger words (GDD §5.3): a
-            # names-only prompt dragged casual command words system-shaped
-            # ("roast" → "Woust", live incident). Vocab rides at the tail —
-            # the part of an over-long prompt Whisper keeps.
-            bias = f"{self._gazetteer.prompt_bias_text()} {grammar.STT_VOCAB_BIAS}".strip()
+        bias = self._stt_bias()
         try:
             result = await asyncio.to_thread(self._transcriber.transcribe, pcm, bias)
         except Exception as exc:
@@ -474,6 +525,72 @@ class DialogEngine:
             last = self._last_audio_at.get(user_id)
             if last is not None and now - last >= gap:
                 self._capture.force_endpoint(user_id)
+                continue
+            # 3. Live recognition (GDD §5.5): while the pilot is still talking,
+            #    decode the buffer-so-far and commit the instant a complete,
+            #    confident command is present — the fix for the "keep talking
+            #    and it drags" latency. Rate-limited per capture and one decode
+            #    in flight per user, so a busy channel can't stampede STT.
+            if cfg.capture.streaming:
+                self._maybe_partial_decode(user_id)
+
+    def _maybe_partial_decode(self, user_id: int) -> None:
+        """Launch an incremental decode for a capturing user if it's time to
+        (GDD §5.5). Sync + cheap: the actual decode runs as its own task so the
+        wheel never blocks on Whisper."""
+        if user_id in self._partial_inflight or self._capture is None:
+            return
+        progress = self._capture.capture_progress(user_id)
+        if progress is None:
+            return
+        pcm, speech_frames, gen = progress
+        ccfg = self._holder.current.capture
+        if speech_frames * FRAME_MS < ccfg.partial_min_speech_ms:
+            return
+        last = self._partial_at_frames.get(user_id, 0)
+        if (speech_frames - last) * FRAME_MS < ccfg.partial_decode_ms:
+            return
+        self._partial_at_frames[user_id] = speech_frames
+        self._partial_inflight.add(user_id)
+        task = asyncio.get_running_loop().create_task(
+            self._partial_decode(user_id, pcm, gen), name=f"stt-partial-{user_id}"
+        )
+        self._voice_tasks.add(task)
+        task.add_done_callback(self._voice_tasks.discard)
+
+    async def _partial_decode(self, user_id: int, pcm: bytes, gen: int) -> None:
+        """Decode one buffer-so-far snapshot and, if it already carries a
+        complete confident command, end the capture now (GDD §5.5).
+
+        Never routes the command itself — it only force-endpoints the live
+        capture (gen-guarded), and the authoritative final decode on emit
+        re-parses and drives the engine. So a mis-parse here can only cost a
+        slightly-early endpoint, never a wrong action."""
+        try:
+            result = await asyncio.to_thread(self._transcriber.transcribe, pcm, self._stt_bias())
+        except Exception as exc:  # noqa: BLE001 — advisory decode; final decode is authoritative
+            # A dropped/failed partial (queue overflow, watchdog) is a non-event:
+            # the normal endpoint still fires. Log sparse, never surface it.
+            log.debug("stt_partial_failed", user_id=user_id, error=str(exc))
+            return
+        finally:
+            del pcm  # constraint 5: the snapshot is dropped the instant we're done
+            self._partial_inflight.discard(user_id)
+        ccfg = self._holder.current.capture
+        if result.avg_logprob < ccfg.early_commit_min_logprob:
+            return
+        parsed = grammar.parse(result.text)
+        if not _early_committable(parsed):
+            return
+        if self._capture is not None and self._capture.force_endpoint(
+            user_id, "early_command", expected_gen=gen
+        ):
+            log.info(
+                "stt_early_commit",
+                user_id=user_id,
+                intent=parsed.intent.value if parsed else None,
+                avg_logprob=round(result.avg_logprob, 3),
+            )
 
     # ── executors: the ported §5 pipeline tail ───────────────────────────────
 

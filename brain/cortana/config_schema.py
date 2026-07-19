@@ -377,6 +377,47 @@ KEYS: Final[tuple[Key, ...]] = (
         minimum=0,
         maximum=3,
     ),
+    Key(
+        "capture.streaming",
+        "bool",
+        Reload.HOT,
+        "Live recognition (GDD §5.5): decode the growing capture while the "
+        "pilot is still talking and commit the instant a complete, confident "
+        "command is present, instead of waiting for silence/the hard cap. The "
+        "fix for the 'keep talking and it drags' latency. Needs CPU headroom "
+        "(each incremental decode is a real Whisper run) — sized for a "
+        "dedicated >=4-vCPU box. false = decode-on-endpoint only.",
+        default=True,
+    ),
+    Key(
+        "capture.partial_decode_ms",
+        "int",
+        Reload.HOT,
+        "Minimum new speech between incremental decodes (GDD §5.5) — the "
+        "incremental-decode rate limiter. Lower = snappier + more CPU.",
+        default=1200,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "capture.partial_min_speech_ms",
+        "int",
+        Reload.HOT,
+        "Don't attempt an incremental decode until at least this much speech "
+        "has accrued (GDD §5.5): a sub-second fragment can't carry a command.",
+        default=900,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "capture.early_commit_min_logprob",
+        "float",
+        Reload.HOT,
+        "Confidence floor for an incremental decode to commit early (GDD "
+        "§5.5). An uncertain partial keeps listening rather than clipping the "
+        "pilot; the normal endpoint still catches it.",
+        default=-1.0,
+    ),
     # stt
     Key(
         "dialog.window_ms",

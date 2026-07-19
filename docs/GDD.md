@@ -341,6 +341,22 @@ Further contract points:
 
 Config: the optional `dialog:` section (`window_ms`, `ack_grace_ms`, `endpoint_gap_floor_ms`, `max_retries`) — §16. The timing defaults are the values tuned on live fleet audio; expect them to move.
 
+### 5.5 Live recognition — commit mid-sentence, not after the room goes quiet
+
+The endpointing in §5.4 has one structural cost: a capture is only decoded **after it closes**, on a silence gap or the hard cap. When a pilot issues an order and *keeps talking* — to their fleet, over someone else's callout, in a channel that never falls silent — the capture runs to the hard cap before the first decode, and the order lands 10–20 seconds late. That is the single worst latency in the system, and it is exactly the moment latency matters most.
+
+**Live recognition (`capture.streaming`) decodes the buffer *while the pilot is still talking* and commits the instant the command is complete.** The dialog wheel (§5.4), already walking every open capture each 100 ms tick, takes a RAM snapshot of the buffer-so-far (`CaptureManager.capture_progress`) and runs an incremental Whisper decode. The moment that partial transcript parses a **complete, confident command** — a recognised intent, plus a resolvable system name for the intents that need one (`_early_committable`) — the wheel ends the capture then and there. The pilot can keep talking; the order is already in flight.
+
+The design's safety comes from what the incremental decode is *not* allowed to do: **it never routes the command.** It only decides "the command is complete, stop capturing now" and calls the same `force_endpoint` the silence path uses. The **final decode on emit stays authoritative** — it re-parses, re-resolves, runs the pilot gate, the confirm-first flow, everything. So a mis-parsed partial can only end the capture a little early; it can never post the wrong card, mint the wrong `@here`, or bypass a gate. Constraint 6 is untouched — this is fixed-grammar parsing over a partial transcript, no model in the routing path.
+
+Three guards keep it cheap and correct:
+
+- **Rate-limited.** An incremental decode fires only after `capture.partial_min_speech_ms` of speech has accrued (a fragment can't carry a command) and then at most once per `capture.partial_decode_ms` of *new* speech, with **one decode in flight per user**. A busy channel cannot stampede the STT queue; overflow is dropped by the bounded queue (§20) and the normal endpoint still catches the command.
+- **Confidence-gated.** Below `capture.early_commit_min_logprob` the partial keeps listening rather than clipping the pilot on a half-heard word; uncertainty is owned by the final decode's confirm-first flow (§8.3), not resolved by guessing early.
+- **Generation-guarded.** The early-commit `force_endpoint` carries the capture generation the snapshot was taken from; if the pilot endpointed and re-woke while the partial decode was in flight, the guard makes it a no-op — a stale decision can never end a *different* capture.
+
+This is the half of "live, flexible recognition" that the §6.1 vocabulary and the §8.3 confirm-first readback complete: she hears the order as it's spoken, reads the situation back naturally, and takes a flexible *yes* — all without the pilot having to stop and wait. It costs real CPU (each partial is a genuine decode), so it is sized for a dedicated ≥4-vCPU host and turns off cleanly (`capture.streaming: false`) on a 2-vCPU box, falling back to decode-on-endpoint. Config: the `capture.streaming` / `partial_decode_ms` / `partial_min_speech_ms` / `early_commit_min_logprob` keys — §16.
+
 ---
 
 ## 6. Voice command reference
@@ -1235,6 +1251,10 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `capture.endpoint_silence_ms` | int | **required** | hot | Trailing silence that ends an utterance (wall-clock under DTX). |
 | `capture.max_utterance_ms` | int | **required** | hot | Hard cap on a single capture window. |
 | `capture.vad_aggressiveness` | int | **required** | restart | webrtcvad mode 0 (permissive) – 3 (aggressive); the VadGate is built once at startup. |
+| `capture.streaming` | bool | `true` | hot | Live recognition (GDD §5.5): decode the growing capture while the pilot is still talking and commit the instant a complete, confident command is present, instead of waiting for silence/the hard cap. The fix for the 'keep talking and it drags' latency. Each incremental decode is a real Whisper run — sized for a dedicated ≥4-vCPU box; set false on a 2-vCPU droplet. |
+| `capture.partial_decode_ms` | int | `1200` | hot | Minimum new speech between incremental decodes (GDD §5.5) — the rate limiter. Lower = snappier + more CPU. |
+| `capture.partial_min_speech_ms` | int | `900` | hot | Don't attempt an incremental decode until at least this much speech has accrued (GDD §5.5): a sub-second fragment can't carry a command. |
+| `capture.early_commit_min_logprob` | float | `-1.0` | hot | Confidence floor for an incremental decode to commit early (GDD §5.5). Below it the partial keeps listening rather than clipping the pilot; the normal endpoint still catches it. |
 | **`dialog:`** | | | | *OPTIONAL voice dialog engine timing/budgets (GDD §5.4); defaults are the tuned live values.* |
 | `dialog.window_ms` | int | `4000` | hot | Wall-clock lifetime of a wake-free window (say-again retry, code-colour opener, bare command override). DTX-proof: the dialog wheel expires it in real time, frames or no frames. |
 | `dialog.ack_grace_ms` | int | `2000` | hot | Endpoint grace after a capture opens or a prompt is spoken — cue playback plus pilot reaction time. |
@@ -1246,7 +1266,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `stt.backend` | str | **required** | restart | Which Transcriber engine to build at startup. One of: `faster-whisper`, `whisper-cpp`. |
 | `stt.model` | str | **required** | restart | Whisper model size or path. |
 | `stt.compute_type` | str | **required** | restart | CTranslate2 quantization. |
-| `stt.cpu_threads` | int | `1` | restart | Whisper inference threads. Default 1 on the 2-vCPU droplet — ON PURPOSE: a decode using BOTH cores starves the Ears real-time Opus mixer, which is exactly the 'her voice is choppy / drops out' symptom (the mixer misses its 20ms frame deadline). One thread leaves a core free for the mixer and the event loop; decodes run a little slower but the voice stays smooth. Raise only on a box with cores to spare. |
+| `stt.cpu_threads` | int | `1` | restart | Whisper inference threads. On the 2-vCPU droplet use 1 — ON PURPOSE: a decode using BOTH cores starves the Ears real-time Opus mixer, which is exactly the 'her voice is choppy / drops out' symptom (the mixer misses its 20ms frame deadline). On a dedicated ≥4-vCPU box set 2: decodes (including streaming's incremental ones, §5.5) run snappier while the high-CPUWeight mixer keeps its cores. The example config ships 2 for that box; drop to 1 if you run on 2 vCPUs. |
 | `stt.bias_with_gazetteer` | bool | `True` | restart | Pass system names as the Whisper initial_prompt. |
 | `stt.whisper_cpp_url` | str | `'http://127.0.0.1:8080/inference'` | restart | whisper.cpp server endpoint; required (non-empty) only when stt.backend is whisper-cpp (cross-checked). |
 | `stt.watchdog_s` | float | `15.0` | restart | GDD §20 "STT worker hang" watchdog deadline. The whisper-cpp HTTP timeout is derived slightly below it so the socket gives up before the watchdog abandons the worker. |
