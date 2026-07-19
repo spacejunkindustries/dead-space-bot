@@ -1,7 +1,24 @@
 # Wake-word options for CORTANA
 
 Verified against live sources 2026-07-18. CORTANA's wake detector is
-openWakeWord loading `.onnx` models — any model listed here is a drop-in:
+openWakeWord loading `.onnx` models — any model listed here is a drop-in.
+
+## Current deployment
+
+**The phrase in service is "hey cortana"**, via a community-trained model
+(openwakeword.com collection, creator #2124, spelled **"hey cortahnah"** in
+the filenames — which is why searches for "cortana" never found it). Two
+variants ship in `assets/wake/` and are installed by `install.sh` into
+`/opt/cortana/models/wake/`:
+
+| File | Arch / steps | False accepts | Role |
+|---|---|---|---|
+| `hey_cortahnah_64x1_20k.onnx` | 64×1, 20k steps | ~1.0/h benchmark | **Primary** (deployed, `threshold: 0.6`) |
+| `hey_cortahnah_128x3_80k.onnx` | 128×3, 80k steps | ~3.4/h benchmark | Fallback if the primary under-triggers |
+
+Both were validated (input shape `[1,16,96]`, sigmoid output) before
+bundling — see `assets/wake/README.md` for the deploy table. Everything
+below remains as the menu of alternatives and fallbacks.
 
 ```yaml
 # /etc/cortana/cortana.yaml
@@ -23,11 +40,13 @@ while the corp gets used to a freshly trained `hey_cortana`, then drop it.
 thresholds are not supported). A broken or missing extra is logged once and
 skipped — only a broken primary disables wake (GDD §5.1).
 
-**The headline fact: no "hey cortana" (or "cortana") model exists anywhere
-public** — not in the official set, not in the 100-model community collection,
-not in openwakeword.com's 1,239-phrase library, not on HuggingFace. The
-custom training run (`training/wake/`) is the only path to the actual phrase;
-everything below is a fallback with a *different* phrase.
+**History note:** this document originally stated no "hey cortana" model
+existed anywhere public. That was true of the *spelling* — the model that is
+now deployed was hiding in openwakeword.com's community library under the
+phonetic filename "hey cortahnah" (see Current deployment above). The custom
+training run (`training/wake/`) remains the path for additional phrases or a
+corp-specific replacement; openwakeword.com's web trainer is the low-effort
+alternative for new phrases.
 
 Phrase rules (GDD §5.2) apply to every option: **≥6 phonemes** and **nobody
 says it naturally on fleet comms**. That second rule is why some famous wake

@@ -305,7 +305,12 @@ Every entry in `wake.extra_models` (§5.1) must pass the same two rules, and the
 
 **Alternative backend: whisper.cpp HTTP server.** Selectable via `stt.backend`. Its native quantized kernels are more predictable on CPU-only hosts; the tradeoff is an extra process. Both implement the same `Transcriber` protocol.
 
-**Gazetteer biasing** is applied on every call: the active system list is passed as Whisper's `initial_prompt`, pulling decoding toward real system names instead of English word salad.
+**Prompt biasing** is applied on every call: Whisper's `initial_prompt` (and `hotwords`, where the backend supports it) carries the active system list **followed by the grammar's own trigger vocabulary** (`grammar.STT_VOCAB_BIAS` — hostiles, tackled, gate camp, code red, insult, roast, tell me a fact, …). Both halves matter, and the second was learned in the field: a names-only prompt biased the decoder so hard toward system names that casual command words came back system-shaped ("roast" → "Woust"). The vocabulary rides at the **tail** because Whisper truncates an over-long prompt from the front — the tail is the part guaranteed to survive.
+
+Two known artifacts of prompt biasing, and their owners:
+
+- **Prompt parroting.** On unclear or near-silent audio Whisper may continue the prompt instead of transcribing — a transcript that is literally a run of system names (`"Systems, Rens, Dodixie, …"`). The relay-framing gate (§8.6) is what keeps these from becoming junk cards; they die as `relay_unframed`.
+- **Phonetic mangling of trigger words** ("insult" → "Insalt", "ping me" → "pink me"). Owned by `_JARGON_NORMALIZE` in the grammar: a small, auditable table of the spellings STT actually produces, extended from `command_log` evidence whenever a real mishearing slips through — never speculatively.
 
 ### 5.4 The dialog engine — one state machine, one clock, one door
 
@@ -874,7 +879,7 @@ A tackled target that jumps out is not a new incident — it is the same inciden
 
 Entertainment for the quiet stretches between fights — designed so it can never cost the intel path anything.
 
-**Content is bundled, not fetched.** `brain/cortana/data/facts/*.json` ships ~16 categories of short, TTS-shaped true facts (space, physics, history, military, tech, animals, the human body, the ocean, gaming, math, geography, engineering, language, food, science, New Eden lore) plus a three-flavour insult pool (`insults_*.json`, each line flagged `spicy` when it carries profanity). Every line was written and then **accuracy/safety-gated offline** before shipping: no myths in the facts; no slurs, no protected-class jokes, no sexual content in the roasts — profanity is allowed (the corp's explicit choice, mirroring `tts.personality: bratty`), cruelty is not. Constraint 6 stands: serving a line is a lookup, not generation — no LLM, no network, deterministic and debuggable.
+**Content is bundled, not fetched.** `brain/cortana/data/facts/*.json` ships **1,692 facts across 16 categories** of short, TTS-shaped true facts (space, physics, history, military, tech, animals, the human body, the ocean, gaming, math, geography, engineering, language, food, science, New Eden lore) plus a three-flavour insult pool of **293 lines** (`insults_*.json` — 113 flagged `spicy` for profanity, 180 clean; each line carries the flag so the pool can be toned down without a redeploy). Every line was written and then **accuracy/safety-gated offline** before shipping: no myths in the facts; no slurs, no protected-class jokes, no sexual content in the roasts — profanity is allowed (the corp's explicit choice, mirroring `tts.personality: bratty`), cruelty is not. Constraint 6 stands: serving a line is a lookup, not generation — no LLM, no network, deterministic and debuggable.
 
 **One engine, two doors (constraint 10).** `cortana.core.fun.FunEngine` serves both the voice intents (`FACT`: *"tell me a fact"*, *"space fact"*, *"fact about the ocean"*; `INSULT`: *"insult this guy"*, *"roast Dave"*) and the slash twins `/fact [category]` / `/insult [target]`. A per-guild **shuffle bag** deals the whole deck before any repeat (and never repeats a line back-to-back across refills); facts and insults carry separate per-guild cooldowns (`fun.fact_cooldown_s` / `fun.insult_cooldown_s`).
 
@@ -1325,11 +1330,13 @@ Ubuntu 24.04 LTS
 ├── systemd
 │   ├── cortana-ears.service     Rust binary,  Restart=always, RestartSec=5
 │   └── cortana-brain.service    Python,       Restart=always, RestartSec=5
+├── /opt/aura-src/             the git clone deploys run from (git pull && bash deploy/install.sh)
 ├── /opt/cortana/
-│   ├── bin/cortana-ears
-│   ├── brain/                 venv + package
-│   └── models/{wake,whisper,piper}/
-├── /etc/cortana/{cortana.yaml,routing.yaml,gazetteer.yaml,token}
+│   ├── releases/<stamp>-<sha>/   staged releases: brain tree + venv + bin/cortana-ears (§17.5)
+│   ├── current -> releases/…     the LIVE release — an atomic symlink flip
+│   ├── models/{wake,whisper,piper}/
+│   └── alert.sh                  OnFailure= hook → webhook/alerts.log
+├── /etc/cortana/{cortana.yaml,routing.yaml,gazetteer.yaml,ears.yaml,token}
 ├── /var/lib/cortana/cortana.db
 ├── /var/lib/cortana/hf/              shared HF cache (whisper weights; HF_HOME)
 ├── /run/cortana/cortana.sock        (tmpfiles.d, mode 0660, root:aura)
@@ -1365,6 +1372,18 @@ piper                  # /usr/local/bin/piper
 
 **Never grant Administrator.** If the token leaks, an Administrator bot can ping everyone, forever.
 
+### 17.5 Staged deploys — install.sh is converge-and-verify
+
+`cd /opt/aura-src && git pull && bash deploy/install.sh` is the whole deploy. The installer is idempotent and staged; a failed deploy can strand nothing, because nothing goes live until it has been proven:
+
+1. **STAGE** — build a complete release under `/opt/cortana/releases/<stamp>-<sha>/`: the brain source tree, the sha256-verified `cortana-ears` binary fetched from the CI-published `ears-bin` branch (no GitHub token on the host), the venv, wake-model prefetch, and the bundled `assets/wake/*.onnx`.
+   - **Venv fast path**: when `requirements.txt` is unchanged from the previous complete release, the venv is hardlink-cloned (`cp -al`, seconds, ~zero RAM — the fresh-build path once thrashed the 2-vCPU droplet into a freeze while the old brain held Whisper in RAM). Two clone hazards are corrected, both learned live: cloned `bin/*` shebangs still point at the old venv's python (rewritten in place; `sed -i` replaces the inode so the write can't bleed through a hardlink), and a plain `pip install -e` skips as "already satisfied" (forced via `python -m pip … --force-reinstall`).
+   - **Self-import verification**: staging then proves, with `cwd=/` so `sys.path` can't mask it, that the staged venv imports `cortana` from **this release's** directory — and dies before the flip otherwise. A release that would run some other release's code cannot go live.
+2. **GATE** — install config examples (existing files kept), then run the **new release's** offline doctor as the service user against the live `/etc/cortana`. A FAIL aborts before anything changes. First installs run `--first-install` (missing-runtime FAILs degrade to WARN) and take an enable-only path.
+3. **FLIP** — atomically repoint `current` at the new release.
+4. **RESTART** — `cortana-brain` always; `cortana-ears` only when the binary hash or unit file changed (otherwise it keeps buffering through the brain restart — no DAVE renegotiation).
+5. **VERIFY** — settle, then check: doctor result, both units active, the Ears⇄Brain handshake, migrations at head. Any failure **auto-rolls back** to the previous release and leaves a `.verify_failed` marker on the bad one. `install.sh --rollback` flips back manually; old releases are pruned, keeping the rollback target.
+
 ---
 
 ## 18. Operations
@@ -1375,7 +1394,7 @@ piper                  # /usr/local/bin/piper
 | **Monitoring** | External uptime check against a systemd watchdog; hourly self-report to `#bot-health`. |
 | **Logs** | `journalctl`, structured JSON, 14-day retention. Transcripts of triggered commands only. |
 | **Secrets** | Token in `/etc/cortana/token`, mode 0600, loaded via `LoadCredential=` in the unit file. Never in the YAML, never in the environment, never in the repo. |
-| **Updates** | `systemctl reload cortana-brain` for config; restart for code. Ears stays connected across Brain restarts. |
+| **Updates** | Code: `cd /opt/aura-src && git pull && bash deploy/install.sh` — the staged converge-and-verify pipeline (§17.5) with auto-rollback. Config only: `systemctl reload cortana-brain` or `/reload`. Ears stays connected across Brain restarts. |
 | **Accuracy review** | Weekly `command_log` query: confidence distribution, mismatch rate by system, per-pilot failure rate. Feeds §8 tuning. |
 | **Operator slash commands** | `/botstatus`, `/doctor`, `/reload` (all admin-gated: Manage Guild or the FC role). Slash-only is fine — constraint 10 governs the voice→slash direction only. |
 

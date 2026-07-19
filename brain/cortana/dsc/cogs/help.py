@@ -310,24 +310,30 @@ HELP_TOPICS: dict[str, HelpTopic] = {
         emoji="🎲",
         title="🎲 Facts & roasts",
         description=(
-            "A big bundled library of true facts across 16 categories, plus a "
-            "roast generator — entertainment kept strictly off the intel path: "
-            "own cooldowns, and alert speech always talks over it."
+            "**1,692 true facts** across 16 categories and a **293-line roast "
+            "generator** — bundled, offline, entertainment kept strictly off "
+            "the intel path: own cooldowns, and alert speech always talks "
+            "over it."
         ),
         fields=(
             (
                 "Facts",
                 "• *“hey cortana, tell me a fact”* — speaks one into voice; add "
-                "a topic: *“space fact”*, *“fact about the ocean”*\n"
+                "a topic: *“space fact”*, *“fact about the ocean”*, *“eve fact”*\n"
                 "• `/fact [category]` — posts one in the channel you ran it in\n"
-                "Every fact was written and accuracy-checked before shipping — "
-                "no myths, no internet lookups mid-fight.",
+                "Categories: space, physics, history, military, tech, animals, "
+                "the human body, the ocean, gaming, math, geography, "
+                "engineering, language, food, science, New Eden lore. Every "
+                "fact was written and accuracy-checked before shipping — no "
+                "myths, no internet lookups mid-fight. No repeats until the "
+                "whole deck has been dealt.",
             ),
             (
                 "Roasts",
                 "• *“hey cortana, insult this guy”* / *“roast Dave”* — spoken roast\n"
                 "• `/insult [target]` — posts in-channel; naming a target renders "
                 "their @ but **never pings** them\n"
+                "Three flavours (sailor-mouth, clean burns, capsuleer-themed). "
                 "All in good fun: friendly-fire humor about piloting and gaming "
                 "skill only — no slurs, ever. `fun.insults_spicy: false` switches "
                 "to the clean-burn pool.",
