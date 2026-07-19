@@ -546,6 +546,8 @@ Either way the jump graph (`Gazetteer.jumps`/`path`, §13) always runs over the
 full seeded adjacency — pruning decides what can be *named*, never how space is
 shaped.
 
+**Two-tier resolution — the reliability safety net (`matching.full_map_fallback`, default on).** Scoping is an accuracy decision, not a hard boundary: a corp with a small scope, or one that roams a jump beyond it, must still be able to report *any* real system. So resolution runs in two tiers. **Tier 1** scores the utterance against the scoped active set *with* the context priors (§8.4) — the home-region-accurate path. **Tier 2** engages only when Tier 1 produces no confident match (LOW): the same utterance is re-scored against the **entire seeded k-space map** (metaphones for all ~5,000 systems are already computed at load, so this costs nothing until it fires), *without* the home/proximity priors (they don't apply out of region), and a MEDIUM full-map hit rides the confirm-flow. An in-region corp never pays for Tier 2; a distant or roaming report resolves instead of dropping to "unknown". This is the fix for the field report where a manual report offered only the ~8 scoped systems — **typed/slash input and autocomplete resolve over the full seeded map directly** (`Gazetteer.by_name_any` / `all_systems`), and **learned aliases resolve over the full map too** (`entry_any`), so a pilot's correction is never vetoed by scope. Set `full_map_fallback: false` to restore strict scoped-only matching.
+
 ### 8.2 Resolution pipeline
 
 ```
@@ -1235,6 +1237,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | **`matching:`** | | | | *Phonetic system-name matcher weights (constraint 7).* |
 | `matching.phonetic_weight` | float | **required** | hot | Weight of metaphone similarity (constraint 7). Must sum to 1.0 with text_weight (cross-checked). |
 | `matching.text_weight` | float | **required** | hot | Weight of raw-text Levenshtein similarity. |
+| `matching.full_map_fallback` | bool | `True` | hot | When a report doesn't confidently match the scoped active set, re-resolve against the ENTIRE seeded k-space map (GDD §8.1) so any real system still resolves — the reliability fix for a small scope or a roaming corp. The scoped set keeps home-region accuracy; the full-map pass runs without home/proximity priors and a MEDIUM hit asks to confirm. false = scoped set only (the old behaviour). |
 | `matching.tiers.high_min` | float | **required** | hot | top1 >= this (and margin) → post immediately. |
 | `matching.tiers.high_margin` | float | **required** | hot | top1 - top2 must also clear this for HIGH tier. |
 | `matching.tiers.medium_min` | float | **required** | hot | top1 >= this → post flagged uncertain, with buttons. Must be <= high_min (cross-checked). |

@@ -185,16 +185,33 @@ class FakeGazetteer:
     entries: dict[int, SystemEntry]
     home: int | None = 1
     jumps_map: dict[tuple[int, int], int] = field(default_factory=dict)
+    #: The full seeded map for two-tier resolution (GDD §8.1). Defaults to the
+    #: scoped ``entries`` so the full-map fallback is a no-op unless a test
+    #: supplies extra out-of-scope systems here.
+    all_entries: dict[int, SystemEntry] | None = None
 
     @property
     def systems(self) -> tuple[SystemEntry, ...]:
         return tuple(self.entries.values())
 
+    @property
+    def all_systems(self) -> tuple[SystemEntry, ...]:
+        return tuple((self.all_entries or self.entries).values())
+
     def by_id(self, system_id: int) -> SystemEntry | None:
         return self.entries.get(system_id)
 
+    def entry_any(self, system_id: int) -> SystemEntry | None:
+        return self.entries.get(system_id) or (self.all_entries or {}).get(system_id)
+
     def by_name(self, name: str) -> SystemEntry | None:
         for entry in self.entries.values():
+            if entry.name.lower() == name.lower():
+                return entry
+        return None
+
+    def by_name_any(self, name: str) -> SystemEntry | None:
+        for entry in (self.all_entries or self.entries).values():
             if entry.name.lower() == name.lower():
                 return entry
         return None

@@ -35,7 +35,7 @@ import structlog
 
 from cortana.config import MatchingConfig, PriorsConfig, TiersConfig
 from cortana.core import db
-from cortana.types import MatchCandidate, PriorContext, Resolution, Tier
+from cortana.types import MatchCandidate, PriorContext, Resolution, SystemEntry, Tier
 
 if TYPE_CHECKING:  # pragma: no cover — import cycle guard only
     from cortana.nlu.gazetteer import Gazetteer
@@ -566,8 +566,11 @@ def _alias_lookup(
         (key,),
     )
     for row in rows:
-        entry = gazetteer.by_id(row["system_id"])
-        if entry is not None:  # aliases to since-pruned systems are skipped
+        # entry_any, not by_id: a learned alias must resolve even to a system
+        # outside the current scope (a corp that moved, or a distant report) —
+        # the alias table IS the pilot's correction, scope must not veto it.
+        entry = gazetteer.entry_any(row["system_id"])
+        if entry is not None:  # aliases to systems missing from the seed skipped
             return MatchCandidate(system_id=entry.id, name=entry.name, score=1.0)
     return None
 
@@ -592,11 +595,43 @@ def resolve(
             return Resolution(tier=Tier.HIGH, candidates=(hit,))
 
     tokens = normalize(text)
-    systems = gazetteer.systems
-    if not tokens or not systems:
+    if not tokens:
         return Resolution(tier=Tier.LOW, candidates=())
-
     windows = _windows(tokens)
+
+    # Tier 1: the scoped active set, WITH context priors (home bias, proximity,
+    # recency) — small pool, home-region accuracy (GDD §8.2/§8.4).
+    scoped = _score_pool(windows, gazetteer.systems, priors, cfg, gazetteer)
+
+    # Tier 2 (GDD §8.1): if the scoped set produced no confident match, re-score
+    # against the ENTIRE seeded k-space map so a report of ANY real system still
+    # resolves — the fix for a corp whose scope is small or who roams. The
+    # home/proximity priors naturally don't fire out of region, so the full-map
+    # pass runs without them; a MEDIUM full-map hit rides the confirm-first flow
+    # (§8.3). Only engaged when scoped failed AND the full map is genuinely
+    # wider, so an in-region corp pays nothing.
+    if (
+        cfg.full_map_fallback
+        and scoped.tier is Tier.LOW
+        and len(gazetteer.all_systems) > len(gazetteer.systems)
+    ):
+        full = _score_pool(windows, gazetteer.all_systems, priors, cfg, gazetteer)
+        if full.tier is not Tier.LOW:
+            log.info("full_map_fallback_hit", raw=text.strip().lower(), tier=str(full.tier))
+            return full
+    return scoped
+
+
+def _score_pool(
+    windows: list[str],
+    systems: tuple[SystemEntry, ...],
+    priors: PriorContext,
+    cfg: MatchingConfig,
+    gazetteer: Gazetteer,
+) -> Resolution:
+    """Score the sliding windows against one system pool and rank (GDD §8.2)."""
+    if not systems:
+        return Resolution(tier=Tier.LOW, candidates=())
     best_base: dict[int, float] = {}
     names: dict[int, str] = {}
     for entry in systems:

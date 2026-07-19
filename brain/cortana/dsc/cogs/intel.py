@@ -68,19 +68,34 @@ _AUDIENCE_ALIAS: dict[str, str] = {
 async def system_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
-    """Autocomplete from the gazetteer's pruned active set (GDD §8.1)."""
+    """Autocomplete over the FULL seeded k-space map (GDD §8.1).
+
+    Typed reports may name any real system, not just the scoped active set —
+    autocompleting only the active set is what made a manual report offer
+    ~8 systems (field report). The scoped set is surfaced FIRST (home region
+    is what pilots usually want), then the rest of k-space fills in.
+    """
     bot = cast("AuraBot", interaction.client)
     needle = current.strip().lower()
-    prefix: list[str] = []
-    contains: list[str] = []
-    for entry in bot.gazetteer.systems:
-        name = entry.name
-        lowered = name.lower()
+    scoped_ids = {e.id for e in bot.gazetteer.systems}
+    scoped_prefix: list[str] = []
+    scoped_contains: list[str] = []
+    other_prefix: list[str] = []
+    other_contains: list[str] = []
+    for entry in bot.gazetteer.all_systems:
+        lowered = entry.name.lower()
+        in_scope = entry.id in scoped_ids
         if not needle or lowered.startswith(needle):
-            prefix.append(name)
+            (scoped_prefix if in_scope else other_prefix).append(entry.name)
         elif needle in lowered:
-            contains.append(name)
-    names = sorted(prefix) + sorted(contains)
+            (scoped_contains if in_scope else other_contains).append(entry.name)
+    # Home-region matches first, then the rest of the map — each block sorted.
+    names = (
+        sorted(scoped_prefix)
+        + sorted(scoped_contains)
+        + sorted(other_prefix)
+        + sorted(other_contains)
+    )
     return [app_commands.Choice(name=n, value=n) for n in names[:25]]
 
 

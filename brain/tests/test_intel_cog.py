@@ -188,3 +188,27 @@ async def test_relay_is_guild_only() -> None:
     await IntelCog.relay.callback(cog, interaction, "some intel")
     assert engine.calls == []
     assert interaction.response.messages == ["Guild only."]
+
+
+# ── autocomplete offers the full seeded map, not just the scoped set ─────────
+
+
+async def test_autocomplete_offers_out_of_scope_systems() -> None:
+    # The "manual report only listed ~8 systems" fix: autocomplete must reach
+    # the full seeded map, with the scoped set surfaced first (GDD §8.1).
+    from cortana.dsc.cogs.intel import system_autocomplete
+    from cortana.types import SystemEntry
+
+    scoped = SystemEntry(id=1, name="Otanuomi", region="Home", constellation=None, metaphone="ATNM")
+    distant = SystemEntry(id=2, name="Otawa", region="Faraway", constellation=None, metaphone="AT")
+
+    class _Gaz:
+        systems = (scoped,)
+        all_systems = (scoped, distant)
+
+    interaction = SimpleNamespace(client=SimpleNamespace(gazetteer=_Gaz()))
+    choices = await system_autocomplete(interaction, "ota")  # type: ignore[arg-type]
+    names = [c.value for c in choices]
+    assert "Otanuomi" in names  # scoped
+    assert "Otawa" in names  # out of scope, but still offered
+    assert names.index("Otanuomi") < names.index("Otawa")  # home region first

@@ -263,6 +263,11 @@ class MatchingConfig:
     text_weight: float
     tiers: TiersConfig
     priors: PriorsConfig
+    #: Two-tier resolution (GDD §8.1): on a LOW-tier scoped match, fall back to
+    #: scoring against the full seeded k-space map so any real system resolves.
+    #: The reliability fix for a small scope / roaming corp; scoped accuracy is
+    #: untouched (the fallback only runs when the scoped set already failed).
+    full_map_fallback: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -667,6 +672,7 @@ def _assemble_matching(v: dict[str, Any]) -> MatchingConfig:
     return MatchingConfig(
         phonetic_weight=v["matching.phonetic_weight"],
         text_weight=v["matching.text_weight"],
+        full_map_fallback=v["matching.full_map_fallback"],
         tiers=TiersConfig(
             high_min=v["matching.tiers.high_min"],
             high_margin=v["matching.tiers.high_margin"],

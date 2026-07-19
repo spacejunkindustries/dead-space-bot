@@ -80,11 +80,23 @@ class FakeGazetteer:
     def systems(self) -> tuple[SystemEntry, ...]:
         return self.entries
 
+    @property
+    def all_systems(self) -> tuple[SystemEntry, ...]:
+        # Full seeded map defaults to the scoped set: the two-tier fallback is a
+        # no-op here (len equal) unless a test sets ``full_entries``.
+        return getattr(self, "full_entries", self.entries)
+
     def by_id(self, system_id: int) -> SystemEntry | None:
         return next((e for e in self.entries if e.id == system_id), None)
 
+    def entry_any(self, system_id: int) -> SystemEntry | None:
+        return next((e for e in self.all_systems if e.id == system_id), None)
+
     def by_name(self, name: str) -> SystemEntry | None:
         return next((e for e in self.entries if e.name.lower() == name.lower()), None)
+
+    def by_name_any(self, name: str) -> SystemEntry | None:
+        return next((e for e in self.all_systems if e.name.lower() == name.lower()), None)
 
     def jumps(self, a: int, b: int) -> int | None:
         if a == b:
@@ -457,3 +469,62 @@ def test_spec_sentence_end_to_end() -> None:
     assert r.best is not None
     assert r.best.name == "M-OEE8"
     assert r.tier is Tier.HIGH
+
+
+# ── two-tier resolution: full k-space fallback (GDD §8.1) ────────────────────
+
+
+def test_full_map_fallback_resolves_out_of_scope_system() -> None:
+    # The scoped set is tiny (the "she only knows 8 systems" field report);
+    # a report names a system that exists in the seed but not the scope.
+    scoped = FakeGazetteer(names=["Otanuomi", "Kisogo"])
+    faraway = SystemEntry(
+        id=999,
+        name="Tama",
+        region="The Citadel",
+        constellation=None,
+        metaphone=double_metaphone("Tama")[0],
+    )
+    scoped.full_entries = scoped.entries + (faraway,)
+    r = resolve("Tama", scoped, NO_PRIORS, CFG, conn=None)
+    assert r.best is not None and r.best.name == "Tama"
+    assert r.tier is not Tier.LOW
+
+
+def test_full_map_fallback_off_keeps_scoped_only() -> None:
+    cfg = MatchingConfig(
+        phonetic_weight=0.6,
+        text_weight=0.4,
+        full_map_fallback=False,
+        tiers=CFG.tiers,
+        priors=CFG.priors,
+    )
+    scoped = FakeGazetteer(names=["Otanuomi", "Kisogo"])
+    faraway = SystemEntry(
+        id=999,
+        name="Tama",
+        region="The Citadel",
+        constellation=None,
+        metaphone=double_metaphone("Tama")[0],
+    )
+    scoped.full_entries = scoped.entries + (faraway,)
+    r = resolve("Tama", scoped, NO_PRIORS, cfg, conn=None)
+    # With the fallback disabled, an out-of-scope name cannot resolve.
+    assert r.best is None or r.best.name != "Tama"
+
+
+def test_scoped_match_never_triggers_fallback() -> None:
+    # A confident in-scope hit must resolve from the scoped set — the fallback
+    # is only a safety net, never the primary path (home-region accuracy).
+    scoped = FakeGazetteer(names=["Otanuomi", "Kisogo"])
+    scoped.full_entries = scoped.entries + (
+        SystemEntry(
+            id=999,
+            name="Otanuomi II",
+            region="X",
+            constellation=None,
+            metaphone=double_metaphone("Otanuomi II")[0],
+        ),
+    )
+    r = resolve("Otanuomi", scoped, NO_PRIORS, CFG, conn=None)
+    assert r.best is not None and r.best.name == "Otanuomi"

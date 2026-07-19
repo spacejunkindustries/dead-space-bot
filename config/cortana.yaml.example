@@ -147,6 +147,13 @@ stt:
 matching:
   phonetic_weight: 0.6                 # weight of metaphone similarity (constraint 7)
   text_weight: 0.4                     # weight of raw-text Levenshtein similarity
+  full_map_fallback: true              # two-tier resolution (GDD §8.1): if a report doesn't
+                                       # confidently match the SCOPED set, re-resolve against
+                                       # the ENTIRE seeded k-space map so ANY real system still
+                                       # resolves — the fix for a small scope / roaming corp.
+                                       # Scoped accuracy is untouched (the fallback only runs
+                                       # when the scoped set already failed). false = old
+                                       # scoped-only behaviour.
   tiers:                               # confidence tiers — GDD §8.3
     high_min: 0.80                     # top1 >= this ...
     high_margin: 0.12                  # ... and top1 - top2 >= this → post immediately

@@ -130,6 +130,15 @@ class Gazetteer:
         self._dist_memo: dict[int, dict[int, int]] = {}
         self._parent_memo: dict[int, dict[int, int]] = {}
         self._all_names: dict[int, str] = {}
+        #: The ENTIRE seeded k-space map (all ~5000 systems), retained with
+        #: precomputed metaphones — the second tier behind the scoped active
+        #: set. A scoped gazetteer keeps home-region accuracy (priors, small
+        #: pool), but a report of ANY real system still resolves against this
+        #: (GDD §8.1, the two-tier resolver): the fix for "she only knows 8
+        #: systems" without widening the accuracy-critical scoped set.
+        self._all_systems: tuple[SystemEntry, ...] = ()
+        self._all_by_id: dict[int, SystemEntry] = {}
+        self._all_by_name: dict[str, SystemEntry] = {}
         self._home_system_id: int | None = None
         self._prompt_bias: str = ""
 
@@ -245,6 +254,11 @@ class Gazetteer:
         self._dist_memo = {}
         self._parent_memo = {}
         self._all_names = {e.id: e.name for e in all_by_id.values()}
+        # Retain the full seeded map (metaphones already computed above) as the
+        # second resolution tier — sorted for stable autocomplete ordering.
+        self._all_systems = tuple(sorted(all_by_id.values(), key=lambda e: e.name.lower()))
+        self._all_by_id = all_by_id
+        self._all_by_name = all_by_name
         self._home_system_id = home.id if home is not None else None
         self._systems = systems
         self._prompt_bias = _build_prompt_bias(
@@ -289,19 +303,41 @@ class Gazetteer:
 
     @property
     def systems(self) -> tuple[SystemEntry, ...]:
-        """The pruned active set, sorted by name."""
+        """The pruned active set, sorted by name — the accuracy-scoped tier."""
         return self._systems
+
+    @property
+    def all_systems(self) -> tuple[SystemEntry, ...]:
+        """The ENTIRE seeded k-space map — the second resolution tier (GDD
+        §8.1). Falls back to the active set only if the full set is empty
+        (defensive; ``load()`` always populates it)."""
+        return self._all_systems or self._systems
 
     @property
     def home_system_id(self) -> int | None:
         return self._home_system_id
 
     def by_id(self, system_id: int) -> SystemEntry | None:
+        """Active-set id lookup. Scoped ON PURPOSE — priors/routing use this to
+        mean 'in the operational region'. Use :meth:`entry_any` for a name that
+        must resolve regardless of scope (learned aliases, distant reports)."""
         return self._by_id.get(system_id)
+
+    def entry_any(self, system_id: int) -> SystemEntry | None:
+        """Id lookup over the FULL seeded map — the active set first (so a
+        scoped entry with its region metadata wins), then any seeded system."""
+        return self._by_id.get(system_id) or self._all_by_id.get(system_id)
 
     def by_name(self, name: str) -> SystemEntry | None:
         """Case-insensitive exact name lookup within the active set."""
         return self._by_name.get(name.strip().lower())
+
+    def by_name_any(self, name: str) -> SystemEntry | None:
+        """Case-insensitive exact name lookup over the FULL seeded map — for
+        typed/slash input, which may name any real k-space system, not just
+        the scoped set (the "manual report only offered 8 systems" fix)."""
+        key = name.strip().lower()
+        return self._by_name.get(key) or self._all_by_name.get(key)
 
     def jumps(self, a_id: int, b_id: int) -> int | None:
         """Jump distance over the full adjacency graph; None if disconnected.

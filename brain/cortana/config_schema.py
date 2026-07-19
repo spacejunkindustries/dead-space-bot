@@ -509,6 +509,18 @@ KEYS: Final[tuple[Key, ...]] = (
         maximum=1.0,
     ),
     Key(
+        "matching.full_map_fallback",
+        "bool",
+        Reload.HOT,
+        "When a report doesn't confidently match the scoped active set, "
+        "re-resolve against the ENTIRE seeded k-space map (GDD §8.1) so any "
+        "real system still resolves — the reliability fix for a small scope "
+        "or a roaming corp. The scoped set keeps home-region accuracy; the "
+        "full-map pass runs without home/proximity priors and a MEDIUM hit "
+        "asks to confirm. false = scoped set only (the old behaviour).",
+        default=True,
+    ),
+    Key(
         "matching.tiers.high_min",
         "float",
         Reload.HOT,
