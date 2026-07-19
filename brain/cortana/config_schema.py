@@ -444,7 +444,14 @@ KEYS: Final[tuple[Key, ...]] = (
         "stt.cpu_threads",
         "int",
         Reload.RESTART,
-        "Inference threads (the droplet has 2 dedicated vCPUs).",
+        "Whisper inference threads. Default 1 on the 2-vCPU droplet — ON "
+        "PURPOSE: a decode using BOTH cores starves the Ears real-time Opus "
+        "mixer, which is exactly the 'her voice is choppy / drops out' "
+        "symptom (the mixer misses its 20ms frame deadline). One thread "
+        "leaves a core free for the mixer and the event loop; decodes run a "
+        "little slower but the voice stays smooth. Raise only on a box with "
+        "cores to spare.",
+        default=1,
         minimum=0,
         exclusive_minimum=True,
     ),

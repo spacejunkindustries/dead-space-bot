@@ -126,7 +126,8 @@ stt:
   backend: faster-whisper              # or: whisper-cpp (same Transcriber protocol)
   model: small                         # Whisper model size
   compute_type: int8                   # CTranslate2 quantization
-  cpu_threads: 2                       # inference threads (droplet has 2 dedicated vCPUs)
+  cpu_threads: 1                       # ONE Whisper thread: 2 starves the Ears real-time
+                                       # mixer and makes her voice choppy (GDD §12/§17).
   bias_with_gazetteer: true            # pass system names as Whisper initial_prompt
   whisper_cpp_url: http://127.0.0.1:8080/inference  # used only when backend: whisper-cpp
   watchdog_s: 15                       # hang watchdog (GDD §20): seconds one decode may run

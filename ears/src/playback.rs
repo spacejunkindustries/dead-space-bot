@@ -32,11 +32,23 @@ pub const PRIORITY_LOW: u8 = 0;
 pub const PRIORITY_NORMAL: u8 = 1;
 pub const PRIORITY_ALERT: u8 = 2;
 
-/// Volume while a human is talking over playback.
-const DUCK_TO: f32 = 0.6;
-/// How recently a tick must have carried human audio to count as
-/// "someone is speaking right now" (a handful of 20 ms ticks).
+/// Volume while a human is talking over playback. 0.75 (not the old hard 0.6)
+/// keeps her clearly intelligible through the duck — a shallow duck pumps less
+/// audibly than a deep one (GDD §12).
+const DUCK_TO: f32 = 0.75;
+/// Attack window: this recently a tick must have carried human audio to START
+/// ducking (a handful of 20 ms ticks).
 const SPEECH_ACTIVE_WINDOW: Duration = Duration::from_millis(250);
+/// Release window (hysteresis): once ducked, she STAYS ducked until speech has
+/// been absent this long. Longer than the attack window so a normal inter-word
+/// pause (DTX drops packets between words) can't un-duck her mid-sentence and
+/// pump the volume — the "her voice goes in and out" fix.
+const SPEECH_RELEASE_WINDOW: Duration = Duration::from_millis(700);
+/// Per-100ms-tick volume glide: attack (ducking down) is quicker than release
+/// (returning up), so she dips promptly out of the pilot's way and eases back
+/// smoothly. A hard step is what made the volume pump audibly.
+const VOLUME_STEP_DOWN: f32 = 0.10;
+const VOLUME_STEP_UP: f32 = 0.06;
 /// Longest a non-alert utterance is held back for human speech before being
 /// dropped as stale (GDD §12.2).
 const HOLD_MAX: Duration = Duration::from_secs(3);
@@ -204,7 +216,45 @@ pub fn hold_outcome(priority: u8, human_speaking: bool, blocked_for: Duration) -
 struct Playing {
     handle: TrackHandle,
     job: TtsJob,
-    ducked: bool,
+    /// Current applied volume, glided toward the duck target each tick. 1.0 =
+    /// full; DUCK_TO = fully ducked. Replaces the old on/off `ducked` bool so
+    /// the transition ramps instead of stepping.
+    volume: f32,
+}
+
+/// The volume this utterance should be heading toward, WITH release hysteresis.
+/// While already ducked (`volume < 1.0`) she needs the longer RELEASE window of
+/// silence to come back up; while at full volume she ducks on the shorter
+/// ATTACK window of speech. This asymmetry is what stops inter-word pauses from
+/// pumping her volume (GDD §12).
+#[must_use]
+pub fn duck_target(volume: f32, human_attack: bool, human_release: bool) -> f32 {
+    let ducking_now = volume < 1.0;
+    let should_duck = if ducking_now { human_release } else { human_attack };
+    if should_duck {
+        DUCK_TO
+    } else {
+        1.0
+    }
+}
+
+/// One tick of the volume glide toward `target`: quick attack down, slower
+/// release up, clamped to `[DUCK_TO, 1.0]`. Pure and exhaustively testable.
+#[must_use]
+pub fn next_volume(current: f32, target: f32) -> f32 {
+    let stepped = if target < current {
+        current - VOLUME_STEP_DOWN
+    } else if target > current {
+        current + VOLUME_STEP_UP
+    } else {
+        return current;
+    };
+    // Never overshoot the target, and never leave the legal band.
+    if target < current {
+        stepped.max(target).clamp(DUCK_TO, 1.0)
+    } else {
+        stepped.min(target).clamp(DUCK_TO, 1.0)
+    }
 }
 
 /// Per-guild playback engine: queue and playing slot. Hold timers ride on
@@ -279,7 +329,9 @@ async fn maintain_guild(
     guild_id: u64,
     engine: &mut GuildPlayback,
 ) {
-    let human = shared.guild(guild_id).speech_within(SPEECH_ACTIVE_WINDOW);
+    let gv = shared.guild(guild_id);
+    let human_attack = gv.speech_within(SPEECH_ACTIVE_WINDOW);
+    let human_release = gv.speech_within(SPEECH_RELEASE_WINDOW);
 
     // Reap the current track if it finished (or its handle died).
     if let Some(current) = engine.playing.take() {
@@ -288,7 +340,7 @@ async fn maintain_guild(
                 debug!(guild_id, "utterance finished");
             },
             Ok(_state) => {
-                engine.playing = Some(duck(current, human));
+                engine.playing = Some(ramp(current, human_attack, human_release));
             },
             Err(_) => {
                 debug!(guild_id, "track handle gone; treating utterance as finished");
@@ -308,10 +360,10 @@ async fn maintain_guild(
     // (that would let it play far past HOLD_MAX, or never drop at all).
     let now = Instant::now();
     let blocked_for = engine.queue.head_blocked_for(now);
-    match hold_outcome(priority, human, blocked_for) {
+    match hold_outcome(priority, human_attack, blocked_for) {
         HoldOutcome::Start => {
             if let Some(job) = engine.queue.pop() {
-                engine.playing = start(manager, human, job).await;
+                engine.playing = start(manager, human_attack, job).await;
             }
         },
         HoldOutcome::Hold => {
@@ -332,12 +384,15 @@ async fn maintain_guild(
     }
 }
 
-/// Apply/release ducking on the playing track when human speech starts/stops.
-fn duck(mut current: Playing, human: bool) -> Playing {
-    if human != current.ducked {
-        let target = if human { DUCK_TO } else { 1.0 };
-        match current.handle.set_volume(target) {
-            Ok(()) => current.ducked = human,
+/// Glide the playing track's volume one tick toward its duck target. Only
+/// touches Songbird when the volume actually changes, so a steady state costs
+/// nothing; the ramp (not a hard step) is what removes the audible pump.
+fn ramp(mut current: Playing, human_attack: bool, human_release: bool) -> Playing {
+    let target = duck_target(current.volume, human_attack, human_release);
+    let next = next_volume(current.volume, target);
+    if (next - current.volume).abs() > f32::EPSILON {
+        match current.handle.set_volume(next) {
+            Ok(()) => current.volume = next,
             Err(e) => debug!(error = %e, "set_volume on finished track"),
         }
     }
@@ -369,23 +424,20 @@ async fn start(manager: &Arc<Songbird>, human_speaking: bool, job: TtsJob) -> Op
         call.play_input(input)
     };
 
-    // If someone is already talking, start ducked.
-    let mut ducked = false;
+    // If someone is already talking, start ducked; otherwise full volume. The
+    // ramp takes over from here on each maintenance tick.
+    let mut volume = 1.0;
     if human_speaking && handle.set_volume(DUCK_TO).is_ok() {
-        ducked = true;
+        volume = DUCK_TO;
     }
 
     debug!(
         guild_id = job.guild_id,
         priority = job.priority,
-        ducked,
+        volume,
         "utterance started"
     );
-    Some(Playing {
-        handle,
-        job,
-        ducked,
-    })
+    Some(Playing { handle, job, volume })
 }
 
 #[cfg(test)]
@@ -503,6 +555,58 @@ mod tests {
         assert!(q.mark_head_blocked(t0));
         assert_eq!(q.pop().map(|j| j.wav[0]), Some(1));
         assert_eq!(q.head_blocked_for(t0 + HOLD_MAX), Duration::ZERO);
+    }
+
+    #[test]
+    fn duck_target_engages_on_attack_releases_on_hysteresis() {
+        // At full volume: duck only when speech is in the short attack window.
+        assert_eq!(duck_target(1.0, true, true), DUCK_TO);
+        assert_eq!(duck_target(1.0, false, true), 1.0); // release-only ≠ attack
+        assert_eq!(duck_target(1.0, false, false), 1.0);
+        // Already ducked: STAY ducked while speech is within the release window
+        // (an inter-word gap keeps human_release true) — no mid-sentence pump.
+        assert_eq!(duck_target(DUCK_TO, false, true), DUCK_TO);
+        // Only a full release window of silence brings her back up.
+        assert_eq!(duck_target(DUCK_TO, false, false), 1.0);
+    }
+
+    #[test]
+    fn next_volume_ramps_and_never_overshoots() {
+        // Attack (down) is quicker than release (up).
+        assert!((next_volume(1.0, DUCK_TO) - (1.0 - VOLUME_STEP_DOWN)).abs() < 1e-6);
+        assert!((next_volume(DUCK_TO, 1.0) - (DUCK_TO + VOLUME_STEP_UP)).abs() < 1e-6);
+        // Never overshoots the target in either direction.
+        assert_eq!(next_volume(DUCK_TO + 0.01, DUCK_TO), DUCK_TO);
+        assert_eq!(next_volume(1.0 - 0.01, 1.0), 1.0);
+        // A no-op when already there.
+        assert_eq!(next_volume(1.0, 1.0), 1.0);
+        assert_eq!(next_volume(DUCK_TO, DUCK_TO), DUCK_TO);
+    }
+
+    #[test]
+    fn next_volume_stays_in_band() {
+        // The glide can never leave [DUCK_TO, 1.0] even from a bad start.
+        for &start in &[DUCK_TO, 0.8, 0.9, 1.0] {
+            let v = next_volume(start, 1.0);
+            assert!((DUCK_TO..=1.0).contains(&v), "up from {start} -> {v}");
+            let v = next_volume(start, DUCK_TO);
+            assert!((DUCK_TO..=1.0).contains(&v), "down from {start} -> {v}");
+        }
+    }
+
+    #[test]
+    fn full_duck_cycle_glides_both_ways() {
+        // A sustained talk-over ramps down to DUCK_TO over a few ticks, holds,
+        // then glides back to full when the pilot stops — no hard steps.
+        let mut v = 1.0;
+        for _ in 0..20 {
+            v = next_volume(v, duck_target(v, true, true));
+        }
+        assert!((v - DUCK_TO).abs() < 1e-6, "settled at duck floor: {v}");
+        for _ in 0..40 {
+            v = next_volume(v, duck_target(v, false, false));
+        }
+        assert!((v - 1.0).abs() < 1e-6, "returned to full: {v}");
     }
 
     #[test]
