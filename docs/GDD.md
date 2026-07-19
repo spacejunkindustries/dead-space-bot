@@ -658,6 +658,7 @@ Incident
 - *"Hey Cortana, clear Otanuomi"* edits that card to ✅ **RESOLVED** and greys it out.
 - Someone scrolling back reads **state**, not archaeology.
 - No updates for 20 minutes → auto-marked **STALE**, silently. Form-ups are exempt: a rally card legitimately sits quiet until it fires — its staleness is anchored by its countdown timer (§13), not by update chatter.
+- No updates for `incidents.auto_resolve_min` (default 60) → auto-**RESOLVED**, silently, in place — STALE is the waypoint, this is the terminus (field request: cards sat open forever unless someone cleared them). Timers *and* form-ups are exempt here — a four-hour structure timer must not vanish at the one-hour mark. `0` disables: cards then live until `/clear`, the card button, or `/clearall`.
 
 **Render-then-deliver.** Every engine method mutates the database and renders the card *under* the engine lock, then hands the Discord I/O to a single deliverer that runs *after* the lock is released. Discord can sleep on rate-limit buckets mid-call; under flood conditions a rate-limited edit must never block the 3-second button-interaction window. One failure policy covers every path: a fresh card's **post** failure raises `PostError` and rolls the incident row (and any discipline charge) back; an **edit** is best-effort — the DB row is the state — except for a lost message.
 
@@ -1243,6 +1244,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | **`incidents:`** | | | | *Dedupe / staleness / cancel windows.* |
 | `incidents.dedupe_window_s` | int | **required** | hot | Same system + type within this window → fold (GDD §9.2). |
 | `incidents.stale_after_min` | int | **required** | hot | No updates for this long → auto-STALE, silently. |
+| `incidents.auto_resolve_min` | int | `60` | hot | No updates for this long → auto-RESOLVE: the card closes in place, silently, instead of sitting open until someone clears it. Timers and form-ups are exempt (their lifecycle anchors on fires_at). 0 = never auto-resolve. |
 | `incidents.cancel_window_s` | int | **required** | hot | "hey cortana, cancel" kills the user's last incident inside this. |
 | **`discipline:`** | | | | *Mention cooldowns and the flood breaker.* |
 | `discipline.user_cooldown_s` | int | **required** | hot | Min seconds between mentions from the same pilot. |

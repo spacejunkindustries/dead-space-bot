@@ -720,11 +720,14 @@ class App:
             # renegotiation) over what was a one-off REST failure.
             try:
                 stale = await self.engine.sweep_stale()
+                resolved = await self.engine.sweep_auto_resolve()
             except Exception:
                 log.exception("sweep_iteration_failed")
                 continue
             if stale:
                 log.info("incidents_marked_stale", ids=stale)
+            if resolved:
+                log.info("incidents_auto_closed", ids=resolved)
 
     async def _timer_loop(self) -> None:
         assert self.engine and self.bot
