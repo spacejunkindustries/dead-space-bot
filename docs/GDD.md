@@ -446,13 +446,18 @@ Fifteen commands. Short enough that pilots remember them under fire, which is th
 
 *"Command override, what's the weather in Chicago?"*
 
-An **explicitly-invoked** chat channel, off by default (`chat.enabled`). When a pilot opens an utterance with *"command override"* (after the wake word), everything that follows goes to a cloud Claude model — general questions, banter, live facts via one web search — and the answer is spoken back (or posted to the intel channel when it exceeds the §12.2 cap, with *"Answer posted to Discord."* spoken instead). Slash twin: `/ask` (constraint 10), sharing the same client and the same per-pilot cooldown.
+An **explicitly-invoked** chat channel, off by default (`chat.enabled`). When a pilot opens an utterance with *"command override"* (after the wake word), everything that follows goes to a language model — general questions, banter, live facts — and the answer is spoken back (or posted to the intel channel when it exceeds the §12.2 cap, with *"Answer posted to Discord."* spoken instead). Slash twin: `/ask` (constraint 10), sharing the same client and the same per-pilot cooldown.
 
-**Constraint 6 is untouched.** The incident grammar never sees an LLM: the override prefix is matched *first* and only in leading position, so a report containing the word "override" mid-sentence can never be diverted, and a non-override utterance never reaches the model. The model is instructed to never invent in-game intel — hostiles, timers, and system status come only from CORTANA's own reports.
+**Two backends, one contract (`chat.backend`).** Both satisfy the same `ChatBackend` protocol — one `ask()` — so the dialog engine and `/ask` never care which is live:
 
-**Cost posture.** Default model is the cheapest Claude tier (fractions of a cent per question); replies are capped at `chat.max_tokens`, web search at one per question, and `chat.user_cooldown_s` throttles each pilot. The cooldown arms only on a successful answer — a failed request must not turn the pilot's retry into a throttle message. The API key rides systemd `LoadCredential=` (`anthropic:` credential; constraint 12), with `chat.api_key_file` as the 0600 dev fallback.
+- **`anthropic`** (default) — a cloud Claude model, with one optional live web search per question (weather, prices). Costs per question; needs a key.
+- **`local`** — an **on-box** OpenAI-compatible server (llama.cpp's `server`, Ollama, …) at `chat.local_url`. This is the **SLM lane**: conversational back-and-forth that runs entirely on the droplet — no API, no key, no per-question cost, no network egress. The pilot wanted CORTANA to "talk back and forth" without paying an API; this is that, on the same hardware the bot already runs on. Deploying the model + server (choosing a small quantised model that fits alongside Whisper and Piper in the box's RAM) is an operator step — CORTANA points at the URL, it does not host the model. No web search (a local model has no such tool).
 
-**Liveness.** The whole `chat:` section applies on SIGHUP — flipping `chat.enabled` or dropping a key into place takes effect on `systemctl reload cortana-brain`, no restart. A spoken "command override …" while the channel is down always gets the fixed *"Override channel unavailable."* line (never a silent fall-through to the grammar), and `/ask` distinguishes "not enabled" from "enabled but no key loaded".
+**Constraint 6 is untouched, either way.** The incident grammar never sees an LLM: the override prefix is matched *first* and only in leading position, so a report containing the word "override" mid-sentence can never be diverted, and a non-override utterance never reaches the model. Both backends are instructed to never invent in-game intel — hostiles, timers, and system status come only from CORTANA's own reports. The SLM is a conversation partner, never an interpreter of reports.
+
+**Cost posture.** For `anthropic`, the default model is the cheapest Claude tier (fractions of a cent per question); replies are capped at `chat.max_tokens`, web search at one per question, and `chat.user_cooldown_s` throttles each pilot. For `local`, there is no per-question cost — but the cooldown still applies (it also paces the box's CPU, shared with Whisper). Either way the cooldown arms only on a successful answer — a failed request must not turn the pilot's retry into a throttle message. The Claude key rides systemd `LoadCredential=` (`anthropic:` credential; constraint 12), with `chat.api_key_file` as the 0600 dev fallback; the local backend needs no credential.
+
+**Liveness.** The whole `chat:` section applies on SIGHUP — flipping `chat.enabled`, switching `chat.backend`, or dropping a key into place takes effect on `systemctl reload cortana-brain`, no restart. A spoken "command override …" while the channel is down always gets the fixed *"Override channel unavailable."* line (never a silent fall-through to the grammar), and `/ask` distinguishes the down states: "not enabled", "no key" (anthropic), and "no url" (local).
 
 ---
 
@@ -1309,8 +1314,10 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `fun.insults_spicy` | bool | `True` | hot | true = the full sailor-mouth pool; false = clean burns only. |
 | `fun.max_speak_s` | float | `20.0` | hot | Spoken-length cap for facts/insults, overriding tts.max_utterance_s — a whole fact runs longer than a command reply. |
 | **`chat:`** | | | | *OPTIONAL "command override" assistant (GDD §6.6); absent = off.* |
-| `chat.enabled` | bool | `False` | sighup | Pilots can say "command override, <question>" (/ask twin). Costs real money per question. |
-| `chat.model` | str | `'claude-haiku-4-5'` | hot | Claude model for override replies. |
+| `chat.enabled` | bool | `False` | sighup | Pilots can say "command override, <question>" (/ask twin). |
+| `chat.backend` | str | `'anthropic'` | sighup | Who answers override questions: `anthropic` = cloud Claude (needs a key, costs per question); `local` = an on-box OpenAI-compatible server at `chat.local_url` (no API, no key, no per-question cost) — the SLM lane. Still OFF the command path (constraint 6). One of: `anthropic`, `local`. |
+| `chat.local_url` | str | `''` | sighup | OpenAI-compatible chat-completions endpoint for `backend='local'` (e.g. `http://127.0.0.1:8081/v1/chat/completions` from llama.cpp/Ollama). Empty = unset. Deploy the model + server yourself. |
+| `chat.model` | str | `'claude-haiku-4-5'` | hot | Model for override replies. `anthropic`: a Claude model id. `local`: the model name the local server expects. |
 | `chat.api_key_file` | str | `'/etc/cortana/anthropic'` | sighup | Dev fallback ONLY (0600); production reads $CREDENTIALS_DIRECTORY/anthropic via LoadCredential= (constraint 12). The client is rebuilt when the on-disk key changes. |
 | `chat.max_tokens` | int | `300` | hot | Hard cap per answer. |
 | `chat.user_cooldown_s` | int | `10` | hot | Per-pilot throttle — the cost control. |

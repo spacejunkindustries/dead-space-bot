@@ -811,10 +811,32 @@ KEYS: Final[tuple[Key, ...]] = (
         default=False,
     ),
     Key(
+        "chat.backend",
+        "str",
+        Reload.SIGHUP,
+        "Who answers override questions: 'anthropic' = the cloud Claude API "
+        "(needs a key, costs per question); 'local' = an on-box "
+        "OpenAI-compatible server at chat.local_url (no API, no key, no "
+        "per-question cost) — the SLM lane for conversational back-and-forth "
+        "on the droplet. Still OFF the command path (constraint 6).",
+        default="anthropic",
+        choices=("anthropic", "local"),
+    ),
+    Key(
+        "chat.local_url",
+        "str",
+        Reload.SIGHUP,
+        "OpenAI-compatible chat-completions endpoint for backend='local' "
+        "(e.g. http://127.0.0.1:8081/v1/chat/completions from llama.cpp's "
+        "server or Ollama). Empty = not configured.",
+        default="",
+    ),
+    Key(
         "chat.model",
         "str",
         Reload.HOT,
-        "Claude model for override replies.",
+        "Model for override replies. For backend='anthropic' a Claude model "
+        "id; for backend='local' the model name the local server expects.",
         default="claude-haiku-4-5",
     ),
     Key(

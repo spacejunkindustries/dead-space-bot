@@ -29,7 +29,7 @@ from cortana import tts as tts_mod
 from cortana.audio.capture import CaptureManager, CaptureMeta, CaptureOrigin
 from cortana.audio.stt import SttError, SttTimeoutError
 from cortana.audio.vad import FRAME_MS
-from cortana.chat import ChatClient, ChatCooldownError
+from cortana.chat import ChatBackend, ChatCooldownError
 from cortana.dialog.machine import transition
 from cortana.dialog.types import (
     Action,
@@ -163,7 +163,7 @@ class DialogEngine:
         gazetteer: Gazetteer,
         conn: sqlite3.Connection,
         health: HealthReporter,
-        chat_provider: Callable[[], tuple[ChatClient | None, str]],
+        chat_provider: Callable[[], tuple[ChatBackend | None, str]],
         member_role_ids: Callable[[int], list[int]],
         send_channel: SendChannel,
         shutdown: asyncio.Event,

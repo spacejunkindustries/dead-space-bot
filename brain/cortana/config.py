@@ -148,9 +148,20 @@ class ChatConfig:
     says "command override …" (or uses the /ask slash twin)."""
 
     enabled: bool = False
-    #: Claude model for override replies. Default is the cheapest tier
-    #: (fractions of a cent per question); claude-opus-4-8 is the smarter,
-    #: ~10x-the-price alternative.
+    #: Who answers override questions:
+    #:   "anthropic" — the cloud Claude API (needs a key, costs per question).
+    #:   "local"     — an on-box OpenAI-compatible server at ``local_url``
+    #:                 (llama.cpp / Ollama / …): no API, no key, no per-question
+    #:                 cost. The SLM lane — conversational back-and-forth on the
+    #:                 droplet itself, still OFF the command path (constraint 6).
+    backend: str = "anthropic"
+    #: OpenAI-compatible chat-completions endpoint for ``backend="local"``
+    #: (e.g. ``http://127.0.0.1:8081/v1/chat/completions``). Empty = unset.
+    local_url: str = ""
+    #: Model for override replies. For ``backend="anthropic"`` a Claude model
+    #: id (the default is the cheapest tier — fractions of a cent per question;
+    #: claude-opus-4-8 is the smarter ~10x alternative). For ``backend="local"``
+    #: the model name the local server expects.
     model: str = "claude-haiku-4-5"
     #: Dev fallback ONLY (0600). Production reads
     #: $CREDENTIALS_DIRECTORY/anthropic via systemd LoadCredential=
@@ -754,6 +765,8 @@ def _assemble_tts(v: dict[str, Any]) -> TtsConfig:
 def _assemble_chat(v: dict[str, Any]) -> ChatConfig:
     return ChatConfig(
         enabled=v["chat.enabled"],
+        backend=v["chat.backend"],
+        local_url=v["chat.local_url"],
         model=v["chat.model"],
         api_key_file=v["chat.api_key_file"],
         max_tokens=v["chat.max_tokens"],

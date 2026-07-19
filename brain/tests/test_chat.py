@@ -153,3 +153,101 @@ def test_chat_config_defaults_to_disabled() -> None:
     cfg = ChatConfig()
     assert cfg.enabled is False
     assert cfg.model == "claude-haiku-4-5"
+    assert cfg.backend == "anthropic"
+    assert cfg.local_url == ""
+
+
+# ── on-box SLM backend (GDD §6.6, chat.backend: local) ───────────────────────
+
+
+import json  # noqa: E402
+
+from cortana.chat import LocalChatClient  # noqa: E402
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _local_holder(**cfg: Any) -> _Holder:
+    base = {
+        "enabled": True,
+        "backend": "local",
+        "local_url": "http://127.0.0.1:8081/v1/chat/completions",
+    }
+    base.update(cfg)
+    return _Holder(ChatConfig(**base))
+
+
+def _openai_reply(text: str) -> dict[str, Any]:
+    return {"choices": [{"message": {"role": "assistant", "content": text}}]}
+
+
+async def test_local_backend_posts_and_returns_text(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: Any, timeout: float | None = None) -> _FakeResponse:
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return _FakeResponse(_openai_reply("Warping to you now, hold tight."))
+
+    monkeypatch.setattr("cortana.chat.urllib.request.urlopen", fake_urlopen)
+    client = LocalChatClient(_local_holder(model="qwen2.5-1.5b-instruct"))
+    reply = await client.ask(42, "you there?")
+    assert reply == "Warping to you now, hold tight."
+    assert captured["url"] == "http://127.0.0.1:8081/v1/chat/completions"
+    assert captured["body"]["model"] == "qwen2.5-1.5b-instruct"
+    assert captured["body"]["messages"][0]["role"] == "system"
+    assert captured["body"]["messages"][1] == {"role": "user", "content": "you there?"}
+    assert captured["body"]["max_tokens"] == 300
+
+
+async def test_local_backend_cooldown_blocks_rapid_repeat(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "cortana.chat.urllib.request.urlopen",
+        lambda request, timeout=None: _FakeResponse(_openai_reply("Copy.")),
+    )
+    client = LocalChatClient(_local_holder(user_cooldown_s=999))
+    assert await client.ask(7, "first") == "Copy."
+    with pytest.raises(ChatCooldownError):
+        await client.ask(7, "too soon")
+
+
+async def test_local_backend_cooldown_not_armed_on_failure(monkeypatch: Any) -> None:
+    def boom(request: Any, timeout: float | None = None) -> _FakeResponse:
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("cortana.chat.urllib.request.urlopen", boom)
+    client = LocalChatClient(_local_holder(user_cooldown_s=999))
+    with pytest.raises(ChatError):
+        await client.ask(7, "first")
+    # A failed request must not convert the pilot's retry into "cooling down".
+    with pytest.raises(ChatError):  # still ChatError (transport), not ChatCooldownError
+        await client.ask(7, "retry")
+
+
+async def test_local_backend_malformed_response_is_chat_error(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "cortana.chat.urllib.request.urlopen",
+        lambda request, timeout=None: _FakeResponse({"unexpected": "shape"}),
+    )
+    client = LocalChatClient(_local_holder())
+    with pytest.raises(ChatError):
+        await client.ask(1, "hello")
+
+
+async def test_local_backend_unconfigured_url_is_chat_error() -> None:
+    client = LocalChatClient(_local_holder(local_url=""))
+    with pytest.raises(ChatError):
+        await client.ask(1, "hello")
