@@ -22,6 +22,7 @@ from cortana.dialog.types import (
     DialogState,
     DisarmWindow,
     Ev,
+    LearnArea,
     Line,
     NoteRejected,
     PendingConfirm,
@@ -699,4 +700,91 @@ def test_card_confirm_timeout_still_closes_silently() -> None:
     s, _ = to_await_confirm(conf)
     s2, actions = step(s, DialogEvent(Ev.DEADLINE, gen=s.gen))
     assert not any(isinstance(a, ConfirmPending) for a in actions)
+
+
+# ── learn-a-word confirm (GDD §8.5a) ─────────────────────────────────────────
+
+
+def _learn_confirm(**kw) -> PendingConfirm:
+    defaults = dict(
+        parsed=parsed_cmd(
+            intent=Intent.HOSTILE_SPOTTED, system_text="the branch", raw="reds the branch"
+        ),
+        candidate=None,
+        incident_id=None,
+        commit_on_timeout=True,
+        learn_word="the branch",
+    )
+    defaults.update(kw)
+    return PendingConfirm(**defaults)
+
+
+def test_learn_confirm_yes_learns_the_word() -> None:
+    conf = _learn_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="yes", confirm_reply="yes"))
+    assert actions == [LearnArea(conf.parsed, "the branch")]
     assert s2.state is DialogState.IDLE
+
+
+def test_learn_confirm_low_confidence_yes_posts_without_learning() -> None:
+    conf = _learn_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="yes", confirm_reply="yes", confident=False))
+    assert actions == [ConfirmPending(conf)]  # posts verbatim, no LearnArea
+    assert not any(isinstance(a, LearnArea) for a in actions)
+
+
+def test_learn_confirm_no_with_real_system_rebinds_and_discards_word() -> None:
+    conf = _learn_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(
+        s, c(text="no it's Kisogo", confirm_reply="no", correction_text="kisogo")
+    )
+    assert len(actions) == 1 and isinstance(actions[0], Report)
+    rebound = actions[0]
+    assert rebound.parsed.system_text == "kisogo"
+    assert rebound.parsed.intent is Intent.HOSTILE_SPOTTED
+    assert rebound.rebound_from is None  # the correction may itself be (re-)learned
+    # The owner's rule: the misheard word is GONE, never nicknamed to Kisogo.
+    assert "the branch" not in (rebound.parsed.system_text or "")
+    assert not any(isinstance(a, LearnArea) for a in actions)
+
+
+def test_learn_confirm_bare_no_opens_say_again() -> None:
+    conf = _learn_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="no", confirm_reply="no", correction_text=None))
+    assert s2.state is DialogState.AWAIT_RETRY_SYSTEM
+    assert Speak(Line.SAY_AGAIN) in actions
+    assert not any(isinstance(a, LearnArea) for a in actions)
+
+
+def test_learn_confirm_timeout_posts_without_learning() -> None:
+    conf = _learn_confirm()
+    s, _ = to_await_confirm(conf)
+    s2, actions = step(s, DialogEvent(Ev.DEADLINE, gen=s.gen))
+    assert ConfirmPending(conf) in actions  # verbatim post
+    assert not any(isinstance(a, LearnArea) for a in actions)
+
+
+def test_learn_confirm_dismissal_learns_nothing() -> None:
+    conf = _learn_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="disregard", dismissed=True))
+    assert Speak(Line.STANDING_DOWN) in actions
+    assert not any(isinstance(a, (LearnArea, ConfirmPending, Report)) for a in actions)
+
+
+def test_report_carries_garbage_gate_verdict() -> None:
+    # Step-4 threads the garbage flag into Report.source_confident.
+    s, _ = wake(idle())
+    s = _to_thinking(s)
+    _, actions = classified(s, c(parsed=parsed_cmd(), garbage=True))
+    assert len(actions) == 1 and isinstance(actions[0], Report)
+    assert actions[0].source_confident is False

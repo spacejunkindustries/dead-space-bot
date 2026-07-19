@@ -23,6 +23,7 @@ __all__ = [
     "DialogState",
     "DisarmWindow",
     "Ev",
+    "LearnArea",
     "Line",
     "NoteRejected",
     "PendingConfirm",
@@ -112,6 +113,12 @@ class PendingConfirm:
     candidate: MatchCandidate | None
     incident_id: int | None = None
     commit_on_timeout: bool = False
+    #: Non-None marks a LEARN-a-word confirm (GDD §8.5a — "Did you say
+    #: <word>?"): the place resolved to no system, so CORTANA is asking whether
+    #: to remember it as a custom area. ``candidate`` is always None here, and
+    #: ``commit_on_timeout`` stays True (silence still posts verbatim) — but
+    #: ONLY a confident explicit yes actually learns the word (via LearnArea).
+    learn_word: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +144,10 @@ class Classified:
     #: Standalone yes/no verdict for an AWAIT_CONFIRM window (GDD §8.3):
     #: ``"yes"`` / ``"no"`` / ``None`` when the utterance is neither.
     confirm_reply: str | None = None
+    #: The corrected place from a "no, it's X" reply in a learn-a-word confirm
+    #: (GDD §8.5a) — the cleaned X, or None for a bare "no". Used only to rebind
+    #: the report to X (a real system is used and the misheard word discarded).
+    correction_text: str | None = None
     #: Standalone dismissal ("end transmission", "disregard", "never mind",
     #: "stand down") — the pilot is closing the dialog, absolutely.
     dismissed: bool = False
@@ -257,6 +268,21 @@ class Report:
     #: This report already went through the confirm-first gate
     #: (``dialog.confirm_reports``) — commit it, never re-ask.
     confirmed: bool = False
+    #: Transcript quality (GDD §8.5a garbage gate): False when the transcript
+    #: was below ``dialog.retry_min_logprob``. Consumed only by the engine's
+    #: learn-a-word guard — a place you couldn't have said clearly is never
+    #: offered up to be remembered. Report execution is otherwise unaffected.
+    source_confident: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class LearnArea:
+    """Persist a confirmed custom area (GDD §8.5a), then post the report
+    verbatim under it. Emitted ONLY on a confident explicit yes to a
+    "Did you say <word>?" confirm — every other exit posts without learning."""
+
+    parsed: ParsedCommand
+    word: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +320,7 @@ Action = Union[  # noqa: UP007 - a named union reads better in match sites
     DisarmWindow,
     RunStt,
     Report,
+    LearnArea,
     Relay,
     RunOverride,
     ConfirmPending,

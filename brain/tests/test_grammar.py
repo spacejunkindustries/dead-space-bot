@@ -10,6 +10,7 @@ from cortana.nlu.grammar import (
     broadcast_text,
     clean_callsign,
     confirm_reply,
+    correction_reply,
     parse,
     sanitize_callsign,
     system_reply,
@@ -1022,6 +1023,63 @@ def test_confirm_reply_affirmatives(heard: str) -> None:
 )
 def test_confirm_reply_negatives(heard: str) -> None:
     assert confirm_reply(heard) == "no"
+
+
+# ── learn-a-word corrections (GDD §8.5a) ─────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("heard", "expected"),
+    [
+        ("no it's Kisogo", "Kisogo"),
+        ("no, it's Kisogo", "Kisogo"),
+        ("nope it is Otanuomi", "Otanuomi"),
+        # The article is stripped exactly as grammar.parse strips it from a
+        # system window, so "the branch" learns and looks up consistently.
+        ("no, the pipe", "pipe"),
+        ("actually the branch", "branch"),
+        ("no that's wildlands", "wildlands"),
+        ("hey cortana no it's Taisy over", "Taisy"),  # wake/signoff residue stripped
+    ],
+)
+def test_correction_reply_extracts_the_place(heard: str, expected: str) -> None:
+    assert correction_reply(heard) == expected
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "no",
+        "nope",
+        "nah",
+        "negative",
+        "",
+        "   ",
+        # Emphatic refusals: the residue is only more negation, so there is no
+        # real correction to rebind (adversarial-review finding) — must be None,
+        # never a junk place like "way"/"wrong"/"cancel".
+        "no way",
+        "no, wrong",
+        "no that's wrong",
+        "no, cancel that",
+        "no, disregard",
+        "nope, incorrect",
+    ],
+)
+def test_correction_reply_refusals_are_none(heard: str) -> None:
+    assert correction_reply(heard) is None
+
+
+def test_clean_place_matches_voice_system_text() -> None:
+    # A slash/pre-seed place must key to the SAME form the voice path stores
+    # (GDD §8.5a constraint-10 parity): the grammar strips the leading article.
+    from cortana.nlu.grammar import clean_place
+
+    assert clean_place("the branch") == parse("reds the branch").system_text
+    assert clean_place("the pipe") == "pipe"
+    assert clean_place("in wildlands") == "wildlands"
+    assert clean_place("the northern branch staging") == "northern branch staging"
+    assert clean_place("   ") == ""
 
 
 @pytest.mark.parametrize(

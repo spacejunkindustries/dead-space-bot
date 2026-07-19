@@ -206,6 +206,7 @@ Every module in the finished system.
 | `core/routing.py` | Subscription evaluation, role union, escalation, quiet hours, personal-ping user mentions |
 | `core/discipline.py` | Per-user cooldowns, global circuit breaker, flood control |
 | `core/fun.py` | Fact library + insult maker (§13.2): bundled-JSON load, per-guild shuffle bags, cooldowns, spicy filter, topic/target extraction |
+| `core/areas.py` | Learned custom areas (§8.5a): pure per-guild store — save/lookup/list/forget/cap for confirmed place words |
 | `core/db.py` | SQLite access, migrations, backup hook |
 | `dsc/bot.py` | discord.py client, intents, persistent view registration |
 | `dsc/views.py` | Incident buttons, ambiguity resolver, subscription picker |
@@ -214,6 +215,7 @@ Every module in the finished system.
 | `dsc/cogs/ops.py` | `/timer`, `/formup`, `/rollcall`, `/jumps` |
 | `dsc/cogs/fun.py` | `/fact`, `/insult` — slash twins of the voice FACT/INSULT intents (§13.2) |
 | `dsc/cogs/admin.py` | `/routing`, `/gazetteer`, `/health`, `/fleetmode` |
+| `dsc/cogs/areas.py` | `/areas-list`, `/areas-forget`, `/areas-add` — manage learned custom areas (§8.5a) |
 | `dsc/cogs/help.py` | `/help` — interactive help topics; the slash twin of voice "help" |
 | `tts.py` | Piper subprocess, raw→WAV wrapping, priority-ordered utterance queue (ALERT ahead of queued NORMAL), length cap |
 | `health.py` | Heartbeats, degradation detection, `#bot-health` reporting |
@@ -500,6 +502,9 @@ Full parity. Every voice command routes to the same engine.
 | `/gazetteer` | *(admin)* Reload / inspect / prune systems |
 | `/fleetmode` | *(admin)* Restrict voice triggering to FC role |
 | `/health` | *(admin)* Pipeline status, STT confidence, incident counts |
+| `/areas-list` | Show the custom areas CORTANA has learned (§8.5a) |
+| `/areas-forget word` | *(admin)* Forget a learned custom area |
+| `/areas-add word` | *(admin)* Pre-seed a custom area without saying it on comms |
 
 The optional `code: red|orange|yellow` and `audience: miners|defense|all-hands` parameters on the four report commands and `/relay` are the typed twins of the spoken colour codes (§6.4) and group aliases (§6.2) — they map onto the exact `ParsedCommand.severity` / `ParsedCommand.group_alias` fields the voice grammar fills, so severity and group targeting survive a voice outage too (constraint 10).
 
@@ -639,6 +644,19 @@ Two kinds of alias, both consulted **before** phonetic matching, both resolving 
 
 - **Learned aliases.** Every time a pilot taps `[Wrong — fix]` and picks the correct system, CORTANA writes `(raw transcript) → (system_id)` into the alias table. Within a month of real use, your corp's specific accents, specific mics, and specific noisy rooms are baked in. **This is the highest-leverage component in the entire system and it is roughly forty lines of code.**
 - **Custom names (config aliases).** A corp calls places by its own words — a branch nickname, a staging name, "home", a region's foothold system. The `aliases:` map in `gazetteer.yaml` (`{"the branch": "M-OEE8", "tribute staging": "5ZXX-K"}`) is FC-authored and stable: a phrase → a real system name, resolved at full confidence before *both* the learned table and phonetics. Case-insensitive; the target may be any k-space system even one outside the active scope; a typo in a target is logged and skipped, never fatal. This is how the corp's actual comms vocabulary — not New Eden's official names — becomes what CORTANA understands. The two layers compose: config names are the deliberate vocabulary, learned aliases are what accrues from real corrections on top.
+
+### 8.5a Custom areas — confirm-and-learn a place word
+
+The two aliases above both point at a **system**. But corps also name places that aren't a single system — a branch, a staging, a whole region ("the pipe", "wildlands", "Tribute"). A custom **area** is the *systemless twin* of the learned-alias table: `phrase → display_name`, no system_id.
+
+The flow is learn-by-talking, and it only fires for a genuinely unknown place:
+
+1. A mention-report names a place that resolves to **no system** (LOW tier, and not already a known alias or area). Instead of committing an uncertain guess, CORTANA asks once: *"Did you say the branch?"*
+2. **"Yes"** (confident) → she saves the word as a custom area, posts the report verbatim under it, and **never asks again** — every later report of that word resolves at HIGH confidence and posts directly. She built a piece of your map from one confirmation.
+3. **"No, it's Kisogo"** → Kisogo is a real system, so she uses it and **throws the misheard word away** — a mishearing is never turned into a nickname for a real system (the corp owner's explicit rule). *"No, it's the pipe"* (another unknown place) re-enters the confirm flow for that word instead.
+4. **Timeout, unmatched speech, or a low-confidence "yes"** → the report still posts verbatim, but **nothing is learned** — an unconfirmed word is not a place, and a distress call is never lost to the question (§8.6).
+
+Guardrails: learning is **role-gated** to @Pilot (the `may_mention` gate — the same people who may report), **per-guild**, and **capped** (`areas.max_per_guild`, default 200; at the cap learning pauses but reports still post, until an FC prunes). The **garbage gate** (`dialog.retry_min_logprob`) excludes chatter-quality transcripts — a place you couldn't have said clearly is never offered up to be remembered. It is **text only** — the confirmed word, never audio or a voiceprint (constraint 5) — exactly the mechanism of the alias table, and it is **deterministic** (constraint 6 holds: the confirm is fixed `confirm_reply`/`correction_reply` grammar, the save is a table write, no model anywhere). Toggle with `areas.learn`; manage with `/areas-list`, `/areas-forget`, `/areas-add` (the FC pre-seed twin). A slash report of a learned word resolves through the same area fallback, so voice and typed reports land identically (constraint 10). One nuance: the grammar strips a leading article, so "the branch" is learned and matched as *branch* — consistently, on both the learning report and every later one.
 
 ### 8.6 Recognition error is a normal operating condition
 
@@ -975,6 +993,17 @@ CREATE TABLE aliases (
     learned_at      TEXT NOT NULL,
     corrected_by    INTEGER NOT NULL,
     PRIMARY KEY (raw_text, system_id)
+);
+
+-- ── learned custom areas (§8.5a); the systemless twin of aliases ──
+CREATE TABLE custom_areas (
+    guild_id      INTEGER NOT NULL,
+    phrase        TEXT    NOT NULL,   -- normalized key: text.strip().lower()
+    display_name  TEXT    NOT NULL,   -- confirmed word, shown verbatim on the card
+    learned_by    INTEGER NOT NULL,
+    learned_at    TEXT    NOT NULL,
+    uses          INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (guild_id, phrase)
 );
 
 -- ── incidents ────────────────────────────────────────────────
@@ -1329,6 +1358,9 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `gazetteer.file` | str | **required** | engine | Scope rules file (regions/within_jumps_of/include_all, GDD §8.1). |
 | `gazetteer.home_system` | opt_str | `None` | engine | Anchor for the home-bias prior (§8.4). null/empty = no home system → prior off (nomadic corps, GDD §8.1). |
 | `gazetteer.include_all` | bool | `False` | engine | Nomadic override, mirrors gazetteer.yaml include_all — either being true activates the entire seeded map. |
+| **`areas:`** | | | | *OPTIONAL custom-area learning (GDD §8.5a); absent = defaults (on).* |
+| `areas.learn` | bool | `True` | hot | Custom-area learning (GDD §8.5a): when a report names a place that resolves to no system, CORTANA asks once ('Did you say <word>?') and on an explicit yes remembers it as a custom area, resolving it for good. false = post unknown places verbatim without ever learning. |
+| `areas.max_per_guild` | int | `200` | hot | Per-guild cap on learned areas (GDD §8.5a). At the cap learning pauses (reports still post) until an FC prunes with /areas-forget — the guard against a stuck mishearing filling the table. |
 | **`routing:`** | | | | *OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.* |
 | `routing.file` | str | `''` | engine | routing.yaml location. Empty (the default) = routing.yaml in the same directory as cortana.yaml. |
 | **`ipc:`** | | | | *The Brain⇄Ears unix socket (GDD §15).* |

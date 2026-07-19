@@ -369,6 +369,21 @@ class FunConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AreasConfig:
+    """Learned custom areas (GDD §8.5a). Optional section; on by default.
+
+    When a report names a place that resolves to no system, CORTANA asks once
+    ("Did you say <word>?") and, on an explicit yes, remembers the word so it
+    resolves for good — the corp's own place vocabulary, learned by talking."""
+
+    #: false = post unknown places verbatim without ever offering to learn them.
+    learn: bool = True
+    #: Per-guild cap. At the cap learning pauses (reports still post) until an
+    #: FC prunes with /areas-forget — the guard against a stuck mishearing.
+    max_per_guild: int = 200
+
+
+@dataclass(frozen=True, slots=True)
 class GazetteerConfig:
     file: str
     home_system: str | None  # None/empty = no home-bias prior (nomadic corp)
@@ -426,6 +441,7 @@ class AuraConfig:
     routing: RoutingFileConfig = field(default_factory=RoutingFileConfig)
     dialog: DialogConfig = field(default_factory=DialogConfig)
     fun: FunConfig = field(default_factory=FunConfig)
+    areas: AreasConfig = field(default_factory=AreasConfig)
 
 
 # ── schema-driven validation ─────────────────────────────────────────────────
@@ -795,6 +811,10 @@ def _assemble_fun(v: dict[str, Any]) -> FunConfig:
     )
 
 
+def _assemble_areas(v: dict[str, Any]) -> AreasConfig:
+    return AreasConfig(learn=v["areas.learn"], max_per_guild=v["areas.max_per_guild"])
+
+
 def _assemble_dialog(v: dict[str, Any]) -> DialogConfig:
     return DialogConfig(
         window_ms=v["dialog.window_ms"],
@@ -827,6 +847,7 @@ def _assemble(values: dict[str, Any]) -> AuraConfig:
         routing=RoutingFileConfig(file=values["routing.file"]),
         dialog=_assemble_dialog(values),
         fun=_assemble_fun(values),
+        areas=_assemble_areas(values),
     )
 
 

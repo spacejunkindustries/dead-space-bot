@@ -265,6 +265,7 @@ class AuraBot(commands.Bot):
         # Imported here, not at module top: the cogs import this module.
         from cortana.dsc import views
         from cortana.dsc.cogs.admin import AdminCog
+        from cortana.dsc.cogs.areas import AreasCog
         from cortana.dsc.cogs.fun import FunCog
         from cortana.dsc.cogs.help import HelpCog, HelpTopicSelect
         from cortana.dsc.cogs.intel import IntelCog
@@ -284,6 +285,7 @@ class AuraBot(commands.Bot):
             UtilityCog(self),
             FunCog(self),
             AdminCog(self),
+            AreasCog(self),
             HelpCog(self),
             StatusCog(self),
         ):

@@ -24,6 +24,7 @@ import cortana.__main__ as app_main
 from cortana.__main__ import App
 from cortana.audio.capture import CaptureMeta, CaptureOrigin
 from cortana.audio.stt import SttTimeoutError
+from cortana.core import areas, db
 from cortana.core.discipline import Discipline
 from cortana.dialog import DialogEngine, DialogState
 from cortana.types import (
@@ -252,6 +253,7 @@ class Rig:
     capture: _Capture
     sent: list[tuple[int, str]]
     chat: _Chat | None
+    conn: Any = None
 
 
 def make_dialog(
@@ -267,14 +269,22 @@ def make_dialog(
     confirm_reports: str = "off",
     transcript_channel: int = 0,
     streaming: bool = False,
+    areas_learn: bool = False,
+    mentions_enabled: bool = True,
 ) -> Rig:
     import dataclasses as _dc
 
     from cortana.config import DialogConfig
 
-    cfg = make_config(wake_ack=wake_ack, relay_mode=relay_mode, chat_enabled=chat_enabled)
+    cfg = make_config(
+        wake_ack=wake_ack,
+        relay_mode=relay_mode,
+        chat_enabled=chat_enabled,
+        mentions_enabled=mentions_enabled,
+    )
     cfg = _dc.replace(cfg, dialog=DialogConfig(confirm_reports=confirm_reports))
     cfg = _dc.replace(cfg, capture=_dc.replace(cfg.capture, streaming=streaming))
+    cfg = _dc.replace(cfg, areas=_dc.replace(cfg.areas, learn=areas_learn))
     if transcript_channel:
         channels = _dc.replace(cfg.discord.channels, transcript=transcript_channel)
         cfg = _dc.replace(cfg, discord=_dc.replace(cfg.discord, channels=channels))
@@ -296,6 +306,8 @@ def make_dialog(
     async def send_channel(channel_id: int, content: str, embed: Any = None) -> None:
         sent.append((channel_id, content))
 
+    conn = db.connect(":memory:")
+    db.migrate(conn)
     dialog = DialogEngine(
         holder,  # type: ignore[arg-type]
         capture=capture,  # type: ignore[arg-type]
@@ -304,7 +316,7 @@ def make_dialog(
         incidents=engine,  # type: ignore[arg-type]
         discipline=Discipline(holder),  # type: ignore[arg-type]
         gazetteer=gaz,  # type: ignore[arg-type]
-        conn=None,  # type: ignore[arg-type]
+        conn=conn,
         health=health,  # type: ignore[arg-type]
         chat_provider=lambda: (chat, "ready" if chat is not None else "disabled"),
         member_role_ids=lambda uid: roles,
@@ -312,7 +324,7 @@ def make_dialog(
         shutdown=asyncio.Event(),
         fun=fun,
     )
-    return Rig(dialog, engine, health, speaker, capture, sent, chat)
+    return Rig(dialog, engine, health, speaker, capture, sent, chat, conn)
 
 
 async def drain(rig: Rig) -> None:
@@ -1508,6 +1520,88 @@ async def test_tick_streaming_off_never_partials() -> None:
     await rig.dialog._tick()
     await drain(rig)
     assert rig.capture.endpoints == []
+
+
+# ── custom-area learning (GDD §8.5a) ─────────────────────────────────────────
+
+
+async def test_learn_area_asks_then_yes_learns_and_posts() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana reds the branch", "yes"]),
+        areas_learn=True,
+    )
+    await utter_wake(rig)
+    # She asks about the unknown place instead of committing a guess.
+    assert any("Did you say" in t and "branch" in t for _, t in rig.speaker.said)
+    assert rig.engine.reports == []  # nothing posted yet
+    assert rig.capture.armed  # confirm window armed
+    await utter_window(rig)  # "yes"
+    # Learned for good, keyed by the parsed place word (the article is stripped
+    # by the grammar exactly as it is on every later report, so it matches).
+    assert areas.lookup_area(rig.conn, GUILD, "branch") == "branch"
+    assert any("Learned" in t for _, t in rig.speaker.said)
+    assert len(rig.engine.reports) == 1
+    _, _, _parsed, resolution = rig.engine.reports[0]
+    assert resolution is not None and resolution.area_name == "branch"
+
+
+async def test_second_report_of_learned_area_posts_directly() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana reds the branch"]),
+        areas_learn=True,
+    )
+    areas.save_area(rig.conn, GUILD, "branch", USER, "t0", max_areas=200)
+    await utter_wake(rig)
+    # Already known → no confirm, posts straight away.
+    assert not any("Did you say" in t for _, t in rig.speaker.said)
+    assert len(rig.engine.reports) == 1
+    _, _, _parsed, resolution = rig.engine.reports[0]
+    assert resolution.area_name == "branch"
+
+
+async def test_learn_area_no_with_real_system_uses_it_and_saves_nothing() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana reds the branch", "no it's Otanuomi"]),
+        areas_learn=True,
+    )
+    await utter_wake(rig)
+    assert rig.capture.armed
+    await utter_window(rig)  # "no it's Otanuomi"
+    # The real system is used; the misheard word is saved as NEITHER area nor alias.
+    assert areas.lookup_area(rig.conn, GUILD, "the branch") is None
+    assert db.query_value(rig.conn, "SELECT COUNT(*) FROM aliases") == 0
+    assert len(rig.engine.reports) == 1
+    _, _, _parsed, resolution = rig.engine.reports[0]
+    assert resolution.best is not None and resolution.best.name == "Otanuomi"
+
+
+async def test_learn_area_off_commits_verbatim_without_asking() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana reds the branch"]),
+        areas_learn=False,
+    )
+    await utter_wake(rig)
+    assert not any("Did you say" in t for _, t in rig.speaker.said)
+    assert len(rig.engine.reports) == 1  # legacy verbatim post, no learning
+
+
+async def test_learn_area_skipped_for_non_pilot_in_silent_mode() -> None:
+    # Silent mode lifts the pilot gate, so a non-pilot reaches the learn gate —
+    # which still requires may_mention, so they can't teach; the report posts.
+    rig = make_dialog(
+        roles=[],  # not a pilot
+        transcriber=_Transcriber(["hey cortana reds the branch"]),
+        areas_learn=True,
+        mentions_enabled=False,
+    )
+    await utter_wake(rig)
+    assert not any("Did you say" in t for _, t in rig.speaker.said)
+    assert areas.count_areas(rig.conn, GUILD) == 0
+    assert len(rig.engine.reports) == 1
 
 
 async def test_restart_via_slash_trips_the_shutdown_event() -> None:

@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -30,6 +32,7 @@ from cortana.audio.capture import CaptureManager, CaptureMeta, CaptureOrigin
 from cortana.audio.stt import SttError, SttTimeoutError
 from cortana.audio.vad import FRAME_MS
 from cortana.chat import ChatBackend, ChatCooldownError
+from cortana.core import areas
 from cortana.dialog.machine import transition
 from cortana.dialog.types import (
     Action,
@@ -41,6 +44,7 @@ from cortana.dialog.types import (
     DialogState,
     DisarmWindow,
     Ev,
+    LearnArea,
     Line,
     NoteRejected,
     PendingConfirm,
@@ -400,6 +404,7 @@ class DialogEngine:
             relay_mode=cfg.stt.relay_mode,
             chat_available=chat is not None and cfg.chat.enabled,
             confirm_reply=grammar.confirm_reply(text),
+            correction_text=grammar.correction_reply(text),
             dismissed=grammar.dismissal(text),
             garbage=avg_logprob < cfg.dialog.retry_min_logprob,
         )
@@ -452,6 +457,8 @@ class DialogEngine:
             await self._run_stt(s, action.gen, pcm)
         elif isinstance(action, Report):
             await self._report(s, action)
+        elif isinstance(action, LearnArea):
+            await self._learn_area(s, action.parsed, action.word)
         elif isinstance(action, Relay):
             await self._relay(s, action)
         elif isinstance(action, RunOverride):
@@ -630,7 +637,7 @@ class DialogEngine:
                 self._incidents.build_prior_context, s.guild_id, s.user_id
             )
             resolution = await asyncio.to_thread(
-                phonetics.resolve,
+                partial(phonetics.resolve, guild_id=s.guild_id),
                 parsed.system_text,
                 self._gazetteer,
                 priors,
@@ -640,6 +647,44 @@ class DialogEngine:
             self._health.record_stt(
                 resolution.best.score if resolution.best else 0.0, resolution.tier
             )
+
+        # Learn-a-word (GDD §8.5a): a mention-report naming a place that
+        # resolved to NO system (LOW, and not already a known area/alias) is
+        # offered up to be remembered — "Did you say <word>?" — instead of
+        # committing an uncertain guess. Only a Pilot may teach, and only a
+        # confident (non-garbage) transcript qualifies: a place you couldn't
+        # have said clearly is never learned. A confirmed candidate, a rebind,
+        # or an already-confirmed report never re-enters this gate.
+        if (
+            cfg.areas.learn
+            and not action.confirmed
+            and action.forced_resolution is None
+            and action.rebound_from is None
+            and action.source_confident
+            and parsed.intent in MENTION_INTENTS
+            and parsed.system_text
+            and (
+                resolution is None or (resolution.tier is Tier.LOW and resolution.area_name is None)
+            )
+            and self._discipline.may_mention(self._member_role_ids(s.user_id))
+        ):
+            word = parsed.system_text
+            log.info("report_learn_area_confirm", user_id=s.user_id, word=word)
+            await self._speak_or_post(s, tts_mod.confirm_area(word))
+            await self._apply(
+                self._session(s.user_id, s.guild_id),
+                DialogEvent(
+                    Ev.ENGINE_ASKED,
+                    confirm=PendingConfirm(
+                        parsed=parsed,
+                        candidate=None,
+                        incident_id=None,
+                        commit_on_timeout=True,
+                        learn_word=word,
+                    ),
+                ),
+            )
+            return
 
         # Confirm-first (GDD §8.3, dialog.confirm_reports): before an
         # uncertain voice report commits, read back what was heard and hold
@@ -655,6 +700,7 @@ class DialogEngine:
             and action.rebound_from is None
             and parsed.intent in MENTION_INTENTS
             and parsed.system_text
+            and (resolution is None or resolution.area_name is None)  # known area posts directly
         ):
             tier = resolution.tier if resolution is not None else Tier.LOW
             certain = resolution is not None and resolution.best is not None and tier is Tier.HIGH
@@ -810,6 +856,33 @@ class DialogEngine:
         # report with the gate bypassed — resolution repeats
         # deterministically and the heard name posts verbatim (GDD §8.6).
         await self._report(s, Report(confirm.parsed, confirmed=True))
+
+    async def _learn_area(self, s: DialogSession, parsed: Any, word: str) -> None:
+        """Persist a confirmed custom area (GDD §8.5a), then post the report
+        under it. Reached only from a confident explicit yes to "Did you say
+        <word>?". At the per-guild cap, learning pauses (the pilot is told) but
+        the report STILL lands — a full table never swallows a distress call.
+        The forced area resolution skips re-resolution AND both gates (they
+        require ``forced_resolution is None``), posting verbatim (system_id
+        NULL) through the incident engine's area branch."""
+        cfg = self._holder.current
+        result = await asyncio.to_thread(
+            areas.save_area,
+            self._conn,
+            s.guild_id,
+            word,
+            s.user_id,
+            datetime.now(UTC).isoformat(),
+            max_areas=cfg.areas.max_per_guild,
+        )
+        if result == "at_cap":
+            log.warning("custom_area_at_cap", guild_id=s.guild_id, word=word)
+            await self._speak_or_post(s, tts_mod.area_limit())
+        elif result == "created":
+            log.info("custom_area_learned", user_id=s.user_id, guild_id=s.guild_id, word=word)
+            await self._speak_or_post(s, tts_mod.area_learned(word))
+        forced = Resolution(tier=Tier.HIGH, candidates=(), area_name=word)
+        await self._report(s, Report(parsed, forced_resolution=forced))
 
     async def _relay(self, s: DialogSession, action: Relay) -> None:
         """Freeform intel relay (GDD §8.6) through the broadcast path.
