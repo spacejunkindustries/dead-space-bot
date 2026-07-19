@@ -68,6 +68,9 @@ class ChannelsConfig:
     intel_alerts: int
     intel_live: int
     health: int
+    #: Optional STT review log (GDD §8.7). 0 = off. When set, one line per
+    #: heard utterance posts here: the transcript plus its parse outcome.
+    transcript: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,9 +148,20 @@ class ChatConfig:
     says "command override …" (or uses the /ask slash twin)."""
 
     enabled: bool = False
-    #: Claude model for override replies. Default is the cheapest tier
-    #: (fractions of a cent per question); claude-opus-4-8 is the smarter,
-    #: ~10x-the-price alternative.
+    #: Who answers override questions:
+    #:   "anthropic" — the cloud Claude API (needs a key, costs per question).
+    #:   "local"     — an on-box OpenAI-compatible server at ``local_url``
+    #:                 (llama.cpp / Ollama / …): no API, no key, no per-question
+    #:                 cost. The SLM lane — conversational back-and-forth on the
+    #:                 droplet itself, still OFF the command path (constraint 6).
+    backend: str = "anthropic"
+    #: OpenAI-compatible chat-completions endpoint for ``backend="local"``
+    #: (e.g. ``http://127.0.0.1:8081/v1/chat/completions``). Empty = unset.
+    local_url: str = ""
+    #: Model for override replies. For ``backend="anthropic"`` a Claude model
+    #: id (the default is the cheapest tier — fractions of a cent per question;
+    #: claude-opus-4-8 is the smarter ~10x alternative). For ``backend="local"``
+    #: the model name the local server expects.
     model: str = "claude-haiku-4-5"
     #: Dev fallback ONLY (0600). Production reads
     #: $CREDENTIALS_DIRECTORY/anthropic via systemd LoadCredential=
@@ -174,6 +188,29 @@ class CaptureConfig:
     endpoint_silence_ms: int
     max_utterance_ms: int
     vad_aggressiveness: int  # webrtcvad 0–3
+    #: Live recognition (GDD §5.5): decode the growing capture buffer while the
+    #: pilot is still talking and commit the instant a complete, confident
+    #: command is present — instead of waiting for them to stop (or the hard
+    #: cap) before the first decode. This is the fix for the "keep talking and
+    #: it drags 10-20s" latency: a distress call lands mid-sentence, not after
+    #: the channel goes quiet. Purely an endpointing optimization — the final
+    #: decode on emit stays authoritative, so it can never mis-route. Needs
+    #: CPU headroom (the incremental decodes are real Whisper runs): sized for
+    #: a dedicated ≥4-vCPU box. Set false to fall back to decode-on-endpoint.
+    streaming: bool = True
+    #: Minimum NEW speech between incremental decodes — the incremental-decode
+    #: rate limiter. Lower = snappier + more CPU; higher = calmer + a touch
+    #: more lag. Each fires one Whisper decode of the buffer-so-far.
+    partial_decode_ms: int = 1200
+    #: Don't attempt an incremental decode until at least this much speech has
+    #: accrued: a sub-second fragment cannot carry a whole command, so decoding
+    #: it just burns CPU and risks an early clip on a half-heard word.
+    partial_min_speech_ms: int = 900
+    #: Confidence floor for an incremental decode to commit early. An uncertain
+    #: partial keeps listening rather than clipping the pilot; the normal
+    #: endpoint (silence or cap) still catches it, and the final decode's
+    #: confirm-first flow (§8.3) owns the uncertainty from there.
+    early_commit_min_logprob: float = -1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,6 +658,7 @@ def _assemble_discord(v: dict[str, Any]) -> DiscordConfig:
             intel_alerts=v["discord.channels.intel_alerts"],
             intel_live=v["discord.channels.intel_live"],
             health=v["discord.channels.health"],
+            transcript=v["discord.channels.transcript"],
         ),
         roles=RolesConfig(
             pilot=v["discord.roles.pilot"],
@@ -651,6 +689,10 @@ def _assemble_capture(v: dict[str, Any]) -> CaptureConfig:
         endpoint_silence_ms=v["capture.endpoint_silence_ms"],
         max_utterance_ms=v["capture.max_utterance_ms"],
         vad_aggressiveness=v["capture.vad_aggressiveness"],
+        streaming=v["capture.streaming"],
+        partial_decode_ms=v["capture.partial_decode_ms"],
+        partial_min_speech_ms=v["capture.partial_min_speech_ms"],
+        early_commit_min_logprob=v["capture.early_commit_min_logprob"],
     )
 
 
@@ -723,6 +765,8 @@ def _assemble_tts(v: dict[str, Any]) -> TtsConfig:
 def _assemble_chat(v: dict[str, Any]) -> ChatConfig:
     return ChatConfig(
         enabled=v["chat.enabled"],
+        backend=v["chat.backend"],
+        local_url=v["chat.local_url"],
         model=v["chat.model"],
         api_key_file=v["chat.api_key_file"],
         max_tokens=v["chat.max_tokens"],

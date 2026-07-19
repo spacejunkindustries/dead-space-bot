@@ -170,6 +170,11 @@ class _Capture:
     armed: list[tuple[int, int, int]] = field(default_factory=list)  # (user, guild, gen)
     disarmed: list[int] = field(default_factory=list)
     dropped: list[int] = field(default_factory=list)
+    # Streaming (GDD §5.5): capturing_users + capture_progress feed the wheel's
+    # incremental decoder; endpoints records force_endpoint calls.
+    capturing: list[int] = field(default_factory=list)
+    progress: dict[int, tuple[bytes, int, int]] = field(default_factory=dict)
+    endpoints: list[tuple[int, str, int | None]] = field(default_factory=list)
 
     def arm_window(self, user_id: int, guild_id: int, gen: int) -> None:
         self.armed.append((user_id, guild_id, gen))
@@ -181,10 +186,19 @@ class _Capture:
         self.dropped.append(user_id)
 
     def capturing_users(self) -> list[int]:
-        return []
+        return list(self.capturing)
 
-    def force_endpoint(self, user_id: int) -> bool:
-        return False
+    def capture_progress(self, user_id: int) -> tuple[bytes, int, int] | None:
+        return self.progress.get(user_id)
+
+    def force_endpoint(
+        self, user_id: int, reason: str = "silence", *, expected_gen: int | None = None
+    ) -> bool:
+        self.endpoints.append((user_id, reason, expected_gen))
+        if user_id in self.capturing:
+            self.capturing.remove(user_id)
+        self.progress.pop(user_id, None)
+        return True
 
     def feed(self, user_id: int, guild_id: int, pcm: bytes) -> None:
         pass
@@ -251,6 +265,8 @@ def make_dialog(
     chat_enabled: bool = False,
     fun: Any | None = None,
     confirm_reports: str = "off",
+    transcript_channel: int = 0,
+    streaming: bool = False,
 ) -> Rig:
     import dataclasses as _dc
 
@@ -258,6 +274,10 @@ def make_dialog(
 
     cfg = make_config(wake_ack=wake_ack, relay_mode=relay_mode, chat_enabled=chat_enabled)
     cfg = _dc.replace(cfg, dialog=DialogConfig(confirm_reports=confirm_reports))
+    cfg = _dc.replace(cfg, capture=_dc.replace(cfg.capture, streaming=streaming))
+    if transcript_channel:
+        channels = _dc.replace(cfg.discord.channels, transcript=transcript_channel)
+        cfg = _dc.replace(cfg, discord=_dc.replace(cfg.discord, channels=channels))
     holder = StubHolder(cfg)
     gaz = _Gazetteer(
         entries={
@@ -1276,7 +1296,11 @@ async def test_confirm_first_low_report_asks_then_yes_commits() -> None:
         confirm_reports="low",
     )
     await utter_wake(rig)
-    assert any("Heard" in t and "Confirm" in t for _, t in rig.speaker.said)
+    # Natural readback: the situation, not just the system ("Under attack in
+    # zanzibar. Confirm?") so a wrong intent is as catchable as a wrong system.
+    assert any(
+        "Under attack" in t and "zanzibar" in t and "Confirm" in t for _, t in rig.speaker.said
+    )
     assert rig.engine.reports == []  # nothing committed yet
     assert rig.capture.armed  # confirm window armed
     await utter_window(rig)  # "yes"
@@ -1328,11 +1352,162 @@ async def test_confirm_first_always_gates_high_tier_and_yes_forces_candidate() -
     )
     await utter_wake(rig)
     assert rig.engine.reports == []
-    assert any("Heard Otanuomi" in t for _, t in rig.speaker.said)
+    # "Hostiles in Otanuomi. Confirm?" — intent-aware readback (GDD §8.3).
+    assert any("Hostiles in Otanuomi" in t and "Confirm" in t for _, t in rig.speaker.said)
     await utter_window(rig)
     assert len(rig.engine.reports) == 1
     _, _, _parsed, resolution = rig.engine.reports[0]
     assert resolution is not None and resolution.tier is Tier.HIGH  # forced candidate
+
+
+async def test_transcript_channel_off_posts_nothing() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, hostiles Otanuomi"]),
+    )
+    await utter_wake(rig)
+    await drain(rig)
+    assert rig.sent == []  # no transcript channel configured → no review post
+
+
+async def test_transcript_channel_logs_one_line_per_utterance() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, hostiles Otanuomi"]),
+        transcript_channel=777,
+    )
+    await utter_wake(rig)
+    await drain(rig)
+    posts = [(cid, text) for cid, text in rig.sent if cid == 777]
+    assert len(posts) == 1
+    _, line = posts[0]
+    assert "hostiles Otanuomi" in line
+    assert Intent.HOSTILE_SPOTTED.value in line
+
+
+async def test_transcript_channel_logs_unmatched_utterances_too() -> None:
+    # The whole point: see the phrasings that DON'T match yet (live request).
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, some gibberish here"]),
+        transcript_channel=777,
+        relay_mode="framed",
+    )
+    await utter_wake(rig)
+    await drain(rig)
+    posts = [text for cid, text in rig.sent if cid == 777]
+    assert len(posts) == 1
+    assert "no command" in posts[0]
+
+
+# ── live recognition / streaming early-commit (GDD §5.5) ─────────────────────
+
+
+def test_early_committable_predicate() -> None:
+    from cortana.dialog.engine import _early_committable
+    from cortana.nlu.grammar import parse
+
+    assert _early_committable(parse("hostiles Otanuomi")) is True  # complete report
+    assert _early_committable(parse("status")) is True  # systemless command
+    assert _early_committable(parse("under attack")) is False  # system not spoken yet
+    assert _early_committable(parse("uh what was that")) is False  # no intent
+    assert _early_committable(None) is False
+
+
+async def test_partial_decode_commits_complete_command() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana hostiles Otanuomi"]),
+        streaming=True,
+    )
+    await rig.dialog._partial_decode(USER, b"\x00\x00", 7)
+    # Ended the capture early, gen-guarded — the final decode does the routing.
+    assert rig.capture.endpoints == [(USER, "early_command", 7)]
+
+
+async def test_partial_decode_waits_for_the_system_name() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana under attack"]),  # system still coming
+        streaming=True,
+    )
+    await rig.dialog._partial_decode(USER, b"\x00\x00", 7)
+    assert rig.capture.endpoints == []  # don't clip the pilot mid-command
+
+
+async def test_partial_decode_ignores_low_confidence() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hostiles Otanuomi"], avg_logprob=-2.5),
+        streaming=True,
+    )
+    await rig.dialog._partial_decode(USER, b"\x00\x00", 7)
+    assert rig.capture.endpoints == []  # too uncertain to commit early
+
+
+async def test_partial_decode_failure_is_a_non_event() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(error=RuntimeError("queue overflow")),
+        streaming=True,
+    )
+    rig.dialog._partial_inflight.add(USER)
+    await rig.dialog._partial_decode(USER, b"\x00\x00", 7)
+    assert USER not in rig.dialog._partial_inflight  # cleared even on failure
+    assert rig.capture.endpoints == []  # normal endpoint still catches it
+
+
+async def test_maybe_partial_decode_rate_limits_by_speech() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hostiles Otanuomi"]),
+        streaming=True,
+    )
+    # 10 frames = 200ms < partial_min_speech_ms (900): too short to decode.
+    rig.capture.progress[USER] = (b"\x00\x00", 10, 3)
+    rig.dialog._maybe_partial_decode(USER)
+    assert USER not in rig.dialog._partial_inflight
+    # 60 frames = 1200ms: past the minimum and the cadence → one decode fires.
+    rig.capture.progress[USER] = (b"\x00\x00", 60, 3)
+    rig.dialog._maybe_partial_decode(USER)
+    assert USER in rig.dialog._partial_inflight
+    assert rig.dialog._partial_at_frames[USER] == 60
+    await drain(rig)
+    assert USER not in rig.dialog._partial_inflight  # cleared when the decode finishes
+
+
+async def test_tick_streaming_early_commits_a_live_command() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana hostiles Otanuomi"]),
+        streaming=True,
+    )
+    gen = wake_open(rig)
+    await drain(rig)
+    now = rig.dialog._now()
+    rig.dialog._grace_until[USER] = 0.0  # ack grace passed
+    rig.dialog._last_audio_at[USER] = now  # recent audio: no silence endpoint
+    rig.capture.capturing = [USER]
+    rig.capture.progress[USER] = (b"\x00\x00", 60, gen)
+    await rig.dialog._tick()
+    await drain(rig)
+    assert (USER, "early_command", gen) in rig.capture.endpoints
+
+
+async def test_tick_streaming_off_never_partials() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana hostiles Otanuomi"]),
+        streaming=False,
+    )
+    now = rig.dialog._now()
+    rig.dialog._grace_until[USER] = 0.0
+    rig.dialog._last_audio_at[USER] = now
+    rig.capture.capturing = [USER]
+    rig.capture.progress[USER] = (b"\x00\x00", 60, 1)
+    await rig.dialog._tick()
+    await drain(rig)
+    assert rig.capture.endpoints == []
 
 
 async def test_restart_via_slash_trips_the_shutdown_event() -> None:

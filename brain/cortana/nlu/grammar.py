@@ -100,9 +100,10 @@ _JARGON_NORMALIZE: tuple[tuple[re.Pattern[str], str], ...] = (
 #: Whisper truncates an over-long initial_prompt from the front, so the tail
 #: is the part guaranteed to survive.
 STT_VOCAB_BIAS = (
-    "Commands: hostiles, reds, neuts, tackled, under attack, need backup, "
-    "gate camp, code red, code orange, clear, status, timer, form up, "
-    "cancel, register, ping me, who am I, update chase, report, "
+    "Commands: hostiles, reds, neuts, enemies, war target, tackled, bubbled, "
+    "scrambled, pointed, webbed, jammed, under attack, need backup, help me, "
+    "send help, gate camp, code red, code orange, clear, status, timer, "
+    "form up, cancel, register, ping me, who am I, update chase, report, "
     "command override, tell me a fact, trivia, insult, roast, over."
 )
 
@@ -167,21 +168,66 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
         re.compile(r"\bstop\s+(?:ping|pin|pink)(?:n?ing|s)?(?:\s+me)?\b", re.I),
     ),
     (Intent.PING_ME, re.compile(r"\b(?:ping|pin|pink|pinging)[\s-]*me\b", re.I)),
-    (Intent.UNDER_ATTACK, re.compile(r"\bunder\s+attack\b|\btackled\b|\bpoint\s+on\s+me\b", re.I)),
-    # "need help" plus the freeform phrasing "request(ing) [heavy] assistance"
-    # — courtesy adjectives are optional, the type word is what matters. Sits
-    # BELOW UNDER_ATTACK so "tackled … and request heavy assistance" is
-    # always the distress call, never demoted to the assist phrasing.
+    # The distress vocabulary (GDD §6.1). Pilots describe the SAME situation a
+    # dozen ways and cannot enumerate them up front (live request), so the
+    # pattern covers the EWAR/tackle verbs that mean "I am in a fight, come
+    # now" — whether the pilot is the one being held ("I'm scrambled",
+    # "bubbled", "pointed") or holding tackle on a target ("I've got them
+    # webbed", "scrambling them"). Either way the fleet response is identical:
+    # warp to them. All of these outrank HOSTILE_SPOTTED so "tackled by reds"
+    # is a distress call, never demoted to a sighting. New verbs come from real
+    # fleet audio — extend from the transcript channel, not from guessing.
     (
-        Intent.ASSIST_REQUEST,
+        Intent.UNDER_ATTACK,
         re.compile(
-            r"\bneed\s+(?:help|backup|back\s*up|assistance|reinforcements|support)\b"
-            r"|\brequest(?:ing)?\s+(?:heavy\s+|immediate\s+|urgent\s+)?"
-            r"(?:assistance|help|backup|back\s*up|reinforcements|support)\b",
+            r"\bunder\s+(?:attack|fire)\b"
+            r"|\b(?:being|getting|taking)\s+(?:attacked|shot|hit)\b"
+            r"|\btaking\s+fire\b"
+            r"|\battacked\b"
+            r"|\btackl(?:ed|ing)\b"
+            r"|\bbubbl(?:ed|ing)\b"
+            r"|\bscram(?:med|bled|bling)?\b"
+            r"|\bpointed\b"
+            r"|\bpinned\b"
+            r"|\bweb(?:bed|bing)\b"
+            r"|\bjam(?:med|ming)\b"
+            r"|\bneut(?:ed|ing)\b"
+            r"|\bengaged\b"
+            r"|\b(?:point|tackle|scram|web|tackled)\s+on\s+(?:me|us|him|them)\b",
             re.I,
         ),
     ),
-    (Intent.HOSTILE_SPOTTED, re.compile(r"\bhostiles?\b|\breds?\b|\bneuts?\b", re.I)),
+    # "need help" / "help me" / "send help", plus the freeform phrasing
+    # "request(ing) [heavy] assistance" — courtesy adjectives are optional, the
+    # type word is what matters. Sits BELOW UNDER_ATTACK so "tackled … and
+    # request heavy assistance" is always the distress call, never demoted to
+    # the assist phrasing; ABOVE the bare HELP intent so "help me" is a distress
+    # call and only a lone "help" reaches the manual.
+    (
+        Intent.ASSIST_REQUEST,
+        re.compile(
+            r"\bneed\s+(?:help|backup|back\s*up|assistance|reinforcements|support|dps|guns)\b"
+            r"|\bhelp\s+me\b"
+            r"|\bsend\s+(?:help|backup|back\s*up|reinforcements|support|the\s+fleet|the\s+cavalry|"
+            r"someone|bodies|dps|guns)\b"
+            r"|\brequest(?:ing)?\s+(?:heavy\s+|immediate\s+|urgent\s+)?"
+            r"(?:assistance|help|backup|back\s*up|reinforcements|support)\b"
+            r"|\b(?:get|come)\s+(?:over\s+here|to\s+me|to\s+us|here|quick|fast|now)\b",
+            re.I,
+        ),
+    ),
+    # Sighting vocabulary: the neutral/hostile nouns pilots call out. "enemy"/
+    # "enemies" and "war target(s)" (EVE's term for a shootable pilot) join the
+    # standard set; "gankers"/"bad guys" are the colloquial forms. Below the
+    # distress intents so any of these prefixed by a tackle verb escalates.
+    (
+        Intent.HOSTILE_SPOTTED,
+        re.compile(
+            r"\bhostiles?\b|\breds?\b|\bneuts?\b|\benem(?:y|ies)\b"
+            r"|\bwar\s*targets?\b|\bgankers?\b|\bbad\s+guys\b",
+            re.I,
+        ),
+    ),
     (Intent.GATE_CAMP, re.compile(r"\bgate\s*camp(?:ed|ers)?\b", re.I)),
     (Intent.RESOLVE, re.compile(r"\bclear(?:ed)?\b", re.I)),
     (Intent.TIMER, re.compile(r"\btimer\b", re.I)),
@@ -631,6 +677,23 @@ _CONFIRM_YES = frozenset(
         "copy",
         "right",
         "positive",
+        # Flexible affirmations pilots actually say to a readback (live
+        # request: "yes or confirm or thats right or ok or post it"). "post"/
+        # "send"/"go" mean "commit it"; "okay"/"good"/"sure"/"yup" are plain
+        # agreement. A destructive confirm still fails closed on any _CONFIRM_NO
+        # word, so a wider YES set only helps the common non-destructive case.
+        "ok",
+        "okay",
+        "kay",
+        "post",
+        "send",
+        "go",
+        "good",
+        "sure",
+        "great",
+        "perfect",
+        "yessir",
+        "yers",
     )
 )
 _CONFIRM_NO = frozenset(
@@ -653,7 +716,24 @@ _CONFIRM_NO = frozenset(
 # Words allowed to ride along without breaking standalone-ness ("yes please",
 # "yeah do it", "confirm it, over").
 _CONFIRM_FILLER = frozenset(
-    ("do", "it", "that", "thats", "is", "the", "please", "over", "out", "um", "uh", "er", "and")
+    (
+        "do",
+        "it",
+        "that",
+        "thats",
+        "is",
+        "the",
+        "please",
+        "over",
+        "out",
+        "um",
+        "uh",
+        "er",
+        "and",
+        "for",
+        "on",
+        "its",
+    )
 )
 _CONFIRM_YES_ALLOWED = _CONFIRM_YES | _CONFIRM_FILLER
 _DO_IT_RE = re.compile(r"\bdo\s+it\b", re.I)

@@ -426,7 +426,9 @@ def check_credentials(ctx: DoctorContext) -> list[CheckResult]:
             systemd_managed=cred_dir is not None,
         )
     ]
-    if ctx.cfg.chat.enabled:
+    if ctx.cfg.chat.enabled and ctx.cfg.chat.backend == "anthropic":
+        # The on-box backend (chat.backend: local) needs no key — it talks to
+        # chat.local_url, not the cloud. Only the anthropic backend is gated here.
         key_path = Path(cred_dir) / "anthropic" if cred_dir else Path(ctx.cfg.chat.api_key_file)
         results.append(
             _credential_result(

@@ -341,6 +341,22 @@ Further contract points:
 
 Config: the optional `dialog:` section (`window_ms`, `ack_grace_ms`, `endpoint_gap_floor_ms`, `max_retries`) — §16. The timing defaults are the values tuned on live fleet audio; expect them to move.
 
+### 5.5 Live recognition — commit mid-sentence, not after the room goes quiet
+
+The endpointing in §5.4 has one structural cost: a capture is only decoded **after it closes**, on a silence gap or the hard cap. When a pilot issues an order and *keeps talking* — to their fleet, over someone else's callout, in a channel that never falls silent — the capture runs to the hard cap before the first decode, and the order lands 10–20 seconds late. That is the single worst latency in the system, and it is exactly the moment latency matters most.
+
+**Live recognition (`capture.streaming`) decodes the buffer *while the pilot is still talking* and commits the instant the command is complete.** The dialog wheel (§5.4), already walking every open capture each 100 ms tick, takes a RAM snapshot of the buffer-so-far (`CaptureManager.capture_progress`) and runs an incremental Whisper decode. The moment that partial transcript parses a **complete, confident command** — a recognised intent, plus a resolvable system name for the intents that need one (`_early_committable`) — the wheel ends the capture then and there. The pilot can keep talking; the order is already in flight.
+
+The design's safety comes from what the incremental decode is *not* allowed to do: **it never routes the command.** It only decides "the command is complete, stop capturing now" and calls the same `force_endpoint` the silence path uses. The **final decode on emit stays authoritative** — it re-parses, re-resolves, runs the pilot gate, the confirm-first flow, everything. So a mis-parsed partial can only end the capture a little early; it can never post the wrong card, mint the wrong `@here`, or bypass a gate. Constraint 6 is untouched — this is fixed-grammar parsing over a partial transcript, no model in the routing path.
+
+Three guards keep it cheap and correct:
+
+- **Rate-limited.** An incremental decode fires only after `capture.partial_min_speech_ms` of speech has accrued (a fragment can't carry a command) and then at most once per `capture.partial_decode_ms` of *new* speech, with **one decode in flight per user**. A busy channel cannot stampede the STT queue; overflow is dropped by the bounded queue (§20) and the normal endpoint still catches the command.
+- **Confidence-gated.** Below `capture.early_commit_min_logprob` the partial keeps listening rather than clipping the pilot on a half-heard word; uncertainty is owned by the final decode's confirm-first flow (§8.3), not resolved by guessing early.
+- **Generation-guarded.** The early-commit `force_endpoint` carries the capture generation the snapshot was taken from; if the pilot endpointed and re-woke while the partial decode was in flight, the guard makes it a no-op — a stale decision can never end a *different* capture.
+
+This is the half of "live, flexible recognition" that the §6.1 vocabulary and the §8.3 confirm-first readback complete: she hears the order as it's spoken, reads the situation back naturally, and takes a flexible *yes* — all without the pilot having to stop and wait. It costs real CPU (each partial is a genuine decode), so it is sized for a dedicated ≥4-vCPU host and turns off cleanly (`capture.streaming: false`) on a 2-vCPU box, falling back to decode-on-endpoint. Config: the `capture.streaming` / `partial_decode_ms` / `partial_min_speech_ms` / `early_commit_min_logprob` keys — §16.
+
 ---
 
 ## 6. Voice command reference
@@ -355,9 +371,9 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 
 | Spoken | Intent | Severity | Default notification |
 |---|---|---|---|
-| "hostiles \<system\>" / "reds \<system\>" / "neuts \<system\>" | `HOSTILE_SPOTTED` | medium | role mention |
-| "under attack \<system\>" / "tackled \<system\>" / "point on me \<system\>" | `UNDER_ATTACK` | **high** | role mention + `@here` |
-| "need help \<system\>" / "need backup \<system\>" / "request(ing) [heavy] assistance\|backup\|reinforcements\|support \<system\>" | `ASSIST_REQUEST` | **high** | role mention + `@here` |
+| "hostiles \<system\>" / "reds \<system\>" / "neuts \<system\>" / "enemies \<system\>" / "war target(s) \<system\>" / "gankers \<system\>" | `HOSTILE_SPOTTED` | medium | role mention |
+| "under attack \<system\>" / "tackled \<system\>" / "bubbled \<system\>" / "scrambled\|scrammed \<system\>" / "pointed\|pinned \<system\>" / "webbed \<system\>" / "jammed\|neuted \<system\>" / "engaged \<system\>" / "taking fire \<system\>" / "point on me \<system\>" | `UNDER_ATTACK` | **high** | role mention + `@here` |
+| "need help \<system\>" / "help me \<system\>" / "send help\|backup\|reinforcements\|the fleet \<system\>" / "request(ing) [heavy] assistance\|backup\|reinforcements\|support \<system\>" | `ASSIST_REQUEST` | **high** | role mention + `@here` |
 | "gate camp \<system\>" | `GATE_CAMP` | medium | role mention |
 | "clear \<system\>" | `RESOLVE` | none | edits card, no mention |
 | "timer \<system\> \<duration\>" | `TIMER` | none | schedules a future ping |
@@ -374,6 +390,8 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 Higher-severity patterns are matched first, so *"tackled, need help in Kisogo"* resolves to `UNDER_ATTACK`, not a sighting. The personal-ping intents are the one exception: their utterances *contain* type words ("ping me for gate camps"), so `PING_ME`/`PING_ME_CLEAR` are matched before the type words can claim the utterance — a genuine distress call never contains "ping me".
 
 **Padding tolerance.** Stressed pilots narrate: *"please report that I am tackled by enemies in system M tack O and request heavy assistance please"* must parse exactly like *"tackled M-OEE8"* (and it does: `UNDER_ATTACK` — tackled outranks the assist phrasing — with the spelled system intact). Two mechanisms, still fixed grammar (constraint 6): intent keywords are matched on the **raw text first**, so no courtesy word can ever break recognition; and the **system window** is then cleaned aggressively — a finite courtesy vocabulary (*please, kindly, that, by enemies/hostiles, request(ing), heavy, immediate(ly), send, right now, …* plus the phrase forms *I am / we are / I've been / be advised / thank you*) is stripped, and when the pilot anchors the name with a preposition (*"in system X"*, *"in X"*, *"at X"*), everything before the **last** anchor is treated as narrative and discarded. The stripping applies to the system window only — `detail` stays verbatim (§6.3) and callsigns keep their words. The article *"a"* survives inside a spelling (*"one d q one tack a"* → 1DQ1-A, §8.2) but is stripped everywhere else. Note *assistance/backup/reinforcements/support* are `ASSIST_REQUEST` **type words** when prefixed by *need/request* — they are matched (and removed from the window) as whole intent phrases before the courtesy set touches anything.
+
+**Situation vocabulary.** Pilots describe the *same* situation a dozen ways and cannot enumerate them up front, so the distress pattern covers the EWAR/tackle verbs that all mean "I'm in a fight, come now" — *bubbled, scrambled/scrammed, pointed, pinned, webbed, jammed, neuted, engaged, taking fire, being/getting attacked* — whether the pilot is the one held (*"I'm scrambled"*) or holding tackle on a target (*"I've got them webbed"*). Either reading calls for the same fleet response, so both land on `UNDER_ATTACK`; all of them outrank the sighting nouns, so *"scrambled by reds"* is a distress call, never demoted. The sighting set likewise widens beyond *hostiles/reds/neuts* to *enemies/enemy*, *war target(s)* (EVE's term for a shootable pilot), and *gankers/bad guys*; and the assist set adds *help me* and *send help/backup/the fleet/the cavalry* alongside the *need/request* phrasings (a lone *"help"* still reaches the `/help` manual — only *"help me"* escalates). This is still fixed grammar (constraint 6): a small, auditable table, extended from the STT transcript log (§8.7) when a real phrasing slips through — never a model guessing intent. `STT_VOCAB_BIAS` carries the new words so Whisper decodes them.
 
 `PING_ME` (§10.3) reuses the type vocabulary above: *hostiles/reds/neuts* → `HOSTILE_SPOTTED`, *gate camp(s)* → `GATE_CAMP`, *under attack/attacks/tackled* → `UNDER_ATTACK`, *need help/need backup/assist request(s)* → `ASSIST_REQUEST`, and *"anything"/"everything"/"all"* (or no type word at all) → all four. The optional system window resolves through the same phonetic pipeline as reports (§8.2); anything below HIGH tier is treated as unresolved — a subscription silently scoped to the wrong system would never fire, so CORTANA answers *"Say again the system."* instead of guessing. No system means the subscription covers all systems. The recognised types travel to the engine encoded in `detail` (comma-separated `Intent` values), shared by the `/pingme` twin.
 
@@ -428,13 +446,18 @@ Fifteen commands. Short enough that pilots remember them under fire, which is th
 
 *"Command override, what's the weather in Chicago?"*
 
-An **explicitly-invoked** chat channel, off by default (`chat.enabled`). When a pilot opens an utterance with *"command override"* (after the wake word), everything that follows goes to a cloud Claude model — general questions, banter, live facts via one web search — and the answer is spoken back (or posted to the intel channel when it exceeds the §12.2 cap, with *"Answer posted to Discord."* spoken instead). Slash twin: `/ask` (constraint 10), sharing the same client and the same per-pilot cooldown.
+An **explicitly-invoked** chat channel, off by default (`chat.enabled`). When a pilot opens an utterance with *"command override"* (after the wake word), everything that follows goes to a language model — general questions, banter, live facts — and the answer is spoken back (or posted to the intel channel when it exceeds the §12.2 cap, with *"Answer posted to Discord."* spoken instead). Slash twin: `/ask` (constraint 10), sharing the same client and the same per-pilot cooldown.
 
-**Constraint 6 is untouched.** The incident grammar never sees an LLM: the override prefix is matched *first* and only in leading position, so a report containing the word "override" mid-sentence can never be diverted, and a non-override utterance never reaches the model. The model is instructed to never invent in-game intel — hostiles, timers, and system status come only from CORTANA's own reports.
+**Two backends, one contract (`chat.backend`).** Both satisfy the same `ChatBackend` protocol — one `ask()` — so the dialog engine and `/ask` never care which is live:
 
-**Cost posture.** Default model is the cheapest Claude tier (fractions of a cent per question); replies are capped at `chat.max_tokens`, web search at one per question, and `chat.user_cooldown_s` throttles each pilot. The cooldown arms only on a successful answer — a failed request must not turn the pilot's retry into a throttle message. The API key rides systemd `LoadCredential=` (`anthropic:` credential; constraint 12), with `chat.api_key_file` as the 0600 dev fallback.
+- **`anthropic`** (default) — a cloud Claude model, with one optional live web search per question (weather, prices). Costs per question; needs a key.
+- **`local`** — an **on-box** OpenAI-compatible server (llama.cpp's `server`, Ollama, …) at `chat.local_url`. This is the **SLM lane**: conversational back-and-forth that runs entirely on the droplet — no API, no key, no per-question cost, no network egress. The pilot wanted CORTANA to "talk back and forth" without paying an API; this is that, on the same hardware the bot already runs on. Deploying the model + server (choosing a small quantised model that fits alongside Whisper and Piper in the box's RAM) is an operator step — CORTANA points at the URL, it does not host the model. No web search (a local model has no such tool).
 
-**Liveness.** The whole `chat:` section applies on SIGHUP — flipping `chat.enabled` or dropping a key into place takes effect on `systemctl reload cortana-brain`, no restart. A spoken "command override …" while the channel is down always gets the fixed *"Override channel unavailable."* line (never a silent fall-through to the grammar), and `/ask` distinguishes "not enabled" from "enabled but no key loaded".
+**Constraint 6 is untouched, either way.** The incident grammar never sees an LLM: the override prefix is matched *first* and only in leading position, so a report containing the word "override" mid-sentence can never be diverted, and a non-override utterance never reaches the model. Both backends are instructed to never invent in-game intel — hostiles, timers, and system status come only from CORTANA's own reports. The SLM is a conversation partner, never an interpreter of reports.
+
+**Cost posture.** For `anthropic`, the default model is the cheapest Claude tier (fractions of a cent per question); replies are capped at `chat.max_tokens`, web search at one per question, and `chat.user_cooldown_s` throttles each pilot. For `local`, there is no per-question cost — but the cooldown still applies (it also paces the box's CPU, shared with Whisper). Either way the cooldown arms only on a successful answer — a failed request must not turn the pilot's retry into a throttle message. The Claude key rides systemd `LoadCredential=` (`anthropic:` credential; constraint 12), with `chat.api_key_file` as the 0600 dev fallback; the local backend needs no credential.
+
+**Liveness.** The whole `chat:` section applies on SIGHUP — flipping `chat.enabled`, switching `chat.backend`, or dropping a key into place takes effect on `systemctl reload cortana-brain`, no restart. A spoken "command override …" while the channel is down always gets the fixed *"Override channel unavailable."* line (never a silent fall-through to the grammar), and `/ask` distinguishes the down states: "not enabled", "no key" (anthropic), and "no url" (local).
 
 ---
 
@@ -583,7 +606,7 @@ Hyphenated names are also matched by their **spoken short form** — the pre-hyp
 |---|---|---|
 | **High** | `top1 ≥ 0.80` and `top1 − top2 ≥ 0.12` | Post immediately. Speak *"Hostiles Otanuomi, pinged."* |
 | **Medium** | `top1 ≥ 0.55` | **Post anyway**, flagged uncertain, with buttons `[Otanuomi] [Kisogo] [Wrong — fix]`. Speak *"Hostiles Otanuomi — say again to confirm."* and arm the wake-free confirm window (below). Speed beats certainty when a pilot is in structure; get the ping out and let humans correct it. |
-| **Low** | below | **Confirm-first** (`dialog.confirm_reports: low`, the default): speak *"Heard \<name\>. Confirm?"* and hold the report in the confirm window. *Yes* — **or silence, or unmatched speech** — posts it with the heard name verbatim (§8.6: a distress call is never lost to an unanswered question); *no* opens the say-again retry that re-binds a bare system name; a dismissal retracts it. With `confirm_reports: off`, posts verbatim immediately (readback only). `always` extends the ask to HIGH-tier reports too. |
+| **Low** | below | **Confirm-first** (`dialog.confirm_reports: low`, the default): read the *situation* back naturally — *"Under attack in Otanuomi, by two cruisers. Confirm?"* (the intent, the system, and a short verbatim detail; a long detail is dropped from speech but kept on the card) — and hold the report in the confirm window. Naming the intent, not just the system, makes a misheard **intent** as catchable as a misheard system. Intents without a readback template fall back to *"Heard \<name\>. Confirm?"*. *Yes* — **or silence, or unmatched speech** — posts it with the heard name verbatim (§8.6: a distress call is never lost to an unanswered question); *no* opens the say-again retry that re-binds a bare system name; a dismissal retracts it. With `confirm_reports: off`, posts verbatim immediately (readback only). `always` extends the ask to HIGH-tier reports too. |
 
 **Destructive and scheduling commands need HIGH.** The tier table above governs *reports*, which post-anyway because speed beats certainty. `clear`, `timer`, and `form up` act irreversibly on a *specific* system — resolving the wrong system's incidents or scheduling a rally in the wrong place has no undo — so they act only on a High-tier match. A Medium match answers *"Heard Otanuomi — say again to confirm."* (the same ASKED outcome as an uncertain report) and holds the command pending in the confirm window. Low still gets *"Say again the system."*
 
@@ -629,6 +652,20 @@ Pilots use phone mics, in noisy rooms, with a game running, stressed and talking
 **The relay is also confidence-gated.** Whatever the mode, a relay posts only when Whisper's `avg_logprob` clears `stt.relay_min_logprob`. Below that, the transcript is treated as decoded noise ("Rens, Rens, Rens" hallucinated from silence) and CORTANA says *"Say again the system."* instead of posting garbage. Recognised commands are **never** gated — a distress call always posts. Stuttered three-plus word repeats in relay text collapse to one word, and every relay logs its confidence to `command_log` so the threshold is tuned from data.
 
 **Relays dedupe like incidents.** Identical relay text (case-insensitive) within `incidents.dedupe_window_s` folds — the pilot hears *"Relayed."* again, but no second card posts. Pilots repeat when they miss the ack; a repeat is not fresh intel. A successful relay is acknowledged with a spoken *"Relayed."* — without the ack, pilots repeat themselves, and every repeat is another card and another STT decode.
+
+### 8.7 The STT transcript log — the phrasing-analysis surface
+
+Recognition is only as good as the vocabulary, and the vocabulary only grows from seeing what pilots *actually say* — including the phrasings that match nothing yet. The JSON journal records every `utterance_transcribed`, but it is 100k lines of debug noise, not something a corp admin scans.
+
+`discord.channels.transcript` (optional, `0` = off) is the human-readable surface for exactly this. When set, **every heard utterance posts one clean line** to that channel: what CORTANA thinks it heard, how the grammar parsed it, and the decoder confidence —
+
+```
+🎧 "tackled by two cruisers in taisy" → UNDER_ATTACK · sys "taisy" · -0.21
+🎧 "we're getting bubbled on the gate" → UNDER_ATTACK · -0.34
+🎧 "they've got us scrammed"           → no command · -0.52
+```
+
+Unmatched utterances are logged too — that is the point: the *"no command"* lines are the backlog of phrasings the fixed grammar (§6.1) should learn next. An admin skims the channel after a fight, spots the misses, and the situation vocabulary is extended from real audio instead of guesswork. The line is a transcript only — no audio, no user id (constraint 5) — and the post is fire-and-forget, so it never sits between hearing and acting. Off by default; a corp that wants it points it at a private channel.
 
 ---
 
@@ -1199,6 +1236,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `discord.channels.intel_alerts` | int | **required** | hot | Channel for incidents that mention a role (GDD §11.2). |
 | `discord.channels.intel_live` | int | **required** | hot | Channel for every incident, no mentions — the firehose. |
 | `discord.channels.health` | int | **required** | hot | Channel for self-reports and degradation alerts. |
+| `discord.channels.transcript` | int | `0` | hot | Optional. When set, every heard utterance posts one clean line — what CORTANA thinks it heard plus how it parsed — so phrasing and misfires can be reviewed at a glance (GDD §8.7). 0 = off. |
 | `discord.roles.pilot` | int | `0` | hot | Only members with this role may trigger mentions. 0 = gate off. |
 | `discord.roles.fc` | int | `0` | hot | Only this role voice-triggers under fleetmode / uses admin commands without Manage Guild. 0 = gate off. |
 | `discord.watch_voice_channels` | int_list | **required** | hot | Voice channels CORTANA watches / auto-joins. |
@@ -1218,18 +1256,22 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `capture.endpoint_silence_ms` | int | **required** | hot | Trailing silence that ends an utterance (wall-clock under DTX). |
 | `capture.max_utterance_ms` | int | **required** | hot | Hard cap on a single capture window. |
 | `capture.vad_aggressiveness` | int | **required** | restart | webrtcvad mode 0 (permissive) – 3 (aggressive); the VadGate is built once at startup. |
+| `capture.streaming` | bool | `True` | hot | Live recognition (GDD §5.5): decode the growing capture while the pilot is still talking and commit the instant a complete, confident command is present, instead of waiting for silence/the hard cap. The fix for the 'keep talking and it drags' latency. Needs CPU headroom (each incremental decode is a real Whisper run) — sized for a dedicated >=4-vCPU box. false = decode-on-endpoint only. |
+| `capture.partial_decode_ms` | int | `1200` | hot | Minimum new speech between incremental decodes (GDD §5.5) — the incremental-decode rate limiter. Lower = snappier + more CPU. |
+| `capture.partial_min_speech_ms` | int | `900` | hot | Don't attempt an incremental decode until at least this much speech has accrued (GDD §5.5): a sub-second fragment can't carry a command. |
+| `capture.early_commit_min_logprob` | float | `-1.0` | hot | Confidence floor for an incremental decode to commit early (GDD §5.5). An uncertain partial keeps listening rather than clipping the pilot; the normal endpoint still catches it. |
 | **`dialog:`** | | | | *OPTIONAL voice dialog engine timing/budgets (GDD §5.4); defaults are the tuned live values.* |
 | `dialog.window_ms` | int | `4000` | hot | Wall-clock lifetime of a wake-free window (say-again retry, code-colour opener, bare command override). DTX-proof: the dialog wheel expires it in real time, frames or no frames. |
 | `dialog.ack_grace_ms` | int | `2000` | hot | Endpoint grace after a capture opens or a prompt is spoken — cue playback plus pilot reaction time. |
 | `dialog.endpoint_gap_floor_ms` | int | `700` | hot | Floor under capture.endpoint_silence_ms for the wall-clock endpoint: DTX drops packets between words; a too-eager gap clips pilots mid-sentence. |
 | `dialog.max_retries` | int | `2` | hot | Wake-free windows per dialog TOTAL (subdialog openers and say-again retries share the budget). Only a fresh wake refills it; exhaustion ends audibly with standing-down. |
-| `dialog.confirm_reports` | str | `'low'` | hot | Confirm-first for voice reports (GDD §8.3): off = commit immediately (readback only); low = uncertain system matches ask "Heard X — confirm?" first; always = every voice report asks. Yes commits, no opens a say-again retry, silence/unmatched commits anyway — a distress call is never lost. One of: `off`, `low`, `always`. |
+| `dialog.confirm_reports` | str | `'low'` | hot | Confirm-first for voice reports (GDD §8.3): off = commit immediately (readback only); low = uncertain system matches read the situation back ("Under attack in X, confirm?") first; always = every voice report asks. Yes commits (flexibly: yes/confirm/ok/post it/send it/…), no opens a say-again retry, silence/unmatched commits anyway — a distress call is never lost. One of: `off`, `low`, `always`. |
 | `dialog.retry_min_logprob` | float | `-1.3` | hot | Transcripts below this Whisper confidence are chatter/noise: they never earn a say-again retry — the dialog closes silently instead of re-prompting into an open mic. Recognised commands are never gated by this. |
 | **`stt:`** | | | | *Speech-to-text backend and relay gates.* |
 | `stt.backend` | str | **required** | restart | Which Transcriber engine to build at startup. One of: `faster-whisper`, `whisper-cpp`. |
 | `stt.model` | str | **required** | restart | Whisper model size or path. |
 | `stt.compute_type` | str | **required** | restart | CTranslate2 quantization. |
-| `stt.cpu_threads` | int | `1` | restart | Whisper inference threads. Default 1 on the 2-vCPU droplet — ON PURPOSE: a decode using BOTH cores starves the Ears real-time Opus mixer, which is exactly the 'her voice is choppy / drops out' symptom (the mixer misses its 20ms frame deadline). One thread leaves a core free for the mixer and the event loop; decodes run a little slower but the voice stays smooth. Raise only on a box with cores to spare. |
+| `stt.cpu_threads` | int | `1` | restart | Whisper inference threads. On a 2-vCPU droplet use 1 — ON PURPOSE: a decode using BOTH cores starves the Ears real-time Opus mixer, which is exactly the 'her voice is choppy / drops out' symptom (the mixer misses its 20ms frame deadline). On a dedicated >=4-vCPU box set 2: decodes (including streaming's incremental ones, §5.5) run snappier while the high-CPUWeight mixer keeps its cores. The example config ships 2 for that box; drop to 1 on 2 vCPUs. |
 | `stt.bias_with_gazetteer` | bool | `True` | restart | Pass system names as the Whisper initial_prompt. |
 | `stt.whisper_cpp_url` | str | `'http://127.0.0.1:8080/inference'` | restart | whisper.cpp server endpoint; required (non-empty) only when stt.backend is whisper-cpp (cross-checked). |
 | `stt.watchdog_s` | float | `15.0` | restart | GDD §20 "STT worker hang" watchdog deadline. The whisper-cpp HTTP timeout is derived slightly below it so the socket gives up before the watchdog abandons the worker. |
@@ -1273,7 +1315,9 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `fun.max_speak_s` | float | `20.0` | hot | Spoken-length cap for facts/insults, overriding tts.max_utterance_s — a whole fact runs longer than a command reply. |
 | **`chat:`** | | | | *OPTIONAL "command override" assistant (GDD §6.6); absent = off.* |
 | `chat.enabled` | bool | `False` | sighup | Pilots can say "command override, <question>" (/ask twin). Costs real money per question. |
-| `chat.model` | str | `'claude-haiku-4-5'` | hot | Claude model for override replies. |
+| `chat.backend` | str | `'anthropic'` | sighup | Who answers override questions: 'anthropic' = the cloud Claude API (needs a key, costs per question); 'local' = an on-box OpenAI-compatible server at chat.local_url (no API, no key, no per-question cost) — the SLM lane for conversational back-and-forth on the droplet. Still OFF the command path (constraint 6). One of: `anthropic`, `local`. |
+| `chat.local_url` | str | `''` | sighup | OpenAI-compatible chat-completions endpoint for backend='local' (e.g. http://127.0.0.1:8081/v1/chat/completions from llama.cpp's server or Ollama). Empty = not configured. |
+| `chat.model` | str | `'claude-haiku-4-5'` | hot | Model for override replies. For backend='anthropic' a Claude model id; for backend='local' the model name the local server expects. |
 | `chat.api_key_file` | str | `'/etc/cortana/anthropic'` | sighup | Dev fallback ONLY (0600); production reads $CREDENTIALS_DIRECTORY/anthropic via LoadCredential= (constraint 12). The client is rebuilt when the on-disk key changes. |
 | `chat.max_tokens` | int | `300` | hot | Hard cap per answer. |
 | `chat.user_cooldown_s` | int | `10` | hot | Per-pilot throttle — the cost control. |

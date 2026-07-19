@@ -30,6 +30,9 @@ discord:
     intel_alerts: 000000000000000000   # only incidents that mention a role (GDD §11.2)
     intel_live:   000000000000000000   # every incident, no mentions — the firehose
     health:       000000000000000000   # hourly self-reports and degradation alerts
+    transcript:   0                    # OPTIONAL STT review log (GDD §8.7): one line per
+                                       # heard utterance — what she thinks she heard + how
+                                       # it parsed — for reviewing phrasing/misfires. 0 = off
   roles:                               # OPTIONAL — leave keys out (or the whole
                                        # section) to run without role gates
     pilot: 000000000000000000          # gate: only members with this role may trigger
@@ -121,13 +124,31 @@ capture:
                                        # reports still end early at the silence
                                        # endpoint, so short commands stay fast.
   vad_aggressiveness: 2                # webrtcvad mode, 0 (permissive) – 3 (aggressive)
+  streaming: true                      # LIVE RECOGNITION (GDD §5.5): decode the growing
+                                       # capture WHILE the pilot is still talking and commit
+                                       # the instant a complete, confident command is present
+                                       # — instead of waiting for them to stop before the
+                                       # first decode. This is the fix for the "keep talking
+                                       # and it drags 10-20s" latency. Each incremental decode
+                                       # is a real Whisper run, so it needs a dedicated
+                                       # >=4-vCPU box; set false on a 2-vCPU droplet.
+  partial_decode_ms: 1200              # minimum new speech between incremental decodes
+                                       # (the rate limiter). Lower = snappier + more CPU.
+  partial_min_speech_ms: 900           # don't decode a fragment shorter than this — it can't
+                                       # carry a whole command, and decoding it risks a clip.
+  early_commit_min_logprob: -1.0       # an incremental decode below this confidence keeps
+                                       # listening rather than clipping the pilot; the normal
+                                       # silence endpoint still catches it.
 
 stt:
   backend: faster-whisper              # or: whisper-cpp (same Transcriber protocol)
   model: small                         # Whisper model size
   compute_type: int8                   # CTranslate2 quantization
-  cpu_threads: 1                       # ONE Whisper thread: 2 starves the Ears real-time
-                                       # mixer and makes her voice choppy (GDD §12/§17).
+  cpu_threads: 2                       # Whisper decode threads. On a dedicated >=4-vCPU box, 2
+                                       # gives snappy decodes (incl. streaming's incremental
+                                       # ones) while the high-CPUWeight Ears mixer keeps its
+                                       # cores. On a 2-vCPU box use 1: there, 2 starves the
+                                       # real-time mixer and her voice goes choppy (GDD §12/§17).
   bias_with_gazetteer: true            # pass system names as Whisper initial_prompt
   whisper_cpp_url: http://127.0.0.1:8080/inference  # used only when backend: whisper-cpp
   watchdog_s: 15                       # hang watchdog (GDD §20): seconds one decode may run
@@ -214,9 +235,20 @@ fun:                                   # fact library / insult maker (GDD §13.2
 
 chat:                                  # "command override" assistant (GDD §6.6) — OFF by default
   enabled: false                       # true = pilots can say "command override, <question>"
-                                       # (slash twin: /ask). Costs real money per question.
-  model: claude-haiku-4-5              # cheapest tier (~$0.002/question);
-                                       # claude-opus-4-8 = smarter, ~10x the price
+                                       # (slash twin: /ask). NEVER touches the command path.
+  backend: anthropic                   # who answers: anthropic = cloud Claude (needs a key,
+                                       # costs per question); local = an on-box
+                                       # OpenAI-compatible server (llama.cpp/Ollama) at
+                                       # local_url — the SLM lane: conversational
+                                       # back-and-forth on the droplet, no API, no key, no
+                                       # per-question cost. Still OFF the command path (§6).
+  local_url: ""                        # backend=local endpoint, e.g.
+                                       # http://127.0.0.1:8081/v1/chat/completions
+                                       # (run: llama-server -m <model.gguf> --port 8081).
+                                       # Empty = unset. Deploy the model+server yourself.
+  model: claude-haiku-4-5              # anthropic: a Claude id — cheapest tier
+                                       # (~$0.002/question); claude-opus-4-8 = ~10x smarter.
+                                       # local: the model name your server expects.
   api_key_file: /etc/cortana/anthropic    # dev fallback ONLY (0600). Production reads
                                        # $CREDENTIALS_DIRECTORY/anthropic via systemd
                                        # LoadCredential= — the key is never in this file.

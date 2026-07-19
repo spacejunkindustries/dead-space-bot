@@ -483,11 +483,18 @@ class UtilityCog(commands.Cog):
             # Distinguish "operator chose off" from "enabled but no key
             # loaded" — the latter used to claim the feature was disabled,
             # sending an admin to the wrong config knob mid-outage.
-            if getattr(self.bot, "chat_status", "disabled") == "no_key":
+            status = getattr(self.bot, "chat_status", "disabled")
+            if status == "no_key":
                 msg = (
                     "The override channel is enabled but no API key is loaded — "
                     "check `/etc/cortana/anthropic` and the service credential, "
                     "then `systemctl reload cortana-brain`."
+                )
+            elif status == "no_url":
+                msg = (
+                    "The override channel is set to the local backend but "
+                    "`chat.local_url` is empty — point it at your on-box model "
+                    "server, then `systemctl reload cortana-brain`."
                 )
             else:
                 msg = "The override channel is not enabled on this server."

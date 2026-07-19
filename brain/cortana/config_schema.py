@@ -228,6 +228,16 @@ KEYS: Final[tuple[Key, ...]] = (
         minimum=0,
     ),
     Key(
+        "discord.channels.transcript",
+        "int",
+        Reload.HOT,
+        "Optional. When set, every heard utterance posts one clean line — "
+        "what CORTANA thinks it heard plus how it parsed — so phrasing and "
+        "misfires can be reviewed at a glance (GDD §8.7). 0 = off.",
+        default=0,
+        minimum=0,
+    ),
+    Key(
         "discord.roles.pilot",
         "int",
         Reload.HOT,
@@ -367,6 +377,47 @@ KEYS: Final[tuple[Key, ...]] = (
         minimum=0,
         maximum=3,
     ),
+    Key(
+        "capture.streaming",
+        "bool",
+        Reload.HOT,
+        "Live recognition (GDD §5.5): decode the growing capture while the "
+        "pilot is still talking and commit the instant a complete, confident "
+        "command is present, instead of waiting for silence/the hard cap. The "
+        "fix for the 'keep talking and it drags' latency. Needs CPU headroom "
+        "(each incremental decode is a real Whisper run) — sized for a "
+        "dedicated >=4-vCPU box. false = decode-on-endpoint only.",
+        default=True,
+    ),
+    Key(
+        "capture.partial_decode_ms",
+        "int",
+        Reload.HOT,
+        "Minimum new speech between incremental decodes (GDD §5.5) — the "
+        "incremental-decode rate limiter. Lower = snappier + more CPU.",
+        default=1200,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "capture.partial_min_speech_ms",
+        "int",
+        Reload.HOT,
+        "Don't attempt an incremental decode until at least this much speech "
+        "has accrued (GDD §5.5): a sub-second fragment can't carry a command.",
+        default=900,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "capture.early_commit_min_logprob",
+        "float",
+        Reload.HOT,
+        "Confidence floor for an incremental decode to commit early (GDD "
+        "§5.5). An uncertain partial keeps listening rather than clipping the "
+        "pilot; the normal endpoint still catches it.",
+        default=-1.0,
+    ),
     # stt
     Key(
         "dialog.window_ms",
@@ -414,9 +465,10 @@ KEYS: Final[tuple[Key, ...]] = (
         "str",
         Reload.HOT,
         "Confirm-first for voice reports (GDD §8.3): off = commit "
-        "immediately (readback only); low = uncertain system matches ask "
-        '"Heard X — confirm?" first; always = every voice report asks. '
-        "Yes commits, no opens a say-again retry, silence/unmatched commits "
+        "immediately (readback only); low = uncertain system matches read "
+        'the situation back ("Under attack in X, confirm?") first; always = '
+        "every voice report asks. Yes commits (flexibly: yes/confirm/ok/post "
+        "it/send it/…), no opens a say-again retry, silence/unmatched commits "
         "anyway — a distress call is never lost.",
         default="low",
         choices=("off", "low", "always"),
@@ -444,13 +496,13 @@ KEYS: Final[tuple[Key, ...]] = (
         "stt.cpu_threads",
         "int",
         Reload.RESTART,
-        "Whisper inference threads. Default 1 on the 2-vCPU droplet — ON "
-        "PURPOSE: a decode using BOTH cores starves the Ears real-time Opus "
-        "mixer, which is exactly the 'her voice is choppy / drops out' "
-        "symptom (the mixer misses its 20ms frame deadline). One thread "
-        "leaves a core free for the mixer and the event loop; decodes run a "
-        "little slower but the voice stays smooth. Raise only on a box with "
-        "cores to spare.",
+        "Whisper inference threads. On a 2-vCPU droplet use 1 — ON PURPOSE: a "
+        "decode using BOTH cores starves the Ears real-time Opus mixer, which "
+        "is exactly the 'her voice is choppy / drops out' symptom (the mixer "
+        "misses its 20ms frame deadline). On a dedicated >=4-vCPU box set 2: "
+        "decodes (including streaming's incremental ones, §5.5) run snappier "
+        "while the high-CPUWeight mixer keeps its cores. The example config "
+        "ships 2 for that box; drop to 1 on 2 vCPUs.",
         default=1,
         minimum=0,
         exclusive_minimum=True,
@@ -760,10 +812,32 @@ KEYS: Final[tuple[Key, ...]] = (
         default=False,
     ),
     Key(
+        "chat.backend",
+        "str",
+        Reload.SIGHUP,
+        "Who answers override questions: 'anthropic' = the cloud Claude API "
+        "(needs a key, costs per question); 'local' = an on-box "
+        "OpenAI-compatible server at chat.local_url (no API, no key, no "
+        "per-question cost) — the SLM lane for conversational back-and-forth "
+        "on the droplet. Still OFF the command path (constraint 6).",
+        default="anthropic",
+        choices=("anthropic", "local"),
+    ),
+    Key(
+        "chat.local_url",
+        "str",
+        Reload.SIGHUP,
+        "OpenAI-compatible chat-completions endpoint for backend='local' "
+        "(e.g. http://127.0.0.1:8081/v1/chat/completions from llama.cpp's "
+        "server or Ollama). Empty = not configured.",
+        default="",
+    ),
+    Key(
         "chat.model",
         "str",
         Reload.HOT,
-        "Claude model for override replies.",
+        "Model for override replies. For backend='anthropic' a Claude model "
+        "id; for backend='local' the model name the local server expects.",
         default="claude-haiku-4-5",
     ),
     Key(

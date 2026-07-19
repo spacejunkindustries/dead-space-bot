@@ -17,10 +17,14 @@ question. The API key rides systemd ``LoadCredential=`` (constraint 12) with
 from __future__ import annotations
 
 import asyncio
+import http.client
+import json
 import os
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import structlog
 
@@ -28,7 +32,14 @@ from cortana.config import ConfigHolder
 
 log = structlog.get_logger(__name__)
 
-__all__ = ["ChatClient", "ChatCooldownError", "ChatError", "read_api_key"]
+__all__ = [
+    "ChatBackend",
+    "ChatClient",
+    "ChatCooldownError",
+    "ChatError",
+    "LocalChatClient",
+    "read_api_key",
+]
 
 #: Server-tool web-search continuation cap: the API may pause a long
 #: server-tool turn (stop_reason "pause_turn"); we resume at most this many
@@ -56,6 +67,17 @@ class ChatError(Exception):
 
 class ChatCooldownError(ChatError):
     """This pilot asked again too soon (``chat.user_cooldown_s``)."""
+
+
+class ChatBackend(Protocol):
+    """The override lane's one method (GDD §6.6). Both the cloud
+    (:class:`ChatClient`) and on-box (:class:`LocalChatClient`) backends satisfy
+    it, so the dialog engine and the ``/ask`` twin never care which is live."""
+
+    async def ask(self, user_id: int, query: str) -> str:
+        """One question in, one short spoken-ready answer out. Raises
+        :class:`ChatCooldownError` on throttle, :class:`ChatError` otherwise."""
+        ...
 
 
 def read_api_key(api_key_file: str) -> str | None:
@@ -179,3 +201,99 @@ class ChatClient:
             output_tokens=response.usage.output_tokens,
         )
         return text
+
+
+#: On-box persona. Same voice as the cloud one, minus the web-search clause a
+#: local model has no tool for. Short spoken lines, and the one hard rule holds
+#: identically: never invent in-game intel (constraint 6 — intel is the
+#: incident engine's alone).
+_SYSTEM_LOCAL = (
+    "You are CORTANA, the ship's AI of the DEAD corporation's fleet in EVE "
+    "Echoes — calm, capable, lightly wry, loyal to the crew. A pilot has opened "
+    "the out-of-band channel ('command override') and is talking to you over "
+    "voice comms. Answer in one to three short spoken sentences — no markdown, "
+    "no lists, no URLs. Never invent in-game fleet intel (hostiles, system "
+    "status, timers): that intel comes only from CORTANA's own incident "
+    "reports, so say so and move on."
+)
+
+
+class LocalChatClient:
+    """On-box override backend — an OpenAI-compatible chat-completions server
+    (llama.cpp's ``server``, Ollama, …) at ``chat.local_url``.
+
+    The SLM lane: conversational back-and-forth that runs entirely on the
+    droplet — no API key, no per-question cost, no network egress. Same
+    :meth:`ask` contract and per-pilot cooldown as :class:`ChatClient`
+    (constraint 10 parity: voice and ``/ask`` ride one clock), so the engine
+    cannot tell the backends apart. Constraint 6 stands untouched — this never
+    sees the incident grammar and never posts intel.
+
+    Blocking HTTP rides ``asyncio.to_thread`` (stdlib ``urllib``; the class is
+    otherwise async), mirroring the whisper.cpp backend — no extra dependency,
+    nothing on the event-loop thread."""
+
+    def __init__(self, holder: ConfigHolder) -> None:
+        self._holder = holder
+        self._lock = asyncio.Lock()
+        self._last_ask: dict[int, float] = {}
+
+    async def ask(self, user_id: int, query: str) -> str:
+        cfg = self._holder.current.chat
+        now = time.monotonic()
+        last = self._last_ask.get(user_id)
+        if last is not None and now - last < cfg.user_cooldown_s:
+            raise ChatCooldownError(f"cooldown: {cfg.user_cooldown_s}s per pilot")
+        if not cfg.local_url:
+            raise ChatError("chat.local_url is not configured")
+        async with self._lock:
+            text = await asyncio.to_thread(
+                _local_completion,
+                cfg.local_url,
+                cfg.model,
+                query,
+                cfg.max_tokens,
+                cfg.timeout_s,
+            )
+        if not text:
+            raise ChatError("empty reply")
+        # Cooldown arms only on SUCCESS (see ChatClient): a failed request must
+        # not convert a pilot's retry into "cooling down".
+        self._last_ask[user_id] = time.monotonic()
+        log.info("override_answered_local", model=cfg.model)
+        return text
+
+
+def _local_completion(url: str, model: str, query: str, max_tokens: int, timeout_s: float) -> str:
+    """POST one OpenAI-style chat completion and return the reply text.
+
+    Sync + stdlib-only (runs in a worker thread). Every transport/shape error
+    surfaces as the :class:`ChatError` the caller contract promises — the pilot
+    hears a fixed line, never a raw traceback on comms."""
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_LOCAL},
+                {"role": "user", "content": query},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.6,
+            "stream": False,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        # OSError covers URLError/TimeoutError/ConnectionReset; HTTPException the
+        # mid-request drops urllib doesn't wrap; ValueError a bad JSON body.
+        raise ChatError(f"local chat request failed: {exc}") from exc
+    try:
+        message = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ChatError(f"local chat response malformed: {exc}") from exc
+    return str(message).strip()

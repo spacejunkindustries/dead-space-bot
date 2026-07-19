@@ -41,7 +41,7 @@ from cortana.audio.capture import CaptureManager, CaptureMeta, CaptureOrigin
 from cortana.audio.stt import Transcriber, make_transcriber
 from cortana.audio.vad import VadGate
 from cortana.audio.wake import OpenWakeWordDetector
-from cortana.chat import ChatClient, read_api_key
+from cortana.chat import ChatBackend, ChatClient, LocalChatClient, read_api_key
 from cortana.config import ConfigError, ConfigHolder
 from cortana.core import db
 from cortana.core.discipline import Discipline
@@ -156,7 +156,7 @@ class App:
         self.alarms: AlarmBus | None = None
         self.gateway: VoiceGateway | None = None
         self.reminders: ReminderService | None = None
-        self.chat: ChatClient | None = None
+        self.chat: ChatBackend | None = None
         self.fun: FunEngine | None = None
         self._chat_status = "disabled"
         self._chat_key: str | None = None
@@ -542,11 +542,23 @@ class App:
         cfg = self.holder.current
         if not cfg.chat.enabled:
             self.chat = None
+            self._chat_key = None
             self._chat_status = "disabled"
+        elif cfg.chat.backend == "local":
+            # On-box SLM lane (GDD §6.6): no key, no cost. Rebuild only when
+            # switching INTO local (a URL edit is read live from the holder).
+            if not cfg.chat.local_url:
+                self.chat = None
+                self._chat_status = "no_url"
+            else:
+                if not isinstance(self.chat, LocalChatClient):
+                    self.chat = LocalChatClient(self.holder)
+                self._chat_key = None
+                self._chat_status = "ready"
         else:
             key = read_api_key(cfg.chat.api_key_file)
             if key:
-                if self.chat is None or self._chat_key != key:
+                if not isinstance(self.chat, ChatClient) or self._chat_key != key:
                     self.chat = ChatClient(self.holder, key)
                     self._chat_key = key
                 self._chat_status = "ready"
@@ -554,7 +566,12 @@ class App:
                 self.chat = None
                 self._chat_key = None
                 self._chat_status = "no_key"
-        log.info("override_channel_status", status=self._chat_status, model=cfg.chat.model)
+        log.info(
+            "override_channel_status",
+            status=self._chat_status,
+            backend=cfg.chat.backend,
+            model=cfg.chat.model,
+        )
         if self.bot is not None:
             self.bot.chat = self.chat
             self.bot.chat_status = self._chat_status
