@@ -94,6 +94,19 @@ dialog:                                # voice dialog engine (GDD §5.4) — OPT
                                        # openers and say-again retries share it);
                                        # only a fresh wake refills the budget —
                                        # exhaustion ends audibly with "standing down"
+  confirm_reports: low                 # confirm-first for voice reports (GDD §8.3):
+                                       # off = commit immediately (readback only);
+                                       # low = uncertain matches ask "Heard X — confirm?";
+                                       # always = every voice report asks.
+                                       # yes commits · no re-opens "say again" ·
+                                       # SILENCE COMMITS ANYWAY (distress is never lost)
+  retry_min_logprob: -1.3              # transcripts below this Whisper confidence are
+                                       # chatter/noise: no say-again retry, the dialog
+                                       # closes silently ("stuck open in comms chatter"
+                                       # loop). Commands are never gated by this.
+                                       # Say "end transmission" / "disregard" /
+                                       # "never mind" / "stand down" to close any
+                                       # open dialog by voice at any time.
 
 capture:
   preroll_ms: 300                      # RAM ring-buffer audio prepended to each capture
@@ -162,7 +175,11 @@ tts:
   enabled: true                        # spoken back-channel on/off
   voice: /opt/cortana/models/piper/en_US-amy-medium.onnx  # Piper voice model
   binary: /usr/local/bin/piper         # Piper invoked as a subprocess (GDD §12 license note)
-  max_utterance_s: 3                   # hard cap; longer text goes to the channel instead
+  max_utterance_s: 6                   # hard cap; longer text falls back to the short
+                                       # "Posted." ack + channel text. 3 was too tight in
+                                       # the field: full readbacks ("Tackled M-OEE8, code
+                                       # red, posted.") got clipped to "Posted." and
+                                       # pilots never heard WHAT was committed.
   effect: none                         # none | holographic (chorus+reverb "ship AI" sheen)
   personality: standard                # standard = exact GDD §12.1 lines;
                                        # cortana = acknowledgement lines rotate

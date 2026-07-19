@@ -78,6 +78,15 @@ def transition(s: DialogSession, ev: DialogEvent, max_retries: int) -> Transitio
     if ev.kind is Ev.DEADLINE:
         # The armed window (or the AWAIT state guarding it) expired unused.
         if s.state in AWAIT_STATES and ev.gen == s.gen:
+            # A confirm-first report commits on silence (GDD §8.6: a
+            # distress call is never lost to an unanswered question) —
+            # only an explicit decline/dismissal retracts it.
+            if (
+                s.state is DialogState.AWAIT_CONFIRM
+                and s.ctx_confirm is not None
+                and s.ctx_confirm.commit_on_timeout
+            ):
+                return TransitionResult(s.idle(), (DisarmWindow(), ConfirmPending(s.ctx_confirm)))
             return TransitionResult(s.idle(), (DisarmWindow(),))
         return TransitionResult(s)
 
@@ -116,14 +125,19 @@ def transition(s: DialogSession, ev: DialogEvent, max_retries: int) -> Transitio
         return TransitionResult(s)
 
     if ev.kind is Ev.ENGINE_ASKED:
-        # The engine answered "say again to confirm" for a MEDIUM-tier match
-        # (GDD §8.3): arm one wake-free window carrying the pending command +
+        # The engine asked to confirm (MEDIUM-tier match, or a confirm-first
+        # report): arm one wake-free window carrying the pending command +
         # candidate, so an affirmative or an exact repeat can complete the
         # confirm by voice instead of dead-ending. Same budgeted door as
-        # every other window; no prompt — the outcome utterance was it.
+        # every other window; no prompt — the readback was it.
         if s.state is DialogState.IDLE and ev.confirm is not None:
             pend = dataclasses.replace(s, pending=PendingKind.CONFIRM, ctx_confirm=ev.confirm)
-            return _fail(pend, None, keep_ctx=True)
+            res = _fail(pend, None, keep_ctx=True)
+            if ev.confirm.commit_on_timeout and res.session.state is DialogState.IDLE:
+                # No budget left for a confirm window: commit outright —
+                # "standing down" must never eat an unposted distress call.
+                return TransitionResult(res.session, (ConfirmPending(ev.confirm),))
+            return res
         return TransitionResult(s)
 
     if ev.kind is Ev.CLASSIFIED:
@@ -138,6 +152,15 @@ def transition(s: DialogSession, ev: DialogEvent, max_retries: int) -> Transitio
 
 
 def _classified(s: DialogSession, c: Classified) -> TransitionResult:
+    # -1. Dismissal is absolute: "end transmission" / "disregard" / "never
+    #     mind" closes the dialog from ANY point — including a pending
+    #     confirm-first report, which it retracts (an explicit abort fails
+    #     closed; only silence commits). The audible ack tells the pilot the
+    #     door actually shut (live complaint: no spoken way out of the
+    #     say-again loop in heavy chatter).
+    if c.dismissed:
+        return TransitionResult(s.idle(), (DisarmWindow(), Speak(Line.STANDING_DOWN)))
+
     # 0. Confirm continuation (GDD §8.3): the window carries a pending
     #    command + candidate — complete it, decline it, or close. It never
     #    re-asks, so the ask-loop the old flow dead-ended in cannot form.
@@ -147,6 +170,10 @@ def _classified(s: DialogSession, c: Classified) -> TransitionResult:
     # 1. Override continuation: the whole utterance IS the question.
     if s.pending is PendingKind.OVERRIDE:
         query = c.override_query or c.relay_text or c.text
+        if c.garbage:
+            # Chatter-quality noise in the question window: close silently
+            # instead of re-prompting into an open mic (the retry loop).
+            return TransitionResult(s.idle(), (NoteRejected("garbage_dropped"),))
         if not c.confident:
             # Noise decoded inside the window must not become a paid API
             # call (live complaint: hallucinated questions burned cooldown).
@@ -188,6 +215,14 @@ def _classified(s: DialogSession, c: Classified) -> TransitionResult:
     # 7. Freeform relay (GDD §8.6). An inherited severity makes the relay
     #    severity-carrying but does NOT frame it: the continuation must still
     #    be framed speech, or hallucinated noise becomes an ORANGE card.
+    #    Chatter-quality garbage (below dialog.retry_min_logprob) that
+    #    matched NOTHING above closes silently first: re-prompting "say
+    #    again" into an open mic full of conversation just recaptures more
+    #    conversation (the stuck-open loop, live complaint). Recognised
+    #    commands and framed relays were already handled — this gates only
+    #    the retry-prompt path.
+    if c.garbage:
+        return TransitionResult(s.idle(), (NoteRejected("garbage_dropped"),))
     inherited = s.ctx_severity if s.pending is PendingKind.SEVERITY else None
     if c.relay_mode == "off":
         return _rejected_fail(s, "relay_off", Line.NOT_UNDERSTOOD, keep_ctx=False)
@@ -209,18 +244,35 @@ def _confirm_continuation(s: DialogSession, ctx: PendingConfirm, c: Classified) 
 
     Completes on a confident standalone affirmative, on a repeat that parses
     to the same intent + system, or on a confident bare reply naming the
-    candidate. A negative — or anything else — closes silently with
-    standing-down semantics: the dialog ends, the budget stays spent, and a
-    fresh wake is the way back in. A destructive confirm fails closed; it is
-    never guessed from an unmatched utterance.
+    candidate.
+
+    On everything else the two confirm flavours diverge:
+
+    - **Card/destructive confirm** (``commit_on_timeout=False``): a negative
+      or unmatched speech closes silently — a destructive confirm fails
+      closed; it is never guessed from an unmatched utterance.
+    - **Confirm-first report** (``commit_on_timeout=True``): the report is
+      not posted yet and must not be LOST — only an explicit decline (or a
+      dismissal, handled above) retracts it; a decline opens a say-again
+      window re-bound to the intent so the pilot can re-say the system.
+      Unmatched speech or chatter commits, exactly like the timeout.
     """
     if c.confirm_reply == "no":
+        if ctx.commit_on_timeout:
+            # Retract the unposted report, then offer the system retry —
+            # the pilot said "no" because the name was wrong.
+            retry = dataclasses.replace(
+                s, pending=PendingKind.RETRY_SYSTEM, ctx_retry=ctx.parsed, ctx_confirm=None
+            )
+            return _fail(retry, Line.SAY_AGAIN, keep_ctx=True)
         return TransitionResult(s.idle(), (NoteRejected("confirm_declined"),))
     if c.confirm_reply == "yes" and c.confident:
         # Short affirmatives are exactly what Whisper hallucinates from
         # noise, so "yes" is confidence-gated like the override path.
         return TransitionResult(s.idle(), (ConfirmPending(ctx),))
-    heard = {(ctx.parsed.system_text or "").casefold(), ctx.candidate.name.casefold()} - {""}
+    heard = {(ctx.parsed.system_text or "").casefold()} - {""}
+    if ctx.candidate is not None:
+        heard.add(ctx.candidate.name.casefold())
     if (
         c.parsed is not None
         and c.parsed.intent is ctx.parsed.intent
@@ -231,6 +283,8 @@ def _confirm_continuation(s: DialogSession, ctx: PendingConfirm, c: Classified) 
         return TransitionResult(s.idle(), (ConfirmPending(ctx),))
     if c.confident and c.system_reply is not None and c.system_reply.casefold() in heard:
         # A bare repeat of just the system name confirms too.
+        return TransitionResult(s.idle(), (ConfirmPending(ctx),))
+    if ctx.commit_on_timeout:
         return TransitionResult(s.idle(), (ConfirmPending(ctx),))
     return TransitionResult(s.idle(), (NoteRejected("confirm_unmatched"),))
 

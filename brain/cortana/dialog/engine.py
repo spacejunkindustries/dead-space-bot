@@ -290,6 +290,8 @@ class DialogEngine:
             relay_mode=cfg.stt.relay_mode,
             chat_available=chat is not None and cfg.chat.enabled,
             confirm_reply=grammar.confirm_reply(text),
+            dismissed=grammar.dismissal(text),
+            garbage=avg_logprob < cfg.dialog.retry_min_logprob,
         )
 
     # ── machine application ──────────────────────────────────────────────────
@@ -463,6 +465,44 @@ class DialogEngine:
                 resolution.best.score if resolution.best else 0.0, resolution.tier
             )
 
+        # Confirm-first (GDD §8.3, dialog.confirm_reports): before an
+        # uncertain voice report commits, read back what was heard and hold
+        # it for a confirm window. "Yes" commits, "no" opens a say-again
+        # retry, and silence/unmatched speech commits anyway — a distress
+        # call is never lost, but a mishearing now gets one audible veto
+        # point (live complaint: wrong systems were committing silently).
+        mode = cfg.dialog.confirm_reports
+        if (
+            mode != "off"
+            and not action.confirmed
+            and action.forced_resolution is None
+            and action.rebound_from is None
+            and parsed.intent in MENTION_INTENTS
+            and parsed.system_text
+        ):
+            tier = resolution.tier if resolution is not None else Tier.LOW
+            certain = resolution is not None and resolution.best is not None and tier is Tier.HIGH
+            # MEDIUM is excluded: the incident engine's own ASKED flow (an
+            # unconfirmed card + candidates + confirm window) covers it.
+            if tier is not Tier.MEDIUM and (mode == "always" or not certain):
+                candidate = resolution.best if (certain and resolution is not None) else None
+                heard = candidate.name if candidate is not None else parsed.system_text
+                log.info("report_confirm_first", user_id=s.user_id, heard=heard, tier=str(tier))
+                await self._speak_or_post(s, tts_mod.confirm_report(heard))
+                await self._apply(
+                    self._session(s.user_id, s.guild_id),
+                    DialogEvent(
+                        Ev.ENGINE_ASKED,
+                        confirm=PendingConfirm(
+                            parsed=parsed,
+                            candidate=candidate,
+                            incident_id=None,
+                            commit_on_timeout=True,
+                        ),
+                    ),
+                )
+                return
+
         # Defence in depth: the gate also rides inside decide_mentions(), so
         # no engine path can mint a mention for a caller the gate refuses.
         outcome = await self._incidents.report(
@@ -583,8 +623,14 @@ class DialogEngine:
             )
             await self._reply(s, effective, outcome)
             return
-        forced = Resolution(tier=Tier.HIGH, candidates=(confirm.candidate,))
-        await self._report(s, Report(confirm.parsed, forced_resolution=forced))
+        if confirm.candidate is not None:
+            forced = Resolution(tier=Tier.HIGH, candidates=(confirm.candidate,))
+            await self._report(s, Report(confirm.parsed, forced_resolution=forced))
+            return
+        # Verbatim confirm-first commit (no gazetteer candidate): re-run the
+        # report with the gate bypassed — resolution repeats
+        # deterministically and the heard name posts verbatim (GDD §8.6).
+        await self._report(s, Report(confirm.parsed, confirmed=True))
 
     async def _relay(self, s: DialogSession, action: Relay) -> None:
         """Freeform intel relay (GDD §8.6) through the broadcast path.

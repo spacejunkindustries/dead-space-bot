@@ -119,8 +119,12 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "How she behaves",
                 "Misheard? She says *“Say again?”* and listens without a new "
                 "wake word — twice max, then *“Standing down”* means wake her "
-                "again. If the system name doesn't match the map, the report "
-                "still posts with the name you said, verbatim.",
+                "again. When she's not sure of the system she asks *“Heard X — "
+                "confirm?”*: say **yes** to post, **no** to re-say the system — "
+                "or say nothing and it posts anyway (a distress call is never "
+                "dropped). Say *“end transmission”*, *“disregard”*, *“never "
+                "mind”* or *“stand down”* at any point to close her out "
+                "immediately.",
             ),
         ),
     ),

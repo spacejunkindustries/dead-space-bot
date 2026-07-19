@@ -49,6 +49,7 @@ __all__ = [
     "chase_hint",
     "chase_no_incident",
     "chase_updated",
+    "confirm_report",
     "degraded",
     "flood_control",
     "fun_cooldown",
@@ -294,6 +295,12 @@ def flood_control() -> str:
 def degraded() -> str:
     """*"Voice offline, use slash commands."*"""
     return "Voice offline, use slash commands."
+
+
+def confirm_report(name: str) -> str:
+    """*"Heard <name>. Confirm?"* — the §8.3 confirm-first readback
+    (``dialog.confirm_reports``). Info-carrying; never varies."""
+    return f"Heard {name}. Confirm?"
 
 
 _FUN_COOLDOWN_BRATTY = (

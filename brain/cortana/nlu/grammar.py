@@ -37,6 +37,7 @@ __all__ = [
     "broadcast_severity",
     "clean_callsign",
     "confirm_reply",
+    "dismissal",
     "encode_ping_types",
     "override_query",
     "parse",
@@ -656,6 +657,52 @@ _CONFIRM_FILLER = frozenset(
 )
 _CONFIRM_YES_ALLOWED = _CONFIRM_YES | _CONFIRM_FILLER
 _DO_IT_RE = re.compile(r"\bdo\s+it\b", re.I)
+
+
+def dismissal(transcript: str) -> bool:
+    """True for a *standalone* dismissal — the pilot closing the dialog.
+
+    "End transmission", "disregard", "never mind", "belay that", "stand
+    down", a bare "stop" — spoken during a capture, a retry window, or as a
+    fresh wake command, any of these ends the dialog immediately with
+    "Standing down." (live complaint: in heavy chatter the say-again loop
+    had no spoken exit). Standalone-ness is required — "stop pinging me" is
+    a command, not a dismissal. "cancel" is deliberately absent: it is the
+    CANCEL intent (retract the last incident) and must keep that meaning.
+    """
+    if not transcript or not transcript.strip():
+        return False
+    work = _BROADCAST_WAKE_RE.sub("", transcript, count=1)
+    work = _WAKE_RE.sub("", work, count=1)
+    tokens = [t for t in re.split(r"[\s,.;:!?'-]+", work.lower()) if t]
+    kept = [t for t in tokens if t not in _DISMISS_FILLER]
+    return " ".join(kept) in _DISMISS_PHRASES
+
+
+#: Words allowed to ride along with a dismissal ("okay never mind, over").
+_DISMISS_FILLER = frozenset(
+    ("ok", "okay", "please", "over", "out", "um", "uh", "er", "that", "it", "now", "thanks")
+)
+
+#: The dismissal vocabulary, matched after filler removal. Phrases only —
+#: no single common word except the imperatives pilots actually use.
+_DISMISS_PHRASES = frozenset(
+    (
+        "end transmission",
+        "end of transmission",
+        "never mind",
+        "nevermind",
+        "disregard",
+        "belay",
+        "stand down",
+        "standing down",
+        "stop",
+        "stop listening",
+        "shut up",
+        "forget",
+        "as you were",
+    )
+)
 
 
 def confirm_reply(transcript: str) -> str | None:
