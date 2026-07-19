@@ -204,6 +204,9 @@ class FakeGazetteer:
     def entry_any(self, system_id: int) -> SystemEntry | None:
         return self.entries.get(system_id) or (self.all_entries or {}).get(system_id)
 
+    def config_alias(self, text: str) -> SystemEntry | None:
+        return None
+
     def by_name(self, name: str) -> SystemEntry | None:
         for entry in self.entries.values():
             if entry.name.lower() == name.lower():

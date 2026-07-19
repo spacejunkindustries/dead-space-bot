@@ -155,6 +155,9 @@ class _Gazetteer:
     def entry_any(self, system_id: int) -> SystemEntry | None:
         return self.by_id(system_id)
 
+    def config_alias(self, text: str) -> SystemEntry | None:
+        return None
+
     @property
     def all_systems(self) -> tuple[SystemEntry, ...]:
         return tuple(self.entries.values())

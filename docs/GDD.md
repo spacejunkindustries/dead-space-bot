@@ -633,11 +633,12 @@ Candidates are reweighted by what is plausible *right now*. A fleet fight is spa
 
 Applied as a cheap multiplicative reweighting over the top-8 base-score candidates — wider than the final top-3 on purpose, so a strong prior can promote a lower-ranked but spatially plausible candidate into the top-3. Weights live in `cortana.yaml`.
 
-### 8.5 Alias learning
+### 8.5 Alias learning — and FC-authored custom names
 
-Every time a pilot taps `[Wrong — fix]` and picks the correct system, CORTANA writes `(raw transcript) → (system_id)` into the alias table, which is consulted **before** phonetic matching on every subsequent utterance.
+Two kinds of alias, both consulted **before** phonetic matching, both resolving at full confidence:
 
-Within a month of real use, your corp's specific accents, specific mics, and specific noisy rooms are baked in. **This is the highest-leverage component in the entire system and it is roughly forty lines of code.**
+- **Learned aliases.** Every time a pilot taps `[Wrong — fix]` and picks the correct system, CORTANA writes `(raw transcript) → (system_id)` into the alias table. Within a month of real use, your corp's specific accents, specific mics, and specific noisy rooms are baked in. **This is the highest-leverage component in the entire system and it is roughly forty lines of code.**
+- **Custom names (config aliases).** A corp calls places by its own words — a branch nickname, a staging name, "home", a region's foothold system. The `aliases:` map in `gazetteer.yaml` (`{"the branch": "M-OEE8", "tribute staging": "5ZXX-K"}`) is FC-authored and stable: a phrase → a real system name, resolved at full confidence before *both* the learned table and phonetics. Case-insensitive; the target may be any k-space system even one outside the active scope; a typo in a target is logged and skipped, never fatal. This is how the corp's actual comms vocabulary — not New Eden's official names — becomes what CORTANA understands. The two layers compose: config names are the deliberate vocabulary, learned aliases are what accrues from real corrections on top.
 
 ### 8.6 Recognition error is a normal operating condition
 

@@ -323,3 +323,39 @@ def test_load_reads_holder_at_point_of_use(conn: sqlite3.Connection, tmp_path: P
     gaz.load()
     assert {e.name for e in gaz.systems} == {"Alenia", "Hulmate", "Jita"}
     assert gaz.home_system_id == 5
+
+
+# ── FC custom names (aliases) — GDD §8.5 ─────────────────────────────────────
+
+
+def test_config_alias_resolves_a_custom_name(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    # The corp calls Alenia "the branch" — even though it's outside the scope.
+    gaz = make_gazetteer(
+        conn,
+        tmp_path,
+        'regions:\n  - Home-Region\naliases:\n  "the branch": Alenia\n  "HOME": Otanuomi\n',
+    )
+    branch = gaz.config_alias("the branch")
+    assert branch is not None and branch.name == "Alenia"  # out-of-scope, still resolves
+    # Case-insensitive on both the phrase and the stored key.
+    assert gaz.config_alias("The Branch") is not None
+    assert gaz.config_alias("home") is not None and gaz.config_alias("home").name == "Otanuomi"
+    assert gaz.config_alias("nowhere") is None
+
+
+def test_config_alias_unknown_target_is_skipped_not_fatal(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    # A typo in one alias target must not take the whole gazetteer down.
+    gaz = make_gazetteer(
+        conn,
+        tmp_path,
+        'aliases:\n  "good": Kisogo\n  "bad": Nowhere-System\n',
+    )
+    assert gaz.config_alias("good") is not None
+    assert gaz.config_alias("bad") is None
+
+
+def test_config_alias_must_be_a_mapping(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    with pytest.raises(GazetteerError):
+        make_gazetteer(conn, tmp_path, "aliases:\n  - not\n  - a map\n")
