@@ -1046,9 +1046,40 @@ def test_correction_reply_extracts_the_place(heard: str, expected: str) -> None:
     assert correction_reply(heard) == expected
 
 
-@pytest.mark.parametrize("heard", ["no", "nope", "nah", "negative", "", "   "])
-def test_correction_reply_bare_no_is_none(heard: str) -> None:
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "no",
+        "nope",
+        "nah",
+        "negative",
+        "",
+        "   ",
+        # Emphatic refusals: the residue is only more negation, so there is no
+        # real correction to rebind (adversarial-review finding) — must be None,
+        # never a junk place like "way"/"wrong"/"cancel".
+        "no way",
+        "no, wrong",
+        "no that's wrong",
+        "no, cancel that",
+        "no, disregard",
+        "nope, incorrect",
+    ],
+)
+def test_correction_reply_refusals_are_none(heard: str) -> None:
     assert correction_reply(heard) is None
+
+
+def test_clean_place_matches_voice_system_text() -> None:
+    # A slash/pre-seed place must key to the SAME form the voice path stores
+    # (GDD §8.5a constraint-10 parity): the grammar strips the leading article.
+    from cortana.nlu.grammar import clean_place
+
+    assert clean_place("the branch") == parse("reds the branch").system_text
+    assert clean_place("the pipe") == "pipe"
+    assert clean_place("in wildlands") == "wildlands"
+    assert clean_place("the northern branch staging") == "northern branch staging"
+    assert clean_place("   ") == ""
 
 
 @pytest.mark.parametrize(

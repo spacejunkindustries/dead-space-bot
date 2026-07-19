@@ -70,6 +70,17 @@ def test_list_ordered_by_uses(conn: sqlite3.Connection) -> None:
     assert [r["display_name"] for r in rows] == ["common", "rare"]  # most-used first
 
 
+def test_cross_surface_key_parity(conn: sqlite3.Connection) -> None:
+    # A voice-learned area is keyed on the grammar-stripped form ("branch");
+    # a slash lookup of "the branch" must find it after grammar.clean_place
+    # (GDD §8.5a constraint-10 parity — the adversarial-review fix).
+    from cortana.nlu.grammar import clean_place
+
+    areas.save_area(conn, 1, "branch", 42, "t0", max_areas=200)  # what voice stores
+    assert areas.lookup_area(conn, 1, clean_place("the branch")) == "branch"
+    assert areas.forget_area(conn, 1, clean_place("the branch")) is True
+
+
 def test_empty_phrase_is_rejected(conn: sqlite3.Connection) -> None:
     with pytest.raises(ValueError):
         areas.save_area(conn, 1, "   ", 1, "t0", max_areas=200)

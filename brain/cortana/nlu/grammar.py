@@ -36,6 +36,7 @@ __all__ = [
     "bare_override",
     "broadcast_severity",
     "clean_callsign",
+    "clean_place",
     "confirm_reply",
     "correction_reply",
     "dismissal",
@@ -528,6 +529,15 @@ def _strip_filler(text: str) -> str:
     return " ".join(_keep_window_tokens(tokens, _WINDOW_FILLER))
 
 
+def clean_place(text: str) -> str:
+    """Canonicalise a raw place phrase to the SAME form the voice path stores
+    (GDD §8.5a) — the system-window filler strip that produces a report's
+    ``system_text``. So a slash ``/areas-add "the branch"`` and a voice "reds
+    the branch" key identically ("branch"): constraint-10 parity for custom
+    areas across surfaces. Returns the cleaned phrase (possibly empty)."""
+    return _strip_filler(text).strip()
+
+
 def _remove_intent_phrases(text: str) -> str:
     """Drop *secondary* intent phrases from the system window.
 
@@ -654,10 +664,11 @@ def system_reply(transcript: str) -> str | None:
 
 
 #: The leading negation/copula run of a "no, it's X" correction ("no", "nope",
-#: "not", "it's", "that's", "actually", "i said/meant") — stripped so the place
-#: X survives. Matches the whole leading run, so "no it's Kisogo" -> "Kisogo".
+#: "not", "it's", "that's", "actually", "i said/meant", the "no way" idiom) —
+#: stripped so the place X survives. Matches the whole leading run, so
+#: "no it's Kisogo" -> "Kisogo".
 _CORRECTION_PREFIX_RE = re.compile(
-    r"^(?:\s*(?:no|nope|nah|negative|not|it'?s|it\s+is|that'?s|that\s+is|"
+    r"^(?:\s*(?:no\s+way|no|nope|nah|negative|not|it'?s|it\s+is|that'?s|that\s+is|"
     r"actually|i\s+said|i\s+meant)\b[\s,]*)+",
     re.I,
 )
@@ -665,19 +676,30 @@ _CORRECTION_PREFIX_RE = re.compile(
 
 def correction_reply(transcript: str) -> str | None:
     """The corrected place from a "no, it's X" reply in a learn-a-word confirm
-    (GDD §8.5a), or ``None`` for a bare "no".
+    (GDD §8.5a), or ``None`` when there is no real correction (a bare/emphatic
+    refusal).
 
     Consulted only when :func:`confirm_reply` already classified the reply as
     ``"no"``. Strips wake/sign-off residue, then the leading negation/copula
     run, then filler — leaving X ("no, it's Kisogo" -> "Kisogo"; "no, the pipe"
-    -> "the pipe"; a bare "no"/"nope" -> ``None``)."""
+    -> "pipe"). Returns ``None`` for a bare "no"/"nope" AND for an emphatic
+    refusal whose residue is only more negation/abort words ("no, wrong" ->
+    None, "no, cancel that" -> None) — otherwise those would be mis-rebound to a
+    junk place and offered up to be learned (adversarial-review finding)."""
     if not transcript or not transcript.strip():
         return None
     work = _WAKE_RE.sub("", transcript, count=1)
     work = _SIGNOFF_RE.sub("", work)
     work = _CORRECTION_PREFIX_RE.sub("", work.strip(), count=1)
     cleaned = _strip_filler(work.strip(" ,.;:!?-"))
-    return cleaned or None
+    if not cleaned:
+        return None
+    # If nothing but negation/abort vocabulary survives, it was a refusal, not a
+    # correction — the bare-no say-again path should run, and nothing learns.
+    residue = [t for t in re.split(r"[\s,.;:!?]+", cleaned.lower()) if t]
+    if residue and all(t in _CONFIRM_NO for t in residue):
+        return None
+    return cleaned
 
 
 # ── confirm-window replies (GDD §8.3 AWAIT_CONFIRM) ──────────────────────────

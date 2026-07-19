@@ -19,6 +19,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from cortana.core import areas
+from cortana.nlu import grammar
 
 if TYPE_CHECKING:  # pragma: no cover
     from cortana.dsc.bot import AuraBot
@@ -85,12 +86,15 @@ class AreasCog(commands.Cog):
         if interaction.guild_id is None:
             await interaction.response.send_message("Guild only.", ephemeral=True)
             return
+        # Clean to the same key the voice path stores (GDD §8.5a): "the branch"
+        # from the FC matches a voice-learned "branch".
+        place = grammar.clean_place(word)
         removed = await asyncio.to_thread(
-            areas.forget_area, self.bot.conn, interaction.guild_id, word
+            areas.forget_area, self.bot.conn, interaction.guild_id, place
         )
         if removed:
-            log.info("custom_area_forgotten", guild_id=interaction.guild_id, word=word)
-            await interaction.response.send_message(f"Forgot `{word}`.", ephemeral=True)
+            log.info("custom_area_forgotten", guild_id=interaction.guild_id, word=place)
+            await interaction.response.send_message(f"Forgot `{place}`.", ephemeral=True)
         else:
             await interaction.response.send_message(
                 f"`{word}` isn't a learned area — check `/areas-list`.", ephemeral=True
@@ -103,7 +107,10 @@ class AreasCog(commands.Cog):
         if interaction.guild_id is None:
             await interaction.response.send_message("Guild only.", ephemeral=True)
             return
-        if not word.strip():
+        # Store the SAME cleaned form the voice path would (GDD §8.5a), so an
+        # FC pre-seeding "the branch" is what a pilot saying "the branch" finds.
+        place = grammar.clean_place(word)
+        if not place:
             await interaction.response.send_message("Give me a word to remember.", ephemeral=True)
             return
         cap = self.bot.holder.current.areas.max_per_guild
@@ -111,7 +118,7 @@ class AreasCog(commands.Cog):
             areas.save_area,
             self.bot.conn,
             interaction.guild_id,
-            word,
+            place,
             interaction.user.id,
             datetime.now(UTC).isoformat(),
             max_areas=cap,
@@ -123,11 +130,11 @@ class AreasCog(commands.Cog):
             )
         elif result == "reinforced":
             await interaction.response.send_message(
-                f"`{word.strip()}` is already known — reinforced it.", ephemeral=True
+                f"`{place}` is already known — reinforced it.", ephemeral=True
             )
         else:
-            log.info("custom_area_added", guild_id=interaction.guild_id, word=word.strip())
-            await interaction.response.send_message(f"Remembered `{word.strip()}`.", ephemeral=True)
+            log.info("custom_area_added", guild_id=interaction.guild_id, word=place)
+            await interaction.response.send_message(f"Remembered `{place}`.", ephemeral=True)
 
 
 async def setup(bot: AuraBot) -> None:  # pragma: no cover — discord.py entrypoint
