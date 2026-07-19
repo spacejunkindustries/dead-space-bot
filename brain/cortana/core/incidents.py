@@ -1773,6 +1773,58 @@ class IncidentEngine:
             log.info("incidents_stale", ids=[i.id for i in stale])
         return [i.id for i in stale]
 
+    async def sweep_auto_resolve(self) -> list[int]:
+        """Auto-RESOLVE incidents quiet for ``auto_resolve_min``, silently.
+
+        Field request: cards sat open forever unless someone cleared them.
+        Runs on the same tick as the stale sweep; ACTIVE and STALE cards both
+        qualify (STALE is the waypoint, this is the terminus). TIMER and
+        FORMUP are exempt — their lifecycle anchors on ``fires_at``, and a
+        four-hour structure timer must not vanish at the one-hour mark.
+        ``auto_resolve_min: 0`` disables the sweep entirely.
+        """
+        minutes = self._holder.current.incidents.auto_resolve_min
+        if minutes <= 0:
+            return []
+        async with self._lock:
+            cutoff = self._clock() - timedelta(minutes=minutes)
+
+            def _sweep() -> list[Incident]:
+                rows = db.query(
+                    self._conn,
+                    "SELECT id FROM incidents WHERE status IN ('ACTIVE', 'STALE')"
+                    " AND updated_at < ? AND type NOT IN ('TIMER', 'FORMUP')",
+                    (_iso(cutoff),),
+                )
+                resolved: list[Incident] = []
+                for row in rows:
+                    db.execute(
+                        self._conn,
+                        "UPDATE incidents SET status = 'RESOLVED', pending_candidates = NULL"
+                        " WHERE id = ?",
+                        (row["id"],),
+                    )
+                    incident = _load_incident(self._conn, row["id"])
+                    if incident is not None:
+                        resolved.append(incident)
+                return resolved
+
+            resolved = await asyncio.to_thread(_sweep)
+            works: list[_Delivery] = []
+            for incident in resolved:
+                self._pending_candidates.pop(incident.id, None)
+                system_name = self._system_name(
+                    incident.system_id, incident.raw_system_text or "unknown"
+                )
+                card = self._render(incident, system_name)
+                # Silent bulk sweep: like sweep_stale, lost cards stay lost.
+                works.append(self._edit_work(incident, card, repost_if_lost=False))
+        # Edits outside the lock, same reasoning as sweep_stale.
+        await self._deliver_all(works)
+        if resolved:
+            log.info("incidents_auto_resolved", ids=[i.id for i in resolved])
+        return [i.id for i in resolved]
+
     async def clear_all(self, guild_id: int) -> list[int]:
         """Resolve EVERY active incident in one sweep (``/clearall``, GDD §7).
 

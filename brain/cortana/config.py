@@ -270,6 +270,11 @@ class IncidentsConfig:
     dedupe_window_s: int
     stale_after_min: int
     cancel_window_s: int
+    #: No updates for this long → the card auto-RESOLVES in place, silently
+    #: (field request: cards sat open forever until someone cleared them).
+    #: Timers/form-ups are exempt — their lifecycle anchors on ``fires_at``.
+    #: 0 = never.
+    auto_resolve_min: int = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -683,6 +688,7 @@ def _assemble_incidents(v: dict[str, Any]) -> IncidentsConfig:
         dedupe_window_s=v["incidents.dedupe_window_s"],
         stale_after_min=v["incidents.stale_after_min"],
         cancel_window_s=v["incidents.cancel_window_s"],
+        auto_resolve_min=v["incidents.auto_resolve_min"],
     )
 
 

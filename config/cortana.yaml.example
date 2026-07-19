@@ -163,6 +163,10 @@ incidents:
   dedupe_window_s: 90                  # same system + type within this window → fold (GDD §9.2)
   stale_after_min: 20                  # no updates for this long → auto-STALE, silently
   cancel_window_s: 30                  # "hey cortana, cancel" kills the user's last incident
+  auto_resolve_min: 60                 # no updates for this long → the card auto-RESOLVES in
+                                       # place, silently — no more boards full of dead cards.
+                                       # Timers/form-ups exempt (they live until fires_at).
+                                       # 0 = never (someone must /clear or /clearall)
 
 discipline:
   user_cooldown_s: 30                  # min seconds between mentions from the same pilot

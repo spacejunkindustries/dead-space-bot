@@ -92,6 +92,7 @@ def make_config(
     dedupe_window_s: int = 90,
     stale_after_min: int = 20,
     cancel_window_s: int = 30,
+    auto_resolve_min: int = 60,
     personal_pings_max: int = 10,
     mentions_enabled: bool = True,
     wake_ack: str = "beep",
@@ -138,6 +139,7 @@ def make_config(
             dedupe_window_s=dedupe_window_s,
             stale_after_min=stale_after_min,
             cancel_window_s=cancel_window_s,
+            auto_resolve_min=auto_resolve_min,
         ),
         discipline=DisciplineConfig(
             user_cooldown_s=user_cooldown_s,
@@ -641,6 +643,56 @@ async def test_stale_sweep_marks_silently(make_env: Callable[..., Env]) -> None:
     row = db.query_one(env.conn, "SELECT status FROM incidents WHERE id = ?", (fresh.incident_id,))
     assert row["status"] == "ACTIVE"
     assert await env.engine.sweep_stale() == []  # idempotent
+
+
+# ── auto-resolve sweep (GDD §9.1 — cards close on their own) ─────────────────
+
+
+async def test_auto_resolve_closes_quiet_incidents(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    old = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    env.clock.advance(55 * 60)
+    fresh = await env.engine.report(GUILD, 43, cmd(Intent.GATE_CAMP), high(2, "Kisogo"))
+    env.clock.advance(6 * 60)  # old: 61 min quiet; fresh: 6
+    posts_before = len(env.poster.posts)
+    resolved = await env.engine.sweep_auto_resolve()
+    assert resolved == [old.incident_id]
+    assert len(env.poster.posts) == posts_before  # silent: edits only
+    row = db.query_one(env.conn, "SELECT status FROM incidents WHERE id = ?", (old.incident_id,))
+    assert row["status"] == "RESOLVED"
+    row = db.query_one(env.conn, "SELECT status FROM incidents WHERE id = ?", (fresh.incident_id,))
+    assert row["status"] == "ACTIVE"
+    assert await env.engine.sweep_auto_resolve() == []  # idempotent
+
+
+async def test_auto_resolve_takes_stale_cards_too(make_env: Callable[..., Env]) -> None:
+    # STALE is the waypoint; auto-resolve is the terminus.
+    env = make_env()
+    inc = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    env.clock.advance(25 * 60)
+    assert await env.engine.sweep_stale() == [inc.incident_id]
+    env.clock.advance(40 * 60)  # 65 min total quiet
+    assert await env.engine.sweep_auto_resolve() == [inc.incident_id]
+
+
+async def test_auto_resolve_zero_disables(make_env: Callable[..., Env]) -> None:
+    env = make_env(auto_resolve_min=0)
+    await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    env.clock.advance(500 * 60)
+    assert await env.engine.sweep_auto_resolve() == []
+
+
+async def test_auto_resolve_exempts_timers_and_formups(make_env: Callable[..., Env]) -> None:
+    # A four-hour structure timer must not vanish at the one-hour mark.
+    env = make_env()
+    out = await env.engine.report(
+        GUILD, 42, cmd(Intent.TIMER, detail="four hours"), high(1, "Otanuomi")
+    )
+    assert out.outcome is not Outcome.REJECTED
+    env.clock.advance(90 * 60)
+    assert await env.engine.sweep_auto_resolve() == []
+    rows = db.query(env.conn, "SELECT status FROM incidents WHERE type = 'TIMER'", ())
+    assert all(row["status"] != "RESOLVED" for row in rows)
 
 
 # ── discipline integration: cooldown + circuit breaker ───────────────────────

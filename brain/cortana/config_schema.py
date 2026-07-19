@@ -594,6 +594,17 @@ KEYS: Final[tuple[Key, ...]] = (
         exclusive_minimum=True,
     ),
     Key(
+        "incidents.auto_resolve_min",
+        "int",
+        Reload.HOT,
+        "No updates for this long → auto-RESOLVE: the card closes in place, "
+        "silently, instead of sitting open until someone clears it. Timers "
+        "and form-ups are exempt (their lifecycle anchors on fires_at). "
+        "0 = never auto-resolve.",
+        default=60,
+        minimum=0,
+    ),
+    Key(
         "incidents.cancel_window_s",
         "int",
         Reload.HOT,
