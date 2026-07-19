@@ -439,9 +439,28 @@ stage_release() {
     if [[ -n "${prev_venv}" ]]; then
         note "venv: requirements unchanged — hardlink clone from $(basename "${prev_rel}")"
         run cp -al "${prev_venv}" "${REL}/venv"
-        # A cloned venv still carries the OLD release's package path from
-        # `pip install -e` — repoint the editable install (cheap, no deps).
-        run nice -n 19 "${REL}/venv/bin/pip" install --quiet --no-deps -e "${REL}/brain"
+        # A cloned venv keeps the OLD venv's absolute paths in two places,
+        # and together they made every clone-path deploy silently serve the
+        # PREVIOUS release's code (live incident — new slash commands never
+        # appeared, the gate doctor validated the old schema):
+        #   1. bin/* console-script shebangs still point at the old venv's
+        #      python, so running ${REL}/venv/bin/pip actually operated on
+        #      the OLD venv — the "repoint" landed in the wrong install;
+        #   2. even aimed correctly, a plain `pip install -e` skips as
+        #      "already satisfied" (same name+version), leaving the editable
+        #      finder mapped to the old release directory.
+        # Fix both: rewrite the shebangs (sed -i replaces the inode, so the
+        # write can never bleed through a hardlink into the source venv),
+        # then force the editable reinstall through `python -m pip` — never
+        # through a cloned bin/ script.
+        for script in "${REL}/venv/bin/"*; do
+            [[ -f "${script}" && ! -L "${script}" ]] || continue
+            if head -c 200 "${script}" | head -n 1 | grep -qF "#!${prev_venv}/bin/"; then
+                run sed -i "1s|${prev_venv}|${REL}/venv|" "${script}"
+            fi
+        done
+        run nice -n 19 "${REL}/venv/bin/python" -m pip install --quiet --no-deps \
+            --force-reinstall -e "${REL}/brain"
     else
         note "venv: building fresh (this is the slow part)"
         run nice -n 19 ionice -c3 python3.12 -m venv "${REL}/venv"
@@ -456,6 +475,22 @@ stage_release() {
         run nice -n 19 "${REL}/venv/bin/pip" install --quiet -e "${REL}/brain"
     fi
     printf '%s' "${req_hash}" > "${REL}/.req_hash"
+    # The staged venv MUST import cortana from THIS release — the check that
+    # would have caught the clone-path bug on day one. cwd=/ so sys.path[0]
+    # (the current directory) can never mask a mispointed editable finder.
+    if [[ "${DRYRUN}" == 1 ]]; then
+        note "dry-run: would verify the staged venv imports cortana from ${REL}"
+    else
+        local resolved expected
+        resolved="$(cd / && "${REL}/venv/bin/python" -c \
+            'import os, cortana; print(os.path.realpath(os.path.dirname(cortana.__file__)))')" \
+            || die "staged venv cannot import cortana at all — venv build is broken"
+        expected="$(readlink -f "${REL}")/brain/cortana"
+        if [[ "${resolved}" != "${expected}" ]]; then
+            die "staged venv imports cortana from ${resolved}, not ${expected} — refusing to flip to a release that would run someone else's code"
+        fi
+        note "venv imports cortana from this release (verified)"
+    fi
     # ProtectSystem=strict makes /opt read-only for the service: precompile
     # bytecode now so the runtime never tries to write __pycache__.
     run nice -n 19 "${REL}/venv/bin/python" -m compileall -q "${REL}/brain/cortana"
