@@ -48,6 +48,13 @@ ExecStart=/opt/cortana/current/venv/bin/python -m cortana --config /etc/cortana/
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
+# CPU scheduling (GDD §12/§17): Brain's Whisper decode is CPU-bound and would
+# otherwise starve the Ears real-time mixer on the 2-vCPU box. A modest
+# CPUWeight (vs Ears' 10000) yields to the mixer under contention while still
+# getting the cores when Ears is idle — the systemd half of the choppy-voice
+# fix, alongside stt.cpu_threads=1.
+CPUWeight=200
+CPUAccounting=yes
 # Exit 78 (EX_CONFIG: invalid config/gazetteer/routing) and 69
 # (EX_UNAVAILABLE: auth) are operator problems a restart cannot fix — stop
 # cleanly with the reason in the journal instead of looping every 5s.

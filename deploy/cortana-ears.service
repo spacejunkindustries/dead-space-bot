@@ -37,6 +37,16 @@ Group=aura
 ExecStart=/opt/cortana/current/bin/cortana-ears /etc/cortana/ears.yaml
 Restart=always
 RestartSec=5
+
+# Real-time audio priority (GDD §12): Ears runs Songbird's 20ms Opus mixer,
+# which MUST hit its frame deadline or her voice goes choppy. On the 2-vCPU
+# box a Whisper decode in Brain would otherwise starve it. A high CPUWeight
+# makes cgroup v2 favour this bursty, low-average-CPU process over Brain's
+# CPU-bound decoder exactly when they collide — the systemd half of the
+# choppy-voice fix (the other half is stt.cpu_threads=1). Needs cgroup v2
+# with accounting; harmless where it doesn't apply.
+CPUWeight=10000
+CPUAccounting=yes
 # Exit 78 (EX_CONFIG) / 69 (EX_UNAVAILABLE: auth) are operator problems a
 # restart cannot fix — stop cleanly instead of looping.
 RestartPreventExitStatus=78 69

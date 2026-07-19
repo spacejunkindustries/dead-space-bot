@@ -115,9 +115,6 @@ impl Receiver {
         stats
             .active_ssrcs
             .store(tick.speaking.len(), Ordering::Relaxed);
-        if !tick.speaking.is_empty() {
-            self.inner.guild.note_speech();
-        }
 
         // DAVE-wedge watchdog (GDD §20): a stuck E2EE session shows up as
         // packets flowing with nothing decoding — every speaker's
@@ -130,6 +127,14 @@ impl Receiver {
             .speaking
             .values()
             .any(|data| data.decoded_voice.is_some());
+
+        // The speech clock drives talk-over ducking (playback.rs). Gate it on
+        // ACTUAL decoded voice, not merely a present SSRC: encrypted/failed
+        // frames and pure-noise streams should not duck her voice — that flap
+        // is half of the "her voice goes in and out" symptom (GDD §12).
+        if any_decoded {
+            self.inner.guild.note_speech();
+        }
         let bad_ms = self
             .inner
             .guild

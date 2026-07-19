@@ -444,7 +444,14 @@ KEYS: Final[tuple[Key, ...]] = (
         "stt.cpu_threads",
         "int",
         Reload.RESTART,
-        "Inference threads (the droplet has 2 dedicated vCPUs).",
+        "Whisper inference threads. Default 1 on the 2-vCPU droplet — ON "
+        "PURPOSE: a decode using BOTH cores starves the Ears real-time Opus "
+        "mixer, which is exactly the 'her voice is choppy / drops out' "
+        "symptom (the mixer misses its 20ms frame deadline). One thread "
+        "leaves a core free for the mixer and the event loop; decodes run a "
+        "little slower but the voice stays smooth. Raise only on a box with "
+        "cores to spare.",
+        default=1,
         minimum=0,
         exclusive_minimum=True,
     ),
@@ -507,6 +514,18 @@ KEYS: Final[tuple[Key, ...]] = (
         "Weight of raw-text Levenshtein similarity.",
         minimum=0.0,
         maximum=1.0,
+    ),
+    Key(
+        "matching.full_map_fallback",
+        "bool",
+        Reload.HOT,
+        "When a report doesn't confidently match the scoped active set, "
+        "re-resolve against the ENTIRE seeded k-space map (GDD §8.1) so any "
+        "real system still resolves — the reliability fix for a small scope "
+        "or a roaming corp. The scoped set keeps home-region accuracy; the "
+        "full-map pass runs without home/proximity priors and a MEDIUM hit "
+        "asks to confirm. false = scoped set only (the old behaviour).",
+        default=True,
     ),
     Key(
         "matching.tiers.high_min",

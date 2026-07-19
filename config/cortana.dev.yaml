@@ -30,7 +30,7 @@ stt:
   backend: faster-whisper
   model: small
   compute_type: int8
-  cpu_threads: 2
+  cpu_threads: 1
   bias_with_gazetteer: true
   whisper_cpp_url: http://127.0.0.1:8080/inference
 

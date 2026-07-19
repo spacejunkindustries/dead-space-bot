@@ -190,9 +190,11 @@ def resolve_typed_system(gazetteer: Gazetteer, name: str) -> Resolution | None:
     Slash input is autocompleted from the gazetteer, so an exact
     (case-insensitive) match resolves at full confidence; anything else is
     the caller's cue to reject with a helpful message — the phonetic matcher
-    is for speech, not typos.
+    is for speech, not typos. Resolves over the FULL seeded map (by_name_any),
+    not just the scoped set: a typed report may name any real k-space system
+    (GDD §8.1), and the autocomplete now offers all of them.
     """
-    entry = gazetteer.by_name(name.strip())
+    entry = gazetteer.by_name_any(name.strip())
     if entry is None:
         return None
     return Resolution(

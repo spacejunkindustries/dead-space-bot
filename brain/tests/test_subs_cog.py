@@ -147,6 +147,18 @@ class _Gazetteer:
                 return entry
         return None
 
+    # Full-map lookups (GDD §8.1 two-tier): no out-of-scope systems in this
+    # stub, so they mirror the scoped lookups.
+    def by_name_any(self, name: str) -> SystemEntry | None:
+        return self.by_name(name)
+
+    def entry_any(self, system_id: int) -> SystemEntry | None:
+        return self.by_id(system_id)
+
+    @property
+    def all_systems(self) -> tuple[SystemEntry, ...]:
+        return tuple(self.entries.values())
+
 
 class _PingRegistry:
     def __init__(self, subs: list[PingSub] | None = None) -> None:

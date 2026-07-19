@@ -546,6 +546,8 @@ Either way the jump graph (`Gazetteer.jumps`/`path`, §13) always runs over the
 full seeded adjacency — pruning decides what can be *named*, never how space is
 shaped.
 
+**Two-tier resolution — the reliability safety net (`matching.full_map_fallback`, default on).** Scoping is an accuracy decision, not a hard boundary: a corp with a small scope, or one that roams a jump beyond it, must still be able to report *any* real system. So resolution runs in two tiers. **Tier 1** scores the utterance against the scoped active set *with* the context priors (§8.4) — the home-region-accurate path. **Tier 2** engages only when Tier 1 produces no confident match (LOW): the same utterance is re-scored against the **entire seeded k-space map** (metaphones for all ~5,000 systems are already computed at load, so this costs nothing until it fires), *without* the home/proximity priors (they don't apply out of region), and a MEDIUM full-map hit rides the confirm-flow. An in-region corp never pays for Tier 2; a distant or roaming report resolves instead of dropping to "unknown". This is the fix for the field report where a manual report offered only the ~8 scoped systems — **typed/slash input and autocomplete resolve over the full seeded map directly** (`Gazetteer.by_name_any` / `all_systems`), and **learned aliases resolve over the full map too** (`entry_any`), so a pilot's correction is never vetoed by scope. Set `full_map_fallback: false` to restore strict scoped-only matching.
+
 ### 8.2 Resolution pipeline
 
 ```
@@ -842,7 +844,8 @@ Personal-ping type words pluralize naturally: *hostiles*, *attacks*, *assist req
 ### 12.2 Speaking rules
 
 - **Never speak over a high-severity report in progress.** If VAD reports active speech, queue. A non-alert utterance still blocked after **3 s** of continuous human speech is **dropped** (logged), never played late — a 3-seconds-stale "Go ahead." spoken over an FC mid-report is worse than none. Alerts always play.
-- Duck to 60% volume. CORTANA is not the FC. The duck level and talk-over suppression are fixed playback mechanics in Ears (`ears/src/playback.rs`), not config knobs.
+- **Duck, smoothly.** While a pilot is talking CORTANA dips to **75%** so she stays out of the way without vanishing. The duck is **ramped, not stepped** — she glides down over ~250 ms (attack) and eases back up over ~400 ms (release), and once ducked she stays ducked until **700 ms** of silence (release hysteresis). This asymmetry is deliberate: Discord DTX drops packets between words, so a hard on/off duck keyed on a short window pumped her volume audibly on every inter-word gap — the "her voice goes in and out" field report. The speech clock that drives it is bumped only by **actually decoded** voice, so encrypted/failed frames and pure-noise SSRCs can't flap it. Duck level, ramp rates, and talk-over suppression are fixed playback mechanics in Ears (`ears/src/playback.rs`, pure-function tested), not config knobs.
+- **She must not fight the CPU for the audio path.** On the 2-vCPU droplet a Whisper decode using both cores starves Songbird's 20 ms real-time Opus mixer, which is *heard directly* as choppy/dropping-out speech (nothing buffers her outbound audio). Two mechanical guards: `stt.cpu_threads: 1` leaves a core for the mixer + event loop, and the systemd units give Ears a high `CPUWeight` (10000 vs Brain's 200) so cgroup v2 lands the mixer's frames on time under contention (§17.2). Diagnose with `mpstat -P ALL 1 10` during a reply — both cores pegged confirms the cause.
 - Playback state (queue, playing slot, hold timer) and the speech-activity clock are **per guild** — speech in one voice call never gates or delays TTS in another.
 - Hard cap **3 seconds** per utterance. Information-carrying replies that do not fit go to the channel instead; **acknowledgement lines never do** — an unspoken ack ("Say again?", "Standing down…") is logged and dropped, because a retry prompt pasted into the intel channel is noise.
 - `/mute-voice` per user. Some pilots will hate this. They can silence it without leaving.
@@ -1226,7 +1229,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `stt.backend` | str | **required** | restart | Which Transcriber engine to build at startup. One of: `faster-whisper`, `whisper-cpp`. |
 | `stt.model` | str | **required** | restart | Whisper model size or path. |
 | `stt.compute_type` | str | **required** | restart | CTranslate2 quantization. |
-| `stt.cpu_threads` | int | **required** | restart | Inference threads (the droplet has 2 dedicated vCPUs). |
+| `stt.cpu_threads` | int | `1` | restart | Whisper inference threads. Default 1 on the 2-vCPU droplet — ON PURPOSE: a decode using BOTH cores starves the Ears real-time Opus mixer, which is exactly the 'her voice is choppy / drops out' symptom (the mixer misses its 20ms frame deadline). One thread leaves a core free for the mixer and the event loop; decodes run a little slower but the voice stays smooth. Raise only on a box with cores to spare. |
 | `stt.bias_with_gazetteer` | bool | `True` | restart | Pass system names as the Whisper initial_prompt. |
 | `stt.whisper_cpp_url` | str | `'http://127.0.0.1:8080/inference'` | restart | whisper.cpp server endpoint; required (non-empty) only when stt.backend is whisper-cpp (cross-checked). |
 | `stt.watchdog_s` | float | `15.0` | restart | GDD §20 "STT worker hang" watchdog deadline. The whisper-cpp HTTP timeout is derived slightly below it so the socket gives up before the watchdog abandons the worker. |
@@ -1235,6 +1238,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | **`matching:`** | | | | *Phonetic system-name matcher weights (constraint 7).* |
 | `matching.phonetic_weight` | float | **required** | hot | Weight of metaphone similarity (constraint 7). Must sum to 1.0 with text_weight (cross-checked). |
 | `matching.text_weight` | float | **required** | hot | Weight of raw-text Levenshtein similarity. |
+| `matching.full_map_fallback` | bool | `True` | hot | When a report doesn't confidently match the scoped active set, re-resolve against the ENTIRE seeded k-space map (GDD §8.1) so any real system still resolves — the reliability fix for a small scope or a roaming corp. The scoped set keeps home-region accuracy; the full-map pass runs without home/proximity priors and a MEDIUM hit asks to confirm. false = scoped set only (the old behaviour). |
 | `matching.tiers.high_min` | float | **required** | hot | top1 >= this (and margin) → post immediately. |
 | `matching.tiers.high_margin` | float | **required** | hot | top1 - top2 must also clear this for HIGH tier. |
 | `matching.tiers.medium_min` | float | **required** | hot | top1 >= this → post flagged uncertain, with buttons. Must be <= high_min (cross-checked). |
