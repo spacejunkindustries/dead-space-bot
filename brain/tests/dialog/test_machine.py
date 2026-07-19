@@ -559,3 +559,144 @@ def test_stale_gen_capture_events_are_dropped() -> None:
     s2, actions = step(s, DialogEvent(Ev.CAPTURE_EMITTED, gen=s.gen + 5))
     assert s2 == s
     assert actions == []
+
+
+# ── dismissal: "end transmission" is an absolute exit ────────────────────────
+
+
+def test_dismissal_from_thinking_stands_down() -> None:
+    s, _ = wake(idle())
+    s = _to_thinking(s)
+    s2, actions = classified(s, c(text="end transmission", dismissed=True))
+    assert s2.state is DialogState.IDLE
+    assert Speak(Line.STANDING_DOWN) in actions
+    assert DisarmWindow in kinds(actions)
+    assert Report not in kinds(actions) and ArmWindow not in kinds(actions)
+
+
+def test_dismissal_kills_pending_subdialog_context() -> None:
+    s, _ = wake(idle())
+    s = _to_thinking(s)
+    s, _ = classified(s, c(bare_code=Severity.MEDIUM))  # severity subdialog armed
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="never mind", dismissed=True))
+    assert s2.state is DialogState.IDLE
+    assert s2.ctx_severity is None
+    assert Speak(Line.STANDING_DOWN) in actions
+
+
+def test_dismissal_retracts_a_pending_confirm_first_report() -> None:
+    # An explicit abort fails closed — the unposted report dies with it.
+    conf = pending_confirm(commit_on_timeout=True, candidate=None)
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="disregard", dismissed=True))
+    assert s2.state is DialogState.IDLE
+    assert not any(isinstance(a, ConfirmPending) for a in actions)
+    assert Speak(Line.STANDING_DOWN) in actions
+
+
+# ── the garbage gate: chatter never earns a retry prompt ─────────────────────
+
+
+def test_garbage_unmatched_closes_silently_without_a_window() -> None:
+    # The stuck-open loop: say-again into an open mic recaptures chatter.
+    s, _ = wake(idle())
+    s = _to_thinking(s)
+    s2, actions = classified(s, c(text="mumble chatter", confident=False, garbage=True))
+    assert s2.state is DialogState.IDLE
+    assert kinds(actions) == [NoteRejected]  # silent: no Speak, no ArmWindow
+
+
+def test_garbage_in_override_window_closes_silently() -> None:
+    s, _ = wake(idle())
+    s = _to_thinking(s)
+    s, _ = classified(s, c(bare_override=True, chat_available=True))
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="crowd noise", confident=False, garbage=True))
+    assert s2.state is DialogState.IDLE
+    assert kinds(actions) == [NoteRejected]
+    assert not any(isinstance(a, RunOverride) for a in actions)
+
+
+def test_garbage_never_gates_a_recognised_command() -> None:
+    # A quiet mic's distress call still posts (GDD §8.6).
+    s, _ = wake(idle())
+    s = _to_thinking(s)
+    p = parsed_cmd(intent=Intent.UNDER_ATTACK, system_text="Otanuomi")
+    s2, actions = classified(s, c(parsed=p, confident=False, garbage=True))
+    assert any(isinstance(a, Report) for a in actions)
+
+
+# ── confirm-first reports (dialog.confirm_reports) ───────────────────────────
+
+
+def _report_confirm(**kw) -> PendingConfirm:
+    defaults = dict(
+        parsed=parsed_cmd(intent=Intent.UNDER_ATTACK, system_text="moee 8", raw="tackled moee 8"),
+        candidate=None,
+        incident_id=None,
+        commit_on_timeout=True,
+    )
+    defaults.update(kw)
+    return PendingConfirm(**defaults)
+
+
+def test_confirm_first_yes_commits() -> None:
+    conf = _report_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="yes", confirm_reply="yes"))
+    assert actions == [ConfirmPending(conf)]
+    assert s2.state is DialogState.IDLE
+
+
+def test_confirm_first_timeout_commits_the_report() -> None:
+    # Silence must never eat an unposted distress call (GDD §8.6).
+    conf = _report_confirm()
+    s, _ = to_await_confirm(conf)
+    s2, actions = step(s, DialogEvent(Ev.DEADLINE, gen=s.gen))
+    assert ConfirmPending(conf) in actions
+    assert s2.state is DialogState.IDLE
+
+
+def test_confirm_first_unmatched_speech_commits() -> None:
+    conf = _report_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="unrelated chatter", confident=False, garbage=True))
+    assert ConfirmPending(conf) in actions
+    assert s2.state is DialogState.IDLE
+
+
+def test_confirm_first_no_opens_system_retry() -> None:
+    conf = _report_confirm()
+    s, _ = to_await_confirm(conf)
+    s = confirm_window_open(s)
+    s2, actions = classified(s, c(text="no", confirm_reply="no"))
+    assert s2.state is DialogState.AWAIT_RETRY_SYSTEM
+    assert s2.ctx_retry == conf.parsed
+    assert Speak(Line.SAY_AGAIN) in actions and ArmWindow(s2.gen) in actions
+    assert not any(isinstance(a, ConfirmPending) for a in actions)
+
+
+def test_confirm_first_without_budget_commits_instead_of_standing_down() -> None:
+    s, _ = wake(idle())
+    s = dataclasses.replace(s, retries_left=0)
+    s = _to_thinking(s)
+    s, _ = classified(s, c(parsed=parsed_cmd(intent=Intent.UNDER_ATTACK)))
+    conf = _report_confirm()
+    s2, actions = step(s, DialogEvent(Ev.ENGINE_ASKED, confirm=conf))
+    assert s2.state is DialogState.IDLE
+    assert ConfirmPending(conf) in actions
+    assert Speak(Line.STANDING_DOWN) not in actions
+
+
+def test_card_confirm_timeout_still_closes_silently() -> None:
+    # The pre-existing flavour (card already posted / destructive) is
+    # unchanged: timeout closes, commits nothing.
+    conf = pending_confirm()  # commit_on_timeout=False
+    s, _ = to_await_confirm(conf)
+    s2, actions = step(s, DialogEvent(Ev.DEADLINE, gen=s.gen))
+    assert not any(isinstance(a, ConfirmPending) for a in actions)
+    assert s2.state is DialogState.IDLE

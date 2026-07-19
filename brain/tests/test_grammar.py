@@ -1047,3 +1047,45 @@ def test_woust_is_a_roast() -> None:
     assert cmd is not None
     assert cmd.intent is Intent.INSULT
     assert cmd.detail is not None and "Space Monkey" in cmd.detail
+
+
+# ── dismissal (GDD §5.4): the spoken exit ────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "end transmission",
+        "hey cortana, end transmission",
+        "End of transmission.",
+        "never mind",
+        "nevermind, over",
+        "okay disregard that",
+        "belay that",
+        "stand down",
+        "stop",
+        "shut up",
+        "forget it",
+    ],
+)
+def test_dismissal_phrases(heard: str) -> None:
+    from cortana.nlu.grammar import dismissal
+
+    assert dismissal(heard) is True
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "",
+        "stop pinging me",  # a command, not a dismissal
+        "forget me",  # UNREGISTER
+        "cancel",  # CANCEL keeps its meaning (retract last incident)
+        "hostiles Otanuomi, end transmission",  # sign-off use, not a dismissal
+        "under attack, stand by",
+    ],
+)
+def test_dismissal_negatives(heard: str) -> None:
+    from cortana.nlu.grammar import dismissal
+
+    assert dismissal(heard) is False

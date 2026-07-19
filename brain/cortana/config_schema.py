@@ -410,6 +410,28 @@ KEYS: Final[tuple[Key, ...]] = (
         minimum=0,
     ),
     Key(
+        "dialog.confirm_reports",
+        "str",
+        Reload.HOT,
+        "Confirm-first for voice reports (GDD §8.3): off = commit "
+        "immediately (readback only); low = uncertain system matches ask "
+        '"Heard X — confirm?" first; always = every voice report asks. '
+        "Yes commits, no opens a say-again retry, silence/unmatched commits "
+        "anyway — a distress call is never lost.",
+        default="low",
+        choices=("off", "low", "always"),
+    ),
+    Key(
+        "dialog.retry_min_logprob",
+        "float",
+        Reload.HOT,
+        "Transcripts below this Whisper confidence are chatter/noise: they "
+        "never earn a say-again retry — the dialog closes silently instead "
+        "of re-prompting into an open mic. Recognised commands are never "
+        "gated by this.",
+        default=-1.3,
+    ),
+    Key(
         "stt.backend",
         "str",
         Reload.RESTART,

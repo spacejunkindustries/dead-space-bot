@@ -199,6 +199,17 @@ class DialogConfig:
     #: and say-again retries share this budget. Only a fresh wake refills it;
     #: exhaustion always ends audibly with "standing down".
     max_retries: int = 2
+    #: Confirm-first for voice reports (GDD §8.3): "off" commits immediately
+    #: (spoken readback only); "low" asks "Heard X — confirm?" when the
+    #: system match is uncertain (LOW tier / verbatim); "always" asks for
+    #: every voice report. Yes commits, no opens a say-again retry, and
+    #: silence/unmatched speech commits anyway — a distress call is never
+    #: lost to an unanswered question.
+    confirm_reports: str = "low"
+    #: Transcripts below this Whisper avg_logprob are chatter/noise: they
+    #: never earn a say-again retry (the open-mic retry loop). Recognised
+    #: commands are never gated by this.
+    retry_min_logprob: float = -1.3
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,6 +745,8 @@ def _assemble_dialog(v: dict[str, Any]) -> DialogConfig:
         ack_grace_ms=v["dialog.ack_grace_ms"],
         endpoint_gap_floor_ms=v["dialog.endpoint_gap_floor_ms"],
         max_retries=v["dialog.max_retries"],
+        confirm_reports=v["dialog.confirm_reports"],
+        retry_min_logprob=v["dialog.retry_min_logprob"],
     )
 
 

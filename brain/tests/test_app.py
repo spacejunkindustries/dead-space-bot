@@ -250,10 +250,15 @@ def make_dialog(
     chat: _Chat | None = None,
     chat_enabled: bool = False,
     fun: Any | None = None,
+    confirm_reports: str = "off",
 ) -> Rig:
-    holder = StubHolder(
-        make_config(wake_ack=wake_ack, relay_mode=relay_mode, chat_enabled=chat_enabled)
-    )
+    import dataclasses as _dc
+
+    from cortana.config import DialogConfig
+
+    cfg = make_config(wake_ack=wake_ack, relay_mode=relay_mode, chat_enabled=chat_enabled)
+    cfg = _dc.replace(cfg, dialog=DialogConfig(confirm_reports=confirm_reports))
+    holder = StubHolder(cfg)
     gaz = _Gazetteer(
         entries={
             sid: SystemEntry(
@@ -656,6 +661,9 @@ async def test_severity_colours_a_framed_relay_but_noise_still_fails() -> None:
 
 
 async def test_low_confidence_gibberish_is_not_relayed() -> None:
+    # -2.4 is deep in garbage territory (below dialog.retry_min_logprob):
+    # the gate closes SILENTLY — no card, and no "say again" prompt into an
+    # open mic that would only recapture more chatter (field round 2).
     rig = make_dialog(
         roles=[PILOT_ROLE],
         transcriber=_Transcriber(["Rens, Rens, Rens"], avg_logprob=-2.4),
@@ -664,7 +672,22 @@ async def test_low_confidence_gibberish_is_not_relayed() -> None:
     await utter_wake(rig)
     assert rig.engine.broadcasts == []  # hallucinated noise never becomes a card
     assert rig.health.rejected == 1
+    assert not any("Say again" in t for _, t in rig.speaker.said)
+    assert rig.capture.armed == []  # and no retry window
+
+
+async def test_marginal_confidence_gibberish_still_gets_say_again() -> None:
+    # Between the relay gate (-0.9) and the garbage floor (-1.3): a quiet
+    # mic, not chatter — the say-again retry is still worth offering.
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["mumbled something"], avg_logprob=-1.1),
+        relay_mode="open",
+    )
+    await utter_wake(rig)
+    assert rig.engine.broadcasts == []
     assert (GUILD, "Say again the system.") in rig.speaker.said
+    assert rig.capture.armed  # retry window armed
 
 
 async def test_confident_relay_posts_and_acks() -> None:
@@ -1229,3 +1252,84 @@ async def test_stt_bias_carries_the_command_vocabulary(tmp_path) -> None:
     assert transcriber.biases, "transcribe was never called"
     assert "insult, roast" in transcriber.biases[0]
     assert "tackled" in transcriber.biases[0]
+
+
+# ── field round 2: dismissal, garbage gate, confirm-first (GDD §5.4/§8.3) ────
+
+
+async def test_dismissal_stands_down_end_to_end() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, end transmission"]),
+    )
+    await utter_wake(rig)
+    assert any("Standing down" in t for _, t in rig.speaker.said)
+    assert rig.engine.reports == [] and rig.engine.broadcasts == []
+    assert rig.capture.armed == []  # no retry window
+
+
+async def test_confirm_first_low_report_asks_then_yes_commits() -> None:
+    # "zanzibar" is nowhere near the gazetteer → LOW/no-match → confirm-first.
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, under attack in zanzibar", "yes"]),
+        confirm_reports="low",
+    )
+    await utter_wake(rig)
+    assert any("Heard" in t and "Confirm" in t for _, t in rig.speaker.said)
+    assert rig.engine.reports == []  # nothing committed yet
+    assert rig.capture.armed  # confirm window armed
+    await utter_window(rig)  # "yes"
+    assert len(rig.engine.reports) == 1
+    _, _, parsed, _resolution = rig.engine.reports[0]
+    assert parsed.intent is Intent.UNDER_ATTACK
+    assert parsed.system_text == "zanzibar"
+
+
+async def test_confirm_first_no_reopens_say_again() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, under attack in zanzibar", "no"]),
+        confirm_reports="low",
+    )
+    await utter_wake(rig)
+    await utter_window(rig)  # "no" → decline, say-again retry armed
+    assert rig.engine.reports == []
+    assert any("Say again" in t for _, t in rig.speaker.said)
+    assert rig.dialog.session_state(USER) is DialogState.AWAIT_RETRY_SYSTEM
+
+
+async def test_confirm_first_off_commits_immediately() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, under attack in zanzibar"]),
+        confirm_reports="off",
+    )
+    await utter_wake(rig)
+    assert len(rig.engine.reports) == 1  # legacy behavior preserved
+
+
+async def test_confirm_first_never_gates_high_tier_in_low_mode() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, hostiles Otanuomi"]),
+        confirm_reports="low",
+    )
+    await utter_wake(rig)
+    assert len(rig.engine.reports) == 1  # exact match commits straight away
+    assert not any("Confirm" in t for _, t in rig.speaker.said)
+
+
+async def test_confirm_first_always_gates_high_tier_and_yes_forces_candidate() -> None:
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana, hostiles Otanuomi", "affirmative"]),
+        confirm_reports="always",
+    )
+    await utter_wake(rig)
+    assert rig.engine.reports == []
+    assert any("Heard Otanuomi" in t for _, t in rig.speaker.said)
+    await utter_window(rig)
+    assert len(rig.engine.reports) == 1
+    _, _, _parsed, resolution = rig.engine.reports[0]
+    assert resolution is not None and resolution.tier is Tier.HIGH  # forced candidate

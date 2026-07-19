@@ -96,15 +96,22 @@ class Ev(Enum):
 
 @dataclass(frozen=True, slots=True)
 class PendingConfirm:
-    """One §8.3 confirm awaiting the pilot's answer: the command as parsed,
-    the MEDIUM-tier candidate CORTANA read back, and — when the engine already
-    posted an uncertain card — the incident whose pick button this mirrors.
-    ``incident_id`` is ``None`` for destructive/scheduling commands
-    (clear/timer/form up), which post nothing until confirmed."""
+    """One confirm awaiting the pilot's answer: the command as parsed, the
+    candidate CORTANA read back (``None`` for a verbatim/no-match readback), and
+    — when the engine already posted an uncertain card — the incident whose
+    pick button this mirrors. ``incident_id`` is ``None`` both for
+    destructive/scheduling commands (clear/timer/form up), which post nothing
+    until confirmed, and for §8.3 confirm-first reports.
+
+    ``commit_on_timeout`` marks a confirm-first report (``dialog.
+    confirm_reports``): the report has NOT been posted yet, and anything
+    other than an explicit decline — timeout, unmatched speech — commits it.
+    A distress call is never lost to an unanswered question (GDD §8.6)."""
 
     parsed: ParsedCommand
-    candidate: MatchCandidate
+    candidate: MatchCandidate | None
     incident_id: int | None = None
+    commit_on_timeout: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +137,14 @@ class Classified:
     #: Standalone yes/no verdict for an AWAIT_CONFIRM window (GDD §8.3):
     #: ``"yes"`` / ``"no"`` / ``None`` when the utterance is neither.
     confirm_reply: str | None = None
+    #: Standalone dismissal ("end transmission", "disregard", "never mind",
+    #: "stand down") — the pilot is closing the dialog, absolutely.
+    dismissed: bool = False
+    #: Transcript confidence below ``dialog.retry_min_logprob``: chatter/noise
+    #: quality. Unmatched garbage closes silently instead of earning a
+    #: say-again retry (the open-mic retry loop, live complaint). Recognised
+    #: commands are never gated by this (a distress call always posts).
+    garbage: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +254,9 @@ class Report:
     #: resolution: the engine skips phonetic re-resolution entirely — the
     #: pilot already vouched for exactly this system.
     forced_resolution: Resolution | None = None
+    #: This report already went through the confirm-first gate
+    #: (``dialog.confirm_reports``) — commit it, never re-ask.
+    confirmed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
