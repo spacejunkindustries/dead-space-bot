@@ -1113,6 +1113,16 @@ KEYS: Final[tuple[Key, ...]] = (
         default=True,
     ),
     Key(
+        "killboard.poller.deaths_post_window_minutes",
+        "int",
+        Reload.HOT,
+        "Anti-backfill-spam window for the deaths sweep: only deaths newer than "
+        "this many minutes are posted; older ones are seeded (kept for Death Fame, "
+        "never posted) so ingesting member history doesn't flood the channel.",
+        default=60,
+        minimum=0,
+    ),
+    Key(
         "killboard.feed.kills_channel",
         "int",
         Reload.HOT,

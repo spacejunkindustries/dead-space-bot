@@ -17,11 +17,12 @@ import pytest
 
 from cortana.config import KbFeedConfig, KillboardConfig
 from cortana.core import db
-from killboard.feed import Feed, _PostResult
-from killboard.model import KILL, EventRow
+from killboard.feed import Feed, _is_backfill_death, _PostResult
+from killboard.model import DEATH, KILL, EventRow
 from killboard.store import MIGRATIONS_DIR, KbStore
 
 KILLS_CHANNEL = 111
+DEATHS_CHANNEL = 222
 
 
 class _FailChannel:
@@ -93,6 +94,42 @@ def _kill_row(event_id: int = 1) -> EventRow:
         battle_id=None,
         location="Somewhere",
     )
+
+
+def _death_row(event_id: int, *, minutes_ago: float, timestamp: str | None = None) -> EventRow:
+    """A DEATH row (tracked guild is the victim). ``minutes_ago`` sets the
+    timestamp relative to real now unless ``timestamp`` is given explicitly."""
+    from datetime import UTC, datetime, timedelta
+
+    ts = (
+        timestamp
+        if timestamp is not None
+        else (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat()
+    )
+    return EventRow(
+        event_id=event_id,
+        timestamp=ts,
+        killer_id="K",
+        killer_name="Ganker",
+        killer_guild_id="OTHER",
+        killer_ip=1000.0,
+        victim_id="V",
+        victim_name="Member",
+        victim_guild_id="G1",
+        victim_ip=900.0,
+        total_fame=5000,
+        relation=DEATH,
+        num_participants=1,
+        battle_id=None,
+        location="Somewhere",
+    )
+
+
+def _death_feed(bot: _Bot, store: KbStore) -> Feed:
+    cfg = SimpleNamespace(
+        killboard=KillboardConfig(feed=KbFeedConfig(deaths_channel=DEATHS_CHANNEL))
+    )
+    return Feed(bot, store, _Cards(), lambda: cfg, _inline_to_thread)  # type: ignore[arg-type]
 
 
 async def test_transient_send_failure_defers_and_never_marks_posted(store: KbStore) -> None:
@@ -350,3 +387,51 @@ async def test_juicy_by_loot_off_when_loot_below_threshold(
 
     await feed._post_one(row)
     assert len(juicy.sent) == 0  # below threshold -> not juicy
+
+
+# ── deaths recency gate: member death HISTORY must not spam the feed ──────────
+
+
+def test_is_backfill_death_gate() -> None:
+    """Pure gate: a death older than the window is backfill; a recent one is not;
+    window 0 disables it; an unparseable/missing timestamp posts (not backfill)."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+
+    def at(mins: float) -> EventRow:
+        return _death_row(1, minutes_ago=0, timestamp=(now - timedelta(minutes=mins)).isoformat())
+
+    assert _is_backfill_death(at(120), 60, now=now) is True  # 2h old > 60m
+    assert _is_backfill_death(at(5), 60, now=now) is False  # fresh
+    assert _is_backfill_death(at(120), 0, now=now) is False  # gate disabled
+    assert _is_backfill_death(_death_row(1, minutes_ago=0, timestamp=""), 60, now=now) is False
+
+
+async def test_old_death_is_seeded_not_posted(store: KbStore) -> None:
+    """A weeks-old death (from the per-member sweep's history) must be seeded as
+    posted — kept for Death Fame, never turned into a stale card in the feed."""
+    row = _death_row(50, minutes_ago=120)  # > 60m default window
+    store.upsert_event(row, "{}")
+    channel = _OkChannel()
+    feed = _death_feed(_Bot({DEATHS_CHANNEL: channel}), store)
+
+    result = await feed._post_one(row)
+
+    assert result is _PostResult.SKIPPED
+    assert channel.sent == []  # never posted an old death card
+    assert store.count_unposted() == 0  # seeded as posted; row stays for Death Fame
+
+
+async def test_recent_death_still_posts(store: KbStore) -> None:
+    """A genuinely recent death is unaffected by the gate and posts normally."""
+    row = _death_row(51, minutes_ago=2)  # within the 60m window
+    store.upsert_event(row, "{}")
+    channel = _OkChannel()
+    feed = _death_feed(_Bot({DEATHS_CHANNEL: channel}), store)
+
+    result = await feed._post_one(row)
+
+    assert result is _PostResult.SENT
+    assert len(channel.sent) == 1
+    assert store.count_unposted() == 0
