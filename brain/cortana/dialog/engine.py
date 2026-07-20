@@ -70,7 +70,7 @@ from cortana.types import (
 if TYPE_CHECKING:
     import sqlite3
 
-    from cortana.config import ConfigHolder
+    from cortana.config import ConfigHolder, NluConfig
     from cortana.core.discipline import Discipline
     from cortana.core.fun import FunEngine
     from cortana.core.incidents import IncidentEngine
@@ -357,7 +357,7 @@ class DialogEngine:
         # callouts the grammar misses pay the round-trip; the place it returns
         # is still resolved deterministically and confirmed before anything
         # pings, so it can never invent a system or fire an unvouched alert.
-        classified = await self._maybe_llm_understand(classified)
+        classified = await self._maybe_llm_understand(s, classified)
         # STT review log (GDD §8.7): fire-and-forget so the Discord round-trip
         # never sits between hearing and acting. Off unless a channel is set.
         self._emit_transcript(s.guild_id, result.text, result.avg_logprob, classified.parsed)
@@ -366,31 +366,44 @@ class DialogEngine:
             DialogEvent(Ev.CLASSIFIED, gen=gen, classified=classified),
         )
 
-    async def _maybe_llm_understand(self, classified: Classified) -> Classified:
+    async def _maybe_llm_understand(self, s: DialogSession, classified: Classified) -> Classified:
         """Fill an unmatched transcript with an LLM-interpreted command (§6.7).
 
-        Runs ONLY when: the feature is on with an endpoint, the grammar found no
-        command, the utterance isn't already a confirm reply / override /
-        dismissal, and it isn't chatter-quality noise (the garbage gate). The
-        model's place is a raw string — downstream resolution and confirm-first
-        own correctness — so this stays within the safe design even though it is
-        an LLM in the command path (owner-authorised; constraint 6 waiver)."""
+        Runs ONLY when :meth:`_llm_understand_applies`: the feature is on with an
+        endpoint, the grammar found no command, the utterance isn't already a
+        confirm reply / override / dismissal, and it isn't chatter-quality noise
+        (the garbage gate). The model's place is a raw string — downstream
+        resolution and confirm-first own correctness — so this stays within the
+        safe design even though it is an LLM in the command path (owner-
+        authorised; constraint 6 waiver)."""
         cfg = self._holder.current.nlu
-        if (
-            not cfg.understanding
-            or not cfg.url
-            or classified.parsed is not None
-            or classified.confirm_reply is not None
-            or classified.override_query is not None
-            or classified.bare_override
-            or classified.dismissed
-            or classified.garbage
-        ):
+        if not self._llm_understand_applies(cfg, classified):
             return classified
+        # The on-box interpret is a multi-second round-trip; without a cue the
+        # pilot hears dead air and thinks she froze. Speak "stand by" FIRST so
+        # the wait reads as working, not broken — ephemeral, dropped if muted,
+        # and it never blocks the interpret (best-effort ACK).
+        await self._speak_or_post(s, tts_mod.thinking())
         parsed = await asyncio.to_thread(llm_nlu.interpret, cfg, classified.text)
         if parsed is None:
             return classified
         return dataclasses.replace(classified, parsed=parsed)
+
+    @staticmethod
+    def _llm_understand_applies(cfg: NluConfig, classified: Classified) -> bool:
+        """Whether the understanding brain should read this utterance (§6.7).
+        Pure gate, factored out so the 'is she about to think?' decision has one
+        home and can be tested without a model or an event loop."""
+        return (
+            cfg.understanding
+            and bool(cfg.url)
+            and classified.parsed is None
+            and classified.confirm_reply is None
+            and classified.override_query is None
+            and not classified.bare_override
+            and not classified.dismissed
+            and not classified.garbage
+        )
 
     def _emit_transcript(
         self, guild_id: int, text: str, avg_logprob: float, parsed: ParsedCommand | None
