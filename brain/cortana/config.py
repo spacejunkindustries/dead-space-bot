@@ -470,6 +470,11 @@ class KbPollerConfig:
     #: (and Death Fame) are polled per-member from /players/{id}/deaths on a slower
     #: cadence. Off = kills-only feed and Death Fame stays 0 (killboard GDD §5).
     track_deaths: bool = True
+    #: Anti-backfill-spam window for the deaths sweep: only deaths newer than this
+    #: many minutes are posted to the feed; older ones are seeded (kept for Death
+    #: Fame, never posted), so ingesting weeks of member history doesn't flood the
+    #: channel with old death cards (killboard GDD §5).
+    deaths_post_window_minutes: int = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -1022,6 +1027,7 @@ def _assemble_killboard(v: dict[str, Any]) -> KillboardConfig:
             page_limit=v["killboard.poller.page_limit"],
             max_backfill_pages=v["killboard.poller.max_backfill_pages"],
             track_deaths=v["killboard.poller.track_deaths"],
+            deaths_post_window_minutes=v["killboard.poller.deaths_post_window_minutes"],
         ),
         feed=KbFeedConfig(
             kills_channel=v["killboard.feed.kills_channel"],

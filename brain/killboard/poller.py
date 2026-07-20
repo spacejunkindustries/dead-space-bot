@@ -80,6 +80,10 @@ _SERVER_OFFSET_CEILING: int = 1000
 _DEATHS_EVERY_TICKS: int = 8
 #: Recent deaths fetched per member each sweep (already-stored ones are skipped).
 _DEATHS_PER_MEMBER: int = 20
+#: Members processed per sweep (round-robin over the roster). Bounds one sweep's
+#: wall-clock so a large guild — or a slow ``/players/{id}/deaths`` endpoint —
+#: can't make a single sweep run for minutes; the rest are covered next sweep.
+_DEATHS_MEMBERS_PER_SWEEP: int = 25
 #: Re-fetch the member roster at most this often (seconds) — it changes rarely.
 _ROSTER_TTL_S: float = 1800.0
 #: Pause between per-member death fetches, to be a polite gameinfo client (§13).
@@ -137,6 +141,7 @@ class Poller:
         self._tick_count: int = 0
         self._roster: list[dict[str, Any]] = []
         self._roster_at: float = 0.0
+        self._deaths_cursor: int = 0  # round-robin position into the roster
 
     # ── supervised entry point ───────────────────────────────────────────────
 
@@ -378,9 +383,19 @@ class Poller:
         deaths never appear there — Death Fame and the death feed stay empty. This
         sweep walks the roster, fetches each member's recent ``/players/{id}/deaths``,
         skips the ones already stored (cheap ``has_event`` dedup), and stores the
-        rest. Stored DEATH events flow to the feed via its normal unposted drain
-        and into the Death-Fame aggregates — no special path. Throttled and roster-
-        cached to stay a polite gameinfo client.
+        rest.
+
+        Ingested deaths flow to the feed via its normal unposted drain and into the
+        Death-Fame aggregates. The feed itself applies the anti-backfill recency
+        gate (``deaths_post_window_minutes``): a member's history spans weeks, so
+        the feed seeds any death older than the window as already-posted — kept for
+        Death Fame, never turned into a stale card. Keeping that gate at the feed's
+        single posting chokepoint (rather than here) also catches deaths that
+        entered the store by any other path.
+
+        Bounded to :data:`_DEATHS_MEMBERS_PER_SWEEP` members per sweep (round-robin
+        over the roster) and throttled between fetches to stay a polite, non-hogging
+        gameinfo client even when the deaths endpoint is slow.
         """
         cfg = self._cfg_provider()
         if not cfg.poller.track_deaths:
@@ -388,9 +403,10 @@ class Poller:
         guild_id = (cfg.guild_id or "").strip()
         if not guild_id:
             return
-        members = await self._current_roster(guild_id)
-        if not members:
+        roster = await self._current_roster(guild_id)
+        if not roster:
             return
+        members = self._roster_slice(roster)
 
         new_rows: list[EventRow] = []
         for member in members:
@@ -412,6 +428,22 @@ class Poller:
             new_rows.sort(key=lambda r: r.event_id)
             await self._emit(new_rows)
             self._log.info("kb_poller.deaths_swept", members=len(members), new_deaths=len(new_rows))
+
+    def _roster_slice(self, roster: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The next round-robin slice of the roster to sweep, advancing the cursor.
+
+        A guild larger than :data:`_DEATHS_MEMBERS_PER_SWEEP` is covered across
+        consecutive sweeps rather than all at once, so one sweep's wall-clock stays
+        bounded regardless of roster size or endpoint latency."""
+        n = len(roster)
+        if n <= _DEATHS_MEMBERS_PER_SWEEP:
+            self._deaths_cursor = 0
+            return roster
+        start = self._deaths_cursor % n
+        end = start + _DEATHS_MEMBERS_PER_SWEEP
+        chunk = roster[start:end] if end <= n else roster[start:] + roster[: end - n]
+        self._deaths_cursor = end % n
+        return chunk
 
     async def _current_roster(self, guild_id: str) -> list[dict[str, Any]]:
         """The member roster, cached with a TTL; keeps the last good list on a

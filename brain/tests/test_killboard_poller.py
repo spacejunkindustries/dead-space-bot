@@ -83,13 +83,20 @@ def _raw(event_id: int, *, guild: str = GUILD_ID, fame: int = 100) -> dict[str, 
     }
 
 
-def _raw_death(event_id: int, *, guild: str = GUILD_ID, fame: int = 100) -> dict[str, Any]:
+def _raw_death(
+    event_id: int, *, guild: str = GUILD_ID, fame: int = 100, minutes_ago: float = 1.0
+) -> dict[str, Any]:
     """A minimal raw death event: the tracked guild is the VICTIM, so
     :func:`~killboard.model.parse_event` classifies it as a DEATH and keeps it.
-    This is the shape ``/players/{id}/deaths`` returns."""
+    This is the shape ``/players/{id}/deaths`` returns. ``minutes_ago`` sets the
+    timestamp relative to real now, so tests can exercise the deaths recency gate
+    (recent → posted, old → seeded) without depending on a wall-clock date."""
+    from datetime import UTC, datetime, timedelta
+
+    ts = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat()
     return {
         "EventId": event_id,
-        "TimeStamp": "2026-07-20T12:00:00Z",
+        "TimeStamp": ts,
         "Killer": {"Id": "K", "Name": "Ganker", "GuildId": "OTHER"},
         "Victim": {"Id": f"M{event_id}", "Name": "Member", "GuildId": guild},
         "TotalVictimKillFame": fame,
@@ -404,6 +411,29 @@ async def test_deaths_sweep_ingests_per_member_deaths(
     # All three landed in the store and count toward Death Fame (300 total).
     assert sorted(row.event_id for row in store.recent(50)) == [201, 202, 203]
     assert store.death_fame("2026-07-01T00:00:00Z") == 300
+
+
+@pytest.mark.asyncio
+async def test_deaths_sweep_round_robins_a_large_roster(
+    store: KbStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A roster larger than the per-sweep cap is covered across consecutive sweeps
+    (round-robin), so one sweep can't run for minutes against a big guild."""
+    monkeypatch.setattr("killboard.poller._MEMBER_THROTTLE_S", 0.0)
+    monkeypatch.setattr("killboard.poller._DEATHS_MEMBERS_PER_SWEEP", 3)
+    roster = [{"Id": f"P{i}"} for i in range(7)]  # 7 members, cap 3
+    api = FakeApi([], roster=roster, deaths={})
+    queue: asyncio.Queue[list[EventRow]] = asyncio.Queue()
+    poller = _make_poller(store, api, queue, _cfg())
+
+    await poller._poll_deaths()
+    assert api.death_calls == ["P0", "P1", "P2"]
+    api.death_calls.clear()
+    await poller._poll_deaths()
+    assert api.death_calls == ["P3", "P4", "P5"]
+    api.death_calls.clear()
+    await poller._poll_deaths()
+    assert api.death_calls == ["P6", "P0", "P1"]  # wraps around
 
 
 @pytest.mark.asyncio

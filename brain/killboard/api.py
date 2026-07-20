@@ -64,7 +64,14 @@ class KbApi:
                 self._session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
             return self._session
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any | None:
+    async def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        max_retries: int | None = None,
+        quiet: bool = False,
+    ) -> Any | None:
         """GET ``{region_host}{path}`` and return parsed JSON, or ``None`` on give-up.
 
         Applies the poller's ``request_timeout_seconds`` per attempt and retries up
@@ -74,6 +81,13 @@ class KbApi:
         client/not-found condition that will not improve on retry, so it returns
         ``None`` immediately. Never raises to the caller — every failure path is a
         logged ``None`` (§13: never a crash).
+
+        ``max_retries`` overrides the poller's setting for this one call — the
+        per-member deaths sweep passes ``0`` (fail fast, no inline retries) because
+        it re-runs every sweep, so retrying a slow member endpoint inline just
+        amplifies load and log noise. ``quiet=True`` drops the transient
+        retry/timeout warnings to ``debug`` (the caller logs one summary instead),
+        so a slow best-effort endpoint doesn't flood the journal.
 
         ``path`` must start with ``/`` and is appended to the region host.
         """
@@ -88,12 +102,15 @@ class KbApi:
         url = f"{base}{path}"
         timeout = aiohttp.ClientTimeout(total=poller.request_timeout_seconds)
         backoff_base = poller.backoff_base_seconds
-        max_retries = poller.max_retries
+        retries = poller.max_retries if max_retries is None else max_retries
+        # Transient failures (timeout / 5xx / 429) log at debug when quiet so a
+        # best-effort sweep can't spam warnings; terminal ones still warn.
+        transient_log = log.debug if quiet else log.warning
 
         session = await self._get_session()
 
-        # attempt 0 is the initial try; attempts 1..max_retries are retries.
-        for attempt in range(max_retries + 1):
+        # attempt 0 is the initial try; attempts 1..retries are retries.
+        for attempt in range(retries + 1):
             try:
                 async with session.get(url, params=params, timeout=timeout) as resp:
                     status = resp.status
@@ -106,26 +123,26 @@ class KbApi:
                     if status == 429:
                         # Rate limited: back off harder than a normal failure.
                         delay = backoff_base * (2 ** (attempt + 1))
-                        log.warning(
+                        transient_log(
                             "kb_api.rate_limited",
                             path=path,
                             attempt=attempt,
                             retry_in=delay,
                         )
-                        if attempt >= max_retries:
+                        if attempt >= retries:
                             return None
                         await asyncio.sleep(delay)
                         continue
                     if 500 <= status < 600:
                         delay = backoff_base * (2**attempt)
-                        log.warning(
+                        transient_log(
                             "kb_api.server_error",
                             path=path,
                             status=status,
                             attempt=attempt,
                             retry_in=delay,
                         )
-                        if attempt >= max_retries:
+                        if attempt >= retries:
                             return None
                         await asyncio.sleep(delay)
                         continue
@@ -134,14 +151,16 @@ class KbApi:
                     return None
             except (TimeoutError, aiohttp.ClientError) as exc:
                 delay = backoff_base * (2**attempt)
-                log.warning(
+                transient_log(
                     "kb_api.request_failed",
                     path=path,
-                    error=str(exc),
+                    # str(TimeoutError()) is "", so fall back to the type name —
+                    # otherwise the log reads a bare, mysterious empty error.
+                    error=str(exc) or type(exc).__name__,
                     attempt=attempt,
                     retry_in=delay,
                 )
-                if attempt >= max_retries:
+                if attempt >= retries:
                     return None
                 await asyncio.sleep(delay)
                 continue
@@ -209,8 +228,15 @@ class KbApi:
         gathered per-member from here and ingested the same way (classify → DEATH).
         Returns the raw event dicts (newest-first) or ``[]`` on failure — a flaky
         member fetch costs that member's deaths this sweep, never the whole poll.
+
+        Fetched with ``max_retries=0`` (fail fast) and ``quiet=True``: the sweep
+        re-runs every cycle, so an inline retry of a slow member endpoint would
+        only amplify load and log spam — a timed-out member is simply retried next
+        sweep. The poller logs one summary per sweep instead of per-member noise.
         """
-        data = await self._get(f"/players/{player_id}/deaths", {"limit": limit})
+        data = await self._get(
+            f"/players/{player_id}/deaths", {"limit": limit}, max_retries=0, quiet=True
+        )
         return _as_dict_list(data)
 
     async def guild(self, guild_id: str) -> dict[str, Any] | None:

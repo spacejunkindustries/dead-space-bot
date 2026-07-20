@@ -34,7 +34,7 @@ import contextlib
 import enum
 import io
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import discord
@@ -271,7 +271,22 @@ class Feed:
         feed (audit fix — a blanket ``except DiscordException`` used to treat 403
         as transient and wedge the backlog).
         """
-        fc = self._cfg_provider().killboard.feed
+        kb = self._cfg_provider().killboard
+        fc = kb.feed
+
+        # Anti-backfill-spam gate for DEATHS. Guild deaths are gathered per-member
+        # from each pilot's death HISTORY, which spans weeks; posting all of it
+        # verbatim would flood the channel with old death cards. A death older than
+        # ``deaths_post_window_minutes`` is seeded as already-posted (kept for the
+        # Death-Fame aggregates, never posted) and skipped. Kills are real-time and
+        # unaffected. This lives at the single posting chokepoint so it catches an
+        # old death no matter how it entered the store (fresh sweep, restart drain).
+        if (row.relation or "").upper() == DEATH and _is_backfill_death(
+            row, kb.poller.deaths_post_window_minutes
+        ):
+            await self._to_thread(self._store.mark_posted, row.event_id, 0, 0)
+            return _PostResult.SKIPPED
+
         targets = route_channels(row, fc)
 
         # The raw event carries the guild tags (for the header) and the item
@@ -507,6 +522,29 @@ class Feed:
 
 
 # ── pure routing + embed helpers (no I/O — unit-testable) ─────────────────────
+
+
+def _is_backfill_death(row: EventRow, window_minutes: int, *, now: datetime | None = None) -> bool:
+    """Whether a DEATH is old enough to be backfill, not a live event.
+
+    ``True`` when the death's timestamp is older than ``window_minutes`` before
+    ``now`` — the deaths sweep pulls weeks of member history, and only genuinely
+    recent deaths should post. An unparseable/missing timestamp returns ``False``
+    (post it once rather than silently swallow a death with no usable time); a
+    ``window_minutes`` of ``0`` disables the gate (nothing is backfill).
+    """
+    if window_minutes <= 0:
+        return False
+    ts = row.timestamp
+    if not ts:
+        return False
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt < (now or datetime.now(UTC)) - timedelta(minutes=window_minutes)
 
 
 def route_channels(row: EventRow, fc: KbFeedConfig) -> list[int]:

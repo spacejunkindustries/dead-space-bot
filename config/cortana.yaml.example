@@ -316,6 +316,9 @@ killboard:                             # Albion Online killboard add-on — OPTI
     track_deaths: true                 # sweep guild DEATHS per-member (the /events guild feed
                                        # is kill-only, so Death Fame + the death feed depend on
                                        # this). Off = kills only, no death cards, Death Fame = 0.
+    deaths_post_window_minutes: 60     # only post deaths newer than this; older ones are seeded
+                                       # (kept for Death Fame, never posted) so the first sweep
+                                       # doesn't spam the channel with weeks-old death cards.
   feed:
     kills_channel: 0                   # channel id for guild kills (0 = unset)
     deaths_channel: 0                  # channel id for guild deaths (may equal kills_channel)
