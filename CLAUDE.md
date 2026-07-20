@@ -52,8 +52,8 @@ Not for debugging. Not in tests. Not behind a feature flag. Not in a temp file. 
 This is the privacy guarantee the corp is asked to trust (GDD §19) and it is the reason CORTANA sidesteps recording-consent law entirely. Breaking it once breaks it permanently.
 Need to debug the audio path? Log the **transcript** and the confidence score. `command_log` exists for this.
 
-**6. No LLM in the command path.**
-The grammar is fixed regex + phonetic matching. This is deliberate. An LLM would be slower, cost money per fight, hallucinate system names, and be undebuggable at 02:00 during a hostile timer. GDD §6.
+**6. No LLM in the command path — EXCEPT the opt-in understanding brain (GDD §6.7), off by default.**
+The grammar is fixed regex + phonetic matching, and that stays the default and the fast path. The original blanket ban existed because an LLM would be slower, cost money per fight, hallucinate system names, and be undebuggable at 02:00. The corp owner later authorised a narrow, safe relaxation — `nlu.understanding` — and it holds *because the model never gets the dangerous powers*: it runs on-box (no cost), only when the grammar already failed (grammar-first), returns the place as a **string** that the deterministic resolver maps to a real system or nothing (it cannot invent a system), and its command still passes through confirm-first before anything pings. Do not widen it past that shape: keep it opt-in, keep the place deterministic, keep the confirm. Escalation stays `decide_mentions()` alone (constraint 11). GDD §6 / §6.7.
 
 **7. Match on phonemes, not characters.**
 STT errors are phonetic, not typographic. Whisper writes *"oh tan you oh me"* — that's character-distance-far from *Otanuomi* but phonetically adjacent. Levenshtein on raw text alone is the wrong tool. Metaphone first, weighted 0.6 phonetic / 0.4 text. GDD §8.2.

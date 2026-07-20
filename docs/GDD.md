@@ -198,6 +198,7 @@ Every module in the finished system.
 | `audio/capture.py` | Per-user capture state machine: pre-roll ring buffer → wake hit → capture → endpoint → emit; owns the wake refractory period |
 | `audio/stt.py` | `Transcriber` protocol; faster-whisper (default) and whisper.cpp HTTP backends; gazetteer prompt biasing; bounded serialized decode queue + `stt.watchdog_s` hang watchdog |
 | `nlu/grammar.py` | Intent extraction, group-alias extraction, detail capture |
+| `nlu/llm_nlu.py` | The understanding brain (§6.7): on-box LLM reads a transcript the grammar missed → structured command JSON → `ParsedCommand` |
 | `nlu/gazetteer.py` | System load, region pruning, adjacency graph, jump-distance BFS with memo |
 | `nlu/phonetics.py` | Double Metaphone + Levenshtein scoring, alias-table lookup, context priors, confidence tiers |
 | `core/incidents.py` | Incident lifecycle, dedupe folding, staleness sweep, message rendering |
@@ -460,6 +461,19 @@ An **explicitly-invoked** chat channel, off by default (`chat.enabled`). When a 
 **Cost posture.** For `anthropic`, the default model is the cheapest Claude tier (fractions of a cent per question); replies are capped at `chat.max_tokens`, web search at one per question, and `chat.user_cooldown_s` throttles each pilot. For `local`, there is no per-question cost — but the cooldown still applies (it also paces the box's CPU, shared with Whisper). Either way the cooldown arms only on a successful answer — a failed request must not turn the pilot's retry into a throttle message. The Claude key rides systemd `LoadCredential=` (`anthropic:` credential; constraint 12), with `chat.api_key_file` as the 0600 dev fallback; the local backend needs no credential.
 
 **Liveness.** The whole `chat:` section applies on SIGHUP — flipping `chat.enabled`, switching `chat.backend`, or dropping a key into place takes effect on `systemctl reload cortana-brain`, no restart. A spoken "command override …" while the channel is down always gets the fixed *"Override channel unavailable."* line (never a silent fall-through to the grammar), and `/ask` distinguishes the down states: "not enabled", "no key" (anthropic), and "no url" (local).
+
+### 6.7 The understanding brain — an LLM in the command path (opt-in)
+
+The fixed grammar (§6.1) is fast, debuggable, and free — but it only knows the phrasings it was written for. Pilots don't talk in a fixed table (*"we got company rolling into Otanuomi"*, *"someone's melting me in Taisy get over here"*), and the corp's whole reason for existing is to catch **those** callouts, not just the textbook ones.
+
+`nlu.understanding` (OFF by default) adds an **on-box model as the understanding layer**: Whisper turns the voice into text, and when the grammar produced no command, the model reads that text and returns one structured command as JSON — intent, place, detail, severity. It runs on the same local server as the SLM (`nlu.url`, an Ollama/llama.cpp endpoint); no cloud, no key, no per-callout cost.
+
+**This is a deliberate, operator-authorised relaxation of the old constraint-6 ("no LLM in the command path").** That rule was written for a bot that had to be instant and could not risk a hallucinated system name mid-fight. Two design facts retire both concerns without trusting the model:
+
+- **The model never chooses a system.** It returns the place as a *string*; the deterministic resolver (§8.2) maps that string to a real seeded system or a learned area (§8.5a), or to nothing. A model cannot invent a system that isn't in the map, and a garbled place simply falls to the confirm/learn flow like any other.
+- **Nothing pings until the pilot confirms.** The LLM's command flows through the exact same confirm-first (§8.3) / learn-a-word (§8.5a) path as a grammar command, so a misunderstanding is read back out loud and vetoed before any alert fires. Escalation is still `decide_mentions()` alone (§11.1) — the LLM adds no mention authority.
+
+And it stays cheap where it matters: **grammar-first.** The model is called *only* when the fast grammar found no command — and never for a confirm reply, an override, a dismissal, or chatter-quality noise (the garbage gate). Clear callouts stay instant; only the messy ones pay the round-trip, capped at `nlu.timeout_s`. A model that is slow, down, or returns junk degrades silently to grammar-only — it can never crash an utterance or block a distress call. Latency is acceptable because accuracy is the point (the corp explicitly traded a few seconds for "understand me the first time"). Config: the optional `nlu:` section (`understanding`, `url`, `model`, `timeout_s`).
 
 ---
 
@@ -1361,6 +1375,11 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | **`areas:`** | | | | *OPTIONAL custom-area learning (GDD §8.5a); absent = defaults (on).* |
 | `areas.learn` | bool | `True` | hot | Custom-area learning (GDD §8.5a): when a report names a place that resolves to no system, CORTANA asks once ('Did you say <word>?') and on an explicit yes remembers it as a custom area, resolving it for good. false = post unknown places verbatim without ever learning. |
 | `areas.max_per_guild` | int | `200` | hot | Per-guild cap on learned areas (GDD §8.5a). At the cap learning pauses (reports still post) until an FC prunes with /areas-forget — the guard against a stuck mishearing filling the table. |
+| **`nlu:`** | | | | *OPTIONAL LLM understanding brain (GDD §6.7); absent = off (grammar only).* |
+| `nlu.understanding` | bool | `False` | hot | When the fixed grammar can't parse a callout, an on-box model reads the transcript and returns the command (GDD §6.7) — pilots can say it any way. The place is still resolved against the real system map (no invented systems) and nothing pings until the pilot confirms. Needs nlu.url + a running local model. false = grammar only. |
+| `nlu.url` | str | `''` | hot | OpenAI-compatible chat-completions endpoint of the on-box model (e.g. http://127.0.0.1:11434/v1/chat/completions from Ollama). Empty = off. |
+| `nlu.model` | str | `''` | hot | Model name the local server expects (e.g. llama3.2:3b). |
+| `nlu.timeout_s` | float | `8.0` | hot | Wall-clock cap on one interpretation; the grammar already answered the clear callouts fast, so this only paces the messy ones. |
 | **`routing:`** | | | | *OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.* |
 | `routing.file` | str | `''` | engine | routing.yaml location. Empty (the default) = routing.yaml in the same directory as cortana.yaml. |
 | **`ipc:`** | | | | *The Brain⇄Ears unix socket (GDD §15).* |

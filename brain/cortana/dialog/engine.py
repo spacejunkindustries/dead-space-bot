@@ -55,7 +55,7 @@ from cortana.dialog.types import (
     Speak,
 )
 from cortana.ipc import PRIORITY_ALERT, PRIORITY_NORMAL
-from cortana.nlu import grammar, phonetics
+from cortana.nlu import grammar, llm_nlu, phonetics
 from cortana.types import (
     INTENT_SEVERITY,
     MENTION_INTENTS,
@@ -352,6 +352,12 @@ class DialogEngine:
             avg_logprob=round(result.avg_logprob, 3),
         )
         classified = self._classify(result.text, result.avg_logprob)
+        # The understanding brain (GDD §6.7): if the fixed grammar found no
+        # command, let the on-box model read the transcript and try. Only the
+        # callouts the grammar misses pay the round-trip; the place it returns
+        # is still resolved deterministically and confirmed before anything
+        # pings, so it can never invent a system or fire an unvouched alert.
+        classified = await self._maybe_llm_understand(classified)
         # STT review log (GDD §8.7): fire-and-forget so the Discord round-trip
         # never sits between hearing and acting. Off unless a channel is set.
         self._emit_transcript(s.guild_id, result.text, result.avg_logprob, classified.parsed)
@@ -359,6 +365,32 @@ class DialogEngine:
             self._session(s.user_id, s.guild_id),
             DialogEvent(Ev.CLASSIFIED, gen=gen, classified=classified),
         )
+
+    async def _maybe_llm_understand(self, classified: Classified) -> Classified:
+        """Fill an unmatched transcript with an LLM-interpreted command (§6.7).
+
+        Runs ONLY when: the feature is on with an endpoint, the grammar found no
+        command, the utterance isn't already a confirm reply / override /
+        dismissal, and it isn't chatter-quality noise (the garbage gate). The
+        model's place is a raw string — downstream resolution and confirm-first
+        own correctness — so this stays within the safe design even though it is
+        an LLM in the command path (owner-authorised; constraint 6 waiver)."""
+        cfg = self._holder.current.nlu
+        if (
+            not cfg.understanding
+            or not cfg.url
+            or classified.parsed is not None
+            or classified.confirm_reply is not None
+            or classified.override_query is not None
+            or classified.bare_override
+            or classified.dismissed
+            or classified.garbage
+        ):
+            return classified
+        parsed = await asyncio.to_thread(llm_nlu.interpret, cfg, classified.text)
+        if parsed is None:
+            return classified
+        return dataclasses.replace(classified, parsed=parsed)
 
     def _emit_transcript(
         self, guild_id: int, text: str, avg_logprob: float, parsed: ParsedCommand | None

@@ -180,6 +180,11 @@ SECTIONS: Final[tuple[Section, ...]] = (
         optional=True,
     ),
     Section(
+        "nlu",
+        "OPTIONAL LLM understanding brain (GDD §6.7); absent = off (grammar only).",
+        optional=True,
+    ),
+    Section(
         "routing",
         "OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.",
         optional=True,
@@ -939,6 +944,44 @@ KEYS: Final[tuple[Key, ...]] = (
         "pauses (reports still post) until an FC prunes with /areas-forget — "
         "the guard against a stuck mishearing filling the table.",
         default=200,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    # nlu (optional section) — the LLM understanding brain (GDD §6.7)
+    Key(
+        "nlu.understanding",
+        "bool",
+        Reload.HOT,
+        "When the fixed grammar can't parse a callout, an on-box model reads "
+        "the transcript and returns the command (GDD §6.7) — pilots can say it "
+        "any way. The place is still resolved against the real system map (no "
+        "invented systems) and nothing pings until the pilot confirms. Needs "
+        "nlu.url + a running local model. false = grammar only.",
+        default=False,
+    ),
+    Key(
+        "nlu.url",
+        "str",
+        Reload.HOT,
+        "OpenAI-compatible chat-completions endpoint of the on-box model "
+        "(e.g. http://127.0.0.1:11434/v1/chat/completions from Ollama). Empty "
+        "= off.",
+        default="",
+    ),
+    Key(
+        "nlu.model",
+        "str",
+        Reload.HOT,
+        "Model name the local server expects (e.g. llama3.2:3b).",
+        default="",
+    ),
+    Key(
+        "nlu.timeout_s",
+        "float",
+        Reload.HOT,
+        "Wall-clock cap on one interpretation; the grammar already answered "
+        "the clear callouts fast, so this only paces the messy ones.",
+        default=8.0,
         minimum=0,
         exclusive_minimum=True,
     ),

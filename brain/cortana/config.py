@@ -384,6 +384,28 @@ class AreasConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class NluConfig:
+    """The LLM understanding brain (GDD §6.7). Optional section; OFF by default.
+
+    When the fixed grammar (§6.1) can't parse a callout, an on-box model reads
+    the transcript and returns the command — so pilots can say it any way they
+    like. The place it names is still resolved deterministically against the
+    real system map (it can't invent a system) and nothing pings until the
+    pilot confirms, so a misunderstanding is caught out loud first."""
+
+    #: Master switch. Needs ``url`` + a running local model to do anything.
+    understanding: bool = False
+    #: OpenAI-compatible chat-completions endpoint of the on-box model
+    #: (e.g. http://127.0.0.1:11434/v1/chat/completions from Ollama). Empty = off.
+    url: str = ""
+    #: The model name the server expects (e.g. "llama3.2:3b").
+    model: str = ""
+    #: Wall-clock cap on one interpretation; the grammar already answered fast,
+    #: so a slow model just means that one messy callout waits a beat.
+    timeout_s: float = 8.0
+
+
+@dataclass(frozen=True, slots=True)
 class GazetteerConfig:
     file: str
     home_system: str | None  # None/empty = no home-bias prior (nomadic corp)
@@ -442,6 +464,7 @@ class AuraConfig:
     dialog: DialogConfig = field(default_factory=DialogConfig)
     fun: FunConfig = field(default_factory=FunConfig)
     areas: AreasConfig = field(default_factory=AreasConfig)
+    nlu: NluConfig = field(default_factory=NluConfig)
 
 
 # ── schema-driven validation ─────────────────────────────────────────────────
@@ -815,6 +838,15 @@ def _assemble_areas(v: dict[str, Any]) -> AreasConfig:
     return AreasConfig(learn=v["areas.learn"], max_per_guild=v["areas.max_per_guild"])
 
 
+def _assemble_nlu(v: dict[str, Any]) -> NluConfig:
+    return NluConfig(
+        understanding=v["nlu.understanding"],
+        url=v["nlu.url"],
+        model=v["nlu.model"],
+        timeout_s=v["nlu.timeout_s"],
+    )
+
+
 def _assemble_dialog(v: dict[str, Any]) -> DialogConfig:
     return DialogConfig(
         window_ms=v["dialog.window_ms"],
@@ -848,6 +880,7 @@ def _assemble(values: dict[str, Any]) -> AuraConfig:
         dialog=_assemble_dialog(values),
         fun=_assemble_fun(values),
         areas=_assemble_areas(values),
+        nlu=_assemble_nlu(values),
     )
 
 
