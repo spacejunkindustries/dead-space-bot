@@ -266,16 +266,37 @@ class Feed:
         """
         fc = self._cfg_provider().killboard.feed
         targets = route_channels(row, fc)
+
+        # The raw event carries the guild tags (for the header) and the item
+        # loadout (for the market loot value) — data the flat row doesn't hold.
+        # It's fetched here, before the empty-targets check, because juicy-by-loot
+        # can ADD the juicy channel to a kill the fame-based routing suppressed
+        # (the common low-fame/high-loot gank). We only pay for it when it can
+        # change the outcome: routing already has a target, OR juicy-by-loot is
+        # armed for this KILL/ASSIST.
+        juicy_by_loot = (
+            fc.juicy_min_loot > 0
+            and bool(fc.juicy_channel)
+            and (row.relation or "").upper() in (KILL, ASSIST)
+        )
+        raw: dict[str, Any] | None = None
+        loot_value: int | None = None
+        if targets or juicy_by_loot:
+            raw = await self._to_thread(self._store.raw_event, row.event_id)
+            loot_value = await self._loot_value(raw)
+            if (
+                juicy_by_loot
+                and loot_value is not None
+                and loot_value >= fc.juicy_min_loot
+                and fc.juicy_channel not in targets
+            ):
+                targets.append(fc.juicy_channel)
+
         if not targets:
             await self._to_thread(self._store.mark_posted, row.event_id, 0, 0)
             return _PostResult.SKIPPED
 
-        # The raw event carries the guild tags (for the header) and the item
-        # loadout (for the market loot value) — data the flat row doesn't hold.
-        # Compute it BEFORE rendering so the loot value can be drawn on the card.
-        raw = await self._to_thread(self._store.raw_event, row.event_id)
         killer_guild, victim_guild = _guild_tags(raw)
-        loot_value = await self._loot_value(raw)
         png = await self._render_card(row, raw, loot_value)
         filename = f"kill_{row.event_id}.png"
         embed = build_embed(
@@ -457,8 +478,10 @@ def route_channels(row: EventRow, fc: KbFeedConfig) -> list[int]:
       suppresses low-IP "naked" deaths.
     * ``blob_participant_threshold`` + ``blob_channel`` redirect large-participant
       fights to the ZvZ channel instead of the main feed.
-    * ``juicy_channel`` + ``juicy_min_fame`` *additionally* mirror high-value kills
-      to a highlights feed, independent of the main-feed suppression.
+    * ``juicy_channel`` + ``juicy_min_fame`` *additionally* mirror high-*fame* kills
+      to a highlights feed, independent of the main-feed suppression. The
+      loot-value twin (``juicy_min_loot``, for low-fame/high-loot ganks) needs the
+      async market lookup, so it is applied by :meth:`_post_one`, not here.
 
     A channel of ``0`` is "unset" and never routed to. An empty list means the
     event is suppressed entirely; the caller still records it as handled so it

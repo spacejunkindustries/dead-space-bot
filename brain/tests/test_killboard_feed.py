@@ -197,3 +197,90 @@ async def test_feed_passes_raw_event_with_equipment_to_card(store: KbStore) -> N
     # The equipment the gear grid needs is present in what the card received.
     assert passed["Victim"]["Equipment"]["MainHand"]["Type"] == "T4_MAIN_SWORD@1"
     assert passed["Killer"]["Equipment"]["MainHand"]["Type"] == "T6_2H_AXE"
+
+
+async def test_juicy_by_loot_routes_low_fame_high_loot_kill(
+    store: KbStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A low-FAME kill with high LOOT value mirrors to the juicy channel even
+    though it never meets juicy_min_fame — the low-fame/high-loot gank."""
+    import json
+
+    from killboard import feed as feed_mod
+
+    JUICY = 222
+    row = _kill_row(9)  # relation KILL, total_fame=5000 (well below juicy_min_fame)
+    store.upsert_event(row, json.dumps({"Victim": {"Name": "V"}, "Killer": {"Name": "K"}}))
+
+    async def _high_loot(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {"total": 1_800_000}
+
+    monkeypatch.setattr(feed_mod, "estimate_value", _high_loot)
+
+    kills, juicy = _OkChannel(), _OkChannel()
+    cfg = SimpleNamespace(
+        killboard=SimpleNamespace(
+            feed=KbFeedConfig(
+                kills_channel=KILLS_CHANNEL,
+                juicy_channel=JUICY,
+                juicy_min_fame=2_000_000,  # fame gate the kill can't meet
+                juicy_min_loot=1_000_000,  # loot gate it clears
+            ),
+            market=SimpleNamespace(enabled=True),
+        )
+    )
+    feed = Feed(
+        _Bot({KILLS_CHANNEL: kills, JUICY: juicy}),
+        store,
+        _Cards(),
+        lambda: cfg,  # type: ignore[arg-type]
+        _inline_to_thread,
+        market=object(),
+    )
+
+    result = await feed._post_one(row)
+
+    assert result is _PostResult.SENT
+    assert len(juicy.sent) == 1  # high loot -> juicy, despite low fame
+    assert len(kills.sent) == 1  # still in the main feed too
+
+
+async def test_juicy_by_loot_off_when_loot_below_threshold(
+    store: KbStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loot under juicy_min_loot does NOT reach the juicy channel."""
+    import json
+
+    from killboard import feed as feed_mod
+
+    JUICY = 223
+    row = _kill_row(10)
+    store.upsert_event(row, json.dumps({"Victim": {"Name": "V"}, "Killer": {"Name": "K"}}))
+
+    async def _low_loot(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {"total": 50_000}
+
+    monkeypatch.setattr(feed_mod, "estimate_value", _low_loot)
+
+    juicy = _OkChannel()
+    cfg = SimpleNamespace(
+        killboard=SimpleNamespace(
+            feed=KbFeedConfig(
+                kills_channel=KILLS_CHANNEL,
+                juicy_channel=JUICY,
+                juicy_min_loot=1_000_000,
+            ),
+            market=SimpleNamespace(enabled=True),
+        )
+    )
+    feed = Feed(
+        _Bot({KILLS_CHANNEL: _OkChannel(), JUICY: juicy}),
+        store,
+        _Cards(),
+        lambda: cfg,  # type: ignore[arg-type]
+        _inline_to_thread,
+        market=object(),
+    )
+
+    await feed._post_one(row)
+    assert len(juicy.sent) == 0  # below threshold -> not juicy

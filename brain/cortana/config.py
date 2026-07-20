@@ -478,6 +478,11 @@ class KbFeedConfig:
     min_fame: int = 0
     juicy_channel: int = 0
     juicy_min_fame: int = 2_000_000
+    #: Route a kill to the juicy channel when its estimated LOOT value (market)
+    #: is at least this many silver — the low-fame/high-loot gank a fame gate
+    #: misses. 0 = off; needs killboard.market.enabled. Complements juicy_min_fame
+    #: (a kill mirrors to juicy if EITHER threshold is met).
+    juicy_min_loot: int = 0
     ignore_deaths_below_ip: int = 0
     blob_participant_threshold: int = 20
     blob_channel: int = 0
@@ -1018,6 +1023,7 @@ def _assemble_killboard(v: dict[str, Any]) -> KillboardConfig:
             min_fame=v["killboard.feed.min_fame"],
             juicy_channel=v["killboard.feed.juicy_channel"],
             juicy_min_fame=v["killboard.feed.juicy_min_fame"],
+            juicy_min_loot=v["killboard.feed.juicy_min_loot"],
             ignore_deaths_below_ip=v["killboard.feed.ignore_deaths_below_ip"],
             blob_participant_threshold=v["killboard.feed.blob_participant_threshold"],
             blob_channel=v["killboard.feed.blob_channel"],

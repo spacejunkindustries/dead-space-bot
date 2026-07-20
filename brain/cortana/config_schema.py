@@ -1145,6 +1145,15 @@ KEYS: Final[tuple[Key, ...]] = (
         minimum=0,
     ),
     Key(
+        "killboard.feed.juicy_min_loot",
+        "int",
+        Reload.HOT,
+        "Loot-value (silver) threshold for a kill to also post to juicy_channel; "
+        "catches low-fame/high-loot ganks. 0 = off; needs killboard.market.enabled.",
+        default=0,
+        minimum=0,
+    ),
+    Key(
         "killboard.feed.ignore_deaths_below_ip",
         "int",
         Reload.HOT,
