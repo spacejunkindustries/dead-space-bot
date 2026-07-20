@@ -11,6 +11,23 @@ Two processes, one socket:
 
 ---
 
+## The Dead platform — one bot, many modules
+
+The Discord this serves ("Dead Gaming") hosts more than EVE. `brain/` is a **modular bot** now: a small game-agnostic kernel (`brain/dead/`) hosts **modules**, and CORTANA (the voice bot) is just the first — and only *critical* — one. The Albion killboard (`brain/killboard/`) is the first add-on. Architecture: `docs/dead-bot-architecture.md`.
+
+What you must know before touching this:
+
+- **CORTANA is wrapped, not replaced.** `cortana/__main__.py::App` is still the composition root — it owns the event loop, signals, `_spawn` (the process-fatal critical-task supervisor), the shutdown event, and the reload transaction. The kernel is **additive**: five small seams in `App`/`AuraBot` build a `ModuleManager` and register modules. `cortana/cortana_module.py` is a thin facade so `/botstatus` and the lifecycle fan-out see CORTANA uniformly. **Do not "modularise" the voice internals** — the whole point is that dialog/IPC/STT/DAVE stay byte-for-byte as they were.
+- **Two task tiers, and it matters.** CORTANA's six voice tasks run on `App._spawn`: a crash is **fatal** → systemd restarts the process (correct for re-handshaking DAVE from clean). Add-on tasks run on `ctx.supervisor.spawn` (`ModuleSupervisor`): a crash is **contained** — logged, alarmed, backed off, quarantined after a storm — and it **never** sets the shutdown event. A killboard blip must never take voice (or Ears' DAVE session) down. `ModuleContext` deliberately does **not** expose `_spawn`; add-ons can only reach `ctx.supervisor`. Never route an add-on task through `_spawn`.
+- **Modules own their own DB.** The killboard opens its **own** sqlite file (never CORTANA's connection) with its own `migrations/` and `user_version`. Add-ons never share CORTANA's schema.
+- **Add-ons are off by default.** A module's `enabled(cfg)` gate keeps it dark until configured; a half-set config degrades gracefully (the module just doesn't start) rather than failing the whole bot's config load. A non-critical module that fails setup is dropped and boot continues — CORTANA never notices.
+- **The never-mention rule spans modules.** Constraint 11 applies everywhere: the killboard feed is informational and every post is `AllowedMentions.none()`. Only CORTANA's `decide_mentions()` may ever `@here`.
+- **To add a new game:** write a `BotModule` in its own top-level package, add it to `brain/dead/registry.py::build_modules` (guarded import), give it a namespaced optional config section, and it plugs in. Nothing in the kernel or CORTANA changes.
+
+The entrypoint and deploy are unchanged: still `python -m cortana` / `cortana-brain.service`. `brain/` now packages `cortana*`, `dead*`, `killboard*`.
+
+---
+
 ## Before you write any voice code
 
 **Read `reference/songbird/` first. Every time.**
@@ -88,7 +105,12 @@ ears/                 Rust — voice socket
     ipc.rs            framed UDS client, reconnect backoff, 60s ring buffer
     playback.rs       WAV → Songbird input, priority queue, talk-over suppression
 brain/                Python — everything else
-  cortana/
+  dead/                 the game-agnostic module kernel (see "The Dead platform" below)
+    module.py         BotModule contract + ModuleContext + ModuleHealth/Status + Backoff
+    supervisor.py     ModuleSupervisor — add-on task restart/backoff/quarantine (contained)
+    manager.py        ModuleManager — lifecycle fan-out with per-phase isolation
+    registry.py       build_modules(): CORTANA first, add-ons appended (guarded)
+  cortana/            the VOICE module (EVE Echoes) — the critical module
     audio/            vad, wake, capture, stt
     nlu/              grammar, gazetteer, phonetics, seed
     dialog/           voice dialog: pure state machine + engine, one 100ms clock (GDD §5.4)
@@ -96,12 +118,16 @@ brain/                Python — everything else
     dsc/              bot, views, cogs/
     data/facts/       bundled fact/insult library (generated + accuracy-gated offline, §13.2)
     tts.py health.py ipc.py config.py config_schema.py voice_gateway.py
-    alarms.py chat.py doctor.py reload.py
+    alarms.py chat.py doctor.py reload.py cortana_module.py
+  killboard/          the ALBION killboard module (add-on) — api/model/store/poller/
+    migrations/       feed/cards/rankings/battles/schedule/views/commands/module + its own db
   schema.sql  migrations/
 config/               cortana.yaml, gazetteer.yaml, routing.yaml (examples)
 deploy/               systemd units + staged converge-and-verify install.sh (GDD §17.5)
 assets/wake/          community "hey cortahnah" ONNX wake models (installer deploys them)
-docs/GDD.md           ← the spec
+docs/GDD.md           ← the voice spec
+docs/dead-bot-architecture.md  ← the module-platform architecture
+docs/KILLBOARD_GDD.md ← the Albion killboard spec
 docs/WAKE_WORDS.md    wake-word options + what is deployed now
 reference/songbird/   vendored @ v0.6.0 — read before touching voice
 training/wake/        offline wake-word training pipeline (GPU box/Colab, never the droplet)
