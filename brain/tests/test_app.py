@@ -271,10 +271,11 @@ def make_dialog(
     streaming: bool = False,
     areas_learn: bool = False,
     mentions_enabled: bool = True,
+    nlu_understanding: bool = False,
 ) -> Rig:
     import dataclasses as _dc
 
-    from cortana.config import DialogConfig
+    from cortana.config import DialogConfig, NluConfig
 
     cfg = make_config(
         wake_ack=wake_ack,
@@ -285,6 +286,10 @@ def make_dialog(
     cfg = _dc.replace(cfg, dialog=DialogConfig(confirm_reports=confirm_reports))
     cfg = _dc.replace(cfg, capture=_dc.replace(cfg.capture, streaming=streaming))
     cfg = _dc.replace(cfg, areas=_dc.replace(cfg.areas, learn=areas_learn))
+    if nlu_understanding:
+        cfg = _dc.replace(
+            cfg, nlu=NluConfig(understanding=True, url="http://127.0.0.1:11434/x", model="m")
+        )
     if transcript_channel:
         channels = _dc.replace(cfg.discord.channels, transcript=transcript_channel)
         cfg = _dc.replace(cfg, discord=_dc.replace(cfg.discord, channels=channels))
@@ -1602,6 +1607,71 @@ async def test_learn_area_skipped_for_non_pilot_in_silent_mode() -> None:
     assert not any("Did you say" in t for _, t in rig.speaker.said)
     assert areas.count_areas(rig.conn, GUILD) == 0
     assert len(rig.engine.reports) == 1
+
+
+# ── LLM understanding brain (GDD §6.7) ───────────────────────────────────────
+
+
+async def test_llm_understands_a_callout_the_grammar_missed(monkeypatch) -> None:
+    from cortana.nlu import grammar, llm_nlu
+    from cortana.types import ParsedCommand
+
+    # A phrasing no fixed rule catches.
+    phrase = "hey cortana we got company rolling into otanuomi"
+    assert grammar.parse(phrase) is None  # grammar genuinely misses it
+
+    def fake_interpret(cfg, text):
+        assert text == phrase
+        return ParsedCommand(
+            intent=Intent.HOSTILE_SPOTTED,
+            system_text="Otanuomi",
+            group_alias=None,
+            detail=None,
+            raw=text,
+            severity=None,
+        )
+
+    monkeypatch.setattr(llm_nlu, "interpret", fake_interpret)
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber([phrase]),
+        nlu_understanding=True,
+    )
+    await utter_wake(rig)
+    # The LLM's command flowed through the normal report path.
+    assert len(rig.engine.reports) == 1
+    _, _, parsed, _resolution = rig.engine.reports[0]
+    assert parsed.intent is Intent.HOSTILE_SPOTTED
+    assert parsed.system_text == "Otanuomi"
+
+
+async def test_llm_not_consulted_when_grammar_already_parsed(monkeypatch) -> None:
+    from cortana.nlu import llm_nlu
+
+    calls = []
+    monkeypatch.setattr(llm_nlu, "interpret", lambda cfg, text: calls.append(text))
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana hostiles Otanuomi"]),
+        nlu_understanding=True,
+    )
+    await utter_wake(rig)
+    assert calls == []  # grammar handled it — the model was never called
+    assert len(rig.engine.reports) == 1
+
+
+async def test_llm_off_by_default_leaves_unmatched_unmatched(monkeypatch) -> None:
+    from cortana.nlu import llm_nlu
+
+    calls = []
+    monkeypatch.setattr(llm_nlu, "interpret", lambda cfg, text: calls.append(text))
+    rig = make_dialog(
+        roles=[PILOT_ROLE],
+        transcriber=_Transcriber(["hey cortana some vague chatter here"]),
+    )
+    await utter_wake(rig)
+    assert calls == []  # understanding off → model never touched
+    assert rig.engine.reports == []
 
 
 async def test_restart_via_slash_trips_the_shutdown_event() -> None:
