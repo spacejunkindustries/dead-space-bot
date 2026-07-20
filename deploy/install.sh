@@ -406,9 +406,19 @@ stage_release() {
     run install -d -m 0755 "${REL}" "${REL}/bin" "${REL}/brain"
 
     # --- brain source tree ---------------------------------------------
+    # brain/ ships three top-level packages that pyproject's find() installs:
+    # cortana (the voice module), dead (the module kernel), and killboard (the
+    # Albion add-on). ALL THREE must be staged — the editable install resolves
+    # them from this release tree, so a missing sibling means `import dead`
+    # (or killboard) fails at runtime and the brain won't boot. rsync of the
+    # whole killboard/ tree also carries its data/, assets/ and migrations/.
     note "brain source tree"
     run rsync -a --delete --exclude '__pycache__' \
         "${REPO_ROOT}/brain/cortana/" "${REL}/brain/cortana/"
+    run rsync -a --delete --exclude '__pycache__' \
+        "${REPO_ROOT}/brain/dead/" "${REL}/brain/dead/"
+    run rsync -a --delete --exclude '__pycache__' \
+        "${REPO_ROOT}/brain/killboard/" "${REL}/brain/killboard/"
     run rsync -a --delete "${REPO_ROOT}/brain/migrations/" "${REL}/brain/migrations/"
     run install -m 0644 "${REPO_ROOT}/brain/schema.sql" "${REL}/brain/schema.sql"
     run install -m 0644 "${REPO_ROOT}/brain/pyproject.toml" "${REL}/brain/pyproject.toml"
@@ -490,10 +500,27 @@ stage_release() {
             die "staged venv imports cortana from ${resolved}, not ${expected} — refusing to flip to a release that would run someone else's code"
         fi
         note "venv imports cortana from this release (verified)"
+        # The kernel + add-on packages must ALSO import from this release, or the
+        # brain dies at boot with ModuleNotFoundError after the flip (caught here
+        # at STAGE instead, before anything is swapped). Each is checked against
+        # this release's tree so a stale sibling can't bleed through either.
+        local pkg pkg_resolved pkg_expected
+        for pkg in dead killboard; do
+            pkg_resolved="$(cd / && "${REL}/venv/bin/python" -c \
+                "import os, ${pkg}; print(os.path.realpath(os.path.dirname(${pkg}.__file__)))")" \
+                || die "staged venv cannot import ${pkg} — the ${pkg}/ package was not staged into ${REL}/brain"
+            pkg_expected="$(readlink -f "${REL}")/brain/${pkg}"
+            if [[ "${pkg_resolved}" != "${pkg_expected}" ]]; then
+                die "staged venv imports ${pkg} from ${pkg_resolved}, not ${pkg_expected} — refusing to flip"
+            fi
+            note "venv imports ${pkg} from this release (verified)"
+        done
     fi
     # ProtectSystem=strict makes /opt read-only for the service: precompile
-    # bytecode now so the runtime never tries to write __pycache__.
-    run nice -n 19 "${REL}/venv/bin/python" -m compileall -q "${REL}/brain/cortana"
+    # bytecode now so the runtime never tries to write __pycache__. All three
+    # staged packages need it — dead/killboard run under the same read-only /opt.
+    run nice -n 19 "${REL}/venv/bin/python" -m compileall -q \
+        "${REL}/brain/cortana" "${REL}/brain/dead" "${REL}/brain/killboard"
 
     # --- model prefetch (best-effort — a warning beats a runtime failure)
     if [[ "${DRYRUN}" == 1 ]]; then
