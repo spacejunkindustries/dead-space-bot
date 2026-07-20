@@ -370,6 +370,16 @@ killboard:                             # Albion Online killboard add-on — OPTI
       - Fort Sterling
       - Thetford
     user_agent: "DeadBot-Killboard (self-hosted; contact your guild admin)"
+  public_juicy:                        # server-wide "notable kills" → juicy channel — OPTIONAL, OFF.
+                                       # Watches the WHOLE server's kill feed (not just your guild)
+                                       # and posts the big ones — the highlights other corps' killbots
+                                       # show. Qualifies on FAME first (feed.juicy_min_fame, free) OR
+                                       # LOOT second (feed.juicy_min_loot, priced only when fame misses;
+                                       # needs market.enabled). When on it OWNS feed.juicy_channel — the
+                                       # guild feed stops mirroring your own kills there (no double-post).
+    enabled: false
+    interval_seconds: 90               # seconds between global-feed scans (sampled highlight reel)
+    scan_pages: 2                      # pages of 51 recent global events per scan (deeper = more coverage)
 
 routing:
   file: ""                             # routing.yaml location (GDD §10.1). "" (the default)

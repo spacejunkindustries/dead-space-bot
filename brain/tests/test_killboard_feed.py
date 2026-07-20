@@ -17,7 +17,7 @@ import pytest
 
 from cortana.config import KbFeedConfig, KillboardConfig
 from cortana.core import db
-from killboard.feed import Feed, _is_backfill_death, _PostResult
+from killboard.feed import Feed, _is_backfill_death, _PostResult, route_channels
 from killboard.model import DEATH, KILL, EventRow
 from killboard.store import MIGRATIONS_DIR, KbStore
 
@@ -435,3 +435,18 @@ async def test_recent_death_still_posts(store: KbStore) -> None:
     assert result is _PostResult.SENT
     assert len(channel.sent) == 1
     assert store.count_unposted() == 0
+
+
+def test_route_channels_yields_juicy_to_public_feed_when_enabled() -> None:
+    """When the server-wide public-juicy feed is on it owns the juicy channel, so
+    the guild feed stops mirroring the corp's own high-fame kills there (they'd
+    double-post — the corp kill is also in the global feed)."""
+    fc = KbFeedConfig(kills_channel=KILLS_CHANNEL, juicy_channel=999, juicy_min_fame=1000)
+    row = _kill_row(1)  # fame 5000 >= juicy_min_fame
+
+    # Default: the guild feed mirrors a high-fame kill to juicy.
+    assert 999 in route_channels(row, fc)
+    # Public juicy on: juicy is dropped, but the main kills channel still gets it.
+    routed = route_channels(row, fc, public_juicy_on=True)
+    assert 999 not in routed
+    assert KILLS_CHANNEL in routed

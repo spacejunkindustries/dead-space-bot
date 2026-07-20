@@ -1431,6 +1431,9 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `killboard.market.default_quality` | int | `1` | hot | Item quality used when a lookup omits it: 1 Normal, 2 Good, 3 Outstanding, 4 Excellent, 5 Masterpiece. |
 | `killboard.market.default_cities` | str_list | `('Caerleon', 'Bridgewatch', 'Lymhurst', 'Martlock', 'Fort Sterling', 'Thetford')` | hot | Cities compared by /market and used to reference-price kill loot. |
 | `killboard.market.user_agent` | str | `'DeadBot-Killboard (self-hosted; contact your guild admin)'` | restart | User-Agent sent to the AODP API (be a good citizen — identify the bot). |
+| `killboard.public_juicy.enabled` | bool | `False` | restart | Post server-wide 'notable kills' (not just the tracked guild's) to the juicy channel — the highlights feed other corps' killbots show. Qualifies on fame first (free) OR market loot second; reuses feed.juicy_min_fame / feed.juicy_min_loot. When on it owns the juicy channel (the guild feed stops mirroring there). Loot pricing needs killboard.market.enabled. |
+| `killboard.public_juicy.interval_seconds` | int | `90` | hot | Seconds between server-wide feed scans (a sampled highlight reel, so this trades coverage for API politeness). |
+| `killboard.public_juicy.scan_pages` | int | `2` | hot | Pages of 51 recent global events scanned per cycle — deeper covers more of a fast firehose but costs more requests and more loot pricing per scan. |
 | **`routing:`** | | | | *OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.* |
 | `routing.file` | str | `''` | engine | routing.yaml location. Empty (the default) = routing.yaml in the same directory as cortana.yaml. |
 | **`ipc:`** | | | | *The Brain⇄Ears unix socket (GDD §15).* |

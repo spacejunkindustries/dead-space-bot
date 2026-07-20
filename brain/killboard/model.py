@@ -217,6 +217,42 @@ def parse_event(event: dict[str, Any], guild_id: str) -> EventRow | None:
     )
 
 
+def parse_public_event(event: dict[str, Any]) -> EventRow | None:
+    """Parse a raw gameinfo event WITHOUT guild scoping (the public feed, §2.3).
+
+    Like :func:`parse_event`, but for the server-wide kill feed where the tracked
+    guild need not be involved: the event is always the killer's kill, so
+    ``relation`` is hard-set to :data:`KILL` and :func:`classify` is bypassed.
+    Only a missing/unparseable ``EventId`` drops the event; everything else
+    degrades to ``None``/``0`` (§2.4). Used by the public-juicy highlights feed,
+    never by the guild ingestion path (which must stay guild-scoped).
+    """
+    if not isinstance(event, dict):
+        return None
+    event_id = _as_int(event.get("EventId"))
+    if event_id is None:
+        return None
+    killer = _obj(event.get("Killer"))
+    victim = _obj(event.get("Victim"))
+    return EventRow(
+        event_id=event_id,
+        timestamp=_as_str(event.get("TimeStamp")) or "",
+        killer_id=_as_str(killer.get("Id")),
+        killer_name=_as_str(killer.get("Name")),
+        killer_guild_id=_as_str(killer.get("GuildId")),
+        killer_ip=_as_float(killer.get("AverageItemPower")),
+        victim_id=_as_str(victim.get("Id")),
+        victim_name=_as_str(victim.get("Name")),
+        victim_guild_id=_as_str(victim.get("GuildId")),
+        victim_ip=_as_float(victim.get("AverageItemPower")),
+        total_fame=_as_int(event.get("TotalVictimKillFame"), default=0) or 0,
+        relation=KILL,
+        num_participants=_num_participants(event),
+        battle_id=_as_int(event.get("BattleId")),
+        location=_location(event),
+    )
+
+
 def participants_of(event: dict[str, Any]) -> list[Participant]:
     """Extract the per-participant damage/heal rows (GDD §11).
 
@@ -246,5 +282,6 @@ __all__ = [
     "Participant",
     "classify",
     "parse_event",
+    "parse_public_event",
     "participants_of",
 ]
