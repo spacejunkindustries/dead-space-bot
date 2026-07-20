@@ -489,11 +489,24 @@ class KbFeedConfig:
 @dataclass(frozen=True, slots=True)
 class KbCardsConfig:
     """Kill-card rendering (killboard GDD §7.1). Icons come from Albion's
-    documented, cacheable render service — never the flaky gameinfo API."""
+    documented, cacheable render service — never the flaky gameinfo API.
+
+    The ``brand_*``/``accent_color`` knobs skin cards for the hosting Discord
+    (Dead Gaming by default): a corner watermark logo, an accent colour on the
+    header/rank boards, and a footer tagline. ``brand_logo_path`` empty → the
+    bundled Dead roundel; a path override swaps in any PNG. ``show_loot_value``
+    prints the victim's estimated silver loot value on the card — it only
+    resolves when ``killboard.market.enabled`` is on (the market client prices
+    the loadout); off, the card simply omits the value."""
 
     enabled: bool = True
     icon_cache_dir: str = "/var/lib/cortana/killboard/icons"
     render_base: str = "https://render.albiononline.com/v1"
+    brand_name: str = "Dead Gaming"
+    brand_logo_path: str = ""
+    accent_color: str = "#E11212"
+    show_loot_value: bool = True
+    daily_ranking_card: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1015,6 +1028,11 @@ def _assemble_killboard(v: dict[str, Any]) -> KillboardConfig:
             enabled=v["killboard.cards.enabled"],
             icon_cache_dir=v["killboard.cards.icon_cache_dir"],
             render_base=v["killboard.cards.render_base"],
+            brand_name=v["killboard.cards.brand_name"],
+            brand_logo_path=v["killboard.cards.brand_logo_path"],
+            accent_color=v["killboard.cards.accent_color"],
+            show_loot_value=v["killboard.cards.show_loot_value"],
+            daily_ranking_card=v["killboard.cards.daily_ranking_card"],
         ),
         rankings=KbRankingsConfig(timezone=v["killboard.rankings.timezone"]),
         battles=KbBattlesConfig(

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -44,7 +45,7 @@ import discord
 import structlog
 
 from cortana.core import db
-from killboard.rankings import build_leaderboard, leaderboard_embed, window_for
+from killboard.rankings import build_daily_ranking, daily_ranking_embed, window_for
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
     from structlog.stdlib import BoundLogger
 
     from cortana.config import KillboardConfig
+    from killboard.cards import CardRenderer
     from killboard.store import KbStore
 
 log = structlog.get_logger(__name__)
@@ -61,10 +63,6 @@ log = structlog.get_logger(__name__)
 #: minute is far finer than the coarsest schedule (hourly), so no boundary is
 #: ever missed by more than ~60s, and the per-tick work is a single small SELECT.
 CHECK_INTERVAL_SECONDS: int = 60
-
-#: The metric scheduled posts rank by. Windowed Kill Fame is what §8.2 assigns to
-#: scheduled rankings (distinct from the API's lagging lifetime fame).
-SCHEDULED_METRIC: str = "fame"
 
 #: How many members a scheduled leaderboard lists.
 DEFAULT_LIMIT: int = 10
@@ -75,6 +73,13 @@ KINDS: dict[str, str] = {
     "daily": "today",
     "weekly": "week",
     "monthly": "month",
+}
+
+#: ``schedules.kind`` → the heading on the ranking embed/card for that period.
+HEADINGS: dict[str, str] = {
+    "daily": "Daily Ranking",
+    "weekly": "Weekly Ranking",
+    "monthly": "Monthly Ranking",
 }
 
 
@@ -218,6 +223,7 @@ class Scheduler:
         log: BoundLogger | None = None,
         *,
         shutdown: asyncio.Event | None = None,
+        cards: CardRenderer | None = None,
     ) -> None:
         self._bot = bot
         self._store = store
@@ -225,6 +231,9 @@ class Scheduler:
         self._to_thread = to_thread
         self._log: Any = log if log is not None else structlog.get_logger(__name__)
         self._shutdown = shutdown
+        #: Optional card renderer — when present, the scheduled post carries the
+        #: branded Daily Ranking image; without it the embed alone is posted.
+        self._cards = cards
 
     # ── supervised entry point ───────────────────────────────────────────────
 
@@ -296,40 +305,53 @@ class Scheduler:
         # falls on the previous calendar day/month, so formatting the UTC string
         # would title July's board "June" (etc). The data uses the UTC bounds.
         label_start = period_start(prev_instant, kind, tz)
+        period_label = _period_label(kind, label_start.isoformat())
+        heading = HEADINGS.get(kind, "Ranking")
 
-        rows = await self._to_thread(
-            build_leaderboard,
+        ranking = await self._to_thread(
+            build_daily_ranking,
             self._store,
-            SCHEDULED_METRIC,
             start_iso,
             end_iso,
             DEFAULT_LIMIT,
         )
-        embed = leaderboard_embed(
-            SCHEDULED_METRIC,
-            _period_label(kind, label_start.isoformat()),
-            rows,
-            guild_name=cfg.guild_name or None,
+        guild_name = cfg.guild_name or None
+        embed = daily_ranking_embed(
+            ranking,
+            period_label,
+            heading=heading,
+            guild_name=guild_name,
             tz=tz,
             now=now,
         )
 
-        posted = await self._post(channel_id, embed)
+        # Branded image twin (best-effort): a card failure degrades to embed-only.
+        png = None
+        if self._cards is not None:
+            png = await self._cards.render_ranking_card(
+                ranking, period_label, heading=heading, guild_name=guild_name
+            )
+        if png is not None:
+            embed.set_image(url="attachment://ranking.png")
+
+        posted = await self._post(channel_id, embed, png)
         if not posted:
             return
         await self._to_thread(_stamp_last_run, self._store, schedule_id, now.isoformat())
+        entries = max(len(ranking.top_kill_fame), len(ranking.top_death_fame))
         self._log.info(
             "kb_schedule.posted",
             schedule_id=schedule_id,
             kind=kind,
             channel_id=channel_id,
-            entries=len(rows),
+            entries=entries,
         )
 
     # ── discord send ─────────────────────────────────────────────────────────
 
-    async def _post(self, channel_id: int, embed: discord.Embed) -> bool:
-        """Send ``embed`` to ``channel_id`` with mentions suppressed (constraint 11).
+    async def _post(self, channel_id: int, embed: discord.Embed, png: bytes | None = None) -> bool:
+        """Send ``embed`` (and an optional card image) to ``channel_id`` with
+        mentions suppressed (constraint 11).
 
         Returns True on a successful send. A missing or non-messageable channel is
         logged and returns False (the schedule stays armed); network/permission
@@ -342,7 +364,8 @@ class Scheduler:
         if not isinstance(channel, discord.abc.Messageable):
             self._log.warning("kb_schedule.bad_channel", channel_id=channel_id)
             return False
-        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        file = discord.File(io.BytesIO(png), filename="ranking.png") if png is not None else None
+        await channel.send(embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none())
         return True
 
     # ── loop plumbing ────────────────────────────────────────────────────────
@@ -390,8 +413,8 @@ def _stamp_last_run(store: KbStore, schedule_id: int, now_iso: str) -> None:
 __all__ = [
     "CHECK_INTERVAL_SECONDS",
     "DEFAULT_LIMIT",
+    "HEADINGS",
     "KINDS",
-    "SCHEDULED_METRIC",
     "Scheduler",
     "period_start",
     "should_fire",

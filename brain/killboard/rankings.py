@@ -92,6 +92,22 @@ class MemberRecord:
     assists: int
 
 
+@dataclass(frozen=True, slots=True)
+class DailyRanking:
+    """A whole-guild ranking snapshot for a window (killboard GDD §8.3).
+
+    Mirrors the "Daily Ranking" card the community killbots post: two guild-wide
+    fame totals plus two ordered top-N boards — one by Kill Fame (fame earned),
+    one by Death Fame (fame lost). Every figure is windowed from the event store,
+    so it is current to the last poll rather than the API's ~daily lifetime lag.
+    """
+
+    total_kill_fame: int
+    total_death_fame: int
+    top_kill_fame: list[tuple[str, int]]
+    top_death_fame: list[tuple[str, int]]
+
+
 # ── pure window math (GDD §8.1) ──────────────────────────────────────────────
 
 
@@ -230,6 +246,30 @@ def build_member_record(
     )
 
 
+def build_daily_ranking(
+    store: KbStore,
+    start: str,
+    end: str | None,
+    limit: int = 10,
+) -> DailyRanking:
+    """Whole-guild fame totals + Top Kill/Death Fame boards for the window (§8.3).
+
+    Four store reads: the guild-wide Kill Fame and Death Fame totals, and the
+    top-``limit`` members by each. The Death Fame board ranks by fame *lost*
+    (``dfame``) and so surfaces members who only died in the window (they appear
+    in the store leaderboard's death-only rows). Blocking sqlite — call inside
+    ``asyncio.to_thread``.
+    """
+    kill_rows = store.leaderboard("fame", start, end, limit=limit)
+    death_rows = store.leaderboard("dfame", start, end, limit=limit)
+    return DailyRanking(
+        total_kill_fame=store.kill_fame(start, end),
+        total_death_fame=store.death_fame(start, end),
+        top_kill_fame=[((r.get("player_name") or "Unknown"), int(r["fame"])) for r in kill_rows],
+        top_death_fame=[((r.get("player_name") or "Unknown"), int(r["dfame"])) for r in death_rows],
+    )
+
+
 # ── pure formatting helpers ──────────────────────────────────────────────────
 
 
@@ -250,6 +290,42 @@ def _fmt_value(metric: str, value: float) -> str:
     if metric == "kd":
         return _fmt_kd(value)
     return f"{int(value):,}"
+
+
+#: Dead Gaming's brand red — the accent the Daily Ranking card and branded kill
+#: cards use. Kept here (not config) so the pure embed builder needs no wiring;
+#: the image cards read the same colour from ``cfg.killboard.cards.accent_color``.
+DEAD_RED: int = 0xE11212
+
+
+def _fmt_fame_short(value: int) -> str:
+    """Compact fame for board rows: ``116.34k`` / ``68k`` / ``744`` / ``2.5m``.
+
+    Matches the community killbot's ranking style — abbreviated with ``k``/``m``
+    and trailing zeros trimmed — so a top-10 stays readable in an embed field.
+    """
+    v = int(value)
+    if abs(v) >= 1_000_000:
+        return _trim(v / 1_000_000) + "m"
+    if abs(v) >= 1_000:
+        return _trim(v / 1_000) + "k"
+    return str(v)
+
+
+def _trim(value: float) -> str:
+    """A ≤2-decimal number with trailing zeros and a bare ``.`` removed."""
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _board_lines(rows: list[tuple[str, int]]) -> str:
+    """Numbered ``1. Name — 116.34k`` board text for a ranking field."""
+    if not rows:
+        return "_No activity._"
+    width = len(str(len(rows)))
+    return "\n".join(
+        f"`{str(rank).rjust(width)}.` **{name}** — {_fmt_fame_short(value)}"
+        for rank, (name, value) in enumerate(rows, start=1)
+    )
 
 
 # ── embed builders (pure: take computed data, no store, no network) ───────────
@@ -297,6 +373,45 @@ def leaderboard_embed(
     return embed
 
 
+def daily_ranking_embed(
+    ranking: DailyRanking,
+    period_label: str,
+    *,
+    heading: str = "Daily Ranking",
+    guild_name: str | None = None,
+    tz: str = "UTC",
+    now: datetime | None = None,
+) -> discord.Embed:
+    """Render a :class:`DailyRanking` as the combined ranking embed (§8.3).
+
+    A header carrying the two guild-wide fame totals, then a **Top Kill Fame** and
+    a **Top Death Fame** board side by side — the layout the community killbots
+    post, in Dead Gaming's accent colour. ``heading`` names the period ("Daily
+    Ranking", "Weekly Ranking", …). Pure: no store, no network, so it is safe to
+    build on the event loop. The image twin is
+    :meth:`killboard.cards.CardRenderer.render_ranking_card`; this embed is the
+    always-available fallback when cards are off or Pillow is absent.
+    """
+    header = (
+        f"**Total Kill Fame:** {_fmt_fame(ranking.total_kill_fame)}\n"
+        f"**Total Death Fame:** {_fmt_fame(ranking.total_death_fame)}"
+    )
+    embed = discord.Embed(
+        title=f"☠️ {heading} · {period_label}",
+        description=header,
+        colour=discord.Colour(DEAD_RED),
+        timestamp=now or datetime.now(UTC),
+    )
+    embed.add_field(name="🗡️ Top Kill Fame", value=_board_lines(ranking.top_kill_fame), inline=True)
+    embed.add_field(
+        name="💀 Top Death Fame", value=_board_lines(ranking.top_death_fame), inline=True
+    )
+    footer = " · ".join(part for part in (guild_name, f"times in {tz}") if part)
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
+
+
 def record_embed(
     record: MemberRecord,
     *,
@@ -341,14 +456,18 @@ def record_embed(
 
 
 __all__ = [
+    "DEAD_RED",
     "METRICS",
     "METRIC_LABELS",
     "PERIODS",
     "PERIOD_LABELS",
+    "DailyRanking",
     "MemberRecord",
+    "build_daily_ranking",
     "build_leaderboard",
     "build_member_record",
     "custom_window",
+    "daily_ranking_embed",
     "leaderboard_embed",
     "record_embed",
     "window_for",

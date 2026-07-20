@@ -48,6 +48,7 @@ _LEADERBOARD_ORDER: dict[str, str] = {
     "kills": "kills DESC, fame DESC",
     "kd": "kd DESC, kills DESC",
     "deaths": "deaths DESC, kills DESC",
+    "dfame": "dfame DESC, deaths DESC",
 }
 
 
@@ -390,6 +391,22 @@ class KbStore:
         sql = f"SELECT COALESCE(SUM(total_fame), 0) FROM events WHERE {' AND '.join(where)}"
         return int(db.query_value(self._conn, sql, params) or 0)
 
+    def death_fame(self, start: str, end: str | None = None, player_id: str | None = None) -> int:
+        """Summed fame lost over DEATH events in the window (killboard GDD §8.2).
+
+        The mirror of :meth:`kill_fame`: the fame value of the deaths a member (or
+        the whole guild) suffered — what the *other* side earned killing them.
+        Scoped to a member's own deaths by their ``victim_id`` when given.
+        """
+        where, params = self._window(start, end, "timestamp")
+        where.append("relation = ?")
+        params.append(DEATH)
+        if player_id is not None:
+            where.append("victim_id = ?")
+            params.append(player_id)
+        sql = f"SELECT COALESCE(SUM(total_fame), 0) FROM events WHERE {' AND '.join(where)}"
+        return int(db.query_value(self._conn, sql, params) or 0)
+
     def assists(self, start: str, end: str | None = None, player_id: str | None = None) -> int:
         """Assist count in the window (GDD §6, §8.1).
 
@@ -445,10 +462,12 @@ class KbStore:
     ) -> list[dict[str, Any]]:
         """Top members by ``metric`` in the window (GDD §8.1, §8.3).
 
-        ``metric`` is one of ``fame``, ``kills``, ``kd``, ``deaths``. Each row
-        aggregates a member's kills, deaths, and fame from KILL/DEATH events, and
-        includes a derived ``kd`` (deaths-zero → raw kills). Returns dicts with
-        keys ``player_id``, ``player_name``, ``kills``, ``deaths``, ``fame``, ``kd``.
+        ``metric`` is one of ``fame``, ``kills``, ``kd``, ``deaths``, ``dfame``.
+        Each row aggregates a member's kills, deaths, Kill Fame, and Death Fame
+        (the fame value of deaths they suffered) from KILL/DEATH events, plus a
+        derived ``kd`` (deaths-zero → raw kills). Returns dicts with keys
+        ``player_id``, ``player_name``, ``kills``, ``deaths``, ``fame``,
+        ``dfame``, ``kd``.
         """
         order = _LEADERBOARD_ORDER.get(metric)
         if order is None:
@@ -471,7 +490,8 @@ class KbStore:
             deaths AS (
                 SELECT victim_id AS pid,
                        MAX(victim_name) AS name,
-                       COUNT(*) AS d
+                       COUNT(*) AS d,
+                       COALESCE(SUM(total_fame), 0) AS df
                 FROM events
                 WHERE relation = 'DEATH' AND victim_id IS NOT NULL AND {window_sql}
                 GROUP BY victim_id
@@ -481,6 +501,7 @@ class KbStore:
                    k.k AS kills,
                    COALESCE(d.d, 0) AS deaths,
                    k.f AS fame,
+                   COALESCE(d.df, 0) AS dfame,
                    CAST(k.k AS REAL)
                        / CASE WHEN COALESCE(d.d, 0) = 0 THEN 1 ELSE d.d END AS kd
             FROM kills k
@@ -491,6 +512,7 @@ class KbStore:
                    0 AS kills,
                    d.d AS deaths,
                    0 AS fame,
+                   d.df AS dfame,
                    0.0 AS kd
             FROM deaths d
             WHERE d.pid NOT IN (SELECT pid FROM kills)
@@ -505,6 +527,7 @@ class KbStore:
                 "kills": int(r["kills"]),
                 "deaths": int(r["deaths"]),
                 "fame": int(r["fame"]),
+                "dfame": int(r["dfame"]),
                 "kd": float(r["kd"]),
             }
             for r in rows

@@ -270,13 +270,14 @@ class Feed:
             await self._to_thread(self._store.mark_posted, row.event_id, 0, 0)
             return _PostResult.SKIPPED
 
-        png = await self._render_card(row)
-        filename = f"kill_{row.event_id}.png"
         # The raw event carries the guild tags (for the header) and the item
         # loadout (for the market loot value) — data the flat row doesn't hold.
+        # Compute it BEFORE rendering so the loot value can be drawn on the card.
         raw = await self._to_thread(self._store.raw_event, row.event_id)
         killer_guild, victim_guild = _guild_tags(raw)
         loot_value = await self._loot_value(raw)
+        png = await self._render_card(row, loot_value)
+        filename = f"kill_{row.event_id}.png"
         embed = build_embed(
             row,
             [],
@@ -328,15 +329,17 @@ class Feed:
         await self._to_thread(self._store.mark_posted, row.event_id, 0, 0)
         return _PostResult.SKIPPED
 
-    async def _render_card(self, row: EventRow) -> bytes | None:
+    async def _render_card(self, row: EventRow, loot_value: int | None = None) -> bytes | None:
         """Render the kill-card PNG for an event, or ``None`` to post embed-only.
 
         The renderer already swallows its own failures (disabled cards, Pillow
         missing, a dead icon fetch) and returns ``None`` (§7.1); this wrapper adds
         a last-resort guard so nothing in the card path can ever take down a post.
+        ``loot_value`` (when the market layer priced the loadout) is drawn on the
+        card; ``None`` simply omits it.
         """
         try:
-            return await self._cards.render(row, [])
+            return await self._cards.render(row, [], loot_value=loot_value)
         except Exception as exc:  # noqa: BLE001 — a card must never break the feed
             self._log.warning("kb_feed.card_error", event_id=row.event_id, error=str(exc))
             return None

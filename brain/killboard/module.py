@@ -184,6 +184,7 @@ class KillboardModule(BotModule):
             ctx.to_thread,
             ctx.log,
             shutdown=ctx.shutdown,
+            cards=self._cards,
         )
         self._cog = KillboardCog(
             ctx.bot,

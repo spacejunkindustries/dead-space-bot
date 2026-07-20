@@ -1409,6 +1409,11 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `killboard.cards.enabled` | bool | `True` | hot | Render composited kill-card images (Pillow). false = embed only. |
 | `killboard.cards.icon_cache_dir` | str | `'/var/lib/cortana/killboard/icons'` | restart | On-disk item-icon cache from the render service (fetched once each). |
 | `killboard.cards.render_base` | str | `'https://render.albiononline.com/v1'` | hot | Albion render service base URL (documented, cacheable — not the gameinfo API). |
+| `killboard.cards.brand_name` | str | `'Dead Gaming'` | hot | Footer tagline on cards (the hosting Discord's name). |
+| `killboard.cards.brand_logo_path` | str | `''` | hot | PNG watermark logo path; empty = the bundled Dead roundel. |
+| `killboard.cards.accent_color` | str | `'#E11212'` | hot | Card accent colour as #RRGGBB (headers, rank boards). |
+| `killboard.cards.show_loot_value` | bool | `True` | hot | Print estimated loot value on kill cards (needs killboard.market.enabled). |
+| `killboard.cards.daily_ranking_card` | bool | `True` | hot | Attach a branded Daily Ranking image to the daily scheduled post. |
 | `killboard.rankings.timezone` | str | `'UTC'` | hot | Timezone for daily/weekly/monthly ranking windows and schedules. |
 | `killboard.battles.channel` | int | `0` | hot | Optional battle-summary channel. 0 = battle posting off. |
 | `killboard.battles.min_players` | int | `20` | hot | Minimum guild participants for a battle to post (killboard GDD §9). |

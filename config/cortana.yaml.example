@@ -328,6 +328,11 @@ killboard:                             # Albion Online killboard add-on — OPTI
     enabled: true                      # render Pillow kill-card images (false = embed only)
     icon_cache_dir: /var/lib/cortana/killboard/icons
     render_base: https://render.albiononline.com/v1
+    brand_name: Dead Gaming            # footer tagline on cards (your Discord's name)
+    brand_logo_path: ""                # PNG watermark; empty = bundled Dead roundel
+    accent_color: "#E11212"            # card accent (#RRGGBB) — headers, rank boards
+    show_loot_value: true              # print loot value on kill cards (needs market.enabled)
+    daily_ranking_card: true           # attach the branded Daily Ranking image to daily posts
   rankings:
     timezone: UTC                      # window boundaries for daily/weekly/monthly rankings
   battles:
