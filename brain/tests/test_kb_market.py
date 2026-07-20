@@ -588,3 +588,55 @@ async def test_estimate_value_dead_market_is_all_unpriced() -> None:
     assert result["total"] is None
     assert result["priced"] == 0
     assert result["unpriced"] == 1
+
+
+# ── /market notice replies must not leave a dangling public spinner ──────────
+
+
+class _FakeInteraction:
+    """A minimal discord.Interaction stand-in for the /market notice path: a
+    command deferred publicly, then a notice is delivered. Records whether the
+    public placeholder was deleted and how the followup was sent."""
+
+    def __init__(self, *, delete_raises: bool = False) -> None:
+        self.deleted = False
+        self.followups: list[tuple[Any, dict[str, Any]]] = []
+        self._delete_raises = delete_raises
+        self.followup = SimpleNamespace(send=self._send)
+
+    async def delete_original_response(self) -> None:
+        if self._delete_raises:
+            import discord
+
+            raise discord.HTTPException(SimpleNamespace(status=404, reason="Not Found"), "gone")
+        self.deleted = True
+
+    async def _send(self, content: Any = None, **kwargs: Any) -> None:
+        self.followups.append((content, kwargs))
+
+
+async def test_market_notice_deletes_public_placeholder_then_replies_ephemeral() -> None:
+    """A /market notice (disabled, item miss, no data) must delete the public
+    "thinking…" placeholder the command deferred, then answer ephemerally — else
+    the spinner dangles publicly forever, the spam the ephemeral reply avoids."""
+    from killboard.market_commands import MarketCog
+
+    inter = _FakeInteraction()
+    await MarketCog._text(object(), inter, "Market data is turned off.")  # type: ignore[arg-type]
+
+    assert inter.deleted is True  # public placeholder removed
+    assert len(inter.followups) == 1
+    _content, kwargs = inter.followups[0]
+    assert kwargs.get("ephemeral") is True
+
+
+async def test_market_notice_tolerates_a_missing_placeholder() -> None:
+    """If the placeholder is already gone (delete raises), the notice still goes
+    out ephemerally — the delete is best-effort, never fatal."""
+    from killboard.market_commands import MarketCog
+
+    inter = _FakeInteraction(delete_raises=True)
+    await MarketCog._text(object(), inter, "Couldn't find that item.")  # type: ignore[arg-type]
+
+    assert len(inter.followups) == 1
+    assert inter.followups[0][1].get("ephemeral") is True

@@ -120,6 +120,25 @@ async def test_setup_failure_is_quarantined_and_boot_continues() -> None:
     assert any(code is AlarmCode.MODULE_SETUP_FAILED for code, _ in alarms.raised)
 
 
+async def test_health_snapshot_explains_a_quarantined_task_not_a_stale_ok() -> None:
+    """When the supervisor's status (a quarantined background task = FAILED) is
+    worse than the module's own OK self-report, the snapshot must surface FAILED
+    *and* replace the reassuring 'ok' detail with why — otherwise /botstatus reads
+    'FAILED — ok' and masks the reason."""
+    sink: list[tuple[str, str]] = []
+    m = _Mod("kb", sink)  # health() → (OK, "ok")
+    mgr, _ = _manager(m)
+    await mgr.setup_enabled()  # kb is active, healthy, not failed
+    # Simulate one of kb's supervised tasks having crash-looped into quarantine.
+    mgr._supervisor.status = lambda name: ModuleStatus.FAILED  # type: ignore[assignment,method-assign]
+
+    snap = mgr.health_snapshot()
+
+    assert snap["kb"].status is ModuleStatus.FAILED
+    assert snap["kb"].detail != "ok"  # not the stale reassuring self-report
+    assert "supervised task" in snap["kb"].detail
+
+
 async def test_critical_setup_failure_is_fatal() -> None:
     sink: list[tuple[str, str]] = []
     crit = _Mod("cortana", sink, critical=True, setup_raises=True)

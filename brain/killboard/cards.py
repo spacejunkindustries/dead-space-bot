@@ -25,6 +25,7 @@ degrades to ``None`` so the feed falls back to an embed-only post.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
@@ -69,6 +70,13 @@ _DEAD_RED_RGB: tuple[int, int, int] = (225, 18, 18)
 #: fetch against a hung render host would stall the whole feed drain; this keeps
 #: a bad host to a brief, bounded stall that degrades to a no-icon card.
 _ICON_TIMEOUT = aiohttp.ClientTimeout(total=10.0)
+
+#: Aggregate wall-clock budget for ALL of one card's icon fetches. A detailed
+#: card can reference ~50 unique item types; fetching them serially with only a
+#: per-icon timeout means a cold cache against a black-hole host could stall the
+#: (sequential) feed drain for minutes. This caps the whole batch — icons not
+#: fetched by the deadline just render icon-less, exactly as a failed fetch does.
+_ICON_BATCH_TIMEOUT_S = 20.0
 
 
 # ── layout constants ─────────────────────────────────────────────────────────
@@ -324,12 +332,23 @@ class CardRenderer:
             participants = _damage_rows(raw.get("Participants"))
 
             # Fetch an icon for every unique item Type across both loadouts and the
-            # dropped inventory (cached on disk after the first render).
+            # dropped inventory (cached on disk after the first render). The whole
+            # batch is bounded by one wall-clock deadline so a degraded icon host
+            # can't stall the sequential feed drain for minutes; icons past the
+            # deadline just render icon-less (the ``icons`` dict fills in place, so
+            # whatever was fetched before the timeout is kept).
             icons: dict[str, bytes] = {}
-            for item_type in _unique_types(killer_equip, victim_equip, inventory):
-                data = await self._icon_for_type(item_type, cards)
-                if data is not None:
-                    icons[item_type] = data
+
+            async def _fetch_icons() -> None:
+                for item_type in _unique_types(killer_equip, victim_equip, inventory):
+                    data = await self._icon_for_type(item_type, cards)
+                    if data is not None:
+                        icons[item_type] = data
+
+            try:
+                await asyncio.wait_for(_fetch_icons(), timeout=_ICON_BATCH_TIMEOUT_S)
+            except TimeoutError:
+                self._log.warning("kb_cards.icon_batch_timeout", fetched=len(icons))
 
             brand = await self._brand_style(cards)
             show_value = loot_value if getattr(cards, "show_loot_value", True) else None
@@ -883,6 +902,22 @@ def _header_data(
 # ── detailed-card compositor (pure Pillow, runs under to_thread) ───────────────
 
 
+def _scrim(
+    canvas: Any, box: tuple[float, float, float, float], rgba: tuple[int, int, int, int]
+) -> None:
+    """Paint a translucent filled rectangle onto an RGB canvas.
+
+    A plain ``draw.rectangle(fill=(r, g, b, a))`` on an RGB ``ImageDraw`` silently
+    drops the alpha byte and paints the box fully opaque (the canvas has no alpha
+    channel). To get the intended semi-transparent scrim we composite a small RGBA
+    overlay through its own alpha instead.
+    """
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    w, h = max(1, x1 - x0), max(1, y1 - y0)
+    overlay = Image.new("RGBA", (w, h), rgba)
+    canvas.paste(overlay, (x0, y0), overlay)
+
+
 def _dc_cell(
     canvas: Any,
     draw: Any,
@@ -922,14 +957,14 @@ def _dc_cell(
     if tier:
         label = _TIER_ROMAN.get(tier, "")
         tw = draw.textlength(label, font=f_badge)
-        draw.rectangle((x + 2, y + 2, x + 8 + tw, y + 18), fill=(0, 0, 0, 160))
+        _scrim(canvas, (x + 2, y + 2, x + 8 + tw, y + 18), (0, 0, 0, 160))
         draw.text((x + 5, y + 3), label, font=f_badge, fill=(235, 235, 235))
     count = _coerce_int(item.get("Count"), 1)
     if show_count and count > 1:
         s = str(count)
         sw = draw.textlength(s, font=f_badge)
-        draw.rectangle(
-            (x + size - sw - 7, y + size - 17, x + size - 1, y + size - 1), fill=(0, 0, 0, 160)
+        _scrim(
+            canvas, (x + size - sw - 7, y + size - 17, x + size - 1, y + size - 1), (0, 0, 0, 160)
         )
         draw.text((x + size - sw - 4, y + size - 16), s, font=f_badge, fill=(255, 255, 210))
 

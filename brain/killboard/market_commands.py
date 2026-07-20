@@ -34,6 +34,7 @@ and every one of them shares the same autocomplete coroutine
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -668,7 +669,16 @@ class MarketCog(commands.Cog):
         friendly ephemeral" contract and stops an off-by-default feature from
         spamming the channel with public "Market data is turned off" replies.
         Successful price data goes through :meth:`_embed`, which stays public.
+
+        The command deferred *publicly* (a public "thinking…" placeholder). An
+        ephemeral followup cannot fill that placeholder — a deferred response's
+        ephemeral-ness is fixed at defer time — so on its own it would leave the
+        public spinner dangling forever, which is exactly the channel spam this
+        method exists to avoid. So delete the public placeholder first, then
+        deliver the notice ephemerally.
         """
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.delete_original_response()
         await interaction.followup.send(message, allowed_mentions=_NO_PING, ephemeral=True)
 
 

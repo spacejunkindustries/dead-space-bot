@@ -257,12 +257,19 @@ class Feed:
         * routed nowhere (``min_fame`` / ``ignore_deaths_below_ip`` / no channel)
           → SKIPPED (marked posted; nothing to deliver);
         * delivered to at least one channel → SENT (marked posted with the id);
-        * every target is a permanently-missing channel → SKIPPED (marked posted
-          so a deleted channel can't wedge the backlog forever);
-        * a resolvable channel refused transiently (5xx/429) and none succeeded →
-          DEFERRED (NOT marked posted; the next drain retries — never dropped,
+        * every target failed *permanently* — a missing/deleted channel, a 403
+          (bot lacks Send Messages), a 404, or a 4xx-rejected embed — → SKIPPED
+          (marked posted, because a retry can never succeed and leaving it
+          un-posted would wedge every newer kill behind it forever);
+        * a resolvable channel refused *transiently* (429/5xx) and none succeeded
+          → DEFERRED (NOT marked posted; the next drain retries — never dropped,
           the bug this guards against silently lost kills on a passing Discord
           hiccup).
+
+        The permanent/transient split is load-bearing: only genuinely retryable
+        failures defer, so a single mis-permissioned channel can never stall the
+        feed (audit fix — a blanket ``except DiscordException`` used to treat 403
+        as transient and wedge the backlog).
         """
         fc = self._cfg_provider().killboard.feed
         targets = route_channels(row, fc)
@@ -326,8 +333,42 @@ class Feed:
                     file=file,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
+            except (discord.Forbidden, discord.NotFound) as exc:
+                # PERMANENT: the bot can't post here (missing Send Messages
+                # permission, or the channel was deleted). A retry can never fix
+                # it, so skip this channel like a structurally-missing one — never
+                # set transient_failure, or a single mis-permissioned channel would
+                # DEFER this event forever and wedge every newer kill behind it.
+                self._log.warning(
+                    "kb_feed.send_forbidden", channel_id=cid, event_id=row.event_id, error=str(exc)
+                )
+                continue
+            except discord.HTTPException as exc:
+                status = getattr(exc, "status", None)
+                if status is not None and 400 <= status < 500 and status != 429:
+                    # PERMANENT client error (e.g. a malformed/oversized embed =
+                    # 400). Won't improve on retry — skip, don't defer.
+                    self._log.warning(
+                        "kb_feed.send_rejected",
+                        channel_id=cid,
+                        event_id=row.event_id,
+                        status=status,
+                        error=str(exc),
+                    )
+                    continue
+                # TRANSIENT: 429 rate limit or 5xx server error — retry next drain.
+                self._log.warning(
+                    "kb_feed.send_failed",
+                    channel_id=cid,
+                    event_id=row.event_id,
+                    status=status,
+                    error=str(exc),
+                )
+                transient_failure = True
+                continue
             except discord.DiscordException as exc:
-                # Transient: a resolvable channel refused (rate limit / 5xx).
+                # Anything else discord raised (e.g. RateLimited) — treat as
+                # transient so it retries rather than silently dropping the event.
                 self._log.warning(
                     "kb_feed.send_failed", channel_id=cid, event_id=row.event_id, error=str(exc)
                 )

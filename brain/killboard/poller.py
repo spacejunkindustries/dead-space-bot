@@ -240,7 +240,20 @@ class Poller:
         A genuinely empty ``[]`` page below the first is a real end-of-window.
         """
         page_limit = max(1, poller_cfg.page_limit)
-        max_pages = max(1, poller_cfg.max_backfill_pages)
+        # The page bound depends on WHY we're walking (the two shapes must not
+        # share a limit):
+        #   * First-run backfill (hwm <= 0): bound by max_backfill_pages — a
+        #     deliberate seed-depth cap (§5.3); abandoning older history is fine.
+        #   * Live spike (hwm > 0): bound ONLY by the server offset ceiling (§5.2).
+        #     Using max_backfill_pages here would let a burst larger than
+        #     max_backfill_pages*page_limit advance the watermark past reachable-
+        #     but-unfetched events and lose them forever. Paging to the ceiling
+        #     reaches every event the API will still serve; past it, loss is
+        #     unavoidable regardless.
+        if hwm <= 0:
+            max_pages = max(1, poller_cfg.max_backfill_pages)
+        else:
+            max_pages = _SERVER_OFFSET_CEILING // page_limit + 2
 
         new_rows: list[EventRow] = []
         max_seen = hwm

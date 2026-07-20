@@ -691,12 +691,23 @@ def _upsert_schedule(store: KbStore, kind: str, channel_id: int, hour_utc: int) 
     Replaces any existing row of that kind so a guild has at most one daily /
     weekly / monthly post, and clears ``last_run`` so the new schedule can fire
     on the next tick. Blocking — call inside ``to_thread``.
+
+    A single atomic ``INSERT ... ON CONFLICT(kind)`` (backed by the UNIQUE(kind)
+    index from migration 0002) — never a DELETE-then-INSERT pair, which two
+    concurrent adds could interleave into two rows of the same kind and thus
+    double-post the ranking every period.
     """
     conn = store._conn  # noqa: SLF001 — killboard's own schedules table
-    db.execute(conn, "DELETE FROM schedules WHERE kind = ?", (kind,))
     db.execute(
         conn,
-        "INSERT INTO schedules (kind, channel_id, hour_utc, last_run) VALUES (?, ?, ?, NULL)",
+        """
+        INSERT INTO schedules (kind, channel_id, hour_utc, last_run)
+        VALUES (?, ?, ?, NULL)
+        ON CONFLICT(kind) DO UPDATE SET
+            channel_id = excluded.channel_id,
+            hour_utc = excluded.hour_utc,
+            last_run = NULL
+        """,
         (kind, channel_id, hour_utc),
     )
 
