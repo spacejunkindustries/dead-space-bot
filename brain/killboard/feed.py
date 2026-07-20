@@ -313,6 +313,19 @@ class Feed:
                 and fc.juicy_channel not in targets
             ):
                 targets.append(fc.juicy_channel)
+            if juicy_by_loot:
+                # Observability for tuning the juicy-by-loot threshold: every kill
+                # evaluated logs the value WE priced it at (which runs lower than a
+                # killboard's "total loot" — unpriced/no-AODP-data items count 0)
+                # and whether it cleared the bar. `grep kb_feed.juicy_check` to see
+                # the distribution and set juicy_min_loot to a value that fires.
+                self._log.info(
+                    "kb_feed.juicy_check",
+                    event_id=row.event_id,
+                    loot_value=loot_value,
+                    juicy_min_loot=fc.juicy_min_loot,
+                    routed_juicy=fc.juicy_channel in targets,
+                )
 
         if not targets:
             await self._to_thread(self._store.mark_posted, row.event_id, 0, 0)
