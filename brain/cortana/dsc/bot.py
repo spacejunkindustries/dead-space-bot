@@ -384,8 +384,20 @@ class AuraBot(commands.Bot):
         """Load routing.yaml through the engine (same path as /routing reload
         and /reload). Every silent-degradation branch — guild missing, file
         rejected, zero rules, unresolved role names — raises its alarm so a
-        phone admin sees "nobody will get pinged" before pilots do."""
+        phone admin sees "nobody will get pinged" before pilots do.
+
+        The "nobody gets mentioned" alarms are gated on ``discord.mentions_enabled``:
+        when mentions are globally OFF (the deliberate silent-mode kill-switch),
+        having zero active rules is the *intended* state, not an emergency — so the
+        rules still load (so counts/errors are logged and ``/routing reload`` works)
+        but the CRITICAL/WARNING alarms are cleared instead of raised. Flip
+        ``mentions_enabled`` back on (and `/reload`) and the full guardrail returns.
+        """
         from cortana.core.routing import RoutingConfigError
+
+        # Silent mode: mentions are intentionally disabled corp-wide. Zero routing
+        # rules is then expected, not a fault — don't page the admin about it.
+        mentions_on = self.holder.current.discord.mentions_enabled
 
         guild = self.get_guild(self.holder.current.discord.guild_id)
         if guild is None:
@@ -393,13 +405,16 @@ class AuraBot(commands.Bot):
                 "routing_rules_not_loaded_guild_missing",
                 guild_id=self.holder.current.discord.guild_id,
             )
-            await self._raise_alarm(
-                AlarmCode.ROUTING_ZERO_RULES,
-                AlarmSeverity.CRITICAL,
-                "Routing rules not loaded — the configured guild is not in the "
-                "bot's cache. Cards post but NOBODY gets mentioned.",
-                "check `discord.guild_id` and that the bot is in that guild",
-            )
+            if mentions_on:
+                await self._raise_alarm(
+                    AlarmCode.ROUTING_ZERO_RULES,
+                    AlarmSeverity.CRITICAL,
+                    "Routing rules not loaded — the configured guild is not in the "
+                    "bot's cache. Cards post but NOBODY gets mentioned.",
+                    "check `discord.guild_id` and that the bot is in that guild",
+                )
+            else:
+                await self._clear_alarm(AlarmCode.ROUTING_ZERO_RULES)
             return
         roles_by_name = {r.name: r.id for r in guild.roles}
         unresolved: set[str] = set()
@@ -414,16 +429,21 @@ class AuraBot(commands.Bot):
             count = await asyncio.to_thread(self.engine.load_routing_rules, resolve_role)
         except RoutingConfigError as exc:
             log.error("routing_rules_rejected", error=str(exc))
-            await self._raise_alarm(
-                AlarmCode.ROUTING_ZERO_RULES,
-                AlarmSeverity.CRITICAL,
-                f"routing.yaml rejected: {exc}. The previous rules stay in "
-                "force (zero on a fresh start).",
-                "fix routing.yaml, then `/routing reload` (or `/reload`)",
-            )
+            if mentions_on:
+                await self._raise_alarm(
+                    AlarmCode.ROUTING_ZERO_RULES,
+                    AlarmSeverity.CRITICAL,
+                    f"routing.yaml rejected: {exc}. The previous rules stay in "
+                    "force (zero on a fresh start).",
+                    "fix routing.yaml, then `/routing reload` (or `/reload`)",
+                )
+            else:
+                await self._clear_alarm(AlarmCode.ROUTING_ZERO_RULES)
             return
-        log.info("routing_rules_loaded", count=count)
-        if unresolved:
+        log.info("routing_rules_loaded", count=count, mentions_enabled=mentions_on)
+        # Unresolved role names are only actionable when mentions are on; while
+        # silent, an unresolved name pings no one, so keep the alarm bay clear.
+        if unresolved and mentions_on:
             await self._raise_alarm(
                 AlarmCode.ROLE_UNRESOLVED,
                 AlarmSeverity.WARNING,
@@ -433,7 +453,7 @@ class AuraBot(commands.Bot):
             )
         else:
             await self._clear_alarm(AlarmCode.ROLE_UNRESOLVED)
-        if count == 0:
+        if count == 0 and mentions_on:
             await self._raise_alarm(
                 AlarmCode.ROUTING_ZERO_RULES,
                 AlarmSeverity.CRITICAL,
@@ -441,6 +461,9 @@ class AuraBot(commands.Bot):
                 "write routing.yaml (or fix its role names), then `/routing reload`",
             )
         else:
+            # Either rules are active, or mentions are intentionally off — clear.
+            if count == 0 and not mentions_on:
+                log.info("routing_silent_mode", detail="mentions disabled; zero rules is by design")
             await self._clear_alarm(AlarmCode.ROUTING_ZERO_RULES)
 
     async def _raise_alarm(
