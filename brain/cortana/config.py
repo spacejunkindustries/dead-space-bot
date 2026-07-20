@@ -275,6 +275,14 @@ class SttConfig:
     #:   open   — any unmatched transcript relays (confidence-gated).
     #:   off    — the freeform relay never posts; commands only.
     relay_mode: str = "framed"
+    #: faster-whisper `no_repeat_ngram_size` (GDD §5.3). Whisper on noisy fleet
+    #: audio is prone to repetition loops — a real system name latched onto and
+    #: emitted dozens of times ("0-R5TS, 0-R5TS, 0-R5TS, …") at HIGH confidence,
+    #: which buries the actual callout and blocks streaming's early-commit
+    #: (§5.5) from ever matching a clean command in a partial. Forbidding any
+    #: n-gram of this length from repeating breaks the loop. 3 is safe for real
+    #: speech (a genuine "three three three" is a 1-gram, untouched); 0 disables.
+    no_repeat_ngram_size: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -746,6 +754,7 @@ def _assemble_stt(v: dict[str, Any]) -> SttConfig:
         relay_min_logprob=v["stt.relay_min_logprob"],
         relay_mode=v["stt.relay_mode"],
         watchdog_s=v["stt.watchdog_s"],
+        no_repeat_ngram_size=v["stt.no_repeat_ngram_size"],
     )
 
 

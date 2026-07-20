@@ -206,6 +206,11 @@ class FasterWhisperTranscriber:
             # full of keyboard noise, breath, and game audio bleed — decoding
             # those spans is where "Rens, Rens, Rens" hallucinations grow.
             "vad_filter": True,
+            # Repetition guard (GDD §5.3): even with greedy decoding, noisy
+            # fleet audio triggers loops where one system name is emitted dozens
+            # of times ("0-R5TS, 0-R5TS, …") at high confidence, burying the
+            # real callout. Forbidding a repeated n-gram breaks the loop.
+            "no_repeat_ngram_size": self._cfg.no_repeat_ngram_size,
         }
         # Feature-probe the installed faster-whisper ONCE instead of
         # try/except TypeError around the call: vad_filter runs Silero
@@ -217,6 +222,9 @@ class FasterWhisperTranscriber:
         if "vad_filter" not in supported:
             log.warning("stt_kwarg_unsupported", kwarg="vad_filter")
             kwargs.pop("vad_filter", None)
+        if "no_repeat_ngram_size" not in supported:
+            log.warning("stt_kwarg_unsupported", kwarg="no_repeat_ngram_size")
+            kwargs.pop("no_repeat_ngram_size", None)
         kwargs.update(self._bias_kwargs(supported, bias))
         segments, _info = model.transcribe(audio, **kwargs)
 

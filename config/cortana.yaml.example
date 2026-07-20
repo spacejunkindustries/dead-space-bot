@@ -149,7 +149,10 @@ stt:
                                        # ones) while the high-CPUWeight Ears mixer keeps its
                                        # cores. On a 2-vCPU box use 1: there, 2 starves the
                                        # real-time mixer and her voice goes choppy (GDD §12/§17).
-  bias_with_gazetteer: true            # pass system names as Whisper initial_prompt
+  bias_with_gazetteer: true            # bias Whisper toward gazetteer system names (hotwords,
+                                       # or initial_prompt on older faster-whisper) — one channel,
+                                       # hard-capped so a wide include_all prompt can't overflow
+                                       # the decoder's 448-token position limit
   whisper_cpp_url: http://127.0.0.1:8080/inference  # used only when backend: whisper-cpp
   watchdog_s: 15                       # hang watchdog (GDD §20): seconds one decode may run
                                        # once it reaches the head of the STT queue before the
@@ -165,6 +168,11 @@ stt:
                                        #            all-hands phrase. Mishearings never post.
                                        #   open   = any unmatched transcript relays
                                        #   off    = freeform relay disabled; commands only
+  no_repeat_ngram_size: 3              # repetition guard (GDD §5.3): forbid a repeated n-gram of
+                                       # this length so noisy audio can't loop one system name
+                                       # ("0-R5TS, 0-R5TS, …") at high confidence and bury the
+                                       # callout. 3 is safe for real speech; 0 disables. Ignored
+                                       # where the installed faster-whisper predates the param.
 
 matching:
   phonetic_weight: 0.6                 # weight of metaphone similarity (constraint 7)
