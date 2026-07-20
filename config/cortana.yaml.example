@@ -313,6 +313,9 @@ killboard:                             # Albion Online killboard add-on — OPTI
     backoff_base_seconds: 5            # exponential: 5, 10, 20 …
     page_limit: 51                     # endpoint maximum
     max_backfill_pages: 20             # first-run history seed depth (≈ server ceiling)
+    track_deaths: true                 # sweep guild DEATHS per-member (the /events guild feed
+                                       # is kill-only, so Death Fame + the death feed depend on
+                                       # this). Off = kills only, no death cards, Death Fame = 0.
   feed:
     kills_channel: 0                   # channel id for guild kills (0 = unset)
     deaths_channel: 0                  # channel id for guild deaths (may equal kills_channel)

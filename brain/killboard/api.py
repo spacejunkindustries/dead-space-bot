@@ -201,6 +201,18 @@ class KbApi:
             return None  # gave up — not an empty window
         return _as_dict_list(data)
 
+    async def player_deaths(self, player_id: str, limit: int = 51) -> list[dict[str, Any]]:
+        """Fetch a player's recent DEATH events (§2.3, §5).
+
+        ``/players/{id}/deaths`` — the guild-events endpoint is kill-only (it only
+        returns events where the guild landed the final blow), so guild deaths are
+        gathered per-member from here and ingested the same way (classify → DEATH).
+        Returns the raw event dicts (newest-first) or ``[]`` on failure — a flaky
+        member fetch costs that member's deaths this sweep, never the whole poll.
+        """
+        data = await self._get(f"/players/{player_id}/deaths", {"limit": limit})
+        return _as_dict_list(data)
+
     async def guild(self, guild_id: str) -> dict[str, Any] | None:
         """Fetch the guild summary (lifetime Kill/Death Fame, member count) (§2.3).
 

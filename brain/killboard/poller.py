@@ -35,6 +35,7 @@ import asyncio
 import contextlib
 import enum
 import json
+import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -71,6 +72,18 @@ log = structlog.get_logger(__name__)
 #: (GDD §5.2). Pagination stops here even if pages are still full, so a runaway
 #: spike can never spin against a wall of ``504``s.
 _SERVER_OFFSET_CEILING: int = 1000
+
+# ── deaths sweep (the guild-events endpoint is kill-only) ─────────────────────
+#: Guild deaths are polled per-member on a slower cadence than the kills loop:
+#: once every this-many poll ticks (deaths change slowly and a sweep is N member
+#: requests, so it must not run every tick).
+_DEATHS_EVERY_TICKS: int = 8
+#: Recent deaths fetched per member each sweep (already-stored ones are skipped).
+_DEATHS_PER_MEMBER: int = 20
+#: Re-fetch the member roster at most this often (seconds) — it changes rarely.
+_ROSTER_TTL_S: float = 1800.0
+#: Pause between per-member death fetches, to be a polite gameinfo client (§13).
+_MEMBER_THROTTLE_S: float = 0.25
 
 #: A sink for genuinely-new events handed to the feed: either an async callback
 #: invoked with the batch, or an :class:`asyncio.Queue` the batch is pushed onto.
@@ -120,6 +133,10 @@ class Poller:
         self._to_thread = to_thread
         self._log: Any = log if log is not None else structlog.get_logger(__name__)
         self._shutdown = shutdown
+        #: deaths-sweep state (guild-events is kill-only; deaths come per-member).
+        self._tick_count: int = 0
+        self._roster: list[dict[str, Any]] = []
+        self._roster_at: float = 0.0
 
     # ── supervised entry point ───────────────────────────────────────────────
 
@@ -142,6 +159,14 @@ class Poller:
                 except Exception as exc:  # noqa: BLE001 — inner net; must not escape
                     self._log.warning("kb_poller.tick_error", error=str(exc), exc_info=True)
                     await self._safe_record_failure()
+                # Deaths ride the SAME task (serialised writes) on a slower cadence,
+                # separately guarded so a deaths hiccup never disturbs the kills loop.
+                self._tick_count += 1
+                if self._tick_count % _DEATHS_EVERY_TICKS == 0:
+                    try:
+                        await self._poll_deaths()
+                    except Exception as exc:  # noqa: BLE001 — contained; kills loop unaffected
+                        self._log.warning("kb_poller.deaths_error", error=str(exc), exc_info=True)
                 await self._wait_next_tick()
         finally:
             self._log.info("kb_poller.stop")
@@ -330,6 +355,62 @@ class Poller:
                 await sink(rows)
         except Exception as exc:  # noqa: BLE001 — feed hand-off must not break ingest
             self._log.warning("kb_poller.emit_error", error=str(exc), count=len(rows))
+
+    # ── deaths sweep (per-member; guild-events is kill-only) ──────────────────
+
+    async def _poll_deaths(self) -> None:
+        """Gather guild DEATHS per-member and ingest them (§5).
+
+        The ``/events?guildId`` endpoint only returns kills the guild landed, so
+        deaths never appear there — Death Fame and the death feed stay empty. This
+        sweep walks the roster, fetches each member's recent ``/players/{id}/deaths``,
+        skips the ones already stored (cheap ``has_event`` dedup), and stores the
+        rest. Stored DEATH events flow to the feed via its normal unposted drain
+        and into the Death-Fame aggregates — no special path. Throttled and roster-
+        cached to stay a polite gameinfo client.
+        """
+        cfg = self._cfg_provider()
+        if not cfg.poller.track_deaths:
+            return
+        guild_id = (cfg.guild_id or "").strip()
+        if not guild_id:
+            return
+        members = await self._current_roster(guild_id)
+        if not members:
+            return
+
+        new_rows: list[EventRow] = []
+        for member in members:
+            if self._shutting_down():
+                break
+            player_id = str(member.get("Id") or "").strip()
+            if not player_id:
+                continue
+            for raw in await self._api.player_deaths(player_id, limit=_DEATHS_PER_MEMBER):
+                event_id = _raw_event_id(raw)
+                if event_id is not None and await self._to_thread(self._store.has_event, event_id):
+                    continue  # already ingested a previous sweep — skip re-store/re-emit
+                outcome = await self._store_event(raw, guild_id)
+                if isinstance(outcome, EventRow):
+                    new_rows.append(outcome)
+            await asyncio.sleep(_MEMBER_THROTTLE_S)
+
+        if new_rows:
+            new_rows.sort(key=lambda r: r.event_id)
+            await self._emit(new_rows)
+            self._log.info("kb_poller.deaths_swept", members=len(members), new_deaths=len(new_rows))
+
+    async def _current_roster(self, guild_id: str) -> list[dict[str, Any]]:
+        """The member roster, cached with a TTL; keeps the last good list on a
+        transient fetch failure so one flaky call doesn't skip the whole sweep."""
+        now = time.monotonic()
+        if self._roster and (now - self._roster_at) < _ROSTER_TTL_S:
+            return self._roster
+        members = await self._api.members(guild_id)
+        if members:
+            self._roster = members
+            self._roster_at = now
+        return self._roster
 
     # ── loop plumbing ────────────────────────────────────────────────────────
 

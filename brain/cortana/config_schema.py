@@ -1105,6 +1105,14 @@ KEYS: Final[tuple[Key, ...]] = (
         minimum=0,
     ),
     Key(
+        "killboard.poller.track_deaths",
+        "bool",
+        Reload.HOT,
+        "Also gather guild DEATHS per-member (the guild-events endpoint is "
+        "kill-only). Off = kills-only feed and Death Fame stays 0.",
+        default=True,
+    ),
+    Key(
         "killboard.feed.kills_channel",
         "int",
         Reload.HOT,
