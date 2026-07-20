@@ -1385,6 +1385,37 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `nlu.url` | str | `''` | hot | OpenAI-compatible chat-completions endpoint of the on-box model (e.g. http://127.0.0.1:11434/v1/chat/completions from Ollama). Empty = off. |
 | `nlu.model` | str | `''` | hot | Model name the local server expects (e.g. llama3.2:3b). |
 | `nlu.timeout_s` | float | `8.0` | hot | Wall-clock cap on one interpretation; the grammar already answered the clear callouts fast, so this only paces the messy ones. |
+| **`killboard:`** | | | | *OPTIONAL Albion Online killboard add-on (killboard GDD); absent/off by default. A separate game module — its own SQLite file, own poll loop.* |
+| `killboard.enabled` | bool | `False` | restart | Master switch for the Albion killboard module. Also needs a guild and a feed channel; the module stays dark until all are set. |
+| `killboard.region` | str | `'west'` | restart | Which Albion server the guild lives on — selects the API host (killboard GDD §2.2). Hitting the wrong region returns empty data. One of: `west`, `europe`, `east`. |
+| `killboard.guild_name` | str | `''` | restart | Guild name, resolved to an id once at startup via /search. Leave empty if setting killboard.guild_id directly. |
+| `killboard.guild_id` | str | `''` | restart | Albion guild id, set directly to skip name resolution. Empty = resolve from killboard.guild_name. |
+| `killboard.poller.interval_seconds` | int | `45` | hot | Seconds between gameinfo polls. Gentle by design (killboard GDD §15). |
+| `killboard.poller.request_timeout_seconds` | int | `10` | hot | Per-request HTTP timeout against the flaky gameinfo API. |
+| `killboard.poller.max_retries` | int | `3` | hot | Retries per poll before giving up until the next tick. |
+| `killboard.poller.backoff_base_seconds` | float | `5.0` | hot | Exponential backoff base on request failure (5, 10, 20 …). |
+| `killboard.poller.page_limit` | int | `51` | hot | Events per request; 51 is the endpoint maximum (killboard GDD §5.2). |
+| `killboard.poller.max_backfill_pages` | int | `20` | restart | First-run backfill depth in pages (≈ the server offset ceiling). Bounds how much recent history the seed captures (killboard GDD §5.3). |
+| `killboard.feed.kills_channel` | int | `0` | hot | Channel id for guild kills. 0 = unset. |
+| `killboard.feed.deaths_channel` | int | `0` | hot | Channel id for guild deaths (may equal kills_channel). 0 = unset. |
+| `killboard.feed.min_fame` | int | `0` | hot | Suppress kills below this fame from the main feed. 0 = show all. |
+| `killboard.feed.juicy_channel` | int | `0` | hot | Optional highlights channel for high-value kills. 0 = off. |
+| `killboard.feed.juicy_min_fame` | int | `2000000` | hot | Fame threshold for a kill to also post to juicy_channel. |
+| `killboard.feed.ignore_deaths_below_ip` | int | `0` | hot | Skip low-item-power 'naked' deaths that just clutter the feed. 0 = none. |
+| `killboard.feed.blob_participant_threshold` | int | `20` | hot | Kills with participant counts above this are flagged as blob/ZvZ and may route to blob_channel. |
+| `killboard.feed.blob_channel` | int | `0` | hot | Optional ZvZ channel for blob kills. 0 = keep them in the main feed. |
+| `killboard.feed.catchup_max_posts` | int | `20` | hot | Cap on feed posts per catch-up cycle after downtime; the rest get a single 'posted N older events' summary (killboard GDD §7.3). |
+| `killboard.feed.post_delay_ms` | int | `750` | hot | Spacing between feed messages so a backfill burst can't hit rate limits. |
+| `killboard.cards.enabled` | bool | `True` | hot | Render composited kill-card images (Pillow). false = embed only. |
+| `killboard.cards.icon_cache_dir` | str | `'/var/lib/dead/killboard/icons'` | restart | On-disk item-icon cache from the render service (fetched once each). |
+| `killboard.cards.render_base` | str | `'https://render.albiononline.com/v1'` | hot | Albion render service base URL (documented, cacheable — not the gameinfo API). |
+| `killboard.rankings.timezone` | str | `'UTC'` | hot | Timezone for daily/weekly/monthly ranking windows and schedules. |
+| `killboard.battles.channel` | int | `0` | hot | Optional battle-summary channel. 0 = battle posting off. |
+| `killboard.battles.min_players` | int | `20` | hot | Minimum guild participants for a battle to post (killboard GDD §9). |
+| `killboard.battles.min_fame` | int | `5000000` | hot | Minimum total fame swung for a battle to post. |
+| `killboard.storage.db_path` | str | `'/var/lib/dead/killboard/killboard.db'` | restart | The killboard's own SQLite file — separate from CORTANA's. Irreplaceable (the API can't re-serve old events); back it up (killboard GDD §2.4). |
+| `killboard.staleness.warn_after_minutes` | int | `30` | hot | No successful poll for this long → surface it in /killboard status. |
+| `killboard.staleness.no_events_notice_hours` | int | `6` | hot | No NEW events for this long → note 'guild is quiet' (not an error). |
 | **`routing:`** | | | | *OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.* |
 | `routing.file` | str | `''` | engine | routing.yaml location. Empty (the default) = routing.yaml in the same directory as cortana.yaml. |
 | **`ipc:`** | | | | *The Brain⇄Ears unix socket (GDD §15).* |

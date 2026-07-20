@@ -298,6 +298,48 @@ nlu:                                   # LLM understanding brain (GDD §6.7) —
   model: ""                            # model name the server expects, e.g. llama3.2:3b
   timeout_s: 8                         # cap on one interpretation
 
+killboard:                             # Albion Online killboard add-on — OPTIONAL, OFF by default.
+                                       # A separate game module: its own SQLite file, its own poll
+                                       # loop, its own /killboard commands. It never touches voice.
+                                       # Enable = set `enabled: true` AND a guild AND a feed channel.
+  enabled: false
+  region: west                         # west | europe | east — which Albion server your guild is on
+  guild_name: ""                       # resolved to an id at startup; or set guild_id directly
+  guild_id: ""                         # set directly to skip name resolution
+  poller:
+    interval_seconds: 45               # seconds between polls (gentle on the shared, flaky API)
+    request_timeout_seconds: 10
+    max_retries: 3
+    backoff_base_seconds: 5            # exponential: 5, 10, 20 …
+    page_limit: 51                     # endpoint maximum
+    max_backfill_pages: 20             # first-run history seed depth (≈ server ceiling)
+  feed:
+    kills_channel: 0                   # channel id for guild kills (0 = unset)
+    deaths_channel: 0                  # channel id for guild deaths (may equal kills_channel)
+    min_fame: 0                        # suppress kills below this fame from the main feed
+    juicy_channel: 0                   # optional highlights channel for big kills (0 = off)
+    juicy_min_fame: 2000000
+    ignore_deaths_below_ip: 0          # skip low-IP "naked" deaths (0 = keep them)
+    blob_participant_threshold: 20     # kills bigger than this are flagged blob/ZvZ
+    blob_channel: 0                    # optional ZvZ channel (0 = keep in main feed)
+    catchup_max_posts: 20              # cap feed posts per catch-up after downtime
+    post_delay_ms: 750                 # spacing between feed messages
+  cards:
+    enabled: true                      # render Pillow kill-card images (false = embed only)
+    icon_cache_dir: /var/lib/dead/killboard/icons
+    render_base: https://render.albiononline.com/v1
+  rankings:
+    timezone: UTC                      # window boundaries for daily/weekly/monthly rankings
+  battles:
+    channel: 0                         # optional battle-summary channel (0 = battles off)
+    min_players: 20
+    min_fame: 5000000
+  storage:
+    db_path: /var/lib/dead/killboard/killboard.db   # the killboard's OWN db — back it up
+  staleness:
+    warn_after_minutes: 30             # no successful poll this long → shown in /killboard status
+    no_events_notice_hours: 6          # no NEW events this long → "guild is quiet" (not an error)
+
 routing:
   file: ""                             # routing.yaml location (GDD §10.1). "" (the default)
                                        # = a file named routing.yaml in the same directory
