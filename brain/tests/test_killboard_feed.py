@@ -49,7 +49,13 @@ class _Bot:
 
 
 class _Cards:
-    async def render(self, row: EventRow, parts: list[Any]) -> bytes | None:
+    def __init__(self) -> None:
+        #: records the last render() call so tests can assert the feed hands the
+        #: parsed raw event (with equipment) to the card — the gear-grid fix.
+        self.last_kwargs: dict[str, Any] | None = None
+
+    async def render(self, row: EventRow, parts: list[Any], **kwargs: Any) -> bytes | None:
+        self.last_kwargs = kwargs
         return None  # embed-only; keeps the test off Pillow
 
 
@@ -163,3 +169,31 @@ async def test_missing_channel_is_skipped_not_deferred(store: KbStore) -> None:
 
     assert result is _PostResult.SKIPPED
     assert store.count_unposted() == 0
+
+
+async def test_feed_passes_raw_event_with_equipment_to_card(store: KbStore) -> None:
+    """The card must receive the PARSED raw event (with Victim/Killer Equipment),
+    not the bare EventRow — the flat row carries no raw_json, so without this the
+    gear grid renders empty. Regression for the empty-loadout kill card."""
+    import json
+
+    row = _kill_row(7)
+    raw = {
+        "Victim": {"Name": "Victim", "Equipment": {"MainHand": {"Type": "T4_MAIN_SWORD@1"}}},
+        "Killer": {"Name": "Killer", "Equipment": {"MainHand": {"Type": "T6_2H_AXE"}}},
+    }
+    store.upsert_event(row, json.dumps(raw))
+
+    cards = _Cards()
+    cfg = SimpleNamespace(killboard=KillboardConfig(feed=KbFeedConfig(kills_channel=KILLS_CHANNEL)))
+    channel = _OkChannel()
+    feed = Feed(_Bot({KILLS_CHANNEL: channel}), store, cards, lambda: cfg, _inline_to_thread)
+
+    await feed._post_one(row)
+
+    assert cards.last_kwargs is not None
+    passed = cards.last_kwargs.get("raw_event")
+    assert passed is not None, "feed did not hand the raw event to the card"
+    # The equipment the gear grid needs is present in what the card received.
+    assert passed["Victim"]["Equipment"]["MainHand"]["Type"] == "T4_MAIN_SWORD@1"
+    assert passed["Killer"]["Equipment"]["MainHand"]["Type"] == "T6_2H_AXE"

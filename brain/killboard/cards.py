@@ -224,15 +224,19 @@ class CardRenderer:
         participants: list[Participant],
         *,
         loot_value: int | None = None,
+        raw_event: Mapping[str, Any] | None = None,
     ) -> bytes | None:
         """Render a kill card to PNG bytes, or ``None`` to fall back to an embed.
 
-        ``event_row`` is any mapping-like row from the ``events`` table (a
-        :class:`sqlite3.Row`, a ``dict``, or the parsed
-        :class:`~killboard.model.EventRow`); its ``raw_json`` column, when
-        present, supplies the equipment grid. ``participants`` drives the
-        damage-contribution bars. ``loot_value`` (when the market layer priced
-        the victim's loadout) is drawn on the card; ``None`` omits it.
+        ``event_row`` supplies the header fields (names, item power, fame,
+        location, timestamp, relation). The equipment grid comes from
+        ``raw_event`` — the *parsed* full event dict (with ``Victim``/``Killer``/
+        ``Equipment``), which the feed fetches via :meth:`KbStore.raw_event`. When
+        ``raw_event`` is omitted it is decoded from ``event_row``'s ``raw_json``
+        column if present; a bare :class:`~killboard.model.EventRow` carries no
+        ``raw_json``, so passing ``raw_event`` explicitly is what makes the gear
+        show. ``participants`` drives the damage bars; ``loot_value`` (when the
+        market layer priced the loadout) is drawn on the card.
 
         Returns ``None`` — never raises — when cards are disabled, Pillow is
         unavailable, or anything in the fetch/composite path fails, so the feed
@@ -247,9 +251,9 @@ class CardRenderer:
             cards = self._cfg_provider().killboard.cards
             if not cards.enabled:
                 return None
-            raw_event = _extract_raw_event(event_row)
-            victim_gear = parse_equipment(raw_event, "Victim")
-            killer_gear = parse_equipment(raw_event, "Killer")
+            raw = raw_event if raw_event is not None else _extract_raw_event(event_row)
+            victim_gear = parse_equipment(raw, "Victim")
+            killer_gear = parse_equipment(raw, "Killer")
 
             icons: dict[str, bytes] = {}
             for item in (*victim_gear, *killer_gear):
