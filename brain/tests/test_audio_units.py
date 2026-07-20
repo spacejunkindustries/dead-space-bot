@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from cortana.audio.stt import (
+    _MAX_BIAS_CHARS,
     DEFAULT_WATCHDOG_S,
     FasterWhisperTranscriber,
     SttError,
@@ -647,6 +648,70 @@ def test_whisper_cpp_omits_prompt_when_biasing_disabled(
     cfg = make_stt_config(backend="whisper-cpp", bias_with_gazetteer=False)
     WhisperCppTranscriber(cfg).transcribe(FRAME, "Otanuomi")
     assert b'name="prompt"' not in captured["body"]
+
+
+def test_whisper_cpp_caps_prompt_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wide include_all gazetteer prompt is clipped to the shared budget so
+    the base model's 448-position limit can't be overflowed."""
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: Any, timeout: float) -> _FakeResponse:
+        captured["body"] = request.data
+        return _FakeResponse({"text": "ok"})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    huge = "Otanuomi " * 500
+    WhisperCppTranscriber(make_stt_config(backend="whisper-cpp")).transcribe(FRAME, huge)
+    assert huge[:_MAX_BIAS_CHARS].encode() in captured["body"]
+    assert huge.encode() not in captured["body"]  # the full, over-budget prompt never sent
+
+
+# ── FasterWhisperTranscriber gazetteer biasing (the 448-token regression) ─────
+#
+# These exercise the channel-selection logic directly via _bias_kwargs — the
+# pure decision that carries the fix — so they run in CI without numpy /
+# faster-whisper (which transcribe() imports and this test env omits).
+
+# The full faster-whisper transcribe() signature exposes both channels; older
+# builds lack hotwords. frozensets stand in for the feature-probe result.
+_SUPPORTED_BOTH = frozenset({"vad_filter", "hotwords", "initial_prompt"})
+_SUPPORTED_NO_HOTWORDS = frozenset({"vad_filter", "initial_prompt"})
+
+
+def test_faster_whisper_biases_through_one_channel_only() -> None:
+    """Regression (live incident): passing the bias as BOTH initial_prompt AND
+    hotwords doubled the decoder prefix past the base model's 448-position
+    limit and failed every decode. Exactly one channel now — hotwords preferred
+    (it biases every window, not just the first)."""
+    transcriber = FasterWhisperTranscriber(make_stt_config(bias_with_gazetteer=True))
+    kwargs = transcriber._bias_kwargs(_SUPPORTED_BOTH, "Otanuomi Kisogo Jita")
+    assert kwargs == {"hotwords": "Otanuomi Kisogo Jita"}  # exactly one channel, never both
+
+
+def test_faster_whisper_caps_bias_length() -> None:
+    """A wide include_all prompt is clipped so even one channel stays inside the
+    448-token budget."""
+    transcriber = FasterWhisperTranscriber(make_stt_config(bias_with_gazetteer=True))
+    kwargs = transcriber._bias_kwargs(_SUPPORTED_BOTH, "Otanuomi " * 500)
+    assert len(kwargs["hotwords"]) == _MAX_BIAS_CHARS
+
+
+def test_faster_whisper_biasing_disabled_passes_neither_channel() -> None:
+    transcriber = FasterWhisperTranscriber(make_stt_config(bias_with_gazetteer=False))
+    assert transcriber._bias_kwargs(_SUPPORTED_BOTH, "Otanuomi Kisogo Jita") == {}
+
+
+def test_faster_whisper_empty_bias_passes_neither_channel() -> None:
+    transcriber = FasterWhisperTranscriber(make_stt_config(bias_with_gazetteer=True))
+    assert transcriber._bias_kwargs(_SUPPORTED_BOTH, "") == {}
+
+
+def test_faster_whisper_falls_back_to_initial_prompt_without_hotwords() -> None:
+    """An older faster-whisper without a hotwords parameter still biases — via
+    initial_prompt, and still through exactly one channel."""
+    transcriber = FasterWhisperTranscriber(make_stt_config(bias_with_gazetteer=True))
+    kwargs = transcriber._bias_kwargs(_SUPPORTED_NO_HOTWORDS, "Otanuomi")
+    assert kwargs == {"initial_prompt": "Otanuomi"}
 
 
 def test_whisper_cpp_wraps_transport_errors(monkeypatch: pytest.MonkeyPatch) -> None:
