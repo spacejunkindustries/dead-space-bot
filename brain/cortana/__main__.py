@@ -57,6 +57,9 @@ from cortana.reload import ReloadResult
 from cortana.tts import Speaker
 from cortana.types import INTENT_SEVERITY, CardRender, Severity
 from cortana.voice_gateway import VoiceGateway
+from dead.manager import ModuleManager
+from dead.registry import build_modules
+from dead.supervisor import ModuleSupervisor
 
 log = structlog.get_logger(__name__)
 
@@ -158,6 +161,10 @@ class App:
         self.reminders: ReminderService | None = None
         self.chat: ChatBackend | None = None
         self.fun: FunEngine | None = None
+        # The module kernel (dead/): built at the tail of setup(). Additive —
+        # with no add-on enabled it changes no runtime behaviour.
+        self.supervisor: ModuleSupervisor | None = None
+        self.modules: ModuleManager | None = None
         self._chat_status = "disabled"
         self._chat_key: str | None = None
         self._reload_task: asyncio.Task[None] | None = None
@@ -344,6 +351,29 @@ class App:
         # a restart never renders a MEDIUM-tier guess as confirmed (§9.1).
         await self.engine.load_pending_candidates()
 
+        # ── module kernel (dead/) ────────────────────────────────────────────
+        # Everything voice is built; now stand up the module host. CORTANA is
+        # registered as a critical facade so /botstatus and the lifecycle
+        # fan-out see it uniformly; its own tasks still run on _spawn (fatal).
+        # Add-on modules (killboard, …) run their tasks under the isolating
+        # ModuleSupervisor. A non-critical module that fails setup is dropped
+        # here and boot continues — CORTANA never notices. With no add-on
+        # enabled, setup_enabled() only builds the CORTANA facade (no-op) and
+        # this whole block is behaviour-neutral.
+        self.supervisor = ModuleSupervisor(self._shutdown, self.alarms)
+        self.modules = ModuleManager(
+            holder=self.holder,
+            bot=self.bot,
+            alarms=self.alarms,
+            shutdown=self._shutdown,
+            supervisor=self.supervisor,
+        )
+        self.modules.register(*build_modules(self))
+        await self.modules.setup_enabled()
+        self.bot.modules = self.modules
+        self.bot.module_cogs = self.modules.all_cogs()
+        self.bot.module_dynamic_items = self.modules.all_dynamic_items()
+
     def _persist_discipline_state(self) -> None:
         """Discipline change hook (sync, on the loop): snapshot to app_state.
 
@@ -392,6 +422,11 @@ class App:
         self._spawn("reminder-poll", self._reminder_loop())
         self._spawn("health-check", self._health_loop())
         self._spawn("dialog-wheel", self.dialog.run())
+
+        # Add-on modules start their supervised background work post-login.
+        # Their tasks ride the ModuleSupervisor (contained), never _spawn.
+        if self.modules is not None:
+            await self.modules.start_enabled()
 
         # Pre-render the scripted acknowledgement lines once the app is fully
         # up (never during setup — see Speaker.start_priming).
@@ -480,6 +515,8 @@ class App:
             if self.bot is not None and self.bot.is_ready():
                 await self.bot._load_routing_rules()
 
+        # Snapshot the pre-swap config so modules see both sides of the change.
+        old_cfg = self.holder.current
         result = await reload_all(
             self.holder,
             file_validators={
@@ -497,6 +534,10 @@ class App:
         # Unconditional: catches a rotated on-disk API key even when no
         # chat.* KEY changed (appliers only fire on key changes).
         self._refresh_chat()
+        # Fan the config swap out to add-on modules so their HOT keys hot-apply
+        # in the same transaction. Isolated per module (a throw is contained).
+        if self.modules is not None and result.swapped:
+            await self.modules.reload_all(old_cfg, self.holder.current)
         # A reload is the operator's sanctioned "try again" for the STT
         # watchdog latch (stt.py: latched until /reload or restart).
         reset_degraded = getattr(self.transcriber, "reset_degraded", None)
@@ -593,6 +634,12 @@ class App:
         log.info("shutdown_complete")
 
     async def _shutdown_sequence(self) -> None:
+        # Add-on modules stop FIRST — each bounded to 2s and suppressed — so a
+        # wedged add-on can't eat the voice teardown's share of the 8s budget.
+        # CORTANA's facade stop() is a no-op; the (unchanged) voice teardown
+        # below still runs exactly as before.
+        if self.modules is not None:
+            await self.modules.stop_all()
         # gateway.close() sends NO leave: Ears keeps its voice connection
         # (and DAVE session) alive across a routine Brain restart, and the
         # fresh Brain's hello replay re-syncs the join state (GDD §15.4).

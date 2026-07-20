@@ -637,6 +637,10 @@ run install -d -m 0750 -o aura -g aura "${VARLIB}"
 # Shared Hugging Face cache: the whisper prefetch (STAGE, runs as aura) and
 # cortana-brain.service (Environment=HF_HOME) both resolve stt.model names here.
 run install -d -m 0750 -o aura -g aura "${VARLIB}/hf"
+# Killboard add-on state (db + icon cache). Inert when the module is disabled;
+# lives under the existing VARLIB so the service's ReadWritePaths already cover
+# it and no systemd change is needed (killboard GDD §14.1).
+run install -d -m 0750 -o aura -g aura "${VARLIB}/killboard" "${VARLIB}/killboard/icons"
 # Pre-create the database with the right owner: the natural way to run the
 # gazetteer seeder is plain `sudo python -m cortana.nlu.seed ...`, which would
 # otherwise create cortana.db as root:root and crash cortana-brain (User=aura)

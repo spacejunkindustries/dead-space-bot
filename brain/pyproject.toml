@@ -18,7 +18,9 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["cortana*"]
+# cortana = the voice module; dead = the game-agnostic kernel; killboard = the
+# Albion add-on. All three install off `pip install -e brain`.
+include = ["cortana*", "dead*", "killboard*"]
 
 [tool.setuptools.package-data]
 # The bundled fact/insult library (GDD §13.2) — plain JSON, loaded once at

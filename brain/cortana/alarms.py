@@ -64,6 +64,11 @@ class AlarmCode(Enum):
     INTERACTION_ERRORS = "INTERACTION_ERRORS"
     POST_FAILURE = "POST_FAILURE"
     VOICE_ABSENT = "VOICE_ABSENT"
+    # Add-on module supervision (dead/ kernel). CORTANA never raises these —
+    # its failures are fatal (systemd restart), not contained.
+    MODULE_SETUP_FAILED = "MODULE_SETUP_FAILED"
+    MODULE_TASK_DEGRADED = "MODULE_TASK_DEGRADED"
+    MODULE_QUARANTINED = "MODULE_QUARANTINED"
 
 
 class AlarmSeverity(Enum):

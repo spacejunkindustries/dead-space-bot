@@ -291,6 +291,28 @@ class AuraBot(commands.Bot):
         ):
             await self.add_cog(cog)
 
+        # Add-on module components (dead/ kernel), registered AFTER the core
+        # cogs so a broken add-on can never displace CORTANA's own commands.
+        # Populated by App.setup(); absent (empty) when no add-on is enabled.
+        # Each registration is isolated: a malformed add-on cog (e.g. a command
+        # name collision) must degrade only that add-on, never raise out of
+        # setup_hook and crash-loop the voice bot (the kernel's core promise —
+        # registration happens here, not in ModuleManager, so it needs its own
+        # containment).
+        for item in tuple(getattr(self, "module_dynamic_items", ())):
+            try:
+                self.add_dynamic_items(item)
+            except Exception:
+                log.exception(
+                    "module_dynamic_item_registration_failed",
+                    item=getattr(item, "__name__", repr(item)),
+                )
+        for cog in getattr(self, "module_cogs", ()):
+            try:
+                await self.add_cog(cog)
+            except Exception:
+                log.exception("module_cog_registration_failed", cog=type(cog).__name__)
+
         # tree.sync is OUT of the startup critical path: it is hash-gated,
         # background, and failure-tolerant (TREE_SYNC_STALE alarm) — a 429 or
         # a wrong guild_id can no longer crash-loop the whole Brain against a
@@ -352,6 +374,11 @@ class AuraBot(commands.Bot):
         # Pilots may already be in voice when Brain (re)starts — no voice
         # event will fire for them, so seed the census once.
         await self._seed_voice_census()
+        # Add-on modules get their on_ready after the census is seeded. Absent
+        # (and a no-op) when no add-on is enabled.
+        modules = getattr(self, "modules", None)
+        if modules is not None:
+            await modules.on_ready()
 
     async def _load_routing_rules(self) -> None:
         """Load routing.yaml through the engine (same path as /routing reload

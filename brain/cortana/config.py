@@ -454,6 +454,107 @@ class DatabaseConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class KbPollerConfig:
+    """Albion gameinfo poll loop (killboard GDD §5). The API keeps no history,
+    so this loop IS the history — persist every event, never miss a window."""
+
+    interval_seconds: int = 45
+    request_timeout_seconds: int = 10
+    max_retries: int = 3
+    backoff_base_seconds: float = 5.0
+    #: Endpoint maximum per request (killboard GDD §5.2).
+    page_limit: int = 51
+    #: First-run backfill depth in pages (≈ the server's offset ceiling).
+    max_backfill_pages: int = 20
+
+
+@dataclass(frozen=True, slots=True)
+class KbFeedConfig:
+    """Kill/death feed routing + filtering (killboard GDD §7.2). Channel ids of
+    0 mean "unset"; the module's enable gate needs at least one of kills/deaths."""
+
+    kills_channel: int = 0
+    deaths_channel: int = 0
+    min_fame: int = 0
+    juicy_channel: int = 0
+    juicy_min_fame: int = 2_000_000
+    ignore_deaths_below_ip: int = 0
+    blob_participant_threshold: int = 20
+    blob_channel: int = 0
+    #: Cap on feed posts per catch-up cycle after downtime (killboard GDD §7.3).
+    catchup_max_posts: int = 20
+    post_delay_ms: int = 750
+
+
+@dataclass(frozen=True, slots=True)
+class KbCardsConfig:
+    """Kill-card rendering (killboard GDD §7.1). Icons come from Albion's
+    documented, cacheable render service — never the flaky gameinfo API."""
+
+    enabled: bool = True
+    icon_cache_dir: str = "/var/lib/cortana/killboard/icons"
+    render_base: str = "https://render.albiononline.com/v1"
+
+
+@dataclass(frozen=True, slots=True)
+class KbRankingsConfig:
+    """Leaderboards computed from the event store (killboard GDD §8). Scheduled
+    posts live in the DB (schedules table), not config — a list-of-dicts can't
+    go through the flat scalar schema."""
+
+    timezone: str = "UTC"
+
+
+@dataclass(frozen=True, slots=True)
+class KbBattlesConfig:
+    """Large-fight summaries (killboard GDD §9); a battle posts only past a
+    participation threshold so routine skirmishes don't spam."""
+
+    channel: int = 0
+    min_players: int = 20
+    min_fame: int = 5_000_000
+
+
+@dataclass(frozen=True, slots=True)
+class KbStorageConfig:
+    """The killboard's OWN sqlite file — never CORTANA's. Irreplaceable: the
+    API cannot re-serve old events (killboard GDD §2.4)."""
+
+    db_path: str = "/var/lib/cortana/killboard/killboard.db"
+
+
+@dataclass(frozen=True, slots=True)
+class KbStalenessConfig:
+    """When a quiet poller becomes a reportable condition (killboard GDD §13)."""
+
+    warn_after_minutes: int = 30
+    no_events_notice_hours: int = 6
+
+
+@dataclass(frozen=True, slots=True)
+class KillboardConfig:
+    """Albion Online killboard add-on (killboard GDD). Optional section; OFF by
+    default — the module only starts when ``enabled`` is set AND a guild AND a
+    feed channel are configured (the gate lives in ``KillboardModule.enabled``,
+    not validation, so a half-set config degrades gracefully instead of
+    crashing the voice bot)."""
+
+    enabled: bool = False
+    #: API host selector — west | europe | east (killboard GDD §2.2).
+    region: str = "west"
+    #: Resolved to an id at startup via /search; or set ``guild_id`` directly.
+    guild_name: str = ""
+    guild_id: str = ""
+    poller: KbPollerConfig = field(default_factory=KbPollerConfig)
+    feed: KbFeedConfig = field(default_factory=KbFeedConfig)
+    cards: KbCardsConfig = field(default_factory=KbCardsConfig)
+    rankings: KbRankingsConfig = field(default_factory=KbRankingsConfig)
+    battles: KbBattlesConfig = field(default_factory=KbBattlesConfig)
+    storage: KbStorageConfig = field(default_factory=KbStorageConfig)
+    staleness: KbStalenessConfig = field(default_factory=KbStalenessConfig)
+
+
+@dataclass(frozen=True, slots=True)
 class AuraConfig:
     discord: DiscordConfig
     wake: WakeConfig
@@ -473,6 +574,7 @@ class AuraConfig:
     fun: FunConfig = field(default_factory=FunConfig)
     areas: AreasConfig = field(default_factory=AreasConfig)
     nlu: NluConfig = field(default_factory=NluConfig)
+    killboard: KillboardConfig = field(default_factory=KillboardConfig)
 
 
 # ── schema-driven validation ─────────────────────────────────────────────────
@@ -856,6 +958,51 @@ def _assemble_nlu(v: dict[str, Any]) -> NluConfig:
     )
 
 
+def _assemble_killboard(v: dict[str, Any]) -> KillboardConfig:
+    return KillboardConfig(
+        enabled=v["killboard.enabled"],
+        region=v["killboard.region"],
+        guild_name=v["killboard.guild_name"],
+        guild_id=v["killboard.guild_id"],
+        poller=KbPollerConfig(
+            interval_seconds=v["killboard.poller.interval_seconds"],
+            request_timeout_seconds=v["killboard.poller.request_timeout_seconds"],
+            max_retries=v["killboard.poller.max_retries"],
+            backoff_base_seconds=v["killboard.poller.backoff_base_seconds"],
+            page_limit=v["killboard.poller.page_limit"],
+            max_backfill_pages=v["killboard.poller.max_backfill_pages"],
+        ),
+        feed=KbFeedConfig(
+            kills_channel=v["killboard.feed.kills_channel"],
+            deaths_channel=v["killboard.feed.deaths_channel"],
+            min_fame=v["killboard.feed.min_fame"],
+            juicy_channel=v["killboard.feed.juicy_channel"],
+            juicy_min_fame=v["killboard.feed.juicy_min_fame"],
+            ignore_deaths_below_ip=v["killboard.feed.ignore_deaths_below_ip"],
+            blob_participant_threshold=v["killboard.feed.blob_participant_threshold"],
+            blob_channel=v["killboard.feed.blob_channel"],
+            catchup_max_posts=v["killboard.feed.catchup_max_posts"],
+            post_delay_ms=v["killboard.feed.post_delay_ms"],
+        ),
+        cards=KbCardsConfig(
+            enabled=v["killboard.cards.enabled"],
+            icon_cache_dir=v["killboard.cards.icon_cache_dir"],
+            render_base=v["killboard.cards.render_base"],
+        ),
+        rankings=KbRankingsConfig(timezone=v["killboard.rankings.timezone"]),
+        battles=KbBattlesConfig(
+            channel=v["killboard.battles.channel"],
+            min_players=v["killboard.battles.min_players"],
+            min_fame=v["killboard.battles.min_fame"],
+        ),
+        storage=KbStorageConfig(db_path=v["killboard.storage.db_path"]),
+        staleness=KbStalenessConfig(
+            warn_after_minutes=v["killboard.staleness.warn_after_minutes"],
+            no_events_notice_hours=v["killboard.staleness.no_events_notice_hours"],
+        ),
+    )
+
+
 def _assemble_dialog(v: dict[str, Any]) -> DialogConfig:
     return DialogConfig(
         window_ms=v["dialog.window_ms"],
@@ -890,6 +1037,7 @@ def _assemble(values: dict[str, Any]) -> AuraConfig:
         fun=_assemble_fun(values),
         areas=_assemble_areas(values),
         nlu=_assemble_nlu(values),
+        killboard=_assemble_killboard(values),
     )
 
 

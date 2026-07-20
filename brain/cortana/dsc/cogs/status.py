@@ -178,6 +178,28 @@ class StatusCog(commands.Cog):
             value="on" if bot.discipline.fleetmode else "off",
             inline=True,
         )
+        # Per-module health (dead/ kernel): one line per registered module —
+        # CORTANA's voice plus any add-ons (killboard, …). Absent when the
+        # kernel isn't wired (unit-test bots), so guarded.
+        modules = getattr(bot, "modules", None)
+        if modules is not None:
+            snapshot = modules.health_snapshot()
+            if snapshot:
+                icons = {
+                    "ok": "🟢",
+                    "starting": "🟡",
+                    "degraded": "🟠",
+                    "failed": "🔴",
+                    "disabled": "⚪",
+                }
+                lines = []
+                for name, mh in sorted(snapshot.items()):
+                    icon = icons.get(mh.status.value, "•")
+                    detail = f" — {mh.detail}" if mh.detail else ""
+                    lines.append(f"{icon} `{name}`{detail}")
+                embed.add_field(name="Modules", value="\n".join(lines), inline=False)
+                if any(mh.status.value in ("degraded", "failed") for mh in snapshot.values()):
+                    embed.color = _COLOR_FAIL
         embed.add_field(name="Active alarms", value=alarm_line, inline=False)
         return embed
 
