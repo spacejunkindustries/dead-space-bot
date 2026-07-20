@@ -1258,7 +1258,9 @@ def _compose_ranking_card(
             (28, 22), f"☠  {heading.upper()}", font=f_title, fill=(255, 255, 255), anchor="lm"
         )
         draw.text((30, 52), period_label, font=f_sub, fill=_COLOR_SUBTLE, anchor="lm")
-        _paste_logo(canvas, brand.logo, (_RANK_W - 84, 18), 56, opacity=0.95)
+        # Roundel in the BOTTOM-right corner (out of the reaper mascot's way, which
+        # bleeds down the right side); footer tagline sits bottom-left.
+        _paste_logo(canvas, brand.logo, (_RANK_W - 58, height - 56), 46, opacity=0.95)
 
         # Guild-wide totals.
         draw.text(
