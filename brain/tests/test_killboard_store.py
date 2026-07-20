@@ -152,3 +152,31 @@ def test_unposted_events_respects_limit(store: KbStore) -> None:
         store.upsert_event(_event(i), raw_json="{}")
     ids = [e.event_id for e in store.unposted_events(limit=2)]
     assert ids == [1, 2]
+
+
+# ── death fame (mirror of kill fame over DEATH events) ─────────────────────────
+
+
+def test_death_fame_sums_death_events_only(store: KbStore) -> None:
+    """death_fame sums total_fame over DEATH events; KILL events don't count."""
+    store.upsert_event(_event(1, relation=KILL, total_fame=5000), raw_json="{}")
+    store.upsert_event(_event(2, relation=DEATH, total_fame=7000, victim_id="V1"), raw_json="{}")
+    store.upsert_event(_event(3, relation=DEATH, total_fame=3000, victim_id="V2"), raw_json="{}")
+    # Guild-wide death fame = 7000 + 3000; kill fame is the separate 5000.
+    assert store.death_fame("2026-07-01T00:00:00+00:00") == 10000
+    assert store.kill_fame("2026-07-01T00:00:00+00:00") == 5000
+    # Scoped to one victim.
+    assert store.death_fame("2026-07-01T00:00:00+00:00", player_id="V1") == 7000
+
+
+def test_leaderboard_dfame_ranks_by_death_fame(store: KbStore) -> None:
+    """The dfame metric ranks members by fame lost, and surfaces death-only members."""
+    # V1 dies twice (big fame), V2 once (small). Neither has any kills.
+    store.upsert_event(_event(1, relation=DEATH, total_fame=700000, victim_id="V1"), raw_json="{}")
+    store.upsert_event(_event(2, relation=DEATH, total_fame=8000, victim_id="V1"), raw_json="{}")
+    store.upsert_event(_event(3, relation=DEATH, total_fame=6000, victim_id="V2"), raw_json="{}")
+    rows = store.leaderboard("dfame", "2026-07-01T00:00:00+00:00", limit=10)
+    # Ordered by death fame desc; death-only members appear (via the UNION half).
+    assert [(r["player_id"], r["dfame"]) for r in rows] == [("V1", 708000), ("V2", 6000)]
+    # Every row carries the new dfame column even for the kill board.
+    assert all("dfame" in r for r in rows)
