@@ -82,6 +82,13 @@ class ModuleSupervisor:
         streak = 0
         last_fail = 0.0
         while not self._shutdown.is_set():
+            # Optimistic on (re)start: a task that crashed and is now retrying
+            # has recovered as far as we know, so clear a stale DEGRADED/FAILED
+            # instead of showing degraded for the rest of the process life. It
+            # flips back to DEGRADED below the instant it crashes again. (Status
+            # is per-module, so with several tasks the last writer wins — good
+            # enough for a health hint; the module's own health() is the detail.)
+            self._status[module] = ModuleStatus.OK
             try:
                 await factory()
                 return  # a task that returns cleanly is DONE, not restarted

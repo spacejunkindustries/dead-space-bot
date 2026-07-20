@@ -150,11 +150,12 @@ class KbApi:
     async def search_guild(self, name: str) -> dict[str, Any] | None:
         """Resolve a guild name to its API record via ``/search`` (§2.3).
 
-        Returns the first guild whose ``Name`` matches ``name`` case-insensitively,
-        falling back to the first guild in the response if none match exactly (the
-        search is prefix/fuzzy on the API side). The returned dict carries the
-        guild ``Id`` the rest of the module keys off. Returns ``None`` if the
-        request fails or no guilds come back.
+        Returns the guild whose ``Name`` matches ``name`` case-insensitively.
+        Returns ``None`` if the request fails, no guilds come back, or NONE match
+        exactly — the search is prefix/fuzzy on the API side, so a typo or a
+        wrong-region query returns plausible-but-wrong candidates; auto-resolving
+        to the first of those would silently track the wrong guild's kills. Fail
+        loud (§13 "resolves empty → fail fast") instead of guessing.
         """
         data = await self._get("/search", {"q": name})
         if not isinstance(data, dict):
@@ -170,18 +171,22 @@ class KbApi:
             gname = guild.get("Name")
             if isinstance(gname, str) and gname.strip().casefold() == wanted:
                 return guild
-        # No exact match: return the first well-formed guild as best effort.
-        for guild in guilds:
-            if isinstance(guild, dict):
-                return guild
+        candidates = [g.get("Name") for g in guilds if isinstance(g, dict)]
+        log.warning("kb_api.guild_no_exact_match", wanted=name, candidates=candidates[:10])
         return None
 
-    async def events(self, guild_id: str, limit: int = 51, offset: int = 0) -> list[dict[str, Any]]:
+    async def events(
+        self, guild_id: str, limit: int = 51, offset: int = 0
+    ) -> list[dict[str, Any]] | None:
         """Fetch recent kill events involving the guild (§2.3, §5).
 
         ``/events?guildId={id}&sort=recent&limit={limit}&offset={offset}``. Returns
-        the list of raw event dicts newest-first, or ``[]`` on failure. ``limit``
-        is capped by the endpoint at 51 (killboard GDD §5.2).
+        the raw event dicts newest-first, an empty list for a genuinely empty
+        window, or **None when the request gave up** (timeout / exhausted 5xx /
+        429). The None-vs-[] distinction is load-bearing for the poller: a failed
+        deeper page during a spike must NOT be mistaken for end-of-window, or the
+        high-water mark advances past events that were never fetched (data loss,
+        killboard GDD §5.2). ``limit`` is capped by the endpoint at 51.
         """
         data = await self._get(
             "/events",
@@ -192,6 +197,8 @@ class KbApi:
                 "offset": offset,
             },
         )
+        if data is None:
+            return None  # gave up — not an empty window
         return _as_dict_list(data)
 
     async def guild(self, guild_id: str) -> dict[str, Any] | None:

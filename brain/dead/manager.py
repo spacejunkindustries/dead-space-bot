@@ -133,16 +133,26 @@ class ModuleManager:
             self._log.info("module_setup_ok", module=module.name)
 
     def all_cogs(self) -> list[commands.Cog]:
-        """Cogs from every active module (CORTANA's stay hard-wired → none here)."""
+        """Cogs from every active module (CORTANA's stay hard-wired → none here).
+        A module whose cogs() raises is contained (dropped + FAILED), never
+        allowed to abort boot."""
         cogs: list[commands.Cog] = []
         for module in self._active:
-            cogs.extend(module.cogs())
+            try:
+                cogs.extend(module.cogs())
+            except Exception:
+                self._log.exception("module_cogs_failed", module=module.name)
+                self._failed[module.name] = "cogs() failed — see the journal"
         return cogs
 
     def all_dynamic_items(self) -> list[type[DynamicItem[Any]]]:
         items: list[type[DynamicItem[Any]]] = []
         for module in self._active:
-            items.extend(module.dynamic_items())
+            try:
+                items.extend(module.dynamic_items())
+            except Exception:
+                self._log.exception("module_dynamic_items_failed", module=module.name)
+                self._failed[module.name] = "dynamic_items() failed — see the journal"
         return items
 
     async def start_enabled(self) -> None:
@@ -190,13 +200,21 @@ class ModuleManager:
         setup/start-failed modules as FAILED."""
         snapshot: dict[str, ModuleHealth] = {}
         for module in self._active:
-            own = module.health()
+            if module.name in self._failed:
+                continue  # start/cog-failed → authoritative FAILED, applied below
+            try:
+                own = module.health()
+            except Exception:
+                self._log.exception("module_health_failed", module=module.name)
+                snapshot[module.name] = ModuleHealth(ModuleStatus.FAILED, "health() raised")
+                continue
             sup = self._supervisor.status(module.name)
             status = own.status if _RANK[own.status] >= _RANK[sup] else sup
             snapshot[module.name] = ModuleHealth(status, own.detail, own.metrics)
+        # _failed is authoritative — a module that failed setup/start/cog wiring
+        # reads FAILED even if it lingers in _active for stop() cleanup.
         for name, detail in self._failed.items():
-            if name not in snapshot:
-                snapshot[name] = ModuleHealth(ModuleStatus.FAILED, detail)
+            snapshot[name] = ModuleHealth(ModuleStatus.FAILED, detail)
         return snapshot
 
     async def _alarm(self, code: AlarmCode, summary: str, hint: str, *, key: str) -> None:

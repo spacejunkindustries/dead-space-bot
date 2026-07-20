@@ -96,8 +96,16 @@ class KbStore:
 
         Keyed on ``event_id``; a re-seen event is a harmless overwrite, which is
         what makes ingestion idempotent across restarts and overlapping polls.
+
+        A blank event ``timestamp`` (the API occasionally omits ``TimeStamp``,
+        GDD §2.4) falls back to the ingestion time. Otherwise the empty string
+        would sort before every ISO-8601 window bound and the kill — though it
+        shows in the feed — would silently vanish from every windowed stat and
+        leaderboard. Events are polled near-real-time, so ingestion time is a
+        faithful stand-in.
         """
         ts = now or _utc_now()
+        timestamp = row.timestamp or ts
         db.execute(
             self._conn,
             """
@@ -126,7 +134,7 @@ class KbStore:
             """,
             (
                 row.event_id,
-                row.timestamp,
+                timestamp,
                 row.killer_id,
                 row.killer_name,
                 row.killer_guild_id,
@@ -282,6 +290,23 @@ class KbStore:
             """,
             (event_id, message_id, channel_id, ts),
         )
+
+    def count_unposted(self) -> int:
+        """How many ingested events are not yet in ``posted``.
+
+        The feed uses this to size catch-up over the WHOLE backlog (§7.3) rather
+        than one fetch window, so a backlog larger than a single window still
+        collapses the oldest and posts only the newest ``catchup_max_posts``.
+        """
+        val = db.query_value(
+            self._conn,
+            """
+            SELECT COUNT(*) FROM events e
+            LEFT JOIN posted p ON e.event_id = p.event_id
+            WHERE p.event_id IS NULL
+            """,
+        )
+        return int(val) if val else 0
 
     def unposted_events(self, limit: int) -> list[EventRow]:
         """Ingested events not yet in ``posted``, oldest first (GDD §7.3).

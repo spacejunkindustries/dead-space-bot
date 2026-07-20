@@ -59,11 +59,14 @@ class CortanaModule(BotModule):
         if reporter is None:
             return ModuleHealth(ModuleStatus.STARTING, "voice pipeline coming up")
         try:
-            ears_down = bool(reporter.ears_down())
-            voice_offline = bool(reporter.voice_offline())
-            degraded = bool(reporter.degraded())
+            # These are @property on HealthReporter — read them, don't call them.
+            ears_down = bool(reporter.ears_down)
+            voice_offline = bool(reporter.voice_offline)
+            degraded = bool(reporter.degraded)
         except Exception:
-            return ModuleHealth(ModuleStatus.OK, "voice up")
+            # An unreadable probe is NOT healthy — surface it rather than
+            # masking a broken voice pipeline as green (CORTANA is critical).
+            return ModuleHealth(ModuleStatus.DEGRADED, "health probe raised — voice state unknown")
         metrics: dict[str, object] = {
             "ears": "down" if ears_down else "up",
             "voice": "offline" if voice_offline else "online",

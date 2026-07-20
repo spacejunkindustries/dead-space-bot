@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import io
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -69,9 +70,24 @@ _COLOUR_ASSIST = discord.Colour(0xFBC02D)
 _FALLBACK_POLL_S = 30.0
 
 #: Max unposted events read from the store per drain fetch. Bounds one iteration's
-#: work; the drain loops until the store reports nothing unposted. Sized to the
-#: API's retained window (GDD §5.2 offset ceiling) so a full backlog fits.
+#: work; catch-up collapse is sized against the TOTAL unposted count (not this
+#: window), so a backlog larger than this still collapses correctly.
 _DRAIN_WINDOW = 1000
+
+
+class _PostResult(enum.Enum):
+    """Outcome of trying to post one event — controls both the drain loop and
+    the exactly-once guarantee (§7.3)."""
+
+    #: Delivered to at least one channel and recorded posted.
+    SENT = "sent"
+    #: Intentionally not sent but recorded posted (routed nowhere, or every
+    #: target is a permanently-missing channel) — removed from the backlog.
+    SKIPPED = "skipped"
+    #: A transient send failure (Discord 5xx/429) on a resolvable channel —
+    #: NOT recorded posted, so the next drain retries it. Never dropped.
+    DEFERRED = "deferred"
+
 
 #: Damage contributors shown in the embed's "Top damage" field (§7.1).
 _MAX_DAMAGE_ROWS = 5
@@ -151,39 +167,62 @@ class Feed:
     async def _drain(self) -> None:
         """Post every unposted event, oldest-first, with catch-up discipline (§7.3).
 
-        Reads a bounded window of unposted events; if it exceeds
-        ``catchup_max_posts`` the feed is catching up from downtime, so the older
-        overflow is collapsed into ``posted`` silently and summarised in one line,
-        and only the newest ``catchup_max_posts`` are posted individually. Loops
-        until the store reports nothing unposted (or shutdown is requested). Each
-        iteration strictly shrinks the backlog — every event handled is marked
-        posted — so the loop always terminates.
+        Catch-up is sized against the WHOLE backlog, not one fetch window: if the
+        total unposted count exceeds ``catchup_max_posts`` (returning from
+        downtime, or first-run backfill), the oldest ``total - cap`` are collapsed
+        into ``posted`` across as many windows as needed and summarised in ONE
+        line, and only the newest ``cap`` are posted individually. A transient
+        Discord outage defers (does not drop) the rest and ends the pass — the
+        next drain retries. Terminates when the store reports nothing unposted or
+        no forward progress is possible.
         """
+        if self._shutting_down():
+            return
+        fc = self._cfg_provider().killboard.feed
+        cap = max(1, fc.catchup_max_posts)
+        delay = max(0.0, fc.post_delay_ms / 1000.0)
+
+        total = await self._to_thread(self._store.count_unposted)
+        if total == 0:
+            return
+
+        # Catch-up collapse over the whole backlog (§7.3), oldest-first.
+        if total > cap:
+            to_collapse = total - cap
+            collapsed = 0
+            while collapsed < to_collapse and not self._shutting_down():
+                batch = await self._to_thread(
+                    self._store.unposted_events, min(_DRAIN_WINDOW, to_collapse - collapsed)
+                )
+                if not batch:
+                    break
+                await self._collapse(batch)
+                collapsed += len(batch)
+            if collapsed:
+                await self._post_summary(fc, collapsed)
+
+        # Post the remaining backlog (now <= cap after any collapse) oldest-first.
         while not self._shutting_down():
-            pending = await self._to_thread(self._store.unposted_events, _DRAIN_WINDOW)
+            pending = await self._to_thread(self._store.unposted_events, cap)
             if not pending:
                 return
-
-            fc = self._cfg_provider().killboard.feed
-            cap = max(1, fc.catchup_max_posts)
-            delay = max(0.0, fc.post_delay_ms / 1000.0)
-
-            if len(pending) > cap:
-                split = len(pending) - cap
-                overflow, to_post = pending[:split], pending[split:]
-                await self._collapse(overflow)
-                await self._post_summary(fc, len(overflow))
-            else:
-                to_post = pending
-
-            for i, row in enumerate(to_post):
+            progressed = False
+            for i, row in enumerate(pending):
                 if self._shutting_down():
                     return
                 if i > 0:
                     await self._sleep(delay)
-                if await self._post_one(row):
+                result = await self._post_one(row)
+                if result is _PostResult.DEFERRED:
+                    # Discord is refusing (5xx/429) — stop this pass rather than
+                    # busy-looping the same events; the next drain retries them.
+                    return
+                progressed = True
+                if result is _PostResult.SENT:
                     self._posted_total += 1
                     self._last_post_at = _utc_now()
+            if not progressed:
+                return
 
     async def _collapse(self, rows: list[EventRow]) -> None:
         """Silently mark a catch-up overflow as posted, without sending it (§7.3).
@@ -198,23 +237,27 @@ class Feed:
 
     # ── posting one event ────────────────────────────────────────────────────
 
-    async def _post_one(self, row: EventRow) -> bool:
-        """Route, render, send, and record one event; return whether it was sent.
+    async def _post_one(self, row: EventRow) -> _PostResult:
+        """Route, render, send, and record one event (§7.2/§7.3).
 
-        Routing (§7.2) decides the target channels from the event's relation,
-        fame, item power, and participant count. An event that routes nowhere
-        (suppressed by ``min_fame`` / ``ignore_deaths_below_ip`` / no channel set)
-        is still marked posted so it never lingers in the unposted backlog. When
-        cards are enabled a kill-card image is rendered once and attached to every
-        target channel (a fresh :class:`discord.File` per send). Missing channels
-        are skipped gracefully; the event is marked posted regardless so a
-        misconfigured channel can never wedge the feed.
+        Exactly-once is preserved by marking ``posted`` ONLY when the event has
+        genuinely left the backlog for good:
+
+        * routed nowhere (``min_fame`` / ``ignore_deaths_below_ip`` / no channel)
+          → SKIPPED (marked posted; nothing to deliver);
+        * delivered to at least one channel → SENT (marked posted with the id);
+        * every target is a permanently-missing channel → SKIPPED (marked posted
+          so a deleted channel can't wedge the backlog forever);
+        * a resolvable channel refused transiently (5xx/429) and none succeeded →
+          DEFERRED (NOT marked posted; the next drain retries — never dropped,
+          the bug this guards against silently lost kills on a passing Discord
+          hiccup).
         """
         fc = self._cfg_provider().killboard.feed
         targets = route_channels(row, fc)
         if not targets:
             await self._to_thread(self._store.mark_posted, row.event_id, 0, 0)
-            return False
+            return _PostResult.SKIPPED
 
         png = await self._render_card(row)
         filename = f"kill_{row.event_id}.png"
@@ -224,9 +267,12 @@ class Feed:
 
         posted_channel = 0
         posted_message = 0
+        transient_failure = False
         for cid in targets:
             channel = self._bot.get_channel(cid)
             if channel is None or not hasattr(channel, "send"):
+                # Structural: the channel is absent/misconfigured. Skip it — a
+                # retry can't resolve it, so it must not defer the event forever.
                 self._log.warning("kb_feed.channel_missing", channel_id=cid, event_id=row.event_id)
                 continue
             file = discord.File(io.BytesIO(png), filename=filename) if png is not None else None
@@ -237,16 +283,28 @@ class Feed:
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except discord.DiscordException as exc:
+                # Transient: a resolvable channel refused (rate limit / 5xx).
                 self._log.warning(
                     "kb_feed.send_failed", channel_id=cid, event_id=row.event_id, error=str(exc)
                 )
+                transient_failure = True
                 continue
             if posted_message == 0:
                 posted_channel = cid
                 posted_message = message.id if message is not None else 0
 
-        await self._to_thread(self._store.mark_posted, row.event_id, posted_message, posted_channel)
-        return posted_message != 0
+        if posted_message != 0:
+            await self._to_thread(
+                self._store.mark_posted, row.event_id, posted_message, posted_channel
+            )
+            return _PostResult.SENT
+        if transient_failure:
+            # Every resolvable target failed transiently — do NOT mark posted.
+            return _PostResult.DEFERRED
+        # No transient failure and nothing sent ⇒ every target was structurally
+        # unresolvable. Mark posted so a permanently-bad channel can't wedge.
+        await self._to_thread(self._store.mark_posted, row.event_id, 0, 0)
+        return _PostResult.SKIPPED
 
     async def _render_card(self, row: EventRow) -> bytes | None:
         """Render the kill-card PNG for an event, or ``None`` to post embed-only.

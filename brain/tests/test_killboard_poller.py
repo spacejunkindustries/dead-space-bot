@@ -248,4 +248,78 @@ async def test_run_polls_then_exits_promptly_on_shutdown(store: KbStore) -> None
 
     assert len(received) == 1
     assert _ids(received[0]) == [101]
-    assert store.high_water_mark() == 101
+
+
+# ── data-loss guards: a fetch/persist failure must NOT advance the mark ───────
+
+
+class _GiveUpApi(FakeApi):
+    """Like :class:`FakeApi`, but returns ``None`` (a give-up, not an empty
+    window) for a configured set of offsets — the real ``events()`` contract
+    after retries are exhausted."""
+
+    def __init__(self, events: list[dict[str, Any]], give_up_offsets: set[int]) -> None:
+        super().__init__(events)
+        self._give_up = give_up_offsets
+
+    async def events(
+        self, guild_id: str, limit: int = 51, offset: int = 0
+    ) -> list[dict[str, Any]] | None:
+        self.calls.append((guild_id, limit, offset))
+        if offset in self._give_up:
+            return None
+        return list(self.window[offset : offset + limit])
+
+
+class _FlakyStore:
+    """Wraps a real :class:`KbStore` but raises on ``upsert_event`` for chosen
+    ids — a transient persist failure (db locked / disk full)."""
+
+    def __init__(self, inner: KbStore, fail_ids: set[int]) -> None:
+        self._inner = inner
+        self._fail_ids = fail_ids
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def upsert_event(self, row: EventRow, raw_json: str, now: str | None = None) -> None:
+        if row.event_id in self._fail_ids:
+            raise sqlite3.OperationalError("database is locked")
+        self._inner.upsert_event(row, raw_json, now)
+
+
+@pytest.mark.asyncio
+async def test_deeper_page_giveup_does_not_advance_mark(store: KbStore) -> None:
+    """A spike whose deeper page GAVE UP (None, not empty) must not advance the
+    high-water mark past the events on that unfetched page — otherwise they are
+    lost forever when the API window rolls off (§5.2)."""
+    store.record_poll(50, advanced=True)
+    # page 0 (offset 0) = 56,55,54 — all newer; the deeper page at offset 3 gives up.
+    window = [_raw(eid) for eid in (56, 55, 54, 53, 52, 51, 50)]
+    api = _GiveUpApi(window, give_up_offsets={3})
+    queue: asyncio.Queue[list[EventRow]] = asyncio.Queue()
+    poller = _make_poller(store, api, queue, _cfg(page_limit=3, max_backfill_pages=10))
+
+    await poller._poll_once()
+
+    # The mark did NOT advance — next tick re-scans from page 0 and retries the
+    # spike, so 51/52/53 are not silently skipped.
+    assert store.high_water_mark() == 50
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_keeps_mark_below_the_failed_event(store: KbStore) -> None:
+    """A transient persist failure on a new event caps the mark strictly below
+    it, so it (and anything older) is retried next tick instead of being lost."""
+    store.record_poll(50, advanced=True)
+    flaky = _FlakyStore(store, fail_ids={52})
+    api = FakeApi([_raw(53), _raw(52), _raw(51)])  # all newer than 50
+    queue: asyncio.Queue[list[EventRow]] = asyncio.Queue()
+    poller = _make_poller(flaky, api, queue, _cfg())  # type: ignore[arg-type]
+
+    await poller._poll_once()
+
+    # 52 failed to persist → the mark is capped at 51 (below 52), so 52 is
+    # refetched next tick. It was NOT written; 51 and 53 were.
+    assert store.high_water_mark() == 51
+    assert sorted(row.event_id for row in store.recent(50)) == [51, 53]

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import json
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,22 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from killboard.model import EventRow, parse_event, participants_of
+
+
+class _StoreOutcome(enum.Enum):
+    """Result of trying to store one event — distinguishing the two None-y cases
+    the high-water mark must treat oppositely (data-loss guard, GDD §5).
+
+    - ``IRRELEVANT``: not the guild's event, no id, or unparseable. Safe to let
+      the watermark pass — re-fetching would never turn it into a row.
+    - ``FAILED``: a *transient* persist failure (db locked, disk full). The
+      watermark must NOT pass it, or the event is lost forever when the API
+      window rolls off; it is retried next tick.
+    """
+
+    IRRELEVANT = "irrelevant"
+    FAILED = "failed"
+
 
 if TYPE_CHECKING:
     from structlog.stdlib import BoundLogger
@@ -183,70 +200,105 @@ class Poller:
         Pagination continues while a page is *entirely* newer than ``hwm`` (the
         oldest event in it still unknown), bounded by ``max_backfill_pages`` and
         the server offset ceiling (GDD §5.2/§5.3). It stops as soon as a stored
-        event is reached, a short page signals the end of the window, or an empty
-        deeper page appears (the per-request retries in ``KbApi`` have already run,
-        so an empty page below the first reads as end-of-window, not a blip).
+        event is reached or a short page signals the end of the window.
+
+        Two failure shapes are handled so the watermark can never advance past an
+        event that wasn't actually captured (data loss, GDD §2.4/§5.2):
+
+        * A **deeper page that gave up** (``events()`` → ``None`` for a timeout /
+          exhausted 5xx/429) is NOT end-of-window — those ids are unknown, so the
+          watermark is left unadvanced this tick (``max_seen = hwm``) and the
+          whole walk is retried next tick (idempotent; the feed dedups).
+        * An event whose **persist failed transiently** caps the watermark
+          strictly below it, so it (and anything older) is refetched next tick.
+
+        A genuinely empty ``[]`` page below the first is a real end-of-window.
         """
         page_limit = max(1, poller_cfg.page_limit)
         max_pages = max(1, poller_cfg.max_backfill_pages)
 
         new_rows: list[EventRow] = []
         max_seen = hwm
+        lowest_unstored: int | None = None
         offset = 0
 
         for page_no in range(max_pages):
             if offset > _SERVER_OFFSET_CEILING:
                 break
             events = await self._api.events(guild_id, limit=page_limit, offset=offset)
-            if not events:
+            if events is None:
+                # Gave up (not an empty window). On page 0 the whole tick failed;
+                # deeper, a spike page is unfetched — don't advance the watermark
+                # past events we never saw. Retry next tick.
                 if page_no == 0:
                     return None
-                break
+                return new_rows, hwm
+            if not events:
+                if page_no == 0:
+                    # An active guild's live window is never truly empty — treat
+                    # an empty page-0 as a failure so backoff/staleness engage.
+                    return None
+                break  # a real empty page below the first = end of window
 
             reached_known_ground = False
             for raw in events:
                 eid = _raw_event_id(raw)
                 if eid is None:
                     continue
-                if eid > max_seen:
-                    max_seen = eid
                 if eid <= hwm:
                     reached_known_ground = True
                     break
-                row = await self._store_event(raw, guild_id)
-                if row is not None:
-                    new_rows.append(row)
+                outcome = await self._store_event(raw, guild_id)
+                if outcome is _StoreOutcome.FAILED:
+                    lowest_unstored = eid if lowest_unstored is None else min(lowest_unstored, eid)
+                    continue
+                # Stored or intentionally-dropped (irrelevant): safe to account
+                # for — the watermark may pass it.
+                if eid > max_seen:
+                    max_seen = eid
+                if isinstance(outcome, EventRow):
+                    new_rows.append(outcome)
 
             if reached_known_ground:
                 break
             if len(events) < page_limit:
-                # A short page means the retained window is exhausted; nothing
-                # older remains to fetch.
+                # A short page means the retained window is exhausted.
                 break
             offset += page_limit
 
+        if lowest_unstored is not None:
+            # Never let the recorded watermark reach or pass an event that failed
+            # to persist — cap strictly below the lowest such event so it (and
+            # everything older) is retried next tick.
+            max_seen = min(max_seen, lowest_unstored - 1)
         return new_rows, max_seen
 
-    async def _store_event(self, raw: dict[str, Any], guild_id: str) -> EventRow | None:
-        """Classify, parse, and persist one raw event; return its row or ``None``.
+    async def _store_event(self, raw: dict[str, Any], guild_id: str) -> EventRow | _StoreOutcome:
+        """Classify, parse, and persist one raw event.
 
-        Tolerant per-event (GDD §2.4): the parsers never raise, but any surprise
-        is caught so a single malformed event can never take down the whole page.
-        Returns ``None`` when the guild is not actually involved (``classify`` →
-        ``None``), when the event lacks an id, or on an unexpected failure — in
-        every case the walk simply continues.
+        Returns the :class:`EventRow` when stored, :attr:`_StoreOutcome.IRRELEVANT`
+        when the guild isn't involved / the event can't be parsed (safe to skip
+        permanently — re-fetching won't help), or :attr:`_StoreOutcome.FAILED`
+        when a *transient* persist error hit (must be retried, so the caller keeps
+        the watermark below it). The parse and persist failures are deliberately
+        separated: a parse error is permanent (skip), a persist error is transient
+        (retry) — conflating them either wedges the poller or loses data (GDD §5).
         """
         try:
             row = parse_event(raw, guild_id)
-            if row is None:
-                return None
+        except Exception as exc:  # noqa: BLE001 — an unparseable event is skipped, not retried
+            self._log.warning("kb_poller.parse_error", error=str(exc), event_id=_raw_event_id(raw))
+            return _StoreOutcome.IRRELEVANT
+        if row is None:
+            return _StoreOutcome.IRRELEVANT
+        try:
             raw_json = json.dumps(raw, separators=(",", ":"), ensure_ascii=False, default=str)
             parts = participants_of(raw)
             await self._to_thread(self._persist, row, raw_json, parts)
-            return row
-        except Exception as exc:  # noqa: BLE001 — never drop a page for one bad row
-            self._log.warning("kb_poller.event_error", error=str(exc), event_id=_raw_event_id(raw))
-            return None
+        except Exception as exc:  # noqa: BLE001 — transient persist failure: retry next tick
+            self._log.warning("kb_poller.persist_error", error=str(exc), event_id=row.event_id)
+            return _StoreOutcome.FAILED
+        return row
 
     def _persist(self, row: EventRow, raw_json: str, parts: list[Any]) -> None:
         """Synchronous upsert of one event plus its participants (runs off-loop).
