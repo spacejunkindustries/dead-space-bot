@@ -7,13 +7,16 @@ human name ("holy staff") and we must resolve it to the id the AODP price API
 speaks (``T8_2H_HOLYSTAFF``); autocomplete must offer id/name pairs as they type;
 and a card rendering a price needs the display name for an id.
 
-:class:`ItemIndex` owns that mapping. The file is loaded exactly once, off the
-event loop via :func:`asyncio.to_thread` (constraint: blocking I/O never runs on
-the loop). Everything else — :meth:`~ItemIndex.resolve`,
+:class:`ItemIndex` owns that mapping. The file is loaded and parsed exactly once,
+off the event loop via :func:`asyncio.to_thread` (constraint: blocking work never
+runs on the loop). The query methods — :meth:`~ItemIndex.resolve`,
 :meth:`~ItemIndex.search`, :meth:`~ItemIndex.name_of`, :meth:`~ItemIndex.tier_of`
-— is pure and synchronous so it is trivially testable and cheap to call from an
-autocomplete callback. A missing or unreadable file degrades to an empty index:
-``resolve`` returns ``None``, ``search`` returns ``[]``, nothing raises.
+— are pure and synchronous so they are trivially testable. ``name_of``/``tier_of``
+are O(1) dict/regex lookups; ``resolve``/``search`` fuzzy-scan all ~5k base
+entries (tens of ms), so callers on the shared loop (autocomplete, command
+handlers) must dispatch them via :func:`asyncio.to_thread` rather than call them
+inline. A missing or unreadable file degrades to an empty index: ``resolve``
+returns ``None``, ``search`` returns ``[]``, nothing raises.
 
 Matching is phonetically naive but structurally aware: names carry a tier
 adjective ("Elder's", "Adept's") that we strip to a *core* name so "holy staff"
@@ -170,17 +173,23 @@ class ItemIndex:
     async def load(self) -> None:
         """Read and index ``items.txt`` once; a no-op after the first call.
 
-        The file read runs in a worker thread. A missing or unreadable file
-        leaves the index empty (logged at ``warning``); it never raises.
+        Both the file read *and* the ~12k-line parse/index run in a worker
+        thread — the parse is CPU-bound (regex per line, thousands of frozen
+        dataclasses) and must not stall the shared event loop that carries the
+        voice path. A missing or unreadable file leaves the index empty (logged
+        at ``warning``); it never raises.
         """
         if self._loaded:
             return
         async with self._lock:
             if self._loaded:
                 return
-            text = await asyncio.to_thread(self._read_text)
-            self._build(text or "")
+            await asyncio.to_thread(self._read_and_build)
             self._loaded = True
+
+    def _read_and_build(self) -> None:
+        """Read the file and build the index — the whole off-loop unit."""
+        self._build(self._read_text() or "")
 
     @classmethod
     def from_text(cls, text: str, path: Path | None = None) -> ItemIndex:

@@ -93,6 +93,12 @@ class _PostResult(enum.Enum):
 #: Damage contributors shown in the embed's "Top damage" field (§7.1).
 _MAX_DAMAGE_ROWS = 5
 
+#: Hard deadline for the best-effort loot-value lookup on the feed path. Loot
+#: value is a decorative field; a slow (but not failing) AODP must never delay a
+#: kill card, so the network fetch is bounded and simply degrades to "unknown"
+#: (None) past this budget rather than serializing seconds onto every post.
+_LOOT_VALUE_TIMEOUT_S = 2.0
+
 
 class Feed:
     """Consumes new events and posts them to the feed channels exactly-once (§7).
@@ -345,7 +351,15 @@ class Feed:
         if not getattr(market_cfg, "enabled", False):
             return None
         try:
-            result = await estimate_value(raw, self._market, side="victim")
+            result = await asyncio.wait_for(
+                estimate_value(raw, self._market, side="victim"),
+                timeout=_LOOT_VALUE_TIMEOUT_S,
+            )
+        except TimeoutError:
+            # A slow-but-healthy AODP: drop the decorative value rather than let
+            # it stall the timeliness-critical feed drain (§7.3).
+            self._log.warning("kb_feed.value_timeout")
+            return None
         except Exception as exc:  # noqa: BLE001 — value is best-effort
             self._log.warning("kb_feed.value_failed", error=str(exc))
             return None

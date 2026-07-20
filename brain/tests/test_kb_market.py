@@ -253,6 +253,91 @@ async def test_prices_give_up_returns_empty_not_exception(monkeypatch: pytest.Mo
     assert len(session.get_urls) == market._MAX_RETRIES + 1
 
 
+class _FlakySession(_FakeSession):
+    """A session that raises for its first ``fail_first`` ``get`` calls, then
+    returns the canned payload — models AODP recovering after a transient blip."""
+
+    def __init__(self, payload: Any, *, fail_first: int) -> None:
+        super().__init__(payload)
+        self._fail_first = fail_first
+
+    def get(self, url: str, *, timeout: Any = None, **_kw: Any) -> _FakeResp:  # noqa: ARG002
+        self.get_urls.append(url)
+        if len(self.get_urls) <= self._fail_first:
+            raise aiohttp.ClientError("transient")
+        return _FakeResp(200, self._payload)
+
+
+async def test_give_up_is_not_cached_so_recovery_refetches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A total fetch failure must NOT poison the cache: once AODP recovers the
+    next call fetches again rather than serving the empty give-up for the TTL."""
+
+    async def _no_sleep(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(market.asyncio, "sleep", _no_sleep)
+
+    # First query series (attempt 0 + _MAX_RETRIES) all raise → give-up → [].
+    session = _FlakySession([_BAG_ROW], fail_first=market._MAX_RETRIES + 1)
+    client = _client_with_session(session)
+
+    first = await client.prices(["T4_BAG"])
+    assert first == []  # gave up
+    assert "" not in client._price_cache  # nothing cached
+    assert client._price_cache == {}  # the empty give-up was NOT stored
+
+    # AODP is back now; the next call must hit the wire again and get real data.
+    second = await client.prices(["T4_BAG"])
+    assert len(second) == 1
+    assert second[0].item_id == "T4_BAG"
+
+
+async def test_empty_but_successful_response_is_cached() -> None:
+    """A genuinely-empty *successful* response is still cached (it is not a
+    failure) — only give-ups are withheld from the cache."""
+    session = _FakeSession([])  # 200 OK, empty array
+    client = _client_with_session(session)
+
+    first = await client.prices(["T4_BAG"])
+    second = await client.prices(["T4_BAG"])
+
+    assert first == [] and second == []
+    assert len(session.get_urls) == 1  # second served from cache
+
+
+async def test_cache_key_includes_region_no_cross_region_bleed() -> None:
+    """A price query is cached per region: an identical query after a region hot
+    reload re-fetches (the previous region's rows must not leak across)."""
+    session = _FakeSession([_BAG_ROW])
+    cfg = _make_cfg(region="east")
+    client = _client_with_session(session, cfg=cfg)
+
+    await client.prices(["T4_BAG"], cities=["Caerleon"], qualities=[1])
+    assert len(session.get_urls) == 1
+
+    # Hot-reload the region on the same live client/cache.
+    cfg.region = "west"
+    await client.prices(["T4_BAG"], cities=["Caerleon"], qualities=[1])
+
+    # Different region ⇒ different key ⇒ a fresh fetch (no stale-region hit).
+    assert len(session.get_urls) == 2
+    assert session.get_urls[1].startswith("https://west.albion-online-data.com")
+
+
+async def test_price_cache_is_bounded() -> None:
+    """The TTL cache never grows past the cap even under a stream of distinct,
+    never-repeated queries (one per unique loadout on the feed path)."""
+    session = _FakeSession([_BAG_ROW])
+    client = _client_with_session(session)
+
+    for i in range(market._MAX_CACHE_ENTRIES + 50):
+        await client.prices([f"T4_ITEM_{i}"])
+
+    assert len(client._price_cache) <= market._MAX_CACHE_ENTRIES
+
+
 # ── host: the AODP .albion-online-data.com host per region ────────────────────
 
 

@@ -118,6 +118,40 @@ async def test_successful_send_marks_posted_once(store: KbStore) -> None:
     assert store.count_unposted() == 0  # recorded posted exactly once
 
 
+async def test_slow_market_loot_value_times_out_not_hangs(
+    store: KbStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow-but-healthy AODP must never serialize latency onto the feed: the
+    loot-value lookup is bounded and degrades to None (unknown) past its deadline
+    instead of stalling the post (§7.3 timeliness)."""
+    import asyncio
+
+    from killboard import feed as feed_mod
+
+    async def _hang(*_a: Any, **_k: Any) -> dict[str, Any]:
+        await asyncio.sleep(60)  # slower than the deadline
+        return {"total": 123}
+
+    monkeypatch.setattr(feed_mod, "estimate_value", _hang)
+    monkeypatch.setattr(feed_mod, "_LOOT_VALUE_TIMEOUT_S", 0.05)
+
+    cfg = SimpleNamespace(
+        killboard=SimpleNamespace(market=SimpleNamespace(enabled=True)),
+    )
+    feed = Feed(
+        _Bot({}),
+        store,
+        _Cards(),
+        lambda: cfg,  # type: ignore[arg-type]
+        _inline_to_thread,
+        market=object(),  # non-None so the value path is taken
+    )
+
+    value = await feed._loot_value({"Victim": {}})
+
+    assert value is None  # timed out → unknown, not a hang
+
+
 async def test_missing_channel_is_skipped_not_deferred(store: KbStore) -> None:
     """A structurally-absent channel (deleted / bad id) is marked posted so it
     can't wedge the backlog forever — distinct from a transient failure."""

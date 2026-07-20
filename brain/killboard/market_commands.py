@@ -20,9 +20,10 @@ Design boundaries mirror the rest of the killboard:
   disabled or unwired market section degrades to a friendly ephemeral, never a
   crash. Config is read live through a zero-arg provider so a hot ``/reload`` of
   region / cities / quality applies to the next command.
-* **Blocking work stays off the loop.** The only blocking work here is the item
-  database read, which :class:`~killboard.items.ItemIndex` already does through
-  ``asyncio.to_thread``; the HTTP is async.
+* **Blocking work stays off the loop.** The item-database read *and* the fuzzy
+  ``search``/``resolve`` scans (tens of ms over ~5k entries) are dispatched via
+  ``asyncio.to_thread`` — autocomplete fires per keystroke and must never stall
+  the shared voice loop — and the HTTP is async.
 
 Item arguments accept either an AODP unique id (``T8_2H_HOLYSTAFF``) or a fuzzy
 localized name ("holy staff"), resolved by :class:`~killboard.items.ItemIndex`,
@@ -32,6 +33,7 @@ and every one of them shares the same autocomplete coroutine
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -191,7 +193,10 @@ class MarketCog(commands.Cog):
         """
         try:
             await self._items.load()
-            hits = self._items.search(current, limit=_AC_LIMIT)
+            # search() fuzzy-scans ~5k entries (tens of ms); Discord fires this
+            # per keystroke. Run it off the shared event loop so it never stalls
+            # the voice path (constraint: blocking work never on the loop).
+            hits = await asyncio.to_thread(self._items.search, current, _AC_LIMIT)
         except Exception as exc:  # noqa: BLE001 — autocomplete must never raise
             log.warning("kb_market.autocomplete_failed", error=str(exc))
             return []
@@ -639,7 +644,8 @@ class MarketCog(commands.Cog):
         caller can bail.
         """
         await self._items.load()
-        item_id = self._items.resolve(item)
+        # resolve() fuzzy-scans ~5k entries; keep it off the shared event loop.
+        item_id = await asyncio.to_thread(self._items.resolve, item)
         if item_id is None:
             await self._text(
                 interaction,
@@ -655,7 +661,15 @@ class MarketCog(commands.Cog):
         await interaction.followup.send(embed=embed, allowed_mentions=_NO_PING)
 
     async def _text(self, interaction: discord.Interaction, message: str) -> None:
-        await interaction.followup.send(message, allowed_mentions=_NO_PING)
+        """Send an informational / error notice — always ephemeral.
+
+        Every notice path (disabled market, item miss, bad city, no data) routes
+        through here, so keeping it ephemeral honours the module's "degrades to a
+        friendly ephemeral" contract and stops an off-by-default feature from
+        spamming the channel with public "Market data is turned off" replies.
+        Successful price data goes through :meth:`_embed`, which stays public.
+        """
+        await interaction.followup.send(message, allowed_mentions=_NO_PING, ephemeral=True)
 
 
 # ── pure helpers (no discord, no I/O) ───────────────────────────────────────────

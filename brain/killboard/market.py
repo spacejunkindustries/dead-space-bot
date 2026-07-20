@@ -72,6 +72,13 @@ _MAX_ITEMS_PER_BATCH: int = 100
 _MAX_RETRIES: int = 3
 _BACKOFF_BASE_S: float = 0.5
 
+#: Hard cap on distinct entries kept in the in-memory price cache. Each posted
+#: kill and each ad-hoc lookup produces a distinct query key, so without a bound
+#: the cache would accumulate one permanent entry per unique loadout over the
+#: droplet's process lifetime. When the cap is hit we sweep expired entries and,
+#: if still over, evict the soonest-to-expire keys.
+_MAX_CACHE_ENTRIES: int = 512
+
 
 @dataclass(frozen=True, slots=True)
 class PriceRow:
@@ -266,23 +273,36 @@ class MarketClient:
         use_cities = _str_list(cities) or mkt.default_cities
         use_qualities = _int_list(qualities) or [mkt.default_quality]
 
-        key = _cache_key(ids, use_cities, use_qualities)
+        # Region is part of the key: AODP serves per-region hosts with different
+        # prices, so a hot reload of cfg.killboard.region must not return the
+        # previous region's cached rows for identical ids/cities/qualities.
+        key = _cache_key(mkt.region, ids, use_cities, use_qualities)
         cached = self._cache_get(key)
         if cached is not None:
             return cached
 
         loc_q = _location_quality_query(use_cities, use_qualities)
         out: list[PriceRow] = []
+        ok = True
         for batch in _batch_items(ids):
             item_seg = quote(",".join(batch), safe=",@")
             url = f"{base}/api/v2/stats/prices/{item_seg}.json{loc_q}"
             data = await self._get_json(url, mkt.request_timeout_s, mkt.user_agent)
+            if data is None:
+                # A give-up (timeout / 5xx / 429-exhausted). Skip the batch, but
+                # remember the query failed so we never cache a short/empty
+                # result — otherwise one transient blip poisons the cache with
+                # "no data" for the whole TTL, blocking recovery after AODP is
+                # back. A genuinely-empty-but-successful response still caches.
+                ok = False
+                continue
             for obj in _as_dict_list(data):
                 row = _parse_price_row(obj)
                 if row is not None:
                     out.append(row)
 
-        self._cache_put(key, out, mkt.cache_ttl_s)
+        if ok:
+            self._cache_put(key, out, mkt.cache_ttl_s)
         return out
 
     # ── history ──────────────────────────────────────────────────────────────
@@ -370,8 +390,9 @@ class MarketClient:
     def _cache_get(self, key: str) -> list[PriceRow] | None:
         """Return live cached rows for ``key``, or ``None`` if absent/expired.
 
-        Expired entries are evicted on access so the cache does not grow
-        unbounded across a long-lived process.
+        Expired entries are evicted on access; :meth:`_cache_put` additionally
+        caps the total entry count (:data:`_MAX_CACHE_ENTRIES`) so a stream of
+        never-repeated queries cannot grow the cache without bound.
         """
         entry = self._price_cache.get(key)
         if entry is None:
@@ -385,7 +406,26 @@ class MarketClient:
     def _cache_put(self, key: str, rows: list[PriceRow], ttl_s: int) -> None:
         if ttl_s <= 0:
             return
-        self._price_cache[key] = (time.monotonic() + ttl_s, rows)
+        now = time.monotonic()
+        # Bound the cache: every posted kill and ad-hoc lookup is a distinct key
+        # that is essentially never re-queried, so lazy per-key eviction alone
+        # would let the cache grow without limit over the process's lifetime.
+        # When at the cap, first sweep anything already expired; if still full,
+        # evict the entries closest to expiry to make room.
+        if key not in self._price_cache and len(self._price_cache) >= _MAX_CACHE_ENTRIES:
+            self._evict(now)
+        self._price_cache[key] = (now + ttl_s, rows)
+
+    def _evict(self, now: float) -> None:
+        """Sweep expired entries; if still at the cap, drop soonest-to-expire."""
+        expired = [k for k, (exp, _) in self._price_cache.items() if now >= exp]
+        for k in expired:
+            self._price_cache.pop(k, None)
+        overflow = len(self._price_cache) - _MAX_CACHE_ENTRIES + 1
+        if overflow > 0:
+            soonest = sorted(self._price_cache.items(), key=lambda kv: kv[1][0])
+            for k, _ in soonest[:overflow]:
+                self._price_cache.pop(k, None)
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -531,10 +571,15 @@ def _location_quality_query(cities: list[str], qualities: list[int]) -> str:
     return ("?" + "&".join(params)) if params else ""
 
 
-def _cache_key(ids: list[str], cities: list[str], qualities: list[int]) -> str:
-    """A normalized, order-independent key for the price cache."""
+def _cache_key(region: str, ids: list[str], cities: list[str], qualities: list[int]) -> str:
+    """A normalized, order-independent key for the price cache.
+
+    ``region`` is the first segment so entries for different AODP regions never
+    collide (city names are identical across regions but prices are not).
+    """
     return "|".join(
         (
+            region.strip().casefold(),
             ",".join(sorted(ids)),
             ",".join(sorted(c.casefold() for c in cities)),
             ",".join(str(q) for q in sorted(qualities)),
