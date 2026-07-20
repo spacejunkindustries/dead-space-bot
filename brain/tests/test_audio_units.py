@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from cortana.audio.stt import (
+    _MAX_BIAS_CHARS,
     DEFAULT_WATCHDOG_S,
     FasterWhisperTranscriber,
     SttError,
@@ -647,6 +648,121 @@ def test_whisper_cpp_omits_prompt_when_biasing_disabled(
     cfg = make_stt_config(backend="whisper-cpp", bias_with_gazetteer=False)
     WhisperCppTranscriber(cfg).transcribe(FRAME, "Otanuomi")
     assert b'name="prompt"' not in captured["body"]
+
+
+def test_whisper_cpp_caps_prompt_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wide include_all gazetteer prompt is clipped to the shared budget so
+    the base model's 448-position limit can't be overflowed."""
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: Any, timeout: float) -> _FakeResponse:
+        captured["body"] = request.data
+        return _FakeResponse({"text": "ok"})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    huge = "Otanuomi " * 500
+    WhisperCppTranscriber(make_stt_config(backend="whisper-cpp")).transcribe(FRAME, huge)
+    assert huge[:_MAX_BIAS_CHARS].encode() in captured["body"]
+    assert huge.encode() not in captured["body"]  # the full, over-budget prompt never sent
+
+
+# ── FasterWhisperTranscriber gazetteer biasing (the 448-token regression) ─────
+
+
+class _FakeSegment:
+    """One decoded segment, as faster-whisper yields it."""
+
+    def __init__(self, text: str, avg_logprob: float = -0.2) -> None:
+        self.text = text
+        self.avg_logprob = avg_logprob
+
+
+class _RecordingWhisperModel:
+    """Stands in for a loaded WhisperModel. Records the biasing kwargs; its
+    transcribe() signature declares the optional kwargs so the transcriber's
+    feature-probe (inspect.signature) sees them as supported."""
+
+    def __init__(self) -> None:
+        self.calls: dict[str, Any] = {}
+
+    def transcribe(
+        self,
+        audio: Any,
+        *,
+        language: str = "en",
+        beam_size: int = 5,
+        temperature: float = 0.0,
+        condition_on_previous_text: bool = True,
+        without_timestamps: bool = False,
+        vad_filter: bool = False,
+        hotwords: str | None = None,
+        initial_prompt: str | None = None,
+    ) -> tuple[list[Any], Any]:
+        self.calls = {"hotwords": hotwords, "initial_prompt": initial_prompt}
+        return [_FakeSegment("hostiles otanuomi")], object()
+
+
+def test_faster_whisper_biases_through_one_channel_only() -> None:
+    """Regression (live incident): passing the bias as BOTH initial_prompt AND
+    hotwords doubled the decoder prefix past the base model's 448-position
+    limit and failed every decode. Exactly one channel now — hotwords preferred
+    (it biases every window, not just the first)."""
+    transcriber = FasterWhisperTranscriber(make_stt_config(bias_with_gazetteer=True))
+    model = _RecordingWhisperModel()
+    transcriber._model = model  # skip the real WhisperModel load
+    result = transcriber.transcribe(FRAME, "Otanuomi Kisogo Jita")
+    assert result.text == "hostiles otanuomi"
+    assert model.calls["hotwords"] == "Otanuomi Kisogo Jita"
+    assert model.calls["initial_prompt"] is None  # never both
+
+
+def test_faster_whisper_caps_bias_length() -> None:
+    """A wide include_all prompt is clipped so even one channel stays inside the
+    448-token budget."""
+    transcriber = FasterWhisperTranscriber(make_stt_config(bias_with_gazetteer=True))
+    model = _RecordingWhisperModel()
+    transcriber._model = model
+    transcriber.transcribe(FRAME, "Otanuomi " * 500)
+    assert len(model.calls["hotwords"]) == _MAX_BIAS_CHARS
+
+
+def test_faster_whisper_biasing_disabled_passes_neither_channel() -> None:
+    transcriber = FasterWhisperTranscriber(make_stt_config(bias_with_gazetteer=False))
+    model = _RecordingWhisperModel()
+    transcriber._model = model
+    transcriber.transcribe(FRAME, "Otanuomi Kisogo Jita")
+    assert model.calls["hotwords"] is None
+    assert model.calls["initial_prompt"] is None
+
+
+def test_faster_whisper_falls_back_to_initial_prompt_without_hotwords() -> None:
+    """An older faster-whisper without a hotwords parameter still biases — via
+    initial_prompt, and still through exactly one channel."""
+
+    class _NoHotwordsModel:
+        def __init__(self) -> None:
+            self.initial_prompt: str | None = None
+
+        def transcribe(
+            self,
+            audio: Any,
+            *,
+            language: str = "en",
+            beam_size: int = 5,
+            temperature: float = 0.0,
+            condition_on_previous_text: bool = True,
+            without_timestamps: bool = False,
+            vad_filter: bool = False,
+            initial_prompt: str | None = None,
+        ) -> tuple[list[Any], Any]:
+            self.initial_prompt = initial_prompt
+            return [_FakeSegment("ok")], object()
+
+    transcriber = FasterWhisperTranscriber(make_stt_config(bias_with_gazetteer=True))
+    model = _NoHotwordsModel()
+    transcriber._model = model
+    transcriber.transcribe(FRAME, "Otanuomi")
+    assert model.initial_prompt == "Otanuomi"
 
 
 def test_whisper_cpp_wraps_transport_errors(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -93,6 +93,15 @@ _INT16_FULL_SCALE = 32768.0
 #: detection (GDD §20) must count an empty decode as low, never high.
 _NO_CONFIDENCE_LOGPROB = -10.0
 
+#: Hard character cap on the gazetteer bias prefix fed to Whisper. The base
+#: model's decoder has 448 absolute-position encodings, and the bias is
+#: prepended to every window; a wide `include_all` gazetteer prompt can run
+#: into the thousands of characters and overflow that limit ("No position
+#: encodings ... got position 449"), failing every decode. ~4 chars/token puts
+#: 600 chars near 150 tokens — a comfortable slice of the budget with plenty of
+#: room left for the audio tokens, whatever the configured prompt width.
+_MAX_BIAS_CHARS = 600
+
 
 class SttError(Exception):
     """A transcription attempt failed (backend error, bad response, ...)."""
@@ -177,11 +186,6 @@ class FasterWhisperTranscriber:
             # those spans is where "Rens, Rens, Rens" hallucinations grow.
             "vad_filter": True,
         }
-        if self._cfg.bias_with_gazetteer and bias:
-            kwargs["initial_prompt"] = bias  # gazetteer biasing, GDD §5.3
-            # hotwords bias the decoder toward these tokens on EVERY window
-            # (initial_prompt only prefixes the first) — helps short system
-            # names survive noisy audio.
         # Feature-probe the installed faster-whisper ONCE instead of
         # try/except TypeError around the call: vad_filter runs Silero
         # eagerly inside transcribe(), so a real TypeError from that path
@@ -189,12 +193,25 @@ class FasterWhisperTranscriber:
         # error — and a blanket retry would silently disable the chatter
         # defence while hiding the actual bug.
         supported = self._transcribe_params(model)
-        for optional in ("vad_filter", "hotwords"):
-            if optional in kwargs and optional not in supported:
-                log.warning("stt_kwarg_unsupported", kwarg=optional)
-                del kwargs[optional]
-        if self._cfg.bias_with_gazetteer and bias and "hotwords" in supported:
-            kwargs["hotwords"] = bias
+        if "vad_filter" not in supported:
+            log.warning("stt_kwarg_unsupported", kwarg="vad_filter")
+            kwargs.pop("vad_filter", None)
+        if self._cfg.bias_with_gazetteer and bias:
+            # Gazetteer biasing (GDD §5.3) through EXACTLY ONE channel — never
+            # both. faster-whisper prepends BOTH initial_prompt AND hotwords to
+            # the decoder; passing the (long) bias in both doubled the prefix
+            # past the model's 448-token position limit ("No position encodings
+            # ... got position 449"), which failed EVERY decode (live incident,
+            # base model). hotwords is the better mechanism — it biases every
+            # window, not just the first — so prefer it and fall back to
+            # initial_prompt only where the backend lacks it. The hard char cap
+            # keeps even one channel comfortably inside the token budget
+            # regardless of how wide the gazetteer prompt is configured.
+            clipped = bias[:_MAX_BIAS_CHARS]
+            if "hotwords" in supported:
+                kwargs["hotwords"] = clipped
+            else:
+                kwargs["initial_prompt"] = clipped
         segments, _info = model.transcribe(audio, **kwargs)
 
         texts: list[str] = []
@@ -257,7 +274,10 @@ class WhisperCppTranscriber:
     def transcribe(self, pcm16k: bytes, bias: str) -> TranscriptResult:
         fields: dict[str, str] = {"response_format": "json"}
         if self._cfg.bias_with_gazetteer and bias:
-            fields["prompt"] = bias
+            # Same 448-position budget as the faster-whisper path: a wide
+            # `include_all` prompt overflows the base model here too. One
+            # channel, hard-capped (see _MAX_BIAS_CHARS).
+            fields["prompt"] = bias[:_MAX_BIAS_CHARS]
         body, content_type = _encode_multipart(
             fields,
             file_field="file",
