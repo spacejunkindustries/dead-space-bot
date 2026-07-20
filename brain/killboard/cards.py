@@ -239,15 +239,14 @@ class CardRenderer:
         can post an embed alone (§7.1). A card with no resolvable gear still
         renders (header, item power, fame, damage).
         """
-        cfg = self._cfg_provider()
-        if not cfg.killboard.cards.enabled:
-            return None
         if not _PIL_OK:
             self._log.warning("kb_cards.pillow_unavailable")
             return None
 
         try:
-            cards = cfg.killboard.cards
+            cards = self._cfg_provider().killboard.cards
+            if not cards.enabled:
+                return None
             raw_event = _extract_raw_event(event_row)
             victim_gear = parse_equipment(raw_event, "Victim")
             killer_gear = parse_equipment(raw_event, "Killer")
@@ -288,14 +287,13 @@ class CardRenderer:
         raises) when cards are disabled or Pillow is absent, so the scheduler
         posts the embed alone.
         """
-        cfg = self._cfg_provider()
-        cards = cfg.killboard.cards
-        if not cards.enabled or not getattr(cards, "daily_ranking_card", True):
-            return None
         if not _PIL_OK:
             self._log.warning("kb_cards.pillow_unavailable")
             return None
         try:
+            cards = self._cfg_provider().killboard.cards
+            if not cards.enabled or not getattr(cards, "daily_ranking_card", True):
+                return None
             brand = await self._brand_style(cards)
             mascot = await self._cached_file(_BRAND_MASCOT_DEFAULT)
             return await self._to_thread(
@@ -324,13 +322,19 @@ class CardRenderer:
         return await self._cached_file(path)
 
     async def _cached_file(self, path: Path) -> bytes | None:
-        """Read a brand asset once per path off the loop, caching the result
-        (including ``None`` for an unreadable path, so it isn't re-statted)."""
+        """Read a brand asset once per path off the loop, caching the result.
+
+        A successful read and a *genuinely-absent* file are both cached (so a
+        missing logo isn't re-statted every card). A ``None`` from a **transient**
+        read error on a file that still exists is NOT cached, so a one-off OSError
+        (e.g. fd exhaustion) can't permanently blank branding — the next card
+        retries."""
         key = str(path)
         if key in self._logo_cache:
             return self._logo_cache[key]
         data = await self._to_thread(_read_file, path)
-        self._logo_cache[key] = data
+        if data is not None or not await self._to_thread(path.is_file):
+            self._logo_cache[key] = data
         return data
 
     async def close(self) -> None:

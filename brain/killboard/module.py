@@ -145,7 +145,10 @@ class KillboardModule(BotModule):
         self._store = await ctx.to_thread(open_store, db_path)
 
         self._api = KbApi(self._kb_cfg)
-        self._cards = CardRenderer(self._kb_cfg, ctx.to_thread, log=ctx.log)
+        # CardRenderer reads cfg.killboard.cards, so it needs the ROOT AuraConfig
+        # provider (like the feed), NOT the KillboardConfig one — a KillboardConfig
+        # has no `.killboard` attribute and every render would AttributeError.
+        self._cards = CardRenderer(self._root_cfg, ctx.to_thread, log=ctx.log)
         self._battles = Battles(self._api, self._kb_cfg, ctx.log)
         # Market layer (AODP): the client + item index power the /market commands
         # and the kill-card loot value. Built unconditionally (cheap; the session

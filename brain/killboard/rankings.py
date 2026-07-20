@@ -262,11 +262,24 @@ def build_daily_ranking(
     """
     kill_rows = store.leaderboard("fame", start, end, limit=limit)
     death_rows = store.leaderboard("dfame", start, end, limit=limit)
+    # Only members who actually earned/lost fame belong on each board. The store
+    # query returns every killer OR victim in the window, so a kill-only member
+    # carries dfame=0 (and a death-only member fame=0); without this filter those
+    # zero rows pad a short board — e.g. a pilot who never died showing on Top
+    # Death Fame as "Name — 0". _board_lines renders an emptied board cleanly.
     return DailyRanking(
         total_kill_fame=store.kill_fame(start, end),
         total_death_fame=store.death_fame(start, end),
-        top_kill_fame=[((r.get("player_name") or "Unknown"), int(r["fame"])) for r in kill_rows],
-        top_death_fame=[((r.get("player_name") or "Unknown"), int(r["dfame"])) for r in death_rows],
+        top_kill_fame=[
+            ((r.get("player_name") or "Unknown"), int(r["fame"]))
+            for r in kill_rows
+            if int(r["fame"]) > 0
+        ],
+        top_death_fame=[
+            ((r.get("player_name") or "Unknown"), int(r["dfame"]))
+            for r in death_rows
+            if int(r["dfame"]) > 0
+        ],
     )
 
 
