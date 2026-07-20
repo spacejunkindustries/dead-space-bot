@@ -512,6 +512,7 @@ class KbCardsConfig:
     accent_color: str = "#E11212"
     show_loot_value: bool = True
     daily_ranking_card: bool = True
+    reaper_watermark: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1039,6 +1040,7 @@ def _assemble_killboard(v: dict[str, Any]) -> KillboardConfig:
             accent_color=v["killboard.cards.accent_color"],
             show_loot_value=v["killboard.cards.show_loot_value"],
             daily_ranking_card=v["killboard.cards.daily_ranking_card"],
+            reaper_watermark=v["killboard.cards.reaper_watermark"],
         ),
         rankings=KbRankingsConfig(timezone=v["killboard.rankings.timezone"]),
         battles=KbBattlesConfig(
