@@ -275,6 +275,28 @@ def go_ahead() -> str:
     )
 
 
+_THINKING_BRATTY = (
+    "Ugh, hang on, let me work this out.",
+    "Give me a sec, genius.",
+    "Hold your horses, thinking.",
+    "One moment, this one's a mess.",
+    "Working on it, don't rush me.",
+)
+
+
+def thinking() -> str:
+    """*"Stand by."* — spoken the instant the grammar misses and the utterance
+    is handed to the understanding brain (§6.7), which is a multi-second on-box
+    model round-trip. Without it the pilot hears dead air and assumes she
+    froze; this bridges the wait so a slow interpret reads as "working," not
+    "broken." Ephemeral (ACK-class): dropped, never posted, if speech fails."""
+    return _pick(
+        "Stand by.",
+        cortana=("Stand by.", "One moment.", "Working on it.", "Let me get that.", "Hold on."),
+        bratty=_THINKING_BRATTY,
+    )
+
+
 def responders(n: int, system: str) -> str:
     """*"Two responding to Otanuomi."*"""
     return f"{number_word(n).capitalize()} responding to {system}."
@@ -546,6 +568,7 @@ def hot_lines() -> tuple[str, ...]:
         "Say again the system.",
         "Say again the callsign.",
         "Relayed.",
+        "Stand by.",
         "Flood control active.",
         "Voice offline, use slash commands.",
         "Command list posted to Discord.",
@@ -558,11 +581,12 @@ def hot_lines() -> tuple[str, ...]:
     if _personality == "cortana":
         lines += ["Listening.", "I'm here. Go ahead.", "Send it.", "Copy. Go ahead."]
         lines += ["Copy that. Relayed.", "On the wire.", "Sent it up the chain."]
+        lines += ["One moment.", "Working on it.", "Let me get that.", "Hold on."]
         for colour in _SEVERITY_SPOKEN.values():
             lines += [f"Code {colour} logged. Go ahead.", f"Copy code {colour}. Send it."]
     if _personality == "bratty":
         lines += list(_GO_AHEAD_BRATTY) + list(_RELAYED_BRATTY) + list(_NOT_UNDERSTOOD_BRATTY)
-        lines += list(_STANDING_DOWN_BRATTY)
+        lines += list(_STANDING_DOWN_BRATTY) + list(_THINKING_BRATTY)
         for colour in _SEVERITY_SPOKEN.values():
             lines += [t.format(colour=colour) for t in _CODE_ACK_BRATTY]
     return tuple(dict.fromkeys(lines))

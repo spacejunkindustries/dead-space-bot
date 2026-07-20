@@ -477,6 +477,8 @@ The fixed grammar (§6.1) is fast, debuggable, and free — but it only knows th
 
 And it stays cheap where it matters: **grammar-first.** The model is called *only* when the fast grammar found no command — and never for a confirm reply, an override, a dismissal, or chatter-quality noise (the garbage gate). Clear callouts stay instant; only the messy ones pay the round-trip, capped at `nlu.timeout_s`. A model that is slow, down, or returns junk degrades silently to grammar-only — it can never crash an utterance or block a distress call. Latency is acceptable because accuracy is the point (the corp explicitly traded a few seconds for "understand me the first time"). Config: the optional `nlu:` section (`understanding`, `url`, `model`, `timeout_s`).
 
+**She says "stand by" before she thinks.** The on-box interpret is a multi-second round-trip, and a pilot who hears nothing assumes she froze — the exact "randomly slow" feeling, since only grammar-*misses* pay it. So the instant the utterance is handed to the model, CORTANA speaks an ephemeral cue (*"Stand by." / "One moment."*, personality-flavoured) — best-effort ACK-class, dropped if she can't speak, and it never delays the interpret. The wait then reads as *working*, not *broken*. The decision to consult the model lives in one pure predicate (`_llm_understand_applies`) so "is she about to think?" has a single home shared by the cue and the call.
+
 ---
 
 ## 7. Slash command reference

@@ -1643,6 +1643,9 @@ async def test_llm_understands_a_callout_the_grammar_missed(monkeypatch) -> None
     _, _, parsed, _resolution = rig.engine.reports[0]
     assert parsed.intent is Intent.HOSTILE_SPOTTED
     assert parsed.system_text == "Otanuomi"
+    # She said "stand by" the moment she handed off to the model, so the
+    # multi-second interpret isn't silent dead air (the "randomly slow" fix).
+    assert (GUILD, "Stand by.") in rig.speaker.said
 
 
 async def test_llm_not_consulted_when_grammar_already_parsed(monkeypatch) -> None:
@@ -1658,6 +1661,8 @@ async def test_llm_not_consulted_when_grammar_already_parsed(monkeypatch) -> Non
     await utter_wake(rig)
     assert calls == []  # grammar handled it — the model was never called
     assert len(rig.engine.reports) == 1
+    # No model round-trip means no "stand by" cue — the fast path stays silent.
+    assert not any(text == "Stand by." for _, text in rig.speaker.said)
 
 
 async def test_llm_off_by_default_leaves_unmatched_unmatched(monkeypatch) -> None:
