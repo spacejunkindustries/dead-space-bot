@@ -98,11 +98,14 @@ class KbStore:
         what makes ingestion idempotent across restarts and overlapping polls.
 
         A blank event ``timestamp`` (the API occasionally omits ``TimeStamp``,
-        GDD §2.4) falls back to the ingestion time. Otherwise the empty string
-        would sort before every ISO-8601 window bound and the kill — though it
-        shows in the feed — would silently vanish from every windowed stat and
-        leaderboard. Events are polled near-real-time, so ingestion time is a
-        faithful stand-in.
+        GDD §2.4) falls back to the ingestion time ON FIRST INSERT — otherwise
+        the empty string sorts before every ISO-8601 window bound and the kill,
+        though it shows in the feed, silently vanishes from every windowed stat.
+        Events are polled near-real-time, so ingestion time is a faithful
+        stand-in. The conflict clause deliberately does NOT touch ``timestamp``:
+        a re-upsert (overlapping poll, backfill) keeps the first-seen value, so
+        an event that later re-appears without its ``TimeStamp`` can't have a
+        good stored timestamp clobbered by a fresh ingestion time.
         """
         ts = now or _utc_now()
         timestamp = row.timestamp or ts
@@ -116,7 +119,6 @@ class KbStore:
                 raw_json, ingested_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_id) DO UPDATE SET
-                timestamp        = excluded.timestamp,
                 killer_id        = excluded.killer_id,
                 killer_name      = excluded.killer_name,
                 killer_guild_id  = excluded.killer_guild_id,

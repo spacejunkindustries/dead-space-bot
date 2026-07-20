@@ -291,6 +291,11 @@ class Scheduler:
         period = KINDS[kind]
         prev_instant = period_start(now, kind, tz).astimezone(UTC) - timedelta(seconds=1)
         start_iso, end_iso = window_for(period, tz, prev_instant)
+        # Label from the LOCAL start of the completed period — NOT the UTC window
+        # string. For an east-of-UTC guild the UTC instant of local midnight
+        # falls on the previous calendar day/month, so formatting the UTC string
+        # would title July's board "June" (etc). The data uses the UTC bounds.
+        label_start = period_start(prev_instant, kind, tz)
 
         rows = await self._to_thread(
             build_leaderboard,
@@ -302,7 +307,7 @@ class Scheduler:
         )
         embed = leaderboard_embed(
             SCHEDULED_METRIC,
-            _period_label(kind, start_iso),
+            _period_label(kind, label_start.isoformat()),
             rows,
             guild_name=cfg.guild_name or None,
             tz=tz,

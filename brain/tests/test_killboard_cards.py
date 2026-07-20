@@ -71,7 +71,8 @@ class _FakeSession:
         self.data = data
         self.calls: list[str] = []
 
-    def get(self, url: str) -> _FakeResponse:
+    def get(self, url: str, **_kwargs: object) -> _FakeResponse:
+        # **_kwargs absorbs the per-request timeout the renderer now passes.
         self.calls.append(url)
         return _FakeResponse(self.status, self.data)
 

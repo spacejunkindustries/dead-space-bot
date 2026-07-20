@@ -120,6 +120,32 @@ async def test_stop_all_cancels_running_task() -> None:
     assert not sup._tasks  # cancelled, awaited, and cleared
 
 
+async def test_one_task_restart_does_not_mask_a_quarantined_sibling() -> None:
+    """A module runs several tasks under one name; a healthy/flapping task's
+    optimistic OK-reset must NOT erase a sibling task that quarantined — status
+    is the WORST across the module's tasks."""
+    sup, _, _ = _sup()
+
+    async def dead() -> None:
+        raise RuntimeError("always")  # quarantines fast
+
+    started = asyncio.Event()
+
+    async def alive() -> None:
+        started.set()
+        await asyncio.sleep(3600)  # healthy sibling, keeps running
+
+    sup.spawn("kb", "feed", dead, backoff=_FAST)
+    await _await_task(sup, "kb", "feed")  # feed quarantines → FAILED
+    assert sup.status("kb") is ModuleStatus.FAILED
+
+    sup.spawn("kb", "poller", alive)  # a healthy sibling starts (sets its own OK)
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    # The module is still FAILED — the sibling's OK didn't erase the dead feed.
+    assert sup.status("kb") is ModuleStatus.FAILED
+    await sup.stop_all()
+
+
 async def test_duplicate_spawn_is_ignored() -> None:
     sup, _, _ = _sup()
     started = asyncio.Event()

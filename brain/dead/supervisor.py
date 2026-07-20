@@ -34,6 +34,16 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
+#: Severity ordering so a module's status is the WORST across its tasks — one
+#: quarantined task must not be masked by a healthy sibling.
+_RANK = {
+    ModuleStatus.DISABLED: 0,
+    ModuleStatus.OK: 1,
+    ModuleStatus.STARTING: 2,
+    ModuleStatus.DEGRADED: 3,
+    ModuleStatus.FAILED: 4,
+}
+
 #: A task factory: called to (re)start one supervised coroutine. It is a
 #: *factory*, not a coroutine, so a restart builds a fresh awaitable — reusing
 #: a spent coroutine would raise ``RuntimeError: cannot reuse already awaited``.
@@ -52,7 +62,10 @@ class ModuleSupervisor:
         self._alarms = alarms
         self._log = logger
         self._tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
-        self._status: dict[str, ModuleStatus] = {}
+        # Status is per (module, task) — a module's reported status is the WORST
+        # across its tasks, so one task's optimistic restart can never erase a
+        # quarantined sibling (a multi-task module like the killboard).
+        self._status: dict[tuple[str, str], ModuleStatus] = {}
 
     def spawn(
         self,
@@ -69,7 +82,7 @@ class ModuleSupervisor:
         if existing is not None and not existing.done():
             self._log.warning("module_task_already_running", module=module, task=task)
             return
-        self._status.setdefault(module, ModuleStatus.OK)
+        self._status.setdefault(key, ModuleStatus.OK)
         runner = asyncio.create_task(
             self._runner(module, task, factory, backoff), name=f"mod:{module}:{task}"
         )
@@ -78,17 +91,17 @@ class ModuleSupervisor:
     async def _runner(self, module: str, task: str, factory: TaskFactory, backoff: Backoff) -> None:
         """Restart loop for one task. Clean return ends it; a crash backs off
         and retries; a storm quarantines. Never sets the shutdown event."""
+        key = (module, task)
         loop = asyncio.get_running_loop()
         streak = 0
         last_fail = 0.0
         while not self._shutdown.is_set():
-            # Optimistic on (re)start: a task that crashed and is now retrying
-            # has recovered as far as we know, so clear a stale DEGRADED/FAILED
-            # instead of showing degraded for the rest of the process life. It
-            # flips back to DEGRADED below the instant it crashes again. (Status
-            # is per-module, so with several tasks the last writer wins — good
-            # enough for a health hint; the module's own health() is the detail.)
-            self._status[module] = ModuleStatus.OK
+            # Optimistic on THIS task's (re)start: a task that crashed and is now
+            # retrying has recovered as far as we know, so clear its own stale
+            # DEGRADED/FAILED. Keyed by (module, task) so it can only reset its
+            # OWN status — a quarantined sibling keeps FAILED, and status(module)
+            # reports the worst across tasks.
+            self._status[key] = ModuleStatus.OK
             try:
                 await factory()
                 return  # a task that returns cleanly is DONE, not restarted
@@ -101,7 +114,7 @@ class ModuleSupervisor:
                     streak = 0  # survived long enough — a fresh incident
                 streak += 1
                 last_fail = now
-                self._status[module] = ModuleStatus.DEGRADED
+                self._status[key] = ModuleStatus.DEGRADED
                 await self._alarm(
                     AlarmCode.MODULE_TASK_DEGRADED,
                     AlarmSeverity.WARNING,
@@ -111,7 +124,7 @@ class ModuleSupervisor:
                     key=f"{module}:{task}",
                 )
                 if streak >= backoff.max_restarts:
-                    self._status[module] = ModuleStatus.FAILED
+                    self._status[key] = ModuleStatus.FAILED
                     await self._alarm(
                         AlarmCode.MODULE_QUARANTINED,
                         AlarmSeverity.CRITICAL,
@@ -145,8 +158,13 @@ class ModuleSupervisor:
             await self._alarms.raise_alarm(code, severity, summary, hint, key=key)
 
     def status(self, module: str) -> ModuleStatus:
-        """The supervisor's view of a module (OK until a task crashes)."""
-        return self._status.get(module, ModuleStatus.OK)
+        """The supervisor's view of a module: the WORST status across its tasks
+        (OK if it has none). A single quarantined task therefore surfaces even
+        while its siblings are healthy."""
+        statuses = [s for (m, _t), s in self._status.items() if m == module]
+        if not statuses:
+            return ModuleStatus.OK
+        return max(statuses, key=lambda s: _RANK[s])
 
     async def stop(self, module: str) -> None:
         """Cancel and await every task for one module. Idempotent."""

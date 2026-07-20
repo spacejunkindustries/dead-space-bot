@@ -25,8 +25,10 @@ degrades to ``None`` so the feed falls back to an embed-only post.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -50,6 +52,11 @@ if TYPE_CHECKING:
     from cortana.config import KillboardConfig
 
 log = structlog.get_logger(__name__)
+
+#: Per-icon fetch timeout. Icons and feed posts are sequential, so an unbounded
+#: fetch against a hung render host would stall the whole feed drain; this keeps
+#: a bad host to a brief, bounded stall that degrades to a no-icon card.
+_ICON_TIMEOUT = aiohttp.ClientTimeout(total=10.0)
 
 
 # ── layout constants ─────────────────────────────────────────────────────────
@@ -228,7 +235,11 @@ class CardRenderer:
         url = render_icon_url(cards.render_base, item.item_type, item.enchant)
         try:
             session = await self._get_session()
-            async with session.get(url) as resp:
+            # Bound the icon fetch: neither the owned session nor the shared API
+            # session sets a session-level timeout, so without this a hung render
+            # host would block on aiohttp's 300s default and, since icons and feed
+            # posts are sequential, wedge the whole feed drain for minutes.
+            async with session.get(url, timeout=_ICON_TIMEOUT) as resp:
                 if resp.status != 200:
                     self._log.warning("kb_cards.icon_status", url=url, status=resp.status)
                     return None
@@ -469,19 +480,28 @@ def _fmt_fame(value: int) -> str:
 
 
 def _read_file(path: Path) -> bytes | None:
-    """Read cached icon bytes, or ``None`` if the file is absent."""
+    """Read cached icon bytes, or ``None`` if absent OR empty. A 0-byte file is
+    treated as a MISS (re-fetch), not a valid cache hit — otherwise a truncated
+    write would blank that icon on every future card."""
     try:
-        return path.read_bytes()
-    except FileNotFoundError:
+        data = path.read_bytes()
+    except (FileNotFoundError, OSError):
         return None
-    except OSError:
-        return None
+    return data or None
 
 
 def _write_file(path: Path, data: bytes) -> None:
-    """Write icon bytes to the cache, creating the directory as needed."""
+    """Write icon bytes to the cache ATOMICALLY (tmp file + os.replace), so a
+    reader never observes a partial file if the process is killed mid-write."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        # If os.replace ran, tmp is gone; otherwise drop the partial temp file.
+        with contextlib.suppress(FileNotFoundError, OSError):
+            tmp.unlink()
 
 
 # ── Pillow compositor (runs under to_thread) ──────────────────────────────────

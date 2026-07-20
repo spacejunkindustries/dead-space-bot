@@ -269,14 +269,17 @@ class KillboardModule(BotModule):
     # ── shutdown ─────────────────────────────────────────────────────────────
 
     async def stop(self) -> None:
-        """Close the API session; idempotent and bounded (<2s).
+        """Close both aiohttp sessions; idempotent and bounded (<2s).
 
         The supervised loops are cancelled by the kernel's supervisor on
-        shutdown; this only releases the module's own resource — the shared
-        ``aiohttp`` session — which :meth:`KbApi.close` closes idempotently.
+        shutdown; this releases the module's own resources — the API client's
+        session AND the card renderer's own icon-fetch session (both
+        ``close()`` idempotently). Missing either leaks a session/connector.
         """
         if self._api is not None:
             await self._api.close()
+        if self._cards is not None:
+            await self._cards.close()
 
     # ── health (killboard GDD §10, §13) ──────────────────────────────────────
 
