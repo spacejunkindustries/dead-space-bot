@@ -456,15 +456,24 @@ class KbStore:
                 WHERE relation = 'DEATH' AND victim_id IS NOT NULL AND {window_sql}
                 GROUP BY victim_id
             )
-            SELECT COALESCE(k.pid, d.pid) AS player_id,
+            SELECT k.pid AS player_id,
                    COALESCE(k.name, d.name) AS player_name,
-                   COALESCE(k.k, 0) AS kills,
+                   k.k AS kills,
                    COALESCE(d.d, 0) AS deaths,
-                   COALESCE(k.f, 0) AS fame,
-                   CAST(COALESCE(k.k, 0) AS REAL)
+                   k.f AS fame,
+                   CAST(k.k AS REAL)
                        / CASE WHEN COALESCE(d.d, 0) = 0 THEN 1 ELSE d.d END AS kd
             FROM kills k
-            FULL OUTER JOIN deaths d ON k.pid = d.pid
+            LEFT JOIN deaths d ON k.pid = d.pid
+            UNION ALL
+            SELECT d.pid AS player_id,
+                   d.name AS player_name,
+                   0 AS kills,
+                   d.d AS deaths,
+                   0 AS fame,
+                   0.0 AS kd
+            FROM deaths d
+            WHERE d.pid NOT IN (SELECT pid FROM kills)
             ORDER BY {order}
             LIMIT ?
         """
