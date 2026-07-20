@@ -642,7 +642,14 @@ def _load_font(size: int) -> Any:
             return ImageFont.truetype(name, size)
         except OSError:
             continue
-    return ImageFont.load_default()
+    # No system DejaVu (e.g. a minimal CI runner). Pillow ≥10.1 bundles a
+    # scalable default via load_default(size=...) that supports the anchor=
+    # kwarg the compositor relies on; the bare load_default() returns a fixed
+    # bitmap font that raises on anchors, so prefer the sized form.
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # pragma: no cover - only on Pillow <10.1
+        return ImageFont.load_default()
 
 
 def _paste_icon(canvas: Any, data: bytes, box: tuple[int, int], size: int) -> None:

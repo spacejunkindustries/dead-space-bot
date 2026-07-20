@@ -20,4 +20,6 @@ numpy>=1.26              # audio/wake.py, audio/stt.py — PCM frame views and m
 anthropic>=0.60          # chat.py — the §6.6 "command override" assistant (opt-in)
 # ── killboard add-on (Albion Online) — only used when the module is enabled ──
 aiohttp>=3.9             # killboard/api.py — async gameinfo client + icon fetch (NOT for voice)
-pillow>=10.0             # killboard/cards.py — kill-card image compositing
+pillow>=10.1             # killboard/cards.py — kill-card image compositing
+                         # (>=10.1 for load_default(size=...), used when the box
+                         #  has no system DejaVu font; anchors need a scalable font)

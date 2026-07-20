@@ -211,6 +211,32 @@ def test_compose_card_without_brand_or_value_still_renders() -> None:
     assert png is not None and png[:8] == _PNG_MAGIC
 
 
+def test_compositors_render_without_system_dejavu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both compositors must render on a box with NO system DejaVu font (a minimal
+    CI runner): _load_font falls back to Pillow's bundled scalable default, which
+    must still support the anchor= draws. Guards the CI-only font regression."""
+    from PIL import ImageFont
+
+    from killboard import cards as cards_mod
+
+    real_truetype = ImageFont.truetype
+
+    def _no_dejavu(name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if isinstance(name, str) and "DejaVu" in name:
+            raise OSError("simulated: no system DejaVu")
+        return real_truetype(name, *args, **kwargs)
+
+    monkeypatch.setattr(cards_mod.ImageFont, "truetype", _no_dejavu)
+
+    rk = DailyRanking(210762, 1049806, [("DjPoppy", 116340)], [("Snapjlr", 708860)])
+    ranking_png = _compose_ranking_card(rk, "Jul 19", "Daily Ranking", "DEAD", _brand(), None)
+    assert ranking_png is not None and ranking_png[:8] == _PNG_MAGIC
+
+    fields = {"relation": "KILL", "killer_name": "A", "victim_name": "B", "total_fame": 5}
+    kill_png = _compose_card(fields, [], [], {}, [], _brand(), 5)
+    assert kill_png is not None and kill_png[:8] == _PNG_MAGIC
+
+
 # ── renderer contract: a config-shape mismatch must degrade, never raise ───────
 
 
