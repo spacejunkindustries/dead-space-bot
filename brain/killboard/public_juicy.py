@@ -31,6 +31,7 @@ import contextlib
 import io
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import discord
@@ -58,6 +59,20 @@ _SEEN_CAP: int = 2000
 #: Bound on how long the whole loot-pricing step for one kill may take, so a slow
 #: AODP can never stall the scan loop (mirrors the guild feed's guard).
 _LOOT_TIMEOUT_S: float = 6.0
+
+
+@dataclass(frozen=True, slots=True)
+class _Candidate:
+    """One qualifying global kill, scored for the per-scan top-N ranking.
+
+    ``score`` is the loot value when priced, else the fame — so the cap keeps the
+    juiciest (biggest) kills and drops the long tail of merely-qualifying ones.
+    """
+
+    score: int
+    raw: dict[str, Any]
+    row: Any
+    loot_value: int | None
 
 
 class PublicJuicyFeed:
@@ -118,7 +133,14 @@ class PublicJuicyFeed:
     # ── one scan ─────────────────────────────────────────────────────────────
 
     async def _scan_once(self) -> None:
-        """Fetch the top pages of the global feed and post the notable, unseen ones."""
+        """Scan the global feed, then post only the BIGGEST few that qualify.
+
+        Every geared-player kill on a whole server prices in the millions, so a
+        raw threshold on the firehose lets dozens through per scan. The hard cap
+        (``max_posts_per_scan``) is the real volume control: all qualifiers in the
+        scanned window are ranked by value (loot, else fame) and only the top ``N``
+        are posted — the juiciest handful, never the whole window.
+        """
         kb = self._cfg_provider().killboard
         pj = kb.public_juicy
         if not pj.enabled:
@@ -131,8 +153,9 @@ class PublicJuicyFeed:
         min_fame = kb.feed.juicy_min_fame
         min_loot = kb.feed.juicy_min_loot
         market_on = self._market is not None and getattr(kb.market, "enabled", False)
+        cap = max(1, pj.max_posts_per_scan)
 
-        posted = 0
+        candidates: list[_Candidate] = []
         for page in range(max(1, pj.scan_pages)):
             if self._shutting_down():
                 break
@@ -142,23 +165,41 @@ class PublicJuicyFeed:
             for raw in events:
                 if self._shutting_down():
                     break
-                if await self._maybe_post(raw, channel_id, min_fame, min_loot, market_on):
-                    posted += 1
-        if posted:
-            self._log.info("kb_public_juicy.posted", count=posted)
+                cand = await self._evaluate(raw, min_fame, min_loot, market_on)
+                if cand is not None:
+                    candidates.append(cand)
 
-    async def _maybe_post(
-        self,
-        raw: dict[str, Any],
-        channel_id: int,
-        min_fame: int,
-        min_loot: int,
-        market_on: bool,
-    ) -> bool:
-        """Qualify one global event (fame-first, loot-second) and post it if new."""
+        if not candidates:
+            return
+        # Post the biggest first; the cap drops the rest of this window's tail.
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        posted = 0
+        for cand in candidates[:cap]:
+            if self._shutting_down():
+                break
+            if await self._post(cand, channel_id):
+                posted += 1
+        if posted or len(candidates) > cap:
+            self._log.info(
+                "kb_public_juicy.posted",
+                count=posted,
+                qualified=len(candidates),
+                capped=max(0, len(candidates) - cap),
+            )
+
+    async def _evaluate(
+        self, raw: dict[str, Any], min_fame: int, min_loot: int, market_on: bool
+    ) -> _Candidate | None:
+        """Qualify one global event (fame-first, loot-second); mark it seen.
+
+        Returns a scored :class:`_Candidate` when it clears a bar, else ``None``.
+        Every event evaluated is remembered (the tiny global window rolls over in
+        seconds), so a qualifier dropped by the cap is not re-priced next scan.
+        """
         row = parse_public_event(raw)
         if row is None or row.event_id in self._seen:
-            return False
+            return None
+        self._remember(row.event_id)
 
         # FAME first — free, straight off the event. LOOT second — only priced
         # when fame missed and the market layer is on (the OR gate; low-fame/high-
@@ -167,7 +208,7 @@ class PublicJuicyFeed:
         if row.total_fame >= min_fame:
             qualifies = True
             if market_on:
-                loot_value = await self._loot_value(raw)  # nice-to-have on the card
+                loot_value = await self._loot_value(raw)  # for ranking + the card
         elif market_on and min_loot > 0:
             loot_value = await self._loot_value(raw)
             qualifies = loot_value is not None and loot_value >= min_loot
@@ -175,18 +216,23 @@ class PublicJuicyFeed:
             qualifies = False
 
         if not qualifies:
-            self._remember(row.event_id)  # don't re-price it next scan
-            return False
+            return None
+        score = loot_value if loot_value is not None else row.total_fame
+        return _Candidate(score=score, raw=raw, row=row, loot_value=loot_value)
 
-        killer_guild = _guild_name(raw.get("Killer"))
-        victim_guild = _guild_name(raw.get("Victim"))
+    async def _post(self, cand: _Candidate, channel_id: int) -> bool:
+        """Render and post one qualifying kill to the juicy channel."""
+        killer_guild = _guild_name(cand.raw.get("Killer"))
+        victim_guild = _guild_name(cand.raw.get("Victim"))
         embed = build_embed(
-            row, [], killer_guild=killer_guild, victim_guild=victim_guild, loot_value=loot_value
+            cand.row,
+            [],
+            killer_guild=killer_guild,
+            victim_guild=victim_guild,
+            loot_value=cand.loot_value,
         )
-        png = await self._render(row, raw, loot_value)
-        sent = await self._send(channel_id, embed, png, row.event_id)
-        self._remember(row.event_id)  # mark seen whether or not the send worked
-        return sent
+        png = await self._render(cand.row, cand.raw, cand.loot_value)
+        return await self._send(channel_id, embed, png, cand.row.event_id)
 
     # ── helpers ──────────────────────────────────────────────────────────────
 

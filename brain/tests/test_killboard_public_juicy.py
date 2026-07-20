@@ -87,13 +87,16 @@ def _cfg(
     min_loot: int = 1_000_000,
     market: bool = False,
     scan_pages: int = 1,
+    max_posts: int = 5,
 ) -> SimpleNamespace:
     kb = KillboardConfig(
         feed=KbFeedConfig(
             juicy_channel=juicy_channel, juicy_min_fame=min_fame, juicy_min_loot=min_loot
         ),
         market=KbMarketConfig(enabled=market),
-        public_juicy=KbPublicJuicyConfig(enabled=enabled, scan_pages=scan_pages),
+        public_juicy=KbPublicJuicyConfig(
+            enabled=enabled, scan_pages=scan_pages, max_posts_per_scan=max_posts
+        ),
     )
     return SimpleNamespace(killboard=kb)
 
@@ -150,6 +153,24 @@ async def test_low_fame_low_loot_is_skipped(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert channel.sent == []
     assert 1 in feed._seen  # remembered, so the next scan won't re-price it
+
+
+async def test_cap_limits_posts_per_scan_to_the_biggest() -> None:
+    """The hard cap is the volume control: with many qualifiers, only the top-N
+    (by value) post — a low threshold on the global firehose can't flood."""
+    channel = _OkChannel()
+    # Six kills all clear the 2M fame bar; cap is 2 → only two post.
+    api = _Api([_raw_kill(i, fame=2_000_000 + i) for i in range(1, 7)])
+    feed = _feed(_Bot({JUICY_CHANNEL: channel}), api, _cfg(market=False, max_posts=2))
+
+    await feed._scan_once()
+
+    assert len(channel.sent) == 2  # capped, not all six
+    # All six were still evaluated + remembered, so the next scan re-posts nothing.
+    assert len(feed._seen) == 6
+    channel.sent.clear()
+    await feed._scan_once()
+    assert channel.sent == []
 
 
 async def test_dedup_across_scans() -> None:
