@@ -42,7 +42,7 @@ from killboard.config import USER_AGENT, render_icon_url
 from killboard.model import Participant
 
 try:  # Pillow is a declared dependency, but honour "Pillow fails → None" (§7.1).
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageChops, ImageDraw, ImageFont
 
     _PIL_OK = True
 except Exception:  # pragma: no cover - only when Pillow is genuinely absent
@@ -171,6 +171,11 @@ _DC_DMG_SEGMENTS: tuple[tuple[int, int, int], ...] = (
     (150, 110, 60),
 )
 _DC_HEAL_COLOR: tuple[int, int, int] = (60, 160, 90)
+
+#: Opacity of the reaper-mascot background emblem on the detailed kill card —
+#: faint enough to read as a Dead Gaming watermark behind the content, not
+#: compete with it. The corner roundel is a separate, opaque mark.
+_REAPER_OPACITY: float = 0.10
 
 #: Daily-ranking card geometry (a taller two-column board).
 _RANK_W: int = 720
@@ -329,6 +334,11 @@ class CardRenderer:
             brand = await self._brand_style(cards)
             show_value = loot_value if getattr(cards, "show_loot_value", True) else None
             header = _header_data(event_row, raw, killer, victim)
+            mascot = (
+                await self._cached_file(_BRAND_MASCOT_DEFAULT)
+                if getattr(cards, "reaper_watermark", True)
+                else None
+            )
 
             return await self._to_thread(
                 _compose_card,
@@ -340,6 +350,7 @@ class CardRenderer:
                 icons,
                 brand,
                 show_value,
+                mascot,
             )
         except Exception as exc:  # never let a card crash the feed (§7.1, §13)
             self._log.warning("kb_cards.render_failed", error=str(exc))
@@ -959,6 +970,40 @@ def _dc_paperdoll(
     return oy + 4 * step
 
 
+def _reaper_background(content: Any, mascot: bytes | None) -> Any:
+    """Composite the finished card over a faint, centred reaper emblem.
+
+    ``content`` is the rendered card (opaque). The reaper is drawn on a fresh
+    background at :data:`_REAPER_OPACITY`, then the card's non-background pixels
+    are laid over it via a difference mask — so the emblem shows only through the
+    card's empty gaps (centre column, margins), never over icons or text. Returns
+    ``content`` unchanged on any failure (branding is decorative, §7.1)."""
+    if not mascot:
+        return content
+    try:
+        w, h = content.size
+        with Image.open(io.BytesIO(mascot)) as img:
+            m = img.convert("RGBA")
+        target_h = int(h * 0.86)
+        scale = target_h / m.height
+        m = m.resize((max(1, int(m.width * scale)), target_h))
+        alpha = m.getchannel("A").point(lambda a: int(a * _REAPER_OPACITY))
+        m.putalpha(alpha)
+        bg = Image.new("RGB", (w, h), _COLOR_BG)
+        bg.paste(m, ((w - m.width) // 2, int(h * 0.07)), m)
+        # Mask = where the card differs from a flat background → its real content.
+        flat = Image.new("RGB", (w, h), _COLOR_BG)
+        mask = (
+            ImageChops.difference(content.convert("RGB"), flat)
+            .convert("L")
+            .point(lambda p: 255 if p > 2 else 0)
+        )
+        bg.paste(content, (0, 0), mask)
+        return bg
+    except Exception:  # emblem is decorative — never fail the card over it (§7.1)
+        return content
+
+
 def _compose_card(
     header: Mapping[str, Any],
     killer_equip: dict[str, dict[str, Any]],
@@ -968,6 +1013,7 @@ def _compose_card(
     icons: Mapping[str, bytes],
     brand: BrandStyle | None = None,
     loot_value: int | None = None,
+    mascot: bytes | None = None,
 ) -> bytes | None:
     """Composite the detailed Albion-style kill card to PNG bytes (killboard §7.1).
 
@@ -1123,6 +1169,7 @@ def _compose_card(
         dy += 26
 
         out = canvas.crop((0, 0, w, min(dy, canvas.height)))
+        out = _reaper_background(out, mascot)
         buffer = io.BytesIO()
         out.save(buffer, format="PNG")
         return buffer.getvalue()

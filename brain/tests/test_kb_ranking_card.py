@@ -384,3 +384,37 @@ def test_detailed_card_renders_full_layout() -> None:
         _kill_header(), killer_equip, victim_equip, inventory, participants, {}, _brand(), 15090028
     )
     assert png is not None and png[:8] == _PNG_MAGIC
+
+
+@_needs_pil
+def test_reaper_watermark_composites_and_degrades() -> None:
+    """The reaper emblem composites behind the card, and bad mascot bytes degrade
+    to the plain card rather than failing the render."""
+    import io
+
+    from PIL import Image
+
+    from killboard.cards import _reaper_background
+
+    # A tiny real PNG as the mascot.
+    buf = io.BytesIO()
+    Image.new("RGBA", (40, 60), (225, 18, 18, 255)).save(buf, format="PNG")
+    mascot = buf.getvalue()
+
+    with_wm = _compose_card(
+        _kill_header(),
+        {"Head": {"Type": "T6_HEAD", "Quality": 2}},
+        {},
+        [],
+        [],
+        {},
+        _brand(),
+        1000,
+        mascot,
+    )
+    assert with_wm is not None and with_wm[:8] == _PNG_MAGIC
+
+    # Bad mascot bytes must not break the card (_reaper_background returns content).
+    content = Image.new("RGB", (100, 80), (28, 30, 33))
+    assert _reaper_background(content, b"not a png") is content
+    assert _reaper_background(content, None) is content

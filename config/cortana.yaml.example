@@ -336,6 +336,7 @@ killboard:                             # Albion Online killboard add-on — OPTI
     accent_color: "#E11212"            # card accent (#RRGGBB) — headers, rank boards
     show_loot_value: true              # print loot value on kill cards (needs market.enabled)
     daily_ranking_card: true           # attach the branded Daily Ranking image to daily posts
+    reaper_watermark: true             # faint Dead reaper emblem behind the kill card
   rankings:
     timezone: UTC                      # window boundaries for daily/weekly/monthly rankings
   battles:

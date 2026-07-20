@@ -1415,6 +1415,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `killboard.cards.accent_color` | str | `'#E11212'` | hot | Card accent colour as #RRGGBB (headers, rank boards). |
 | `killboard.cards.show_loot_value` | bool | `True` | hot | Print estimated loot value on kill cards (needs killboard.market.enabled). |
 | `killboard.cards.daily_ranking_card` | bool | `True` | hot | Attach a branded Daily Ranking image to the daily scheduled post. |
+| `killboard.cards.reaper_watermark` | bool | `True` | hot | Faint Dead reaper emblem behind the kill card (the corner roundel is separate). |
 | `killboard.rankings.timezone` | str | `'UTC'` | hot | Timezone for daily/weekly/monthly ranking windows and schedules. |
 | `killboard.battles.channel` | int | `0` | hot | Optional battle-summary channel. 0 = battle posting off. |
 | `killboard.battles.min_players` | int | `20` | hot | Minimum guild participants for a battle to post (killboard GDD §9). |

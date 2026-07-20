@@ -1253,6 +1253,13 @@ KEYS: Final[tuple[Key, ...]] = (
         default=True,
     ),
     Key(
+        "killboard.cards.reaper_watermark",
+        "bool",
+        Reload.HOT,
+        "Faint Dead reaper emblem behind the kill card (the corner roundel is separate).",
+        default=True,
+    ),
+    Key(
         "killboard.rankings.timezone",
         "str",
         Reload.HOT,
