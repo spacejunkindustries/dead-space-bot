@@ -159,6 +159,27 @@ class FasterWhisperTranscriber:
                 self._transcribe_params_cache = frozenset()
         return self._transcribe_params_cache
 
+    def _bias_kwargs(self, supported: frozenset[str], bias: str) -> dict[str, str]:
+        """Which gazetteer-biasing kwarg to hand faster-whisper — EXACTLY ONE
+        channel, never both (GDD §5.3).
+
+        faster-whisper prepends BOTH ``initial_prompt`` AND ``hotwords`` to the
+        decoder; passing the (long) bias in both doubled the prefix past the
+        model's 448-token position limit ("No position encodings ... got
+        position 449"), which failed EVERY decode (live incident, base model).
+        ``hotwords`` is the better mechanism — it biases every decode window,
+        not just the first — so prefer it and fall back to ``initial_prompt``
+        only where the backend lacks it. The hard char cap keeps even one
+        channel comfortably inside the token budget regardless of how wide the
+        gazetteer prompt is configured. Pure (no model, no numpy) so the
+        channel-selection logic is unit-testable on its own."""
+        if not (self._cfg.bias_with_gazetteer and bias):
+            return {}
+        clipped = bias[:_MAX_BIAS_CHARS]
+        if "hotwords" in supported:
+            return {"hotwords": clipped}
+        return {"initial_prompt": clipped}
+
     def transcribe(self, pcm16k: bytes, bias: str) -> TranscriptResult:
         import numpy as np  # lazy
 
@@ -196,22 +217,7 @@ class FasterWhisperTranscriber:
         if "vad_filter" not in supported:
             log.warning("stt_kwarg_unsupported", kwarg="vad_filter")
             kwargs.pop("vad_filter", None)
-        if self._cfg.bias_with_gazetteer and bias:
-            # Gazetteer biasing (GDD §5.3) through EXACTLY ONE channel — never
-            # both. faster-whisper prepends BOTH initial_prompt AND hotwords to
-            # the decoder; passing the (long) bias in both doubled the prefix
-            # past the model's 448-token position limit ("No position encodings
-            # ... got position 449"), which failed EVERY decode (live incident,
-            # base model). hotwords is the better mechanism — it biases every
-            # window, not just the first — so prefer it and fall back to
-            # initial_prompt only where the backend lacks it. The hard char cap
-            # keeps even one channel comfortably inside the token budget
-            # regardless of how wide the gazetteer prompt is configured.
-            clipped = bias[:_MAX_BIAS_CHARS]
-            if "hotwords" in supported:
-                kwargs["hotwords"] = clipped
-            else:
-                kwargs["initial_prompt"] = clipped
+        kwargs.update(self._bias_kwargs(supported, bias))
         segments, _info = model.transcribe(audio, **kwargs)
 
         texts: list[str] = []
