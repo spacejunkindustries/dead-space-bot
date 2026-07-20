@@ -291,6 +291,15 @@ class AuraBot(commands.Bot):
         ):
             await self.add_cog(cog)
 
+        # Add-on module components (dead/ kernel), registered AFTER the core
+        # cogs so a broken add-on can never displace CORTANA's own commands.
+        # Populated by App.setup(); absent (empty) when no add-on is enabled.
+        module_items = tuple(getattr(self, "module_dynamic_items", ()))
+        if module_items:
+            self.add_dynamic_items(*module_items)
+        for cog in getattr(self, "module_cogs", ()):
+            await self.add_cog(cog)
+
         # tree.sync is OUT of the startup critical path: it is hash-gated,
         # background, and failure-tolerant (TREE_SYNC_STALE alarm) — a 429 or
         # a wrong guild_id can no longer crash-loop the whole Brain against a
@@ -352,6 +361,11 @@ class AuraBot(commands.Bot):
         # Pilots may already be in voice when Brain (re)starts — no voice
         # event will fire for them, so seed the census once.
         await self._seed_voice_census()
+        # Add-on modules get their on_ready after the census is seeded. Absent
+        # (and a no-op) when no add-on is enabled.
+        modules = getattr(self, "modules", None)
+        if modules is not None:
+            await modules.on_ready()
 
     async def _load_routing_rules(self) -> None:
         """Load routing.yaml through the engine (same path as /routing reload
