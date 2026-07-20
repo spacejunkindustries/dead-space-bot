@@ -1401,6 +1401,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `killboard.feed.min_fame` | int | `0` | hot | Suppress kills below this fame from the main feed. 0 = show all. |
 | `killboard.feed.juicy_channel` | int | `0` | hot | Optional highlights channel for high-value kills. 0 = off. |
 | `killboard.feed.juicy_min_fame` | int | `2000000` | hot | Fame threshold for a kill to also post to juicy_channel. |
+| `killboard.feed.juicy_min_loot` | int | `0` | hot | Loot-value (silver) threshold for a kill to also post to juicy_channel; catches low-fame/high-loot ganks. 0 = off; needs killboard.market.enabled. |
 | `killboard.feed.ignore_deaths_below_ip` | int | `0` | hot | Skip low-item-power 'naked' deaths that just clutter the feed. 0 = none. |
 | `killboard.feed.blob_participant_threshold` | int | `20` | hot | Kills with participant counts above this are flagged as blob/ZvZ and may route to blob_channel. |
 | `killboard.feed.blob_channel` | int | `0` | hot | Optional ZvZ channel for blob kills. 0 = keep them in the main feed. |

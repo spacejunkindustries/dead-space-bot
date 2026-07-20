@@ -318,7 +318,10 @@ killboard:                             # Albion Online killboard add-on — OPTI
     deaths_channel: 0                  # channel id for guild deaths (may equal kills_channel)
     min_fame: 0                        # suppress kills below this fame from the main feed
     juicy_channel: 0                   # optional highlights channel for big kills (0 = off)
-    juicy_min_fame: 2000000
+    juicy_min_fame: 2000000            # mirror to juicy when kill FAME >= this
+    juicy_min_loot: 0                  # mirror to juicy when LOOT value (silver) >= this —
+                                       # catches low-fame/high-loot ganks. 0 = off;
+                                       # needs killboard.market.enabled. e.g. 1000000
     ignore_deaths_below_ip: 0          # skip low-IP "naked" deaths (0 = keep them)
     blob_participant_threshold: 20     # kills bigger than this are flagged blob/ZvZ
     blob_channel: 0                    # optional ZvZ channel (0 = keep in main feed)
