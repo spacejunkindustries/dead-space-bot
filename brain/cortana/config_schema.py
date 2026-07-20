@@ -521,7 +521,10 @@ KEYS: Final[tuple[Key, ...]] = (
         "stt.bias_with_gazetteer",
         "bool",
         Reload.RESTART,
-        "Pass system names as the Whisper initial_prompt.",
+        "Bias Whisper toward the gazetteer's system names (via hotwords, or "
+        "initial_prompt on older faster-whisper) — through exactly one channel, "
+        "hard-capped so a wide include_all prompt can't overflow the decoder's "
+        "448-token position limit.",
         default=True,
     ),
     Key(
@@ -558,6 +561,19 @@ KEYS: Final[tuple[Key, ...]] = (
         "What unmatched speech may become a relay card (GDD §8.6).",
         default="framed",
         choices=("framed", "open", "off"),
+    ),
+    Key(
+        "stt.no_repeat_ngram_size",
+        "int",
+        Reload.HOT,
+        "faster-whisper repetition guard (GDD §5.3): forbid any n-gram of this "
+        "length from repeating in a decode, breaking the noisy-audio loops "
+        'where one system name is emitted dozens of times ("0-R5TS, 0-R5TS, '
+        '…") at high confidence — which buries the callout and starves '
+        "streaming's early-commit. 3 is safe for real speech; 0 disables. "
+        "Ignored where the installed faster-whisper predates the parameter.",
+        default=3,
+        minimum=0,
     ),
     # matching
     Key(
