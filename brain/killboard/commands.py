@@ -534,6 +534,61 @@ class KillboardCog(commands.Cog):
             embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
         )
 
+    @killboard.command(
+        name="schedule-add",
+        description="(admin) Set an automated daily/weekly/monthly ranking post.",
+    )
+    @app_commands.describe(
+        kind="how often to post the ranking",
+        channel="channel the ranking is posted to",
+        hour_utc="hour of day in UTC to post (0-23)",
+    )
+    @app_commands.check(_is_admin)
+    async def schedule_add(
+        self,
+        interaction: discord.Interaction,
+        kind: Literal["daily", "weekly", "monthly"],
+        channel: discord.TextChannel,
+        hour_utc: app_commands.Range[int, 0, 23],
+    ) -> None:
+        """Create/replace the ``kind`` scheduled ranking post (§8.3).
+
+        One row per kind: adding a ``daily`` replaces any existing daily. The
+        scheduler picks it up on its next tick (within ~60s) and posts the
+        completed period's ranking at ``hour_utc``:00 UTC.
+        """
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self._to_thread(_upsert_schedule, self._store, kind, channel.id, int(hour_utc))
+        await interaction.followup.send(
+            f"✅ **{kind.capitalize()} ranking** will post to {channel.mention} at "
+            f"**{int(hour_utc):02d}:00 UTC** — it reports the completed {kind[:-2]}"
+            f"{'y' if kind == 'daily' else ''} and fires on the next scheduler tick.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @killboard.command(
+        name="schedule-remove", description="(admin) Stop an automated ranking post."
+    )
+    @app_commands.describe(kind="which scheduled post to remove")
+    @app_commands.check(_is_admin)
+    async def schedule_remove(
+        self,
+        interaction: discord.Interaction,
+        kind: Literal["daily", "weekly", "monthly"],
+    ) -> None:
+        """Remove the ``kind`` scheduled ranking post (§8.3)."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        removed = await self._to_thread(_delete_schedule, self._store, kind)
+        msg = (
+            f"🗑️ Removed the **{kind}** ranking post."
+            if removed
+            else f"No **{kind}** ranking post was configured."
+        )
+        await interaction.followup.send(
+            msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        )
+
 
 # ── blocking store helpers (run inside to_thread) ─────────────────────────────
 #
@@ -625,6 +680,30 @@ def _list_schedules(store: KbStore) -> list[sqlite3.Row]:
         store._conn,  # noqa: SLF001 — killboard's own schedules table
         "SELECT id, kind, channel_id, hour_utc, last_run FROM schedules ORDER BY kind, hour_utc",
     )
+
+
+def _upsert_schedule(store: KbStore, kind: str, channel_id: int, hour_utc: int) -> None:
+    """Create or update the ``kind`` schedule (one row per kind) (§8.3).
+
+    Replaces any existing row of that kind so a guild has at most one daily /
+    weekly / monthly post, and clears ``last_run`` so the new schedule can fire
+    on the next tick. Blocking — call inside ``to_thread``.
+    """
+    conn = store._conn  # noqa: SLF001 — killboard's own schedules table
+    db.execute(conn, "DELETE FROM schedules WHERE kind = ?", (kind,))
+    db.execute(
+        conn,
+        "INSERT INTO schedules (kind, channel_id, hour_utc, last_run) VALUES (?, ?, ?, NULL)",
+        (kind, channel_id, hour_utc),
+    )
+
+
+def _delete_schedule(store: KbStore, kind: str) -> int:
+    """Remove the ``kind`` schedule; returns how many rows were deleted (§8.3)."""
+    conn = store._conn  # noqa: SLF001 — killboard's own schedules table
+    before = db.query_value(conn, "SELECT COUNT(*) FROM schedules WHERE kind = ?", (kind,)) or 0
+    db.execute(conn, "DELETE FROM schedules WHERE kind = ?", (kind,))
+    return int(before)
 
 
 # ── pure formatting helpers ───────────────────────────────────────────────────

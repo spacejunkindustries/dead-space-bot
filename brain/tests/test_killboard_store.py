@@ -180,3 +180,31 @@ def test_leaderboard_dfame_ranks_by_death_fame(store: KbStore) -> None:
     assert [(r["player_id"], r["dfame"]) for r in rows] == [("V1", 708000), ("V2", 6000)]
     # Every row carries the new dfame column even for the kill board.
     assert all("dfame" in r for r in rows)
+
+
+# ── schedule add/remove admin helpers (drive the daily-ranking scheduler) ──────
+
+
+def test_schedule_upsert_list_and_remove(store: KbStore) -> None:
+    """/killboard schedule-add creates one row per kind (replacing on re-add) and
+    schedule-remove deletes it — the rows the scheduler fires from."""
+    from killboard.commands import _delete_schedule, _list_schedules, _upsert_schedule
+
+    _upsert_schedule(store, "daily", 111, 12)
+    _upsert_schedule(store, "weekly", 222, 8)
+    rows = _list_schedules(store)
+    assert {(r["kind"], r["channel_id"], r["hour_utc"]) for r in rows} == {
+        ("daily", 111, 12),
+        ("weekly", 222, 8),
+    }
+    assert all(r["last_run"] is None for r in rows)
+
+    # Re-adding a kind replaces it (at most one daily) and re-arms last_run.
+    _upsert_schedule(store, "daily", 999, 5)
+    daily = [r for r in _list_schedules(store) if r["kind"] == "daily"]
+    assert len(daily) == 1
+    assert (daily[0]["channel_id"], daily[0]["hour_utc"]) == (999, 5)
+
+    assert _delete_schedule(store, "daily") == 1
+    assert _delete_schedule(store, "daily") == 0  # already gone
+    assert {r["kind"] for r in _list_schedules(store)} == {"weekly"}
