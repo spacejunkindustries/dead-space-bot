@@ -616,6 +616,57 @@ def check_placeholder_ids(ctx: DoctorContext) -> list[CheckResult]:
     ]
 
 
+def check_killboard(ctx: DoctorContext) -> list[CheckResult]:
+    """Killboard add-on preflight (offline). Skipped when disabled so a
+    voice-only deploy stays green. When enabled, checks config coherence and
+    that its own data dir is writable — network reachability (region host,
+    guild resolution) is verified at module start, not here (killboard GDD)."""
+    assert ctx.cfg is not None
+    kb = ctx.cfg.killboard
+    if not kb.enabled:
+        return [CheckResult("killboard", Status.PASS, "disabled — killboard checks skipped")]
+    results: list[CheckResult] = []
+    if not (kb.guild_id or kb.guild_name):
+        results.append(
+            CheckResult(
+                "killboard.guild",
+                Status.FAIL,
+                "enabled but no guild_id/guild_name set",
+                "set killboard.guild_name (or guild_id)",
+                config_error=True,
+            )
+        )
+    if not (kb.feed.kills_channel or kb.feed.deaths_channel):
+        results.append(
+            CheckResult(
+                "killboard.feed",
+                Status.FAIL,
+                "enabled but no kills_channel/deaths_channel set",
+                "set killboard.feed.kills_channel (or deaths_channel)",
+                config_error=True,
+            )
+        )
+    db_dir = Path(kb.storage.db_path).parent
+    if not os.access(db_dir, os.W_OK):
+        results.append(
+            CheckResult(
+                "killboard.storage",
+                Status.WARN,
+                f"{db_dir} not writable by this user",
+                "install.sh creates /var/lib/cortana/killboard owned by aura",
+            )
+        )
+    if not results:
+        results.append(
+            CheckResult(
+                "killboard",
+                Status.PASS,
+                f"enabled, region {kb.region}, guild + feed configured",
+            )
+        )
+    return results
+
+
 #: Checks that need a valid config; run in order after ``check_config``.
 OFFLINE_CHECKS: tuple[Check, ...] = (
     check_gazetteer_yaml,
@@ -627,6 +678,7 @@ OFFLINE_CHECKS: tuple[Check, ...] = (
     check_database,
     check_ipc_socket,
     check_placeholder_ids,
+    check_killboard,
 )
 
 
