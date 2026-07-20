@@ -532,6 +532,32 @@ class KbStalenessConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class KbMarketConfig:
+    """Albion market-data layer (AODP). Prices item loot value onto kill cards
+    and powers the /market lookup commands. Optional; OFF by default (it hits a
+    third, crowd-sourced API, so it's opt-in). Region is inherited from
+    ``killboard.region`` — the AODP host is derived from it."""
+
+    enabled: bool = False
+    #: In-memory price-cache TTL. Prices move on the minute at most, so caching
+    #: hard keeps well under the AODP rate limit (180/min).
+    cache_ttl_s: int = 300
+    request_timeout_s: int = 10
+    #: Default item quality (1 Normal … 5 Masterpiece) when a lookup omits it.
+    default_quality: int = 1
+    #: Cities compared by /market price and used to reference-price kill loot.
+    default_cities: tuple[str, ...] = (
+        "Caerleon",
+        "Bridgewatch",
+        "Lymhurst",
+        "Martlock",
+        "Fort Sterling",
+        "Thetford",
+    )
+    user_agent: str = "DeadBot-Killboard (self-hosted; contact your guild admin)"
+
+
+@dataclass(frozen=True, slots=True)
 class KillboardConfig:
     """Albion Online killboard add-on (killboard GDD). Optional section; OFF by
     default — the module only starts when ``enabled`` is set AND a guild AND a
@@ -552,6 +578,7 @@ class KillboardConfig:
     battles: KbBattlesConfig = field(default_factory=KbBattlesConfig)
     storage: KbStorageConfig = field(default_factory=KbStorageConfig)
     staleness: KbStalenessConfig = field(default_factory=KbStalenessConfig)
+    market: KbMarketConfig = field(default_factory=KbMarketConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -999,6 +1026,14 @@ def _assemble_killboard(v: dict[str, Any]) -> KillboardConfig:
         staleness=KbStalenessConfig(
             warn_after_minutes=v["killboard.staleness.warn_after_minutes"],
             no_events_notice_hours=v["killboard.staleness.no_events_notice_hours"],
+        ),
+        market=KbMarketConfig(
+            enabled=v["killboard.market.enabled"],
+            cache_ttl_s=v["killboard.market.cache_ttl_s"],
+            request_timeout_s=v["killboard.market.request_timeout_s"],
+            default_quality=v["killboard.market.default_quality"],
+            default_cities=v["killboard.market.default_cities"],
+            user_agent=v["killboard.market.user_agent"],
         ),
     )
 

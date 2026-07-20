@@ -339,6 +339,22 @@ killboard:                             # Albion Online killboard add-on — OPTI
   staleness:
     warn_after_minutes: 30             # no successful poll this long → shown in /killboard status
     no_events_notice_hours: 6          # no NEW events this long → "guild is quiet" (not an error)
+  market:                              # Albion market data (AODP) — OPTIONAL, OFF by default.
+                                       # Prices loot value onto kill cards + enables /market commands.
+                                       # Uses the crowd-sourced Albion Online Data Project API
+                                       # (host derived from killboard.region).
+    enabled: false
+    cache_ttl_s: 300                   # cache a price lookup this long (respects the AODP rate limit)
+    request_timeout_s: 10
+    default_quality: 1                 # 1 Normal · 2 Good · 3 Outstanding · 4 Excellent · 5 Masterpiece
+    default_cities:                    # cities compared by /market + used to price kill loot
+      - Caerleon
+      - Bridgewatch
+      - Lymhurst
+      - Martlock
+      - Fort Sterling
+      - Thetford
+    user_agent: "DeadBot-Killboard (self-hosted; contact your guild admin)"
 
 routing:
   file: ""                             # routing.yaml location (GDD §10.1). "" (the default)

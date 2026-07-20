@@ -26,6 +26,8 @@ include = ["cortana*", "dead*", "killboard*"]
 # The bundled fact/insult library (GDD §13.2) — plain JSON, loaded once at
 # startup via importlib.resources.
 cortana = ["data/facts/*.json"]
+# The Albion item id↔name database (ao-bin-dumps) for the market layer.
+killboard = ["data/*.txt", "migrations/*.sql"]
 
 [tool.ruff]
 line-length = 100
