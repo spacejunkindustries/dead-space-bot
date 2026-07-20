@@ -197,26 +197,35 @@ def test_compose_ranking_card_empty_boards_still_renders() -> None:
     assert png is not None and png[:8] == _PNG_MAGIC
 
 
-@_needs_pil
-def test_compose_card_with_brand_and_loot_value() -> None:
-    fields = {
-        "relation": "KILL",
+def _kill_header(relation: str = "KILL", fame: int = 204880) -> dict:
+    return {
+        "relation": relation,
         "killer_name": "DjPoppy",
         "victim_name": "Snapjlr",
+        "killer_guild": "DEAD Renegadez",
+        "victim_guild": "Enemy",
         "killer_ip": 1350,
         "victim_ip": 1290,
-        "total_fame": 204880,
-        "location": "Bridgewatch",
+        "fame": fame,
         "timestamp": "2026-07-20T09:26:00",
     }
-    png = _compose_card(fields, [], [], {}, [], _brand(), 204880)
+
+
+@_needs_pil
+def test_compose_card_with_brand_and_loot_value() -> None:
+    killer_equip = {"MainHand": {"Type": "T8_2H_HOLYSTAFF@3", "Quality": 3, "Count": 1}}
+    victim_equip = {"Head": {"Type": "T6_HEAD_CLOTH_SET1", "Quality": 2, "Count": 1}}
+    inventory = [{"Type": "T4_BAG", "Quality": 1, "Count": 3}]
+    participants = [{"name": "DjPoppy", "ip": 1350, "damage": 2275, "healing": 0}]
+    png = _compose_card(
+        _kill_header(), killer_equip, victim_equip, inventory, participants, {}, _brand(), 204880
+    )
     assert png is not None and png[:8] == _PNG_MAGIC
 
 
 @_needs_pil
 def test_compose_card_without_brand_or_value_still_renders() -> None:
-    fields = {"relation": "DEATH", "killer_name": "A", "victim_name": "B", "total_fame": 0}
-    png = _compose_card(fields, [], [], {}, [])
+    png = _compose_card(_kill_header("DEATH", 0), {}, {}, [], [], {})
     assert png is not None and png[:8] == _PNG_MAGIC
 
 
@@ -242,8 +251,7 @@ def test_compositors_render_without_system_dejavu(monkeypatch: pytest.MonkeyPatc
     ranking_png = _compose_ranking_card(rk, "Jul 19", "Daily Ranking", "DEAD", _brand(), None)
     assert ranking_png is not None and ranking_png[:8] == _PNG_MAGIC
 
-    fields = {"relation": "KILL", "killer_name": "A", "victim_name": "B", "total_fame": 5}
-    kill_png = _compose_card(fields, [], [], {}, [], _brand(), 5)
+    kill_png = _compose_card(_kill_header("KILL", 5), {}, {}, [], [], {}, _brand(), 5)
     assert kill_png is not None and kill_png[:8] == _PNG_MAGIC
 
 
@@ -299,3 +307,80 @@ async def test_cached_file_absent_is_cached_transient_is_not(
     assert await renderer._cached_file(present) is None
     assert calls["n"] == 2  # re-read each time — the transient None was not cached
     assert str(present) not in renderer._logo_cache
+
+
+# ── detailed kill-card data extraction ────────────────────────────────────────
+
+
+def test_detailed_card_data_helpers() -> None:
+    """The pure extractors turn a raw gameinfo event into paperdoll/inventory/
+    damage data, tolerating the API's partial shapes."""
+    from killboard.cards import (
+        _damage_rows,
+        _header_data,
+        _inventory_items,
+        _slot_items,
+        _tier_of,
+        _unique_types,
+    )
+
+    raw = {
+        "Killer": {
+            "Name": "SuperTazz",
+            "GuildName": "DEAD",
+            "AverageItemPower": 1340.6,
+            "Equipment": {
+                "MainHand": {"Type": "T8_2H_AXE@1", "Quality": 3},
+                "OffHand": None,
+                "Head": {},
+            },
+        },
+        "Victim": {
+            "Name": "HunterCDH",
+            "GuildName": "Enemy",
+            "AverageItemPower": 1075.0,
+            "Equipment": {"Head": {"Type": "T6_HEAD_LEATHER", "Quality": 2}},
+            "Inventory": [{"Type": "T4_BAG", "Count": 3}, None, {"Count": 5}],
+        },
+        "TotalVictimKillFame": 36288,
+        "TimeStamp": "2026-07-20T08:04:39",
+        "Participants": [
+            {"Name": "SuperTazz", "AverageItemPower": 1340, "DamageDone": 2275.0},
+            {"Name": "Cherry", "SupportHealingDone": 2096.0},
+        ],
+    }
+
+    ke = _slot_items(raw["Killer"]["Equipment"])
+    assert set(ke) == {"MainHand"}  # None / typeless slots dropped
+    inv = _inventory_items(raw["Victim"]["Inventory"])
+    assert [i["Type"] for i in inv] == ["T4_BAG"]  # junk rows filtered
+    dmg = _damage_rows(raw["Participants"])
+    assert dmg[0] == {"name": "SuperTazz", "ip": 1340, "damage": 2275, "healing": 0}
+    assert dmg[1]["healing"] == 2096
+    assert "T8_2H_AXE@1" in _unique_types(ke, inv)
+    assert _tier_of("T8_2H_AXE@1") == 8 and _tier_of("junk") == 0
+
+    header = _header_data({"relation": "KILL"}, raw, raw["Killer"], raw["Victim"])
+    assert header["killer_name"] == "SuperTazz" and header["killer_guild"] == "DEAD"
+    assert header["killer_ip"] == 1340 and header["fame"] == 36288
+
+
+@_needs_pil
+def test_detailed_card_renders_full_layout() -> None:
+    """A full kill card with both paperdolls, participants and dropped loot
+    composites to a real PNG (no network — icons omitted)."""
+    killer_equip = {
+        "MainHand": {"Type": "T8_2H_AXE@1", "Quality": 3, "Count": 1},
+        "Armor": {"Type": "T7_ARMOR_PLATE_SET1", "Quality": 2, "Count": 1},
+        "Mount": {"Type": "T8_MOUNT_HORSE", "Quality": 1, "Count": 1},
+    }
+    victim_equip = {"Head": {"Type": "T6_HEAD_LEATHER_SET1", "Quality": 4, "Count": 1}}
+    inventory = [{"Type": f"T{4 + (i % 4)}_RUNE", "Quality": 1, "Count": i + 1} for i in range(20)]
+    participants = [
+        {"name": "SuperTazz", "ip": 1340, "damage": 2275, "healing": 0},
+        {"name": "Cherry", "ip": 1251, "damage": 0, "healing": 2096},
+    ]
+    png = _compose_card(
+        _kill_header(), killer_equip, victim_equip, inventory, participants, {}, _brand(), 15090028
+    )
+    assert png is not None and png[:8] == _PNG_MAGIC

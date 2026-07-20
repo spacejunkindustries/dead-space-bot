@@ -114,6 +114,64 @@ _DAMAGE_ROWS: int = 5
 _ACCENT_H: int = 4
 _LOGO_SIZE: int = 44
 
+# ── detailed Albion-style kill card ──────────────────────────────────────────
+
+#: Detailed-card geometry. Killer paperdoll (left) + centre stats + victim
+#: paperdoll (right), then damage/healing, then the dropped-inventory grid.
+_DC_W: int = 860
+_DC_CELL: int = 70  # equipment slot cell
+_DC_INV_CELL: int = 50  # dropped-loot cell
+_DC_INV_COLS: int = 14
+#: Cap on dropped-loot items rendered (and icons fetched) per card — bounds the
+#: card height and the first-render icon fetch burst on the shared feed drain.
+_INV_MAX: int = 42
+
+#: Item quality → border colour, matching Albion's in-game rarity tints
+#: (Normal, Good, Outstanding, Excellent, Masterpiece).
+_QUALITY_COLORS: dict[int, tuple[int, int, int]] = {
+    1: (128, 130, 134),
+    2: (86, 170, 74),
+    3: (58, 130, 214),
+    4: (150, 90, 200),
+    5: (224, 176, 40),
+}
+
+#: Item-tier digit → roman numeral badge (T4 → IV …), drawn top-left of a cell.
+_TIER_ROMAN: dict[int, str] = {
+    1: "I",
+    2: "II",
+    3: "III",
+    4: "IV",
+    5: "V",
+    6: "VI",
+    7: "VII",
+    8: "VIII",
+}
+
+#: The in-game equipment paperdoll: (col, row) → gameinfo Equipment slot name.
+#: Mount sits centred on a fourth row (handled separately).
+_ALBION_SLOTS: dict[tuple[int, int], str] = {
+    (0, 0): "Bag",
+    (1, 0): "Head",
+    (2, 0): "Cape",
+    (0, 1): "MainHand",
+    (1, 1): "Armor",
+    (2, 1): "OffHand",
+    (0, 2): "Potion",
+    (1, 2): "Shoes",
+    (2, 2): "Food",
+}
+_MOUNT_SLOT: str = "Mount"
+
+#: Damage-bar segment colours (cycled across contributors), and the healing tint.
+_DC_DMG_SEGMENTS: tuple[tuple[int, int, int], ...] = (
+    (196, 60, 55),
+    (200, 130, 50),
+    (210, 180, 60),
+    (150, 110, 60),
+)
+_DC_HEAL_COLOR: tuple[int, int, int] = (60, 160, 90)
+
 #: Daily-ranking card geometry (a taller two-column board).
 _RANK_W: int = 720
 _RANK_HEADER_H: int = 132
@@ -251,25 +309,37 @@ class CardRenderer:
             cards = self._cfg_provider().killboard.cards
             if not cards.enabled:
                 return None
-            raw = raw_event if raw_event is not None else _extract_raw_event(event_row)
-            victim_gear = parse_equipment(raw, "Victim")
-            killer_gear = parse_equipment(raw, "Killer")
+            raw = dict(raw_event) if raw_event is not None else _extract_raw_event(event_row)
 
+            killer = raw.get("Killer") if isinstance(raw.get("Killer"), dict) else {}
+            victim = raw.get("Victim") if isinstance(raw.get("Victim"), dict) else {}
+            killer_equip = _slot_items(killer.get("Equipment"))
+            victim_equip = _slot_items(victim.get("Equipment"))
+            inventory = _inventory_items(victim.get("Inventory"))[:_INV_MAX]
+            participants = _damage_rows(raw.get("Participants"))
+
+            # Fetch an icon for every unique item Type across both loadouts and the
+            # dropped inventory (cached on disk after the first render).
             icons: dict[str, bytes] = {}
-            for item in (*victim_gear, *killer_gear):
-                if item.token in icons:
-                    continue
-                data = await self._icon_bytes(item, cards)
+            for item_type in _unique_types(killer_equip, victim_equip, inventory):
+                data = await self._icon_for_type(item_type, cards)
                 if data is not None:
-                    icons[item.token] = data
+                    icons[item_type] = data
 
-            shares = damage_shares(participants, _DAMAGE_ROWS)
-            fields = _header_fields(event_row)
             brand = await self._brand_style(cards)
             show_value = loot_value if getattr(cards, "show_loot_value", True) else None
+            header = _header_data(event_row, raw, killer, victim)
 
             return await self._to_thread(
-                _compose_card, fields, victim_gear, killer_gear, icons, shares, brand, show_value
+                _compose_card,
+                header,
+                killer_equip,
+                victim_equip,
+                inventory,
+                participants,
+                icons,
+                brand,
+                show_value,
             )
         except Exception as exc:  # never let a card crash the feed (§7.1, §13)
             self._log.warning("kb_cards.render_failed", error=str(exc))
@@ -351,6 +421,15 @@ class CardRenderer:
     # ── icon fetch + on-disk cache ───────────────────────────────────────────
 
     async def _icon_bytes(self, item: GearItem, cards: Any) -> bytes | None:
+        """Icon PNG bytes for a parsed :class:`GearItem` (see :meth:`_icon_by_key`)."""
+        return await self._icon_by_key(item.item_type, item.enchant, cards)
+
+    async def _icon_for_type(self, item_type: str, cards: Any) -> bytes | None:
+        """Icon PNG bytes for a raw API item ``Type`` (e.g. ``"T4_2H_AXE@1"``)."""
+        base, enchant = split_enchant(str(item_type))
+        return await self._icon_by_key(base, enchant, cards)
+
+    async def _icon_by_key(self, base: str, enchant: int, cards: Any) -> bytes | None:
         """Return the PNG bytes for an item's icon, fetching once then caching.
 
         Checks the on-disk cache first (``icon_cache_dir/{token}.png``); on a
@@ -358,13 +437,14 @@ class CardRenderer:
         bytes. Any failure (bad status, network error, unwritable cache) yields
         ``None`` and the item simply renders without an icon (§7.1).
         """
-        path = icon_cache_path(cards.icon_cache_dir, item.token)
+        token = f"{base}@{enchant}" if enchant else base
+        path = icon_cache_path(cards.icon_cache_dir, token)
 
         cached = await self._to_thread(_read_file, path)
         if cached is not None:
             return cached
 
-        url = render_icon_url(cards.render_base, item.item_type, item.enchant)
+        url = render_icon_url(cards.render_base, base, enchant)
         try:
             session = await self._get_session()
             # Bound the icon fetch: neither the owned session nor the shared API
@@ -519,6 +599,14 @@ def icon_cache_path(cache_dir: str | Path, token: str) -> Path:
     """
     safe = re.sub(r"[^A-Za-z0-9@._-]", "_", token) or "unknown"
     return Path(cache_dir) / f"{safe}.png"
+
+
+def _first_str(value: Any) -> str | None:
+    """A non-empty stripped string, or ``None`` (tolerant parse path §2.4)."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -697,131 +785,346 @@ def _fmt_short(value: int) -> str:
     return str(v)
 
 
-def _compose_card(
-    fields: Mapping[str, Any],
-    victim_gear: list[GearItem],
-    killer_gear: list[GearItem],
+# ── detailed-card data extraction (pure; tolerant of the API's partial data) ──
+
+
+def _tier_of(item_type: str) -> int:
+    """Tier digit from an item type prefix (``T4_...`` → 4), or 0 if absent."""
+    m = re.match(r"[Tt]([1-8])_", item_type or "")
+    return int(m.group(1)) if m else 0
+
+
+def _slot_items(equipment: Any) -> dict[str, dict[str, Any]]:
+    """A ``slot → item`` map for the paperdoll, keeping only real, typed slots."""
+    if not isinstance(equipment, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for slot, item in equipment.items():
+        if isinstance(item, dict) and item.get("Type"):
+            out[str(slot)] = item
+    return out
+
+
+def _inventory_items(inventory: Any) -> list[dict[str, Any]]:
+    """The victim's dropped inventory as a flat list of real, typed items."""
+    if not isinstance(inventory, list):
+        return []
+    return [it for it in inventory if isinstance(it, dict) and it.get("Type")]
+
+
+def _damage_rows(participants: Any) -> list[dict[str, Any]]:
+    """Normalise the ``Participants`` list into ``{name, ip, damage, healing}``."""
+    if not isinstance(participants, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for p in participants:
+        if not isinstance(p, dict):
+            continue
+        rows.append(
+            {
+                "name": _first_str(p.get("Name")) or "?",
+                "ip": _coerce_int(p.get("AverageItemPower"), 0),
+                "damage": _coerce_int(p.get("DamageDone"), 0),
+                "healing": _coerce_int(p.get("SupportHealingDone"), 0),
+            }
+        )
+    return rows
+
+
+def _unique_types(*groups: Any) -> list[str]:
+    """Every distinct item ``Type`` across slot-maps and inventory lists."""
+    seen: dict[str, None] = {}
+    for group in groups:
+        items = group.values() if isinstance(group, dict) else group
+        for it in items:
+            if isinstance(it, dict) and it.get("Type"):
+                seen.setdefault(str(it["Type"]), None)
+    return list(seen)
+
+
+def _header_data(
+    event_row: Mapping[str, Any] | Any,
+    raw: Mapping[str, Any],
+    killer: Mapping[str, Any],
+    victim: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Header text: names, guilds, item power, fame, timestamp, relation.
+
+    Names/guilds/IP come from the richer raw event; relation/timestamp fall back
+    to the flat row so a card still labels itself when the raw event is sparse.
+    """
+    return {
+        "relation": _field(event_row, "relation"),
+        "killer_name": _first_str(killer.get("Name")) or _field(event_row, "killer_name") or "?",
+        "victim_name": _first_str(victim.get("Name")) or _field(event_row, "victim_name") or "?",
+        "killer_guild": _first_str(killer.get("GuildName")) or "",
+        "victim_guild": _first_str(victim.get("GuildName")) or "",
+        "killer_ip": _coerce_int(killer.get("AverageItemPower"), 0)
+        or _coerce_int(_field(event_row, "killer_ip"), 0),
+        "victim_ip": _coerce_int(victim.get("AverageItemPower"), 0)
+        or _coerce_int(_field(event_row, "victim_ip"), 0),
+        "fame": _coerce_int(_field(event_row, "total_fame"), 0)
+        or _coerce_int(raw.get("TotalVictimKillFame"), 0),
+        "timestamp": _first_str(_field(event_row, "timestamp")) or _first_str(raw.get("TimeStamp")),
+    }
+
+
+# ── detailed-card compositor (pure Pillow, runs under to_thread) ───────────────
+
+
+def _dc_cell(
+    canvas: Any,
+    draw: Any,
+    item: Mapping[str, Any] | None,
     icons: Mapping[str, bytes],
-    shares: list[DamageShare],
+    box: tuple[int, int],
+    size: int,
+    f_badge: Any,
+    *,
+    show_count: bool,
+) -> None:
+    """Draw one Albion-style item slot: quality border, icon, tier + count badges."""
+    x, y = box
+    if not item or not item.get("Type"):
+        draw.rounded_rectangle(
+            (x, y, x + size, y + size), radius=6, fill=(38, 41, 45), outline=(60, 64, 69), width=1
+        )
+        return
+    item_type = str(item["Type"])
+    quality = _coerce_int(item.get("Quality"), 1) or 1
+    border = _QUALITY_COLORS.get(quality, _QUALITY_COLORS[1])
+    draw.rounded_rectangle(
+        (x, y, x + size, y + size), radius=6, fill=_COLOR_PANEL, outline=border, width=2
+    )
+
+    data = icons.get(item_type)
+    if data is not None:
+        try:
+            with Image.open(io.BytesIO(data)) as img:
+                pad = max(2, size // 20)
+                ic = img.convert("RGBA").resize((size - 2 * pad, size - 2 * pad))
+            canvas.paste(ic, (x + pad, y + pad), ic)
+        except Exception:  # a single bad icon never fails the card (§7.1)
+            pass
+
+    tier = _tier_of(item_type)
+    if tier:
+        label = _TIER_ROMAN.get(tier, "")
+        tw = draw.textlength(label, font=f_badge)
+        draw.rectangle((x + 2, y + 2, x + 8 + tw, y + 18), fill=(0, 0, 0, 160))
+        draw.text((x + 5, y + 3), label, font=f_badge, fill=(235, 235, 235))
+    count = _coerce_int(item.get("Count"), 1)
+    if show_count and count > 1:
+        s = str(count)
+        sw = draw.textlength(s, font=f_badge)
+        draw.rectangle(
+            (x + size - sw - 7, y + size - 17, x + size - 1, y + size - 1), fill=(0, 0, 0, 160)
+        )
+        draw.text((x + size - sw - 4, y + size - 16), s, font=f_badge, fill=(255, 255, 210))
+
+
+def _dc_paperdoll(
+    canvas: Any,
+    draw: Any,
+    equip: dict[str, dict[str, Any]],
+    icons: Mapping[str, bytes],
+    origin: tuple[int, int],
+    size: int,
+    f_badge: Any,
+) -> int:
+    """Draw a 3×3 + mount equipment paperdoll; return the y just past its bottom."""
+    ox, oy = origin
+    step = size + 6
+    for (col, row), slot in _ALBION_SLOTS.items():
+        _dc_cell(
+            canvas,
+            draw,
+            equip.get(slot),
+            icons,
+            (ox + col * step, oy + row * step),
+            size,
+            f_badge,
+            show_count=False,
+        )
+    _dc_cell(
+        canvas,
+        draw,
+        equip.get(_MOUNT_SLOT),
+        icons,
+        (ox + step, oy + 3 * step),
+        size,
+        f_badge,
+        show_count=False,
+    )
+    return oy + 4 * step
+
+
+def _compose_card(
+    header: Mapping[str, Any],
+    killer_equip: dict[str, dict[str, Any]],
+    victim_equip: dict[str, dict[str, Any]],
+    inventory: list[dict[str, Any]],
+    participants: list[dict[str, Any]],
+    icons: Mapping[str, bytes],
     brand: BrandStyle | None = None,
     loot_value: int | None = None,
 ) -> bytes | None:
-    """Composite the final card to PNG bytes (killboard GDD §7.1). Pure Pillow.
+    """Composite the detailed Albion-style kill card to PNG bytes (killboard §7.1).
 
-    Runs entirely inside ``to_thread``. Returns ``None`` if Pillow raises for any
-    reason, so the caller falls back to an embed-only post. ``brand`` skins the
-    card (accent stripe, watermark, footer tagline); ``loot_value`` prints the
-    victim's estimated silver loot when the market layer priced it.
+    Killer paperdoll (left) and victim paperdoll (right) in the in-game slot
+    layout, a centre column of party/fame/loot, damage + healing bars with their
+    contributor lists, and the victim's dropped-inventory grid. Pure Pillow, run
+    inside ``to_thread``. Returns ``None`` on any Pillow failure so the feed falls
+    back to an embed-only post.
     """
     try:
-        canvas = Image.new("RGB", (_CARD_W, _CARD_H), _COLOR_BG)
-        draw = ImageDraw.Draw(canvas)
+        w = _DC_W
+        canvas = Image.new("RGB", (w, 1600), _COLOR_BG)
+        d = ImageDraw.Draw(canvas)
+        f_guild = _load_font(15)
+        f_name = _load_font(26)
+        f_ip = _load_font(15)
+        f_badge = _load_font(13)
+        f_stat = _load_font(24)
+        f_lbl = _load_font(13)
+        f_row = _load_font(15)
 
-        f_title = _load_font(26)
-        f_body = _load_font(18)
-        f_small = _load_font(15)
-
-        # Header bar, colour-coded by relation.
-        header = relation_color(fields.get("relation"))
-        draw.rectangle((0, 0, _CARD_W, _HEADER_H), fill=header)
-        # Brand accent stripe just beneath the header.
-        if brand is not None:
-            draw.rectangle((0, _HEADER_H, _CARD_W, _HEADER_H + _ACCENT_H), fill=brand.accent)
-        title = f"{fields.get('killer_name', '?')}  ▸  {fields.get('victim_name', '?')}"
-        draw.text((20, _HEADER_H // 2), title, font=f_title, fill=(255, 255, 255), anchor="lm")
-
-        # Item power + fame line.
-        ip_line = f"IP  {_fmt_ip(fields.get('killer_ip'))}  vs  {_fmt_ip(fields.get('victim_ip'))}"
-        draw.text((20, _HEADER_H + 22), ip_line, font=f_body, fill=_COLOR_TEXT, anchor="lm")
-        fame_line = f"Fame  {_fmt_fame(_coerce_int(fields.get('total_fame'), 0))}"
-        draw.text(
-            (_CARD_W - 20, _HEADER_H + 22), fame_line, font=f_body, fill=_COLOR_TEXT, anchor="rm"
+        # ── header: killer (L) · timestamp (C) · victim (R) ──
+        kg = header.get("killer_guild")
+        vg = header.get("victim_guild")
+        if kg:
+            d.text((24, 14), f"[{kg}]", font=f_guild, fill=_COLOR_SUBTLE)
+        d.text((24, 34), str(header.get("killer_name", "?")), font=f_name, fill=_COLOR_TEXT)
+        d.text(
+            (24, 66), f"IP {_coerce_int(header.get('killer_ip'), 0)}", font=f_ip, fill=_COLOR_SUBTLE
         )
-        # Estimated loot value (market layer), under the fame line when present.
-        if loot_value is not None and loot_value > 0:
-            accent = brand.accent if brand is not None else _DEAD_RED_RGB
-            draw.text(
-                (_CARD_W - 20, _HEADER_H + 44),
-                f"Loot  {_fmt_fame(int(loot_value))}",
-                font=f_small,
-                fill=accent,
-                anchor="rm",
-            )
-
-        # Victim gear grid (left side).
-        gear_origin = (20, _HEADER_H + 52)
-        draw.text(
-            (gear_origin[0], gear_origin[1] - 18),
-            "Victim loadout",
-            font=f_small,
+        if vg:
+            d.text((w - 24, 14), f"[{vg}]", font=f_guild, fill=_COLOR_SUBTLE, anchor="ra")
+        d.text(
+            (w - 24, 34),
+            str(header.get("victim_name", "?")),
+            font=f_name,
+            fill=_COLOR_TEXT,
+            anchor="ra",
+        )
+        d.text(
+            (w - 24, 66),
+            f"IP {_coerce_int(header.get('victim_ip'), 0)}",
+            font=f_ip,
             fill=_COLOR_SUBTLE,
-            anchor="lm",
+            anchor="ra",
         )
-        positions = grid_positions(len(victim_gear), _GEAR_COLS, _ICON_CELL, gear_origin)
-        for item, (x, y) in zip(victim_gear, positions, strict=False):
-            draw.rectangle((x, y, x + _ICON_CELL, y + _ICON_CELL), fill=_COLOR_PANEL)
-            data = icons.get(item.token)
-            if data is not None:
-                _paste_icon(canvas, data, (x, y), _ICON_CELL)
+        ts = str(header.get("timestamp") or "")[:16].replace("T", " ")
+        d.text((w // 2, 30), ts, font=f_ip, fill=_COLOR_SUBTLE, anchor="mm")
+        accent = relation_color(header.get("relation"))
+        d.rectangle((0, 92, w, 92 + _ACCENT_H), fill=accent)
 
-        # Killer loadout, compact single row beneath the victim grid.
-        rows = (len(victim_gear) + _GEAR_COLS - 1) // _GEAR_COLS if victim_gear else 0
-        k_origin = (20, gear_origin[1] + rows * (_ICON_CELL + _ICON_PAD) + 24)
-        draw.text(
-            (k_origin[0], k_origin[1] - 16),
-            "Killer",
-            font=f_small,
-            fill=_COLOR_SUBTLE,
-            anchor="lm",
-        )
-        k_cell = 40
-        k_positions = grid_positions(len(killer_gear), 10, k_cell, k_origin, pad=6)
-        for item, (x, y) in zip(killer_gear, k_positions, strict=False):
-            draw.rectangle((x, y, x + k_cell, y + k_cell), fill=_COLOR_PANEL)
-            data = icons.get(item.token)
-            if data is not None:
-                _paste_icon(canvas, data, (x, y), k_cell)
+        # ── paperdolls + centre stats ──
+        cell = _DC_CELL
+        y0 = 108
+        k_ox = 24
+        v_ox = w - 24 - (3 * cell + 2 * 6)
+        bottom = _dc_paperdoll(canvas, d, killer_equip, icons, (k_ox, y0), cell, f_badge)
+        _dc_paperdoll(canvas, d, victim_equip, icons, (v_ox, y0), cell, f_badge)
 
-        # Damage-contribution bars (right side).
-        bar_x = 470
-        bar_w = _CARD_W - bar_x - 20
-        bar_y = _HEADER_H + 52
-        draw.text((bar_x, bar_y - 18), "Damage", font=f_small, fill=_COLOR_SUBTLE, anchor="lm")
-        for share in shares:
-            draw.rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + 18), fill=_COLOR_BAR_BG)
-            fill_w = int(bar_w * share.fraction)
-            if fill_w > 0:
-                draw.rectangle((bar_x, bar_y, bar_x + fill_w, bar_y + 18), fill=_COLOR_BAR)
-            label = f"{share.name}  {int(round(share.fraction * 100))}%"
-            draw.text((bar_x + 6, bar_y + 9), label, font=f_small, fill=_COLOR_TEXT, anchor="lm")
-            bar_y += 26
-
-        # Footer: brand tagline · location · timestamp.
-        brand_name = brand.name if brand is not None else ""
-        footer_bits = [
-            str(b) for b in (brand_name, fields.get("location"), fields.get("timestamp")) if b
+        cx = w // 2
+        stats = [
+            ("PARTY", f"{max(len(participants), 1):,}", _COLOR_TEXT),
+            ("FAME", f"{_coerce_int(header.get('fame'), 0):,}", (240, 220, 120)),
         ]
-        if footer_bits:
-            draw.text(
-                (20, _CARD_H - 18),
-                "  ·  ".join(footer_bits),
-                font=f_small,
-                fill=_COLOR_SUBTLE,
-                anchor="lm",
-            )
+        if loot_value is not None and loot_value > 0:
+            stats.append(("LOOT", f"{int(loot_value):,}", (240, 220, 120)))
+        sy = y0 + 22
+        for label, value, colour in stats:
+            d.text((cx, sy), label, font=f_lbl, fill=_COLOR_SUBTLE, anchor="mm")
+            d.text((cx, sy + 22), value, font=f_stat, fill=colour, anchor="mm")
+            sy += 74
 
-        # Brand watermark, bottom-right corner.
+        # ── damage / healing ──
+        dmg = [p for p in participants if p["damage"] > 0]
+        heal = [p for p in participants if p["healing"] > 0]
+        dy = bottom + 16
+        if dmg or heal:
+            d.text((24, dy), "Damage", font=f_lbl, fill=_COLOR_SUBTLE)
+            if heal:
+                d.text((w // 2 + 16, dy), "Healing", font=f_lbl, fill=_COLOR_SUBTLE)
+            dy += 20
+            bar_l, bar_w = 24, w // 2 - 44
+            total_d = sum(p["damage"] for p in dmg) or 1
+            x = bar_l
+            for i, p in enumerate(dmg):
+                seg = int(bar_w * p["damage"] / total_d)
+                if seg > 0:
+                    d.rectangle(
+                        (x, dy, x + seg, dy + 16), fill=_DC_DMG_SEGMENTS[i % len(_DC_DMG_SEGMENTS)]
+                    )
+                    x += seg
+            hb_l = w // 2 + 16
+            hb_w = w - 24 - hb_l
+            if heal:
+                d.rectangle((hb_l, dy, hb_l + hb_w, dy + 16), fill=_DC_HEAL_COLOR)
+            dy += 24
+            list_top = dy
+            for p in dmg[:_DAMAGE_ROWS]:
+                d.text((24, dy), f"{p['name']} [{p['ip']}]", font=f_row, fill=_COLOR_TEXT)
+                d.text(
+                    (w // 2 - 44, dy),
+                    f"{p['damage']:,}",
+                    font=f_row,
+                    fill=(230, 120, 110),
+                    anchor="ra",
+                )
+                dy += 22
+            hy = list_top
+            for p in heal[:_DAMAGE_ROWS]:
+                d.text((hb_l, hy), f"{p['name']} [{p['ip']}]", font=f_row, fill=_COLOR_TEXT)
+                d.text(
+                    (w - 24, hy), f"{p['healing']:,}", font=f_row, fill=(120, 210, 140), anchor="ra"
+                )
+                hy += 22
+            dy = max(dy, hy)
+        dy += 12
+
+        # ── dropped-loot grid ──
+        if inventory:
+            d.text((24, dy), "Dropped loot", font=f_lbl, fill=_COLOR_SUBTLE)
+            dy += 20
+            isz, ipad, cols = _DC_INV_CELL, 5, _DC_INV_COLS
+            for i, it in enumerate(inventory):
+                col, row = i % cols, i // cols
+                _dc_cell(
+                    canvas,
+                    d,
+                    it,
+                    icons,
+                    (24 + col * (isz + ipad), dy + row * (isz + ipad)),
+                    isz,
+                    f_badge,
+                    show_count=True,
+                )
+            rows = (len(inventory) + cols - 1) // cols
+            dy += rows * (isz + ipad)
+        dy += 12
+
+        # ── footer ──
+        footer = brand.name if brand is not None else ""
+        if footer:
+            d.text((24, dy), footer, font=f_lbl, fill=_COLOR_SUBTLE)
+        if loot_value is not None and loot_value > 0:
+            d.text(
+                (w - 24, dy),
+                f"Total loot  {int(loot_value):,}",
+                font=f_row,
+                fill=(240, 220, 120),
+                anchor="ra",
+            )
         if brand is not None:
-            _paste_logo(
-                canvas,
-                brand.logo,
-                (_CARD_W - _LOGO_SIZE - 14, _CARD_H - _LOGO_SIZE - 26),
-                _LOGO_SIZE,
-                opacity=0.9,
-            )
+            _paste_logo(canvas, brand.logo, (w - 58, dy - 46), 40, opacity=0.9)
+        dy += 26
 
+        out = canvas.crop((0, 0, w, min(dy, canvas.height)))
         buffer = io.BytesIO()
-        canvas.save(buffer, format="PNG")
+        out.save(buffer, format="PNG")
         return buffer.getvalue()
     except Exception:  # pragma: no cover - defensive; any Pillow failure → embed
         log.warning("kb_cards.compose_failed")
