@@ -46,6 +46,9 @@ from killboard.battles import Battles
 from killboard.cards import CardRenderer
 from killboard.commands import KillboardCog
 from killboard.feed import Feed
+from killboard.items import ItemIndex
+from killboard.market import MarketClient
+from killboard.market_commands import MarketCog
 from killboard.poller import Poller
 from killboard.schedule import Scheduler
 from killboard.store import KbStore, open_store
@@ -90,6 +93,9 @@ class KillboardModule(BotModule):
         self._feed: Feed | None = None
         self._scheduler: Scheduler | None = None
         self._cog: KillboardCog | None = None
+        self._market: MarketClient | None = None
+        self._items: ItemIndex | None = None
+        self._market_cog: MarketCog | None = None
         self._queue: asyncio.Queue[list[EventRow]] | None = None
         # Bound in setup() from the context; only read after setup completes.
         self._holder: ConfigHolder
@@ -141,6 +147,11 @@ class KillboardModule(BotModule):
         self._api = KbApi(self._kb_cfg)
         self._cards = CardRenderer(self._kb_cfg, ctx.to_thread, log=ctx.log)
         self._battles = Battles(self._api, self._kb_cfg, ctx.log)
+        # Market layer (AODP): the client + item index power the /market commands
+        # and the kill-card loot value. Built unconditionally (cheap; the session
+        # is lazy) — it self-gates on killboard.market.enabled at each use.
+        self._market = MarketClient(self._kb_cfg)
+        self._items = ItemIndex()
 
         # One queue shared poller → feed: the poller pushes genuinely-new events
         # as a wake-up signal; the feed re-reads the store for exactly-once.
@@ -164,6 +175,7 @@ class KillboardModule(BotModule):
             ctx.log,
             queue=self._queue,
             shutdown=ctx.shutdown,
+            market=self._market,
         )
         self._scheduler = Scheduler(
             ctx.bot,
@@ -180,11 +192,13 @@ class KillboardModule(BotModule):
             self._kb_cfg,
             ctx.to_thread,
         )
+        self._market_cog = MarketCog(ctx.bot, self._market, self._items, self._kb_cfg)
         ctx.log.info("kb_module.setup", db_path=db_path)
 
     def cogs(self) -> Iterable[commands.Cog]:
-        """The single ``/killboard *`` command cog (killboard GDD §10)."""
-        return [self._cog] if self._cog is not None else []
+        """The ``/killboard *`` cog plus the ``/market *`` cog (killboard GDD §10).
+        The market cog self-gates on ``killboard.market.enabled``."""
+        return [c for c in (self._cog, self._market_cog) if c is not None]
 
     def dynamic_items(self) -> Iterable[type[DynamicItem[Any]]]:
         """The restart-proof leaderboard pager button (killboard GDD §8, views)."""
@@ -280,6 +294,8 @@ class KillboardModule(BotModule):
             await self._api.close()
         if self._cards is not None:
             await self._cards.close()
+        if self._market is not None:
+            await self._market.close()
 
     # ── health (killboard GDD §10, §13) ──────────────────────────────────────
 

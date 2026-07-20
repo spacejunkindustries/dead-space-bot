@@ -198,6 +198,9 @@ SECTIONS: Final[tuple[Section, ...]] = (
     Section("killboard.storage", "The killboard's own SQLite file.", optional=True),
     Section("killboard.staleness", "When a quiet poller becomes reportable.", optional=True),
     Section(
+        "killboard.market", "Albion market data (AODP) — item values + /market.", optional=True
+    ),
+    Section(
         "routing",
         "OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.",
         optional=True,
@@ -1262,6 +1265,59 @@ KEYS: Final[tuple[Key, ...]] = (
         default=6,
         minimum=0,
         exclusive_minimum=True,
+    ),
+    # killboard.market (optional) — Albion Online Data Project market layer
+    Key(
+        "killboard.market.enabled",
+        "bool",
+        Reload.RESTART,
+        "Turn on the market layer: prices item loot value onto kill cards and "
+        "enables the /market commands. Uses the crowd-sourced AODP API (its host "
+        "is derived from killboard.region), so it's opt-in.",
+        default=False,
+    ),
+    Key(
+        "killboard.market.cache_ttl_s",
+        "int",
+        Reload.HOT,
+        "Seconds to cache a price lookup in memory. Prices move on the minute at "
+        "most, so caching hard stays well under the AODP rate limit.",
+        default=300,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "killboard.market.request_timeout_s",
+        "int",
+        Reload.HOT,
+        "Per-request HTTP timeout against the AODP API.",
+        default=10,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "killboard.market.default_quality",
+        "int",
+        Reload.HOT,
+        "Item quality used when a lookup omits it: 1 Normal, 2 Good, "
+        "3 Outstanding, 4 Excellent, 5 Masterpiece.",
+        default=1,
+        minimum=1,
+        maximum=5,
+    ),
+    Key(
+        "killboard.market.default_cities",
+        "str_list",
+        Reload.HOT,
+        "Cities compared by /market and used to reference-price kill loot.",
+        default=("Caerleon", "Bridgewatch", "Lymhurst", "Martlock", "Fort Sterling", "Thetford"),
+    ),
+    Key(
+        "killboard.market.user_agent",
+        "str",
+        Reload.RESTART,
+        "User-Agent sent to the AODP API (be a good citizen — identify the bot).",
+        default="DeadBot-Killboard (self-hosted; contact your guild admin)",
     ),
     # routing (optional section)
     Key(

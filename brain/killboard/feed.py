@@ -42,6 +42,7 @@ import structlog
 
 from killboard.cards import damage_shares
 from killboard.model import ASSIST, DEATH, KILL
+from killboard.value import estimate_value
 
 if TYPE_CHECKING:
     from discord.ext import commands
@@ -92,6 +93,12 @@ class _PostResult(enum.Enum):
 #: Damage contributors shown in the embed's "Top damage" field (§7.1).
 _MAX_DAMAGE_ROWS = 5
 
+#: Hard deadline for the best-effort loot-value lookup on the feed path. Loot
+#: value is a decorative field; a slow (but not failing) AODP must never delay a
+#: kill card, so the network fetch is bounded and simply degrades to "unknown"
+#: (None) past this budget rather than serializing seconds onto every post.
+_LOOT_VALUE_TIMEOUT_S = 2.0
+
 
 class Feed:
     """Consumes new events and posts them to the feed channels exactly-once (§7).
@@ -118,12 +125,16 @@ class Feed:
         *,
         queue: asyncio.Queue[list[EventRow]] | None = None,
         shutdown: asyncio.Event | None = None,
+        market: Any = None,
     ) -> None:
         self._bot = bot
         self._store = store
         self._cards = cards
         self._cfg_provider = cfg_provider
         self._to_thread = to_thread
+        #: Optional MarketClient — when the market layer is on, kill cards carry
+        #: an estimated silver loot value. None = no value shown.
+        self._market = market
         self._log: Any = log if log is not None else structlog.get_logger(__name__)
         self._queue = queue
         self._shutdown = shutdown
@@ -261,7 +272,18 @@ class Feed:
 
         png = await self._render_card(row)
         filename = f"kill_{row.event_id}.png"
-        embed = build_embed(row, [])
+        # The raw event carries the guild tags (for the header) and the item
+        # loadout (for the market loot value) — data the flat row doesn't hold.
+        raw = await self._to_thread(self._store.raw_event, row.event_id)
+        killer_guild, victim_guild = _guild_tags(raw)
+        loot_value = await self._loot_value(raw)
+        embed = build_embed(
+            row,
+            [],
+            killer_guild=killer_guild,
+            victim_guild=victim_guild,
+            loot_value=loot_value,
+        )
         if png is not None:
             embed.set_image(url=f"attachment://{filename}")
 
@@ -318,6 +340,30 @@ class Feed:
         except Exception as exc:  # noqa: BLE001 — a card must never break the feed
             self._log.warning("kb_feed.card_error", event_id=row.event_id, error=str(exc))
             return None
+
+    async def _loot_value(self, raw: dict[str, Any] | None) -> int | None:
+        """Estimated silver value of the victim's dropped loadout (§7.1), or
+        ``None`` when the market layer is off or nothing could be priced. Never
+        raises — a market hiccup must not break a post."""
+        if self._market is None or raw is None:
+            return None
+        market_cfg = getattr(self._cfg_provider().killboard, "market", None)
+        if not getattr(market_cfg, "enabled", False):
+            return None
+        try:
+            result = await asyncio.wait_for(
+                estimate_value(raw, self._market, side="victim"),
+                timeout=_LOOT_VALUE_TIMEOUT_S,
+            )
+        except TimeoutError:
+            # A slow-but-healthy AODP: drop the decorative value rather than let
+            # it stall the timeliness-critical feed drain (§7.3).
+            self._log.warning("kb_feed.value_timeout")
+            return None
+        except Exception as exc:  # noqa: BLE001 — value is best-effort
+            self._log.warning("kb_feed.value_failed", error=str(exc))
+            return None
+        return result.get("total")
 
     async def _post_summary(self, fc: KbFeedConfig, count: int) -> None:
         """Post the single catch-up summary line to the main feed channel (§7.3)."""
@@ -441,14 +487,22 @@ def route_channels(row: EventRow, fc: KbFeedConfig) -> list[int]:
     return out
 
 
-def build_embed(row: EventRow, participants: list[Participant]) -> discord.Embed:
+def build_embed(
+    row: EventRow,
+    participants: list[Participant],
+    *,
+    killer_guild: str | None = None,
+    victim_guild: str | None = None,
+    loot_value: int | None = None,
+) -> discord.Embed:
     """Build the feed embed for one event (killboard GDD §7.1).
 
-    Header is ``Killer ▸ Victim`` linking to the official killboard, colour-coded
-    by relation (green kill / red death / amber assist). Fields carry item power
-    per side, the kill fame, the party size, the top damage contributors (when
-    known), and the location; the event time drives the embed timestamp. Every
-    field is read tolerantly (§2.4) so a partial event still yields a valid embed.
+    Header is ``[Guild] Killer killed [Guild] Victim`` (matching the community
+    killbots) linking to the official killboard, colour-coded by relation (green
+    kill / red death / amber assist). Fields carry item power per side, kill
+    fame, party size, top damage contributors, location, and — when the market
+    layer priced it — the estimated silver loot value. Every field is read
+    tolerantly (§2.4) so a partial event still yields a valid embed.
 
     Pure and side-effect free — the caller sends it with ``AllowedMentions.none()``
     (CLAUDE.md constraint 11).
@@ -456,9 +510,14 @@ def build_embed(row: EventRow, participants: list[Participant]) -> discord.Embed
     relation = (row.relation or "").upper()
     killer = row.killer_name or "Unknown"
     victim = row.victim_name or "Unknown"
+    killer_label = f"[{killer_guild}] {killer}" if killer_guild else killer
+    victim_label = f"[{victim_guild}] {victim}" if victim_guild else victim
+    # "[DEAD Renegadez] Snapjlr killed [MOIX] chavana" — killer always landed the
+    # blow; the green/red accent carries whose perspective it is.
+    title = _clip(f"{killer_label} killed {victim_label}", 256)
 
     embed = discord.Embed(
-        title=f"{killer}  ▸  {victim}",
+        title=title,
         colour=_relation_colour(relation),
         url=_EVENT_URL.format(event_id=row.event_id),
     )
@@ -468,6 +527,8 @@ def build_embed(row: EventRow, participants: list[Participant]) -> discord.Embed
         inline=True,
     )
     embed.add_field(name="Fame", value=f"{row.total_fame or 0:,}", inline=True)
+    if loot_value is not None:
+        embed.add_field(name="💰 Loot value", value=f"~{loot_value:,} silver", inline=True)
     if row.num_participants:
         embed.add_field(name="Party", value=str(row.num_participants), inline=True)
 
@@ -485,6 +546,22 @@ def build_embed(row: EventRow, participants: list[Participant]) -> discord.Embed
 
     embed.set_footer(text=_relation_label(relation))
     return embed
+
+
+def _guild_tags(raw: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """Extract ``(killer_guild, victim_guild)`` display names from the raw event
+    for the header, tolerant of missing fields (§2.4)."""
+    if not isinstance(raw, dict):
+        return None, None
+
+    def _name(side: str) -> str | None:
+        obj = raw.get(side)
+        if not isinstance(obj, dict):
+            return None
+        name = obj.get("GuildName")
+        return name.strip() if isinstance(name, str) and name.strip() else None
+
+    return _name("Killer"), _name("Victim")
 
 
 def _relation_colour(relation: str) -> discord.Colour:

@@ -24,6 +24,7 @@ takes an optional ``now`` for testability; when omitted it is computed fresh.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -292,6 +293,23 @@ class KbStore:
             """,
             (event_id, message_id, channel_id, ts),
         )
+
+    def raw_event(self, event_id: int) -> dict[str, Any] | None:
+        """The stored full event JSON for ``event_id`` (§5.4), or ``None``.
+
+        The feed uses it for the guild-tagged header and market loot-value — data
+        the flat ``events`` columns don't carry. Tolerant: a missing row or
+        unparseable JSON yields ``None``."""
+        raw = db.query_value(
+            self._conn, "SELECT raw_json FROM events WHERE event_id = ?", (event_id,)
+        )
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
 
     def count_unposted(self) -> int:
         """How many ingested events are not yet in ``posted``.

@@ -1416,6 +1416,12 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `killboard.storage.db_path` | str | `'/var/lib/cortana/killboard/killboard.db'` | restart | The killboard's own SQLite file — separate from CORTANA's. Irreplaceable (the API can't re-serve old events); back it up (killboard GDD §2.4). |
 | `killboard.staleness.warn_after_minutes` | int | `30` | hot | No successful poll for this long → surface it in /killboard status. |
 | `killboard.staleness.no_events_notice_hours` | int | `6` | hot | No NEW events for this long → note 'guild is quiet' (not an error). |
+| `killboard.market.enabled` | bool | `False` | restart | Turn on the market layer: prices item loot value onto kill cards and enables the /market commands. Uses the crowd-sourced AODP API (its host is derived from killboard.region), so it's opt-in. |
+| `killboard.market.cache_ttl_s` | int | `300` | hot | Seconds to cache a price lookup in memory. Prices move on the minute at most, so caching hard stays well under the AODP rate limit. |
+| `killboard.market.request_timeout_s` | int | `10` | hot | Per-request HTTP timeout against the AODP API. |
+| `killboard.market.default_quality` | int | `1` | hot | Item quality used when a lookup omits it: 1 Normal, 2 Good, 3 Outstanding, 4 Excellent, 5 Masterpiece. |
+| `killboard.market.default_cities` | str_list | `('Caerleon', 'Bridgewatch', 'Lymhurst', 'Martlock', 'Fort Sterling', 'Thetford')` | hot | Cities compared by /market and used to reference-price kill loot. |
+| `killboard.market.user_agent` | str | `'DeadBot-Killboard (self-hosted; contact your guild admin)'` | restart | User-Agent sent to the AODP API (be a good citizen — identify the bot). |
 | **`routing:`** | | | | *OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.* |
 | `routing.file` | str | `''` | engine | routing.yaml location. Empty (the default) = routing.yaml in the same directory as cortana.yaml. |
 | **`ipc:`** | | | | *The Brain⇄Ears unix socket (GDD §15).* |
