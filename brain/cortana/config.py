@@ -492,7 +492,7 @@ class KbCardsConfig:
     documented, cacheable render service — never the flaky gameinfo API."""
 
     enabled: bool = True
-    icon_cache_dir: str = "/var/lib/dead/killboard/icons"
+    icon_cache_dir: str = "/var/lib/cortana/killboard/icons"
     render_base: str = "https://render.albiononline.com/v1"
 
 
@@ -520,7 +520,7 @@ class KbStorageConfig:
     """The killboard's OWN sqlite file — never CORTANA's. Irreplaceable: the
     API cannot re-serve old events (killboard GDD §2.4)."""
 
-    db_path: str = "/var/lib/dead/killboard/killboard.db"
+    db_path: str = "/var/lib/cortana/killboard/killboard.db"
 
 
 @dataclass(frozen=True, slots=True)

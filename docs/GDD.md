@@ -1407,13 +1407,13 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `killboard.feed.catchup_max_posts` | int | `20` | hot | Cap on feed posts per catch-up cycle after downtime; the rest get a single 'posted N older events' summary (killboard GDD §7.3). |
 | `killboard.feed.post_delay_ms` | int | `750` | hot | Spacing between feed messages so a backfill burst can't hit rate limits. |
 | `killboard.cards.enabled` | bool | `True` | hot | Render composited kill-card images (Pillow). false = embed only. |
-| `killboard.cards.icon_cache_dir` | str | `'/var/lib/dead/killboard/icons'` | restart | On-disk item-icon cache from the render service (fetched once each). |
+| `killboard.cards.icon_cache_dir` | str | `'/var/lib/cortana/killboard/icons'` | restart | On-disk item-icon cache from the render service (fetched once each). |
 | `killboard.cards.render_base` | str | `'https://render.albiononline.com/v1'` | hot | Albion render service base URL (documented, cacheable — not the gameinfo API). |
 | `killboard.rankings.timezone` | str | `'UTC'` | hot | Timezone for daily/weekly/monthly ranking windows and schedules. |
 | `killboard.battles.channel` | int | `0` | hot | Optional battle-summary channel. 0 = battle posting off. |
 | `killboard.battles.min_players` | int | `20` | hot | Minimum guild participants for a battle to post (killboard GDD §9). |
 | `killboard.battles.min_fame` | int | `5000000` | hot | Minimum total fame swung for a battle to post. |
-| `killboard.storage.db_path` | str | `'/var/lib/dead/killboard/killboard.db'` | restart | The killboard's own SQLite file — separate from CORTANA's. Irreplaceable (the API can't re-serve old events); back it up (killboard GDD §2.4). |
+| `killboard.storage.db_path` | str | `'/var/lib/cortana/killboard/killboard.db'` | restart | The killboard's own SQLite file — separate from CORTANA's. Irreplaceable (the API can't re-serve old events); back it up (killboard GDD §2.4). |
 | `killboard.staleness.warn_after_minutes` | int | `30` | hot | No successful poll for this long → surface it in /killboard status. |
 | `killboard.staleness.no_events_notice_hours` | int | `6` | hot | No NEW events for this long → note 'guild is quiet' (not an error). |
 | **`routing:`** | | | | *OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.* |

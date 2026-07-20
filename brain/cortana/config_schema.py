@@ -1196,14 +1196,13 @@ KEYS: Final[tuple[Key, ...]] = (
         "str",
         Reload.RESTART,
         "On-disk item-icon cache from the render service (fetched once each).",
-        default="/var/lib/dead/killboard/icons",
+        default="/var/lib/cortana/killboard/icons",
     ),
     Key(
         "killboard.cards.render_base",
         "str",
         Reload.HOT,
-        "Albion render service base URL (documented, cacheable — not the "
-        "gameinfo API).",
+        "Albion render service base URL (documented, cacheable — not the gameinfo API).",
         default="https://render.albiononline.com/v1",
     ),
     Key(
@@ -1244,7 +1243,7 @@ KEYS: Final[tuple[Key, ...]] = (
         Reload.RESTART,
         "The killboard's own SQLite file — separate from CORTANA's. Irreplaceable "
         "(the API can't re-serve old events); back it up (killboard GDD §2.4).",
-        default="/var/lib/dead/killboard/killboard.db",
+        default="/var/lib/cortana/killboard/killboard.db",
     ),
     Key(
         "killboard.staleness.warn_after_minutes",

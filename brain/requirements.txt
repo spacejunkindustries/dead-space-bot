@@ -18,3 +18,6 @@ requests>=2.31           # openwakeword.utils — model downloads
 faster-whisper>=1.0      # audio/stt.py — default STT backend (CTranslate2, releases the GIL)
 numpy>=1.26              # audio/wake.py, audio/stt.py — PCM frame views and model input tensors
 anthropic>=0.60          # chat.py — the §6.6 "command override" assistant (opt-in)
+# ── killboard add-on (Albion Online) — only used when the module is enabled ──
+aiohttp>=3.9             # killboard/api.py — async gameinfo client + icon fetch (NOT for voice)
+pillow>=10.0             # killboard/cards.py — kill-card image compositing

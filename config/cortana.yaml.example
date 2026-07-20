@@ -326,7 +326,7 @@ killboard:                             # Albion Online killboard add-on — OPTI
     post_delay_ms: 750                 # spacing between feed messages
   cards:
     enabled: true                      # render Pillow kill-card images (false = embed only)
-    icon_cache_dir: /var/lib/dead/killboard/icons
+    icon_cache_dir: /var/lib/cortana/killboard/icons
     render_base: https://render.albiononline.com/v1
   rankings:
     timezone: UTC                      # window boundaries for daily/weekly/monthly rankings
@@ -335,7 +335,7 @@ killboard:                             # Albion Online killboard add-on — OPTI
     min_players: 20
     min_fame: 5000000
   storage:
-    db_path: /var/lib/dead/killboard/killboard.db   # the killboard's OWN db — back it up
+    db_path: /var/lib/cortana/killboard/killboard.db   # the killboard's OWN db — back it up
   staleness:
     warn_after_minutes: 30             # no successful poll this long → shown in /killboard status
     no_events_notice_hours: 6          # no NEW events this long → "guild is quiet" (not an error)
