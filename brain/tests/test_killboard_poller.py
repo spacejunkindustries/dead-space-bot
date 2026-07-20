@@ -39,13 +39,30 @@ class FakeApi:
     real pagination sees. Every call is recorded in :attr:`calls` for assertions.
     """
 
-    def __init__(self, events: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        roster: list[dict[str, Any]] | None = None,
+        deaths: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
         self.window = list(events)
         self.calls: list[tuple[str, int, int]] = []
+        #: deaths-sweep seams — a member roster and each member's death window.
+        self._roster = list(roster or [])
+        self._deaths = dict(deaths or {})
+        self.death_calls: list[str] = []
 
     async def events(self, guild_id: str, limit: int = 51, offset: int = 0) -> list[dict[str, Any]]:
         self.calls.append((guild_id, limit, offset))
         return list(self.window[offset : offset + limit])
+
+    async def members(self, guild_id: str) -> list[dict[str, Any]]:
+        return list(self._roster)
+
+    async def player_deaths(self, player_id: str, limit: int = 51) -> list[dict[str, Any]]:
+        self.death_calls.append(player_id)
+        return list(self._deaths.get(player_id, [])[:limit])
 
 
 async def _inline_to_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -62,6 +79,19 @@ def _raw(event_id: int, *, guild: str = GUILD_ID, fame: int = 100) -> dict[str, 
         "TimeStamp": "2026-07-20T12:00:00Z",
         "Killer": {"Id": "K", "Name": "Killer", "GuildId": guild},
         "Victim": {"Id": f"V{event_id}", "Name": "Victim", "GuildId": "OTHER"},
+        "TotalVictimKillFame": fame,
+    }
+
+
+def _raw_death(event_id: int, *, guild: str = GUILD_ID, fame: int = 100) -> dict[str, Any]:
+    """A minimal raw death event: the tracked guild is the VICTIM, so
+    :func:`~killboard.model.parse_event` classifies it as a DEATH and keeps it.
+    This is the shape ``/players/{id}/deaths`` returns."""
+    return {
+        "EventId": event_id,
+        "TimeStamp": "2026-07-20T12:00:00Z",
+        "Killer": {"Id": "K", "Name": "Ganker", "GuildId": "OTHER"},
+        "Victim": {"Id": f"M{event_id}", "Name": "Member", "GuildId": guild},
         "TotalVictimKillFame": fame,
     }
 
@@ -323,3 +353,73 @@ async def test_persist_failure_keeps_mark_below_the_failed_event(store: KbStore)
     # refetched next tick. It was NOT written; 51 and 53 were.
     assert store.high_water_mark() == 51
     assert sorted(row.event_id for row in store.recent(50)) == [51, 53]
+
+
+# ── deaths sweep (guild-events is kill-only; deaths come per-member) ──────────
+
+
+@pytest.mark.asyncio
+async def test_deaths_sweep_ingests_per_member_deaths(
+    store: KbStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-member deaths sweep fetches each roster member's deaths, stores
+    the ones not already seen, and hands them to the feed classified as DEATHs —
+    the only path by which Death Fame becomes non-zero (the guild feed is
+    kill-only)."""
+    monkeypatch.setattr("killboard.poller._MEMBER_THROTTLE_S", 0.0)
+    roster = [{"Id": "P1", "Name": "One"}, {"Id": "P2", "Name": "Two"}]
+    deaths = {"P1": [_raw_death(201)], "P2": [_raw_death(202), _raw_death(203)]}
+    api = FakeApi([], roster=roster, deaths=deaths)
+    queue: asyncio.Queue[list[EventRow]] = asyncio.Queue()
+    poller = _make_poller(store, api, queue, _cfg())
+
+    await poller._poll_deaths()
+
+    batch = queue.get_nowait()
+    assert _ids(batch) == [201, 202, 203]  # sorted oldest-first for the feed
+    assert api.death_calls == ["P1", "P2"]
+    # All three landed in the store and count toward Death Fame (300 total).
+    assert sorted(row.event_id for row in store.recent(50)) == [201, 202, 203]
+    assert store.death_fame("2026-07-01T00:00:00Z") == 300
+
+
+@pytest.mark.asyncio
+async def test_deaths_sweep_skips_already_stored(
+    store: KbStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A death already ingested on a previous sweep is skipped — no re-store and,
+    crucially, no re-emit to the feed (the sweep re-fetches the same recent
+    window every pass)."""
+    monkeypatch.setattr("killboard.poller._MEMBER_THROTTLE_S", 0.0)
+    roster = [{"Id": "P1", "Name": "One"}]
+    api = FakeApi([], roster=roster, deaths={"P1": [_raw_death(201), _raw_death(200)]})
+    queue: asyncio.Queue[list[EventRow]] = asyncio.Queue()
+    poller = _make_poller(store, api, queue, _cfg())
+
+    await poller._poll_deaths()  # first sweep stores both
+    assert _ids(queue.get_nowait()) == [200, 201]
+
+    await poller._poll_deaths()  # second sweep re-fetches the same window
+    assert queue.empty()  # nothing new emitted
+    assert sorted(row.event_id for row in store.recent(50)) == [200, 201]
+
+
+@pytest.mark.asyncio
+async def test_deaths_sweep_disabled_by_config(
+    store: KbStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``track_deaths=False`` the sweep is a no-op — no member fetches, no
+    writes — so a corp that only wants kills pays nothing for deaths."""
+    monkeypatch.setattr("killboard.poller._MEMBER_THROTTLE_S", 0.0)
+    cfg = KillboardConfig(
+        guild_id=GUILD_ID,
+        poller=KbPollerConfig(interval_seconds=1, track_deaths=False),
+    )
+    api = FakeApi([], roster=[{"Id": "P1"}], deaths={"P1": [_raw_death(201)]})
+    queue: asyncio.Queue[list[EventRow]] = asyncio.Queue()
+    poller = _make_poller(store, api, queue, cfg)
+
+    await poller._poll_deaths()
+
+    assert api.death_calls == []
+    assert store.recent(50) == []

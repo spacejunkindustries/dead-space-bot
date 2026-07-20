@@ -91,6 +91,14 @@ class KbStore:
         mx = db.query_value(self._conn, "SELECT MAX(event_id) FROM events")
         return int(mx) if mx else 0
 
+    def has_event(self, event_id: int) -> bool:
+        """Whether ``event_id`` is already stored — cheap dedup for the deaths
+        sweep, which re-fetches the same recent deaths each pass (GDD §5)."""
+        val = db.query_value(
+            self._conn, "SELECT 1 FROM events WHERE event_id = ? LIMIT 1", (event_id,)
+        )
+        return val is not None
+
     # ── ingestion: event / participant upserts ───────────────────────────────
 
     def upsert_event(self, row: EventRow, raw_json: str, now: str | None = None) -> None:

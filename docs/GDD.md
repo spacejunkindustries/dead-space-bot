@@ -1396,6 +1396,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `killboard.poller.backoff_base_seconds` | float | `5.0` | hot | Exponential backoff base on request failure (5, 10, 20 …). |
 | `killboard.poller.page_limit` | int | `51` | hot | Events per request; 51 is the endpoint maximum (killboard GDD §5.2). |
 | `killboard.poller.max_backfill_pages` | int | `20` | restart | First-run backfill depth in pages (≈ the server offset ceiling). Bounds how much recent history the seed captures (killboard GDD §5.3). |
+| `killboard.poller.track_deaths` | bool | `True` | hot | Also gather guild DEATHS per-member (the guild-events endpoint is kill-only). Off = kills-only feed and Death Fame stays 0. |
 | `killboard.feed.kills_channel` | int | `0` | hot | Channel id for guild kills. 0 = unset. |
 | `killboard.feed.deaths_channel` | int | `0` | hot | Channel id for guild deaths (may equal kills_channel). 0 = unset. |
 | `killboard.feed.min_fame` | int | `0` | hot | Suppress kills below this fame from the main feed. 0 = show all. |

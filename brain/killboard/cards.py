@@ -1207,7 +1207,7 @@ def _clip_name(name: str, limit: int) -> str:
 
 
 def _paste_mascot(canvas: Any, data: bytes | None, height: int) -> None:
-    """Bleed the reaper mascot faintly off the card's right edge; no-op if absent."""
+    """Centre the reaper mascot faintly behind the ranking card; no-op if absent."""
     if not data:
         return
     try:
@@ -1217,7 +1217,7 @@ def _paste_mascot(canvas: Any, data: bytes | None, height: int) -> None:
         new = mascot.resize((max(1, int(mascot.width * scale)), height))
         alpha = new.getchannel("A").point(lambda a: int(a * 0.12))
         new.putalpha(alpha)
-        canvas.paste(new, (_RANK_W - new.width + 60, 0), new)
+        canvas.paste(new, ((_RANK_W - new.width) // 2, 0), new)
     except Exception:  # decorative — never fail the ranking card over it (§7.1)
         return
 
@@ -1258,7 +1258,9 @@ def _compose_ranking_card(
             (28, 22), f"☠  {heading.upper()}", font=f_title, fill=(255, 255, 255), anchor="lm"
         )
         draw.text((30, 52), period_label, font=f_sub, fill=_COLOR_SUBTLE, anchor="lm")
-        _paste_logo(canvas, brand.logo, (_RANK_W - 84, 18), 56, opacity=0.95)
+        # Roundel in the BOTTOM-right corner (out of the reaper mascot's way, which
+        # bleeds down the right side); footer tagline sits bottom-left.
+        _paste_logo(canvas, brand.logo, (_RANK_W - 58, height - 56), 46, opacity=0.95)
 
         # Guild-wide totals.
         draw.text(

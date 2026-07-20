@@ -466,6 +466,10 @@ class KbPollerConfig:
     page_limit: int = 51
     #: First-run backfill depth in pages (≈ the server's offset ceiling).
     max_backfill_pages: int = 20
+    #: Also gather guild DEATHS. The guild-events endpoint is kill-only, so deaths
+    #: (and Death Fame) are polled per-member from /players/{id}/deaths on a slower
+    #: cadence. Off = kills-only feed and Death Fame stays 0 (killboard GDD §5).
+    track_deaths: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1017,6 +1021,7 @@ def _assemble_killboard(v: dict[str, Any]) -> KillboardConfig:
             backoff_base_seconds=v["killboard.poller.backoff_base_seconds"],
             page_limit=v["killboard.poller.page_limit"],
             max_backfill_pages=v["killboard.poller.max_backfill_pages"],
+            track_deaths=v["killboard.poller.track_deaths"],
         ),
         feed=KbFeedConfig(
             kills_channel=v["killboard.feed.kills_channel"],
