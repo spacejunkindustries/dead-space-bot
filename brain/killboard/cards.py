@@ -1207,7 +1207,7 @@ def _clip_name(name: str, limit: int) -> str:
 
 
 def _paste_mascot(canvas: Any, data: bytes | None, height: int) -> None:
-    """Bleed the reaper mascot faintly off the card's right edge; no-op if absent."""
+    """Centre the reaper mascot faintly behind the ranking card; no-op if absent."""
     if not data:
         return
     try:
@@ -1217,7 +1217,7 @@ def _paste_mascot(canvas: Any, data: bytes | None, height: int) -> None:
         new = mascot.resize((max(1, int(mascot.width * scale)), height))
         alpha = new.getchannel("A").point(lambda a: int(a * 0.12))
         new.putalpha(alpha)
-        canvas.paste(new, (_RANK_W - new.width + 60, 0), new)
+        canvas.paste(new, ((_RANK_W - new.width) // 2, 0), new)
     except Exception:  # decorative — never fail the ranking card over it (§7.1)
         return
 
