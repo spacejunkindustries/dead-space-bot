@@ -75,6 +75,13 @@ class KbStore:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        # In-memory mirror of the poll_state row, kept fresh by record_poll /
+        # record_poll_failure. health() (a sync BotModule method invoked on the
+        # voice event loop) reads THIS, never sqlite — a loop-thread SELECT on a
+        # connection concurrently written by worker threads would serialise on the
+        # shared connection lock and stall the event loop. Seeded once here at
+        # construction (module setup, before any worker task runs).
+        self._poll_cache: dict[str, Any] = self._read_poll_state()
 
     # ── ingestion: high-water mark ───────────────────────────────────────────
 
@@ -229,6 +236,13 @@ class KbStore:
             """,
             (last_event_id, ts, advanced_ts, 1 if advanced else 0),
         )
+        # Mirror the write into the health cache (same semantics as the SQL:
+        # last_advanced_at only moves on a genuine advance).
+        self._poll_cache["last_event_id"] = int(last_event_id)
+        self._poll_cache["last_success_at"] = ts
+        if advanced:
+            self._poll_cache["last_advanced_at"] = ts
+        self._poll_cache["consecutive_fails"] = 0
 
     def record_poll_failure(self, now: str | None = None) -> None:
         """Record a failed poll: increment ``consecutive_fails`` (GDD §13).
@@ -247,12 +261,27 @@ class KbStore:
                 consecutive_fails = poll_state.consecutive_fails + 1
             """,
         )
+        self._poll_cache["consecutive_fails"] = (
+            int(self._poll_cache.get("consecutive_fails", 0)) + 1
+        )
 
     def poll_state(self) -> dict[str, Any]:
-        """The single poll-state row as a plain dict, for health/status (GDD §10).
+        """The current poll-state, for health/status (GDD §10).
+
+        Serves the in-memory cache (kept in step with every ``record_poll`` /
+        ``record_poll_failure``) rather than reading sqlite, so a caller on the
+        voice event loop (``health()`` → ``/botstatus``) never issues a blocking
+        SELECT on the connection worker threads are writing. The cache is a
+        faithful mirror; it is seeded from the row at construction.
+        """
+        return dict(self._poll_cache)
+
+    def _read_poll_state(self) -> dict[str, Any]:
+        """Read the single poll-state row from sqlite as a plain dict.
 
         Returns zero/``None`` defaults when the row does not yet exist so callers
-        never have to special-case a fresh database.
+        never have to special-case a fresh database. Used to seed the in-memory
+        cache at construction; not on the hot path.
         """
         row = db.query_one(
             self._conn,

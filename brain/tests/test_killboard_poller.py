@@ -355,6 +355,29 @@ async def test_persist_failure_keeps_mark_below_the_failed_event(store: KbStore)
     assert sorted(row.event_id for row in store.recent(50)) == [51, 53]
 
 
+@pytest.mark.asyncio
+async def test_spike_larger_than_backfill_bound_is_not_partially_dropped(store: KbStore) -> None:
+    """A live spike (hwm>0) must page to the server offset ceiling, NOT stop at
+    the first-run backfill bound (max_backfill_pages). Otherwise a burst larger
+    than max_backfill_pages*page_limit advances the mark to the top and silently
+    drops the oldest still-new events on the un-fetched pages (§5.2)."""
+    store.record_poll(100, advanced=True)
+    # 250 events all newer than the mark — far more than max_backfill_pages(5) *
+    # page_limit(10) = 50 — then event 100 as known ground below them.
+    window = [_raw(eid) for eid in range(350, 100, -1)]  # 350..101, newest-first
+    window.append(_raw(100))  # stored ground
+    api = FakeApi(window)
+    queue: asyncio.Queue[list[EventRow]] = asyncio.Queue()
+    poller = _make_poller(store, api, queue, _cfg(page_limit=10, max_backfill_pages=5))
+
+    await poller._poll_once()
+
+    # ALL 250 new events ingested — the spike paged past the 50-event backfill
+    # bound down to known ground, losing none.
+    assert store.high_water_mark() == 350
+    assert len(store.recent(500)) == 250
+
+
 # ── deaths sweep (guild-events is kill-only; deaths come per-member) ──────────
 
 

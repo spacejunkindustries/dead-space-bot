@@ -310,8 +310,9 @@ class KillboardModule(BotModule):
         FAILED when startup could not resolve the guild; STARTING before the
         first successful poll; DEGRADED when polling is stale (no success within
         ``staleness.warn_after_minutes``) or a deep failure streak is running;
-        OK otherwise. Reads only the single ``poll_state`` row (a cheap indexed
-        lookup) plus the feed's in-memory counters — safe to call on the loop.
+        OK otherwise. Reads only in-memory state — the store's poll-state cache
+        (kept fresh by the poller) and the feed's counters — so it never issues a
+        blocking sqlite read on the event loop.
         """
         if self._store is None:
             return ModuleHealth(ModuleStatus.STARTING, "killboard initialising")

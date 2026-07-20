@@ -171,6 +171,72 @@ async def test_missing_channel_is_skipped_not_deferred(store: KbStore) -> None:
     assert store.count_unposted() == 0
 
 
+class _ForbiddenChannel:
+    """A resolvable channel whose send raises a PERMANENT 403 (bot lacks Send
+    Messages) — the case that must SKIP, not DEFER."""
+
+    async def send(self, **_kwargs: Any) -> Any:
+        raise discord.Forbidden(
+            SimpleNamespace(status=403, reason="Forbidden"), "Missing Permissions"
+        )
+
+
+class _BadRequestChannel:
+    """A resolvable channel whose send raises a PERMANENT 400 (e.g. a malformed /
+    oversized embed) — also must SKIP, not DEFER."""
+
+    async def send(self, **_kwargs: Any) -> Any:
+        raise discord.HTTPException(
+            SimpleNamespace(status=400, reason="Bad Request"), "Invalid Form Body"
+        )
+
+
+async def test_permanent_forbidden_is_skipped_not_deferred(store: KbStore) -> None:
+    """A 403 (missing Send Messages) on the only target must SKIP (marked posted)
+    — NOT defer. Deferring a permanent error would re-attempt this same oldest
+    event every drain and wedge every newer kill behind it forever."""
+    row = _kill_row(4)
+    store.upsert_event(row, "{}")
+    feed = _feed(_Bot({KILLS_CHANNEL: _ForbiddenChannel()}), store)
+
+    result = await feed._post_one(row)
+
+    assert result is _PostResult.SKIPPED
+    assert store.count_unposted() == 0  # marked posted → cannot wedge the backlog
+
+
+async def test_permanent_bad_request_is_skipped_not_deferred(store: KbStore) -> None:
+    """A 400 (malformed embed) is permanent too — SKIP, don't defer."""
+    row = _kill_row(5)
+    store.upsert_event(row, "{}")
+    feed = _feed(_Bot({KILLS_CHANNEL: _BadRequestChannel()}), store)
+
+    result = await feed._post_one(row)
+
+    assert result is _PostResult.SKIPPED
+    assert store.count_unposted() == 0
+
+
+async def test_server_5xx_still_defers(store: KbStore) -> None:
+    """A 500 is transient — it must still DEFER (retry next drain), so the
+    permanent/transient split didn't break the never-drop guarantee."""
+
+    class _ServerErrorChannel:
+        async def send(self, **_kwargs: Any) -> Any:
+            raise discord.HTTPException(
+                SimpleNamespace(status=503, reason="Service Unavailable"), "try later"
+            )
+
+    row = _kill_row(6)
+    store.upsert_event(row, "{}")
+    feed = _feed(_Bot({KILLS_CHANNEL: _ServerErrorChannel()}), store)
+
+    result = await feed._post_one(row)
+
+    assert result is _PostResult.DEFERRED
+    assert store.count_unposted() == 1  # NOT marked posted — retryable
+
+
 async def test_feed_passes_raw_event_with_equipment_to_card(store: KbStore) -> None:
     """The card must receive the PARSED raw event (with Victim/Killer Equipment),
     not the bare EventRow — the flat row carries no raw_json, so without this the

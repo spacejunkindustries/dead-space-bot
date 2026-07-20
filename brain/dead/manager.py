@@ -209,8 +209,17 @@ class ModuleManager:
                 snapshot[module.name] = ModuleHealth(ModuleStatus.FAILED, "health() raised")
                 continue
             sup = self._supervisor.status(module.name)
-            status = own.status if _RANK[own.status] >= _RANK[sup] else sup
-            snapshot[module.name] = ModuleHealth(status, own.detail, own.metrics)
+            if _RANK[sup] > _RANK[own.status]:
+                # A supervised task is worse than the module's self-report (e.g.
+                # a background task crash-looped into quarantine). Surface WHY —
+                # own.detail would read reassuringly ("polling") and mask the
+                # failure, defeating the point of showing the worse status.
+                own_detail = own.detail.strip()
+                prefix = f"{own_detail} — " if own_detail else ""
+                detail = f"{prefix}a supervised task is {sup.value} (check the journal)"
+                snapshot[module.name] = ModuleHealth(sup, detail, own.metrics)
+            else:
+                snapshot[module.name] = ModuleHealth(own.status, own.detail, own.metrics)
         # _failed is authoritative — a module that failed setup/start/cog wiring
         # reads FAILED even if it lingers in _active for stop() cleanup.
         for name, detail in self._failed.items():

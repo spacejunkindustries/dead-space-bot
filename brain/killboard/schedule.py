@@ -134,17 +134,46 @@ def period_start(now: datetime, kind: str, tz: str) -> datetime:
     raise ValueError(f"unknown schedule kind: {kind!r}")
 
 
-def _fire_due(period_start_local: datetime, hour_utc: int) -> datetime:
+def _next_period_start(period_start_local: datetime, kind: str, tz: str) -> datetime:
+    """The start of the period *following* the one beginning at
+    ``period_start_local`` (local-aware), computed via a probe safely inside the
+    next period so DST-short/long days and variable month lengths are handled by
+    :func:`period_start` itself."""
+    if kind == "weekly":
+        probe = period_start_local + timedelta(days=7, hours=2)
+    elif kind == "monthly":
+        probe = period_start_local + timedelta(days=32)
+    else:  # daily (and any tolerant fallthrough)
+        probe = period_start_local + timedelta(days=1, hours=2)
+    return period_start(probe, kind, tz)
+
+
+def _fire_due(
+    period_start_local: datetime, next_period_start_local: datetime, hour_utc: int
+) -> datetime:
     """The UTC instant at which the current period's post becomes due.
 
     The first ``hour_utc``:00 UTC at or after the period's start. Clamped to a
     valid hour so a bad config value can never raise.
+
+    DST guard: a daily period spanning a spring-forward day is only 23h in UTC,
+    so the ideal ``hour_utc``:00 can land exactly on (or past) the *next* period's
+    start and thus never inside this period — which would make ``should_fire``
+    return False for the whole shortened period and silently skip that day's post.
+    When the computed instant is not strictly within ``[start, next_start)`` we
+    fall back to firing at the period start, guaranteeing exactly one fire per
+    period regardless of DST.
     """
     hour = max(0, min(23, hour_utc))
-    base = period_start_local.astimezone(UTC)
-    candidate = base.replace(hour=hour, minute=0, second=0, microsecond=0)
-    if candidate < base:
+    start = period_start_local.astimezone(UTC)
+    nxt = next_period_start_local.astimezone(UTC)
+    candidate = start.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if candidate < start:
         candidate += timedelta(days=1)
+    if candidate >= nxt:
+        # The ideal hour doesn't fall within this (short) period — fire at its
+        # start instead of never.
+        candidate = start
     return candidate
 
 
@@ -165,7 +194,8 @@ def should_fire(
         return False
     start_local = period_start(now, kind, tz)
     start_utc = start_local.astimezone(UTC)
-    if now < _fire_due(start_local, hour_utc):
+    next_local = _next_period_start(start_local, kind, tz)
+    if now < _fire_due(start_local, next_local, hour_utc):
         return False
     last = _parse_iso(last_run)
     return last is None or last < start_utc

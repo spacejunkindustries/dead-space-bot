@@ -208,3 +208,42 @@ def test_schedule_upsert_list_and_remove(store: KbStore) -> None:
     assert _delete_schedule(store, "daily") == 1
     assert _delete_schedule(store, "daily") == 0  # already gone
     assert {r["kind"] for r in _list_schedules(store)} == {"weekly"}
+
+
+def test_poll_state_serves_cache_matching_the_db(store: KbStore) -> None:
+    """poll_state() serves an in-memory mirror (so health() never reads sqlite on
+    the event loop). The mirror must match a fresh DB read after every write."""
+    store.record_poll(500, advanced=True)
+    store.record_poll_failure()
+    store.record_poll_failure()
+
+    cached = store.poll_state()
+    from_db = store._read_poll_state()  # noqa: SLF001 — assert cache == truth
+    assert cached == from_db
+    assert cached["last_event_id"] == 500
+    assert cached["consecutive_fails"] == 2
+
+    # A success resets the fail streak and advances the mark — cache stays true.
+    store.record_poll(600, advanced=True)
+    assert store.poll_state() == store._read_poll_state()  # noqa: SLF001
+    assert store.poll_state()["consecutive_fails"] == 0
+    assert store.poll_state()["last_event_id"] == 600
+
+
+def test_schedules_kind_is_unique(store: KbStore) -> None:
+    """Migration 0002 makes kind UNIQUE, so single-row-per-kind is enforced
+    structurally — a second row of the same kind (e.g. a raced schedule-add)
+    can't be inserted and thus can't double-post."""
+    import pytest
+
+    from cortana.core import db
+
+    db.execute(
+        store._conn,  # noqa: SLF001 — killboard's own schedules table
+        "INSERT INTO schedules (kind, channel_id, hour_utc) VALUES ('daily', 1, 4)",
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            store._conn,  # noqa: SLF001
+            "INSERT INTO schedules (kind, channel_id, hour_utc) VALUES ('daily', 2, 5)",
+        )
