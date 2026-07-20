@@ -607,6 +607,10 @@ class KbPublicJuicyConfig:
     #: Pages of 51 recent global events scanned per cycle (deeper = more coverage
     #: of a fast firehose, but more requests + more loot pricing per scan).
     scan_pages: int = 2
+    #: HARD cap on posts per scan — the real volume control. Every geared kill on
+    #: a whole server prices in the millions, so a threshold alone lets dozens
+    #: through; the scan ranks qualifiers by value and posts only the top N.
+    max_posts_per_scan: int = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -1101,6 +1105,7 @@ def _assemble_killboard(v: dict[str, Any]) -> KillboardConfig:
             enabled=v["killboard.public_juicy.enabled"],
             interval_seconds=v["killboard.public_juicy.interval_seconds"],
             scan_pages=v["killboard.public_juicy.scan_pages"],
+            max_posts_per_scan=v["killboard.public_juicy.max_posts_per_scan"],
         ),
     )
 

@@ -380,6 +380,9 @@ killboard:                             # Albion Online killboard add-on — OPTI
     enabled: false
     interval_seconds: 90               # seconds between global-feed scans (sampled highlight reel)
     scan_pages: 2                      # pages of 51 recent global events per scan (deeper = more coverage)
+    max_posts_per_scan: 5              # HARD cap — posts only the top-N biggest per scan (the real
+                                       # volume control; every geared global kill prices ~1M+, so a
+                                       # threshold alone floods — raise feed.juicy_min_loot too, e.g. 5M)
 
 routing:
   file: ""                             # routing.yaml location (GDD §10.1). "" (the default)

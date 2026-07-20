@@ -1423,6 +1423,17 @@ KEYS: Final[tuple[Key, ...]] = (
         minimum=1,
         maximum=10,
     ),
+    Key(
+        "killboard.public_juicy.max_posts_per_scan",
+        "int",
+        Reload.HOT,
+        "HARD cap on posts per scan — the real volume control. Qualifiers are "
+        "ranked by value (loot, else fame) and only the top N post, so a low "
+        "threshold on the global firehose can't flood the channel.",
+        default=5,
+        minimum=1,
+        maximum=50,
+    ),
     # routing (optional section)
     Key(
         "routing.file",
