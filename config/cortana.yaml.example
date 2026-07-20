@@ -383,6 +383,9 @@ killboard:                             # Albion Online killboard add-on — OPTI
     max_posts_per_scan: 5              # HARD cap — posts only the top-N biggest per scan (the real
                                        # volume control; every geared global kill prices ~1M+, so a
                                        # threshold alone floods — raise feed.juicy_min_loot too, e.g. 5M)
+    max_priced_per_scan: 60            # per-scan loot-pricing budget — caps how many AODP lookups a
+                                       # scan makes (fame is free; only sub-fame kills are priced).
+                                       # 0 = fame-only, never price the public feed.
 
 routing:
   file: ""                             # routing.yaml location (GDD §10.1). "" (the default)

@@ -1435,6 +1435,7 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `killboard.public_juicy.interval_seconds` | int | `90` | hot | Seconds between server-wide feed scans (a sampled highlight reel, so this trades coverage for API politeness). |
 | `killboard.public_juicy.scan_pages` | int | `2` | hot | Pages of 51 recent global events scanned per cycle — deeper covers more of a fast firehose but costs more requests and more loot pricing per scan. |
 | `killboard.public_juicy.max_posts_per_scan` | int | `5` | hot | HARD cap on posts per scan — the real volume control. Qualifiers are ranked by value (loot, else fame) and only the top N post, so a low threshold on the global firehose can't flood the channel. |
+| `killboard.public_juicy.max_priced_per_scan` | int | `60` | hot | Per-scan loot-pricing budget. Fame is free; only sub-fame events are priced (with bounded concurrency) to check the loot bar, so this caps how many AODP market lookups one scan makes — keeping the bot polite to the shared, rate-limited API. 0 = fame-only (never price the public feed). |
 | **`routing:`** | | | | *OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.* |
 | `routing.file` | str | `''` | engine | routing.yaml location. Empty (the default) = routing.yaml in the same directory as cortana.yaml. |
 | **`ipc:`** | | | | *The Brain⇄Ears unix socket (GDD §15).* |

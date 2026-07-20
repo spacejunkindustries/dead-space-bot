@@ -241,9 +241,14 @@ class Feed:
         These older events are represented by the single summary line rather than
         an individual card each; recording them in ``posted`` (channel/message 0)
         keeps the feed exactly-once and stops them re-appearing on the next drain.
+
+        Marked in ONE batched write (not one ``to_thread(mark_posted)`` per row):
+        a first-run/downtime backlog can be thousands of events, and the sibling
+        fetch on this path is already batched.
         """
-        for row in rows:
-            await self._to_thread(self._store.mark_posted, row.event_id, 0, 0)
+        if not rows:
+            return
+        await self._to_thread(self._store.mark_posted_many, [row.event_id for row in rows])
         self._collapsed_total += len(rows)
 
     # ── posting one event ────────────────────────────────────────────────────
