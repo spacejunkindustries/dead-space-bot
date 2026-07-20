@@ -276,7 +276,7 @@ class Feed:
         raw = await self._to_thread(self._store.raw_event, row.event_id)
         killer_guild, victim_guild = _guild_tags(raw)
         loot_value = await self._loot_value(raw)
-        png = await self._render_card(row, loot_value)
+        png = await self._render_card(row, raw, loot_value)
         filename = f"kill_{row.event_id}.png"
         embed = build_embed(
             row,
@@ -329,17 +329,21 @@ class Feed:
         await self._to_thread(self._store.mark_posted, row.event_id, 0, 0)
         return _PostResult.SKIPPED
 
-    async def _render_card(self, row: EventRow, loot_value: int | None = None) -> bytes | None:
+    async def _render_card(
+        self, row: EventRow, raw: dict[str, Any] | None, loot_value: int | None = None
+    ) -> bytes | None:
         """Render the kill-card PNG for an event, or ``None`` to post embed-only.
 
-        The renderer already swallows its own failures (disabled cards, Pillow
-        missing, a dead icon fetch) and returns ``None`` (§7.1); this wrapper adds
-        a last-resort guard so nothing in the card path can ever take down a post.
-        ``loot_value`` (when the market layer priced the loadout) is drawn on the
-        card; ``None`` simply omits it.
+        ``raw`` is the parsed full event (from :meth:`KbStore.raw_event`); it
+        carries the equipment grid the flat ``row`` does not, so passing it is
+        what makes the gear icons render. The renderer already swallows its own
+        failures (disabled cards, Pillow missing, a dead icon fetch) and returns
+        ``None`` (§7.1); this wrapper adds a last-resort guard so nothing in the
+        card path can ever take down a post. ``loot_value`` (when the market
+        layer priced the loadout) is drawn on the card; ``None`` omits it.
         """
         try:
-            return await self._cards.render(row, [], loot_value=loot_value)
+            return await self._cards.render(row, [], loot_value=loot_value, raw_event=raw)
         except Exception as exc:  # noqa: BLE001 — a card must never break the feed
             self._log.warning("kb_feed.card_error", event_id=row.event_id, error=str(exc))
             return None
