@@ -210,6 +210,41 @@ def test_schedule_upsert_list_and_remove(store: KbStore) -> None:
     assert {r["kind"] for r in _list_schedules(store)} == {"weekly"}
 
 
+def test_mark_posted_many_batches(store: KbStore) -> None:
+    """mark_posted_many records a whole overflow in one call — the catch-up
+    collapse's batched path — leaving nothing unposted and being idempotent."""
+    from killboard.model import KILL, EventRow
+
+    def _row(eid: int) -> EventRow:
+        return EventRow(
+            event_id=eid,
+            timestamp="2026-07-20T12:00:00Z",
+            killer_id="K",
+            killer_name="K",
+            killer_guild_id="G1",
+            killer_ip=1.0,
+            victim_id=f"V{eid}",
+            victim_name="V",
+            victim_guild_id="O",
+            victim_ip=1.0,
+            total_fame=100,
+            relation=KILL,
+            num_participants=1,
+            battle_id=None,
+            location=None,
+        )
+
+    for eid in (1, 2, 3):
+        store.upsert_event(_row(eid), "{}")
+    assert store.count_unposted() == 3
+
+    store.mark_posted_many([1, 2, 3])
+    assert store.count_unposted() == 0
+    store.mark_posted_many([1, 2, 3])  # idempotent — no error, still 0
+    assert store.count_unposted() == 0
+    store.mark_posted_many([])  # empty is a no-op
+
+
 def test_poll_state_serves_cache_matching_the_db(store: KbStore) -> None:
     """poll_state() serves an in-memory mirror (so health() never reads sqlite on
     the event loop). The mirror must match a fresh DB read after every write."""

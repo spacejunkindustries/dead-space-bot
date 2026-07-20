@@ -135,16 +135,28 @@ class KillboardModule(BotModule):
         open path is single-threaded, keeping the blocking sqlite work off-loop
         by convention (GDD §14).
         """
-        # Import here (not at module top) so a construction path is obvious and
-        # the KbApi type stays a type-only import above.
-        from killboard.api import KbApi
-
         self._holder = ctx.holder
         self._to_thread = ctx.to_thread
         self._log = ctx.log
 
         db_path = ctx.holder.current.killboard.storage.db_path
         self._store = await ctx.to_thread(open_store, db_path)
+
+        # The store's sqlite connection is now open. Everything below is pure
+        # construction, but a manager that drops a module on a setup error never
+        # calls stop() — so if any collaborator build raises, close the store here
+        # or its fd + WAL lock would leak for the process lifetime.
+        try:
+            self._wire(ctx)
+        except Exception:
+            self._store.close()
+            self._store = None
+            raise
+        ctx.log.info("kb_module.setup", db_path=db_path)
+
+    def _wire(self, ctx: ModuleContext) -> None:
+        """Build every collaborator from the context (no network, no tasks)."""
+        from killboard.api import KbApi
 
         self._api = KbApi(self._kb_cfg)
         # CardRenderer reads cfg.killboard.cards, so it needs the ROOT AuraConfig
@@ -159,8 +171,12 @@ class KillboardModule(BotModule):
         self._items = ItemIndex()
 
         # One queue shared poller → feed: the poller pushes genuinely-new events
-        # as a wake-up signal; the feed re-reads the store for exactly-once.
-        self._queue = asyncio.Queue()
+        # as a wake-up signal; the feed re-reads the store for exactly-once. Bound
+        # to a single slot — the contents are a discarded wake nudge, so a
+        # quarantined (non-draining) feed must never let the poller accumulate an
+        # unbounded backlog here. The poller's _emit swallows the resulting
+        # QueueFull, so a full queue simply coalesces to "there is work".
+        self._queue = asyncio.Queue(maxsize=1)
 
         self._poller = Poller(
             self._store,
@@ -212,7 +228,6 @@ class KillboardModule(BotModule):
             ctx.to_thread,
         )
         self._market_cog = MarketCog(ctx.bot, self._market, self._items, self._kb_cfg)
-        ctx.log.info("kb_module.setup", db_path=db_path)
 
     def cogs(self) -> Iterable[commands.Cog]:
         """The ``/killboard *`` cog plus the ``/market *`` cog (killboard GDD §10).
@@ -313,8 +328,9 @@ class KillboardModule(BotModule):
 
         The supervised loops are cancelled by the kernel's supervisor on
         shutdown; this releases the module's own resources — the API client's
-        session AND the card renderer's own icon-fetch session (both
-        ``close()`` idempotently). Missing either leaks a session/connector.
+        session, the card renderer's own icon-fetch session, the market session,
+        AND the store's sqlite connection (all ``close()`` idempotently). Missing
+        any leaks a session/connector or a file handle + WAL lock.
         """
         if self._api is not None:
             await self._api.close()
@@ -322,6 +338,8 @@ class KillboardModule(BotModule):
             await self._cards.close()
         if self._market is not None:
             await self._market.close()
+        if self._store is not None:
+            self._store.close()
 
     # ── health (killboard GDD §10, §13) ──────────────────────────────────────
 

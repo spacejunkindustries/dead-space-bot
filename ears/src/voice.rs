@@ -135,11 +135,9 @@ impl Receiver {
         if any_decoded {
             self.inner.guild.note_speech();
         }
-        let bad_ms = self
-            .inner
-            .guild
-            .decode_watchdog
-            .observe(epoch_ms(), any_packets, any_decoded);
+        // Monotonic clock (via the guild's epoch) — never the wall clock — so a
+        // clock step can't spuriously trip this process-exit or mask a real wedge.
+        let bad_ms = self.inner.guild.observe_decode(any_packets, any_decoded);
         if bad_ms >= DECODE_WEDGE_MS {
             error!(
                 guild_id = self.inner.guild.guild_id,

@@ -611,6 +611,11 @@ class KbPublicJuicyConfig:
     #: a whole server prices in the millions, so a threshold alone lets dozens
     #: through; the scan ranks qualifiers by value and posts only the top N.
     max_posts_per_scan: int = 5
+    #: Per-scan LOOT-PRICING budget. Fame is free; only sub-fame events are priced
+    #: to check the loot bar, and the global firehose is ~all sub-fame — so this
+    #: caps how many AODP lookups one scan makes (priced with bounded concurrency),
+    #: keeping the bot a polite client of the shared, rate-limited market API.
+    max_priced_per_scan: int = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -1106,6 +1111,7 @@ def _assemble_killboard(v: dict[str, Any]) -> KillboardConfig:
             interval_seconds=v["killboard.public_juicy.interval_seconds"],
             scan_pages=v["killboard.public_juicy.scan_pages"],
             max_posts_per_scan=v["killboard.public_juicy.max_posts_per_scan"],
+            max_priced_per_scan=v["killboard.public_juicy.max_priced_per_scan"],
         ),
     )
 

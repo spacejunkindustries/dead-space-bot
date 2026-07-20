@@ -24,6 +24,7 @@ takes an optional ``now`` for testability; when omitted it is computed fresh.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -82,6 +83,13 @@ class KbStore:
         # shared connection lock and stall the event loop. Seeded once here at
         # construction (module setup, before any worker task runs).
         self._poll_cache: dict[str, Any] = self._read_poll_state()
+
+    def close(self) -> None:
+        """Close the underlying sqlite connection (checkpoints the WAL). Idempotent
+        and safe to call from shutdown or a setup-failure path; a double close or a
+        close on an already-dead connection is swallowed."""
+        with contextlib.suppress(sqlite3.Error):
+            self._conn.close()
 
     # ── ingestion: high-water mark ───────────────────────────────────────────
 
@@ -330,6 +338,30 @@ class KbStore:
                 posted_at  = excluded.posted_at
             """,
             (event_id, message_id, channel_id, ts),
+        )
+
+    def mark_posted_many(self, event_ids: list[int], now: str | None = None) -> None:
+        """Mark a batch of events posted (channel/message 0) in one round-trip.
+
+        The catch-up collapse (GDD §7.3) records a large overflow as posted without
+        sending it; on a first-run/downtime backlog that is thousands of rows, so a
+        single ``executemany`` beats one write (and one ``to_thread`` hop) per row.
+        Idempotent per ``event_id`` like :meth:`mark_posted`.
+        """
+        if not event_ids:
+            return
+        ts = now or _utc_now()
+        db.executemany(
+            self._conn,
+            """
+            INSERT INTO posted (event_id, message_id, channel_id, posted_at)
+            VALUES (?, 0, 0, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                message_id = excluded.message_id,
+                channel_id = excluded.channel_id,
+                posted_at  = excluded.posted_at
+            """,
+            [(eid, ts) for eid in event_ids],
         )
 
     def raw_event(self, event_id: int) -> dict[str, Any] | None:

@@ -188,6 +188,20 @@ impl GuildVoice {
         let now = self.epoch.elapsed().as_millis() as u64;
         now.saturating_sub(last) <= window.as_millis() as u64
     }
+
+    /// Observe one decode-watchdog tick using this guild's MONOTONIC clock.
+    ///
+    /// The run length that drives the DAVE-wedge exit must be measured against
+    /// `epoch.elapsed()` (like the speech clock), never the wall clock: a wall
+    /// step — an NTP correction, or a host live-migration / pause-resume on the
+    /// droplet — could otherwise make one bad tick read as a >=30s run and
+    /// spuriously `process::exit` (dropping voice for every guild), or a backward
+    /// step could saturate the run to 0 and mask a genuine wedge.
+    #[must_use]
+    pub fn observe_decode(&self, any_packets: bool, any_decoded: bool) -> u64 {
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        self.decode_watchdog.observe(now_ms, any_packets, any_decoded)
+    }
 }
 
 /// Process-wide shared state.

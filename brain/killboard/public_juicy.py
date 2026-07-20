@@ -59,6 +59,10 @@ _SEEN_CAP: int = 2000
 #: Bound on how long the whole loot-pricing step for one kill may take, so a slow
 #: AODP can never stall the scan loop (mirrors the guild feed's guard).
 _LOOT_TIMEOUT_S: float = 6.0
+#: Max concurrent loot-price lookups within one scan — parallelises the pricing
+#: (so a scan finishes in seconds, not ~pricing-count × latency) while staying a
+#: polite, non-bursty client of the shared AODP API.
+_PRICE_CONCURRENCY: int = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,10 +140,15 @@ class PublicJuicyFeed:
         """Scan the global feed, then post only the BIGGEST few that qualify.
 
         Every geared-player kill on a whole server prices in the millions, so a
-        raw threshold on the firehose lets dozens through per scan. The hard cap
-        (``max_posts_per_scan``) is the real volume control: all qualifiers in the
-        scanned window are ranked by value (loot, else fame) and only the top ``N``
-        are posted — the juiciest handful, never the whole window.
+        raw threshold on the firehose lets dozens through per scan. Two guards
+        keep it sane: a per-scan LOOT-PRICING BUDGET (``max_priced_per_scan``,
+        priced with bounded concurrency) so the flaky AODP API is never hit with
+        ~100 sequential lookups every cycle, and the POST CAP (``max_posts_per_scan``)
+        that ranks qualifiers by value and posts only the top ``N`` — the juiciest
+        handful, never the whole window.
+
+        FAME is free (straight off the event) so it is evaluated first with no
+        network; only sub-fame events consume the loot-pricing budget.
         """
         kb = self._cfg_provider().killboard
         pj = kb.public_juicy
@@ -154,8 +163,11 @@ class PublicJuicyFeed:
         min_loot = kb.feed.juicy_min_loot
         market_on = self._market is not None and getattr(kb.market, "enabled", False)
         cap = max(1, pj.max_posts_per_scan)
+        price_budget = max(0, pj.max_priced_per_scan)
 
-        candidates: list[_Candidate] = []
+        # ── Phase 1: cheap — parse, dedup, split on the FREE fame gate (no I/O).
+        fame_hits: list[tuple[Any, dict[str, Any]]] = []  # clear fame → always in
+        to_price: list[tuple[Any, dict[str, Any]]] = []  # sub-fame → need a price
         for page in range(max(1, pj.scan_pages)):
             if self._shutting_down():
                 break
@@ -163,13 +175,50 @@ class PublicJuicyFeed:
             if not events:  # None (gave up) or [] (empty) — nothing to do this page
                 break
             for raw in events:
-                if self._shutting_down():
-                    break
-                cand = await self._evaluate(raw, min_fame, min_loot, market_on)
-                if cand is not None:
-                    candidates.append(cand)
+                row = parse_public_event(raw)
+                if row is None or row.event_id in self._seen:
+                    continue
+                self._remember(row.event_id)  # the window rolls in seconds; never re-eval
+                if row.total_fame >= min_fame:
+                    fame_hits.append((row, raw))
+                elif market_on and min_loot > 0:
+                    to_price.append((row, raw))
+                # else: sub-fame with no loot gate → can't qualify; dropped.
+
+        # ── Phase 2: price with BOUNDED CONCURRENCY under a per-scan budget.
+        priced_dropped = max(0, len(to_price) - price_budget)
+        to_price = to_price[:price_budget]
+        sem = asyncio.Semaphore(_PRICE_CONCURRENCY)
+
+        async def _priced(raw: dict[str, Any]) -> int | None:
+            async with sem:
+                return await self._loot_value(raw)
+
+        candidates: list[_Candidate] = []
+        # Fame hits always qualify; price them (bounded, few) only to show loot.
+        fame_loot = (
+            await asyncio.gather(*[_priced(raw) for _row, raw in fame_hits])
+            if market_on
+            else [None] * len(fame_hits)
+        )
+        for (row, raw), loot in zip(fame_hits, fame_loot, strict=True):
+            candidates.append(
+                _Candidate(
+                    score=loot if loot is not None else row.total_fame,
+                    raw=raw,
+                    row=row,
+                    loot_value=loot,
+                )
+            )
+        # Sub-fame events qualify only if their priced loot clears the bar.
+        sub_loot = await asyncio.gather(*[_priced(raw) for _row, raw in to_price])
+        for (row, raw), loot in zip(to_price, sub_loot, strict=True):
+            if loot is not None and loot >= min_loot:
+                candidates.append(_Candidate(score=loot, raw=raw, row=row, loot_value=loot))
 
         if not candidates:
+            if priced_dropped:
+                self._log.info("kb_public_juicy.scan", priced_dropped=priced_dropped)
             return
         # Post the biggest first; the cap drops the rest of this window's tail.
         candidates.sort(key=lambda c: c.score, reverse=True)
@@ -179,46 +228,14 @@ class PublicJuicyFeed:
                 break
             if await self._post(cand, channel_id):
                 posted += 1
-        if posted or len(candidates) > cap:
+        if posted or len(candidates) > cap or priced_dropped:
             self._log.info(
                 "kb_public_juicy.posted",
                 count=posted,
                 qualified=len(candidates),
                 capped=max(0, len(candidates) - cap),
+                priced_dropped=priced_dropped,
             )
-
-    async def _evaluate(
-        self, raw: dict[str, Any], min_fame: int, min_loot: int, market_on: bool
-    ) -> _Candidate | None:
-        """Qualify one global event (fame-first, loot-second); mark it seen.
-
-        Returns a scored :class:`_Candidate` when it clears a bar, else ``None``.
-        Every event evaluated is remembered (the tiny global window rolls over in
-        seconds), so a qualifier dropped by the cap is not re-priced next scan.
-        """
-        row = parse_public_event(raw)
-        if row is None or row.event_id in self._seen:
-            return None
-        self._remember(row.event_id)
-
-        # FAME first — free, straight off the event. LOOT second — only priced
-        # when fame missed and the market layer is on (the OR gate; low-fame/high-
-        # loot ganks still qualify).
-        loot_value: int | None = None
-        if row.total_fame >= min_fame:
-            qualifies = True
-            if market_on:
-                loot_value = await self._loot_value(raw)  # for ranking + the card
-        elif market_on and min_loot > 0:
-            loot_value = await self._loot_value(raw)
-            qualifies = loot_value is not None and loot_value >= min_loot
-        else:
-            qualifies = False
-
-        if not qualifies:
-            return None
-        score = loot_value if loot_value is not None else row.total_fame
-        return _Candidate(score=score, raw=raw, row=row, loot_value=loot_value)
 
     async def _post(self, cand: _Candidate, channel_id: int) -> bool:
         """Render and post one qualifying kill to the juicy channel."""

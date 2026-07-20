@@ -1434,6 +1434,18 @@ KEYS: Final[tuple[Key, ...]] = (
         minimum=1,
         maximum=50,
     ),
+    Key(
+        "killboard.public_juicy.max_priced_per_scan",
+        "int",
+        Reload.HOT,
+        "Per-scan loot-pricing budget. Fame is free; only sub-fame events are "
+        "priced (with bounded concurrency) to check the loot bar, so this caps how "
+        "many AODP market lookups one scan makes — keeping the bot polite to the "
+        "shared, rate-limited API. 0 = fame-only (never price the public feed).",
+        default=60,
+        minimum=0,
+        maximum=200,
+    ),
     # routing (optional section)
     Key(
         "routing.file",

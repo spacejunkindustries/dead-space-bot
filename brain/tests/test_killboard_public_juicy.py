@@ -88,6 +88,7 @@ def _cfg(
     market: bool = False,
     scan_pages: int = 1,
     max_posts: int = 5,
+    max_priced: int = 60,
 ) -> SimpleNamespace:
     kb = KillboardConfig(
         feed=KbFeedConfig(
@@ -95,7 +96,10 @@ def _cfg(
         ),
         market=KbMarketConfig(enabled=market),
         public_juicy=KbPublicJuicyConfig(
-            enabled=enabled, scan_pages=scan_pages, max_posts_per_scan=max_posts
+            enabled=enabled,
+            scan_pages=scan_pages,
+            max_posts_per_scan=max_posts,
+            max_priced_per_scan=max_priced,
         ),
     )
     return SimpleNamespace(killboard=kb)
@@ -171,6 +175,52 @@ async def test_cap_limits_posts_per_scan_to_the_biggest() -> None:
     channel.sent.clear()
     await feed._scan_once()
     assert channel.sent == []
+
+
+async def test_pricing_budget_caps_market_lookups_per_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The per-scan loot-pricing budget bounds AODP calls: only max_priced sub-fame
+    events are priced, so the global firehose can't drive ~100 lookups per scan."""
+    calls = {"n": 0}
+
+    async def _counting(*_a: Any, **_k: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        return {"total": 20_000_000}  # every priced event clears the loot bar
+
+    monkeypatch.setattr("killboard.public_juicy.estimate_value", _counting)
+    # 8 sub-fame kills (below the 2M fame bar), market on, budget 3.
+    api = _Api([_raw_kill(i, fame=100) for i in range(1, 9)])
+    channel = _OkChannel()
+    feed = _feed(
+        _Bot({JUICY_CHANNEL: channel}),
+        api,
+        _cfg(market=True, max_priced=3, max_posts=5),
+        _Market(0),
+    )
+
+    await feed._scan_once()
+
+    assert calls["n"] == 3  # priced exactly the budget, not all 8
+    assert len(channel.sent) == 3  # the 3 priced (all clear the loot bar)
+    assert len(feed._seen) == 8  # all 8 still remembered (won't re-price next scan)
+
+
+async def test_fame_only_when_pricing_budget_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """max_priced_per_scan=0 makes the public feed fame-only — zero AODP calls."""
+    calls = {"n": 0}
+
+    async def _counting(*_a: Any, **_k: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        return {"total": 20_000_000}
+
+    monkeypatch.setattr("killboard.public_juicy.estimate_value", _counting)
+    api = _Api([_raw_kill(1, fame=100), _raw_kill(2, fame=3_000_000)])  # one sub-fame, one fame-hit
+    channel = _OkChannel()
+    feed = _feed(_Bot({JUICY_CHANNEL: channel}), api, _cfg(market=True, max_priced=0), _Market(0))
+
+    await feed._scan_once()
+
+    assert calls["n"] == 1  # only the fame-hit is priced (for display); no sub-fame pricing
+    assert len(channel.sent) == 1  # just the 3M-fame kill
 
 
 async def test_dedup_across_scans() -> None:
