@@ -540,27 +540,48 @@ class KillboardCog(commands.Cog):
     )
     @app_commands.describe(
         kind="how often to post the ranking",
-        channel="channel the ranking is posted to",
         hour_utc="hour of day in UTC to post (0-23)",
+        channel="channel to post to — leave blank to use THIS channel",
     )
     @app_commands.check(_is_admin)
     async def schedule_add(
         self,
         interaction: discord.Interaction,
         kind: Literal["daily", "weekly", "monthly"],
-        channel: discord.TextChannel,
         hour_utc: app_commands.Range[int, 0, 23],
+        channel: (
+            discord.TextChannel
+            | discord.VoiceChannel
+            | discord.StageChannel
+            | discord.Thread
+            | None
+        ) = None,
     ) -> None:
         """Create/replace the ``kind`` scheduled ranking post (§8.3).
 
+        ``channel`` defaults to the channel the command is run in, so an operator
+        can just invoke it inside the target channel when the picker is awkward.
         One row per kind: adding a ``daily`` replaces any existing daily. The
         scheduler picks it up on its next tick (within ~60s) and posts the
         completed period's ranking at ``hour_utc``:00 UTC.
         """
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self._to_thread(_upsert_schedule, self._store, kind, channel.id, int(hour_utc))
+        target = channel or interaction.channel
+        if (
+            target is None
+            or not isinstance(target, discord.abc.Messageable)
+            or not hasattr(target, "id")
+        ):
+            await interaction.followup.send(
+                "Pick a text channel, or run this command inside the channel you want the "
+                "ranking posted to.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        await self._to_thread(_upsert_schedule, self._store, kind, target.id, int(hour_utc))
         await interaction.followup.send(
-            f"✅ **{kind.capitalize()} ranking** will post to {channel.mention} at "
+            f"✅ **{kind.capitalize()} ranking** will post to <#{target.id}> at "
             f"**{int(hour_utc):02d}:00 UTC** — it reports the completed {kind[:-2]}"
             f"{'y' if kind == 'daily' else ''} and fires on the next scheduler tick.",
             ephemeral=True,
