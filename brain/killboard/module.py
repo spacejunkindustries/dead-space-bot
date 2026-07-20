@@ -50,6 +50,7 @@ from killboard.items import ItemIndex
 from killboard.market import MarketClient
 from killboard.market_commands import MarketCog
 from killboard.poller import Poller
+from killboard.public_juicy import PublicJuicyFeed
 from killboard.schedule import Scheduler
 from killboard.store import KbStore, open_store
 from killboard.views import RankingPageButton
@@ -91,6 +92,7 @@ class KillboardModule(BotModule):
         self._battles: Battles | None = None
         self._poller: Poller | None = None
         self._feed: Feed | None = None
+        self._public_juicy: PublicJuicyFeed | None = None
         self._scheduler: Scheduler | None = None
         self._cog: KillboardCog | None = None
         self._market: MarketClient | None = None
@@ -180,6 +182,19 @@ class KillboardModule(BotModule):
             shutdown=ctx.shutdown,
             market=self._market,
         )
+        # Server-wide "notable kills" highlights → the juicy channel. Built
+        # unconditionally (cheap; no session until it runs); it self-gates on
+        # killboard.public_juicy.enabled and is only spawned when enabled.
+        self._public_juicy = PublicJuicyFeed(
+            ctx.bot,
+            self._api,
+            self._cards,
+            self._market,
+            self._root_cfg,
+            ctx.to_thread,
+            ctx.log,
+            shutdown=ctx.shutdown,
+        )
         self._scheduler = Scheduler(
             ctx.bot,
             self._store,
@@ -233,6 +248,13 @@ class KillboardModule(BotModule):
         ctx.supervisor.spawn("killboard", "poller", self._poller.run)
         ctx.supervisor.spawn("killboard", "feed", self._feed.run)
         ctx.supervisor.spawn("killboard", "scheduler", self._scheduler.run)
+        # The server-wide highlights loop is separately gated — off by default, and
+        # it needs the juicy channel set. A crash is contained like the others.
+        if cfg.public_juicy.enabled and self._public_juicy is not None:
+            if cfg.feed.juicy_channel:
+                ctx.supervisor.spawn("killboard", "public_juicy", self._public_juicy.run)
+            else:
+                ctx.log.warning("kb_module.public_juicy_no_channel")
         ctx.log.info(
             "kb_module.start",
             guild_id=(cfg.guild_id or self._resolved_guild_id),

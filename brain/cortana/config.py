@@ -586,6 +586,30 @@ class KbMarketConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class KbPublicJuicyConfig:
+    """Server-wide "notable kills" highlights feed (the public juicy channel).
+
+    OFF by default. When on, a separate supervised loop watches Albion's
+    *whole-server* recent kill feed (not the tracked guild) and posts kills that
+    clear a bar to ``killboard.feed.juicy_channel`` — the "juicy" highlights other
+    corps' killbots show. A kill qualifies on FAME first (free, from the event) OR
+    on market LOOT value second (priced only for the ones that miss on fame), so a
+    low-fame/high-loot gank still lands. Reuses ``feed.juicy_min_fame`` /
+    ``feed.juicy_min_loot`` as the two bars. When enabled it OWNS the juicy
+    channel — the guild feed stops mirroring the corp's own kills there, so a
+    corp kill (which also appears in the global feed) is never double-posted.
+    Loot pricing needs ``killboard.market.enabled``."""
+
+    enabled: bool = False
+    #: Seconds between global-feed scans. The public feed is a sampled highlight
+    #: reel, not an exact-once log, so this trades coverage for API politeness.
+    interval_seconds: int = 90
+    #: Pages of 51 recent global events scanned per cycle (deeper = more coverage
+    #: of a fast firehose, but more requests + more loot pricing per scan).
+    scan_pages: int = 2
+
+
+@dataclass(frozen=True, slots=True)
 class KillboardConfig:
     """Albion Online killboard add-on (killboard GDD). Optional section; OFF by
     default — the module only starts when ``enabled`` is set AND a guild AND a
@@ -607,6 +631,7 @@ class KillboardConfig:
     storage: KbStorageConfig = field(default_factory=KbStorageConfig)
     staleness: KbStalenessConfig = field(default_factory=KbStalenessConfig)
     market: KbMarketConfig = field(default_factory=KbMarketConfig)
+    public_juicy: KbPublicJuicyConfig = field(default_factory=KbPublicJuicyConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1071,6 +1096,11 @@ def _assemble_killboard(v: dict[str, Any]) -> KillboardConfig:
             default_quality=v["killboard.market.default_quality"],
             default_cities=v["killboard.market.default_cities"],
             user_agent=v["killboard.market.user_agent"],
+        ),
+        public_juicy=KbPublicJuicyConfig(
+            enabled=v["killboard.public_juicy.enabled"],
+            interval_seconds=v["killboard.public_juicy.interval_seconds"],
+            scan_pages=v["killboard.public_juicy.scan_pages"],
         ),
     )
 

@@ -239,6 +239,20 @@ class KbApi:
         )
         return _as_dict_list(data)
 
+    async def global_events(self, limit: int = 51, offset: int = 0) -> list[dict[str, Any]] | None:
+        """Fetch the server-wide recent kill feed — NO guild filter (§2.3).
+
+        ``/events?sort=recent&limit={limit}&offset={offset}`` with no ``guildId``
+        returns the whole server's recent kills (newest-first), the source for the
+        public-juicy highlights feed. Same None-vs-[] contract as :meth:`events`:
+        ``None`` on give-up (timeout / exhausted 5xx/429), ``[]`` for a genuinely
+        empty window. ``limit`` is capped by the endpoint at 51.
+        """
+        data = await self._get("/events", {"sort": "recent", "limit": limit, "offset": offset})
+        if data is None:
+            return None  # gave up — not an empty window
+        return _as_dict_list(data)
+
     async def guild(self, guild_id: str) -> dict[str, Any] | None:
         """Fetch the guild summary (lifetime Kill/Death Fame, member count) (§2.3).
 

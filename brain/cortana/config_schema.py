@@ -201,6 +201,11 @@ SECTIONS: Final[tuple[Section, ...]] = (
         "killboard.market", "Albion market data (AODP) — item values + /market.", optional=True
     ),
     Section(
+        "killboard.public_juicy",
+        "Server-wide notable-kills highlights feed (the public juicy channel).",
+        optional=True,
+    ),
+    Section(
         "routing",
         "OPTIONAL routing.yaml location; absent = sibling of cortana.yaml.",
         optional=True,
@@ -1387,6 +1392,36 @@ KEYS: Final[tuple[Key, ...]] = (
         Reload.RESTART,
         "User-Agent sent to the AODP API (be a good citizen — identify the bot).",
         default="DeadBot-Killboard (self-hosted; contact your guild admin)",
+    ),
+    Key(
+        "killboard.public_juicy.enabled",
+        "bool",
+        Reload.RESTART,
+        "Post server-wide 'notable kills' (not just the tracked guild's) to the "
+        "juicy channel — the highlights feed other corps' killbots show. Qualifies "
+        "on fame first (free) OR market loot second; reuses feed.juicy_min_fame / "
+        "feed.juicy_min_loot. When on it owns the juicy channel (the guild feed "
+        "stops mirroring there). Loot pricing needs killboard.market.enabled.",
+        default=False,
+    ),
+    Key(
+        "killboard.public_juicy.interval_seconds",
+        "int",
+        Reload.HOT,
+        "Seconds between server-wide feed scans (a sampled highlight reel, so this "
+        "trades coverage for API politeness).",
+        default=90,
+        minimum=15,
+    ),
+    Key(
+        "killboard.public_juicy.scan_pages",
+        "int",
+        Reload.HOT,
+        "Pages of 51 recent global events scanned per cycle — deeper covers more of "
+        "a fast firehose but costs more requests and more loot pricing per scan.",
+        default=2,
+        minimum=1,
+        maximum=10,
     ),
     # routing (optional section)
     Key(

@@ -287,7 +287,12 @@ class Feed:
             await self._to_thread(self._store.mark_posted, row.event_id, 0, 0)
             return _PostResult.SKIPPED
 
-        targets = route_channels(row, fc)
+        # When the server-wide public-juicy feed is on it OWNS the juicy channel,
+        # so the guild feed stops mirroring the corp's own kills there (they'd
+        # double-post — a corp kill is also in the global feed the public feed
+        # scans).
+        public_juicy_on = bool(getattr(getattr(kb, "public_juicy", None), "enabled", False))
+        targets = route_channels(row, fc, public_juicy_on=public_juicy_on)
 
         # The raw event carries the guild tags (for the header) and the item
         # loadout (for the market loot value) — data the flat row doesn't hold.
@@ -297,7 +302,8 @@ class Feed:
         # change the outcome: routing already has a target, OR juicy-by-loot is
         # armed for this KILL/ASSIST.
         juicy_by_loot = (
-            fc.juicy_min_loot > 0
+            not public_juicy_on
+            and fc.juicy_min_loot > 0
             and bool(fc.juicy_channel)
             and (row.relation or "").upper() in (KILL, ASSIST)
         )
@@ -560,7 +566,7 @@ def _is_backfill_death(row: EventRow, window_minutes: int, *, now: datetime | No
     return dt < (now or datetime.now(UTC)) - timedelta(minutes=window_minutes)
 
 
-def route_channels(row: EventRow, fc: KbFeedConfig) -> list[int]:
+def route_channels(row: EventRow, fc: KbFeedConfig, *, public_juicy_on: bool = False) -> list[int]:
     """Target channel ids for an event, in send order, deduped (killboard GDD §7.2).
 
     Applies the operator's routing and suppression rules:
@@ -574,6 +580,10 @@ def route_channels(row: EventRow, fc: KbFeedConfig) -> list[int]:
       to a highlights feed, independent of the main-feed suppression. The
       loot-value twin (``juicy_min_loot``, for low-fame/high-loot ganks) needs the
       async market lookup, so it is applied by :meth:`_post_one`, not here.
+
+    ``public_juicy_on`` — when the server-wide public-juicy feed is enabled it OWNS
+    the juicy channel, so the guild feed stops mirroring the corp's own kills there
+    (the corp kill also shows up in the global feed, so mirroring would double-post).
 
     A channel of ``0`` is "unset" and never routed to. An empty list means the
     event is suppressed entirely; the caller still records it as handled so it
@@ -596,7 +606,7 @@ def route_channels(row: EventRow, fc: KbFeedConfig) -> list[int]:
                 add(fc.blob_channel)
             else:
                 add(fc.kills_channel)
-        if fame >= fc.juicy_min_fame:
+        if fame >= fc.juicy_min_fame and not public_juicy_on:
             add(fc.juicy_channel)
     elif relation == DEATH:
         victim_ip = row.victim_ip or 0
