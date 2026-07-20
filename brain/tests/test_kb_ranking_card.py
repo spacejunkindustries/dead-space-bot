@@ -18,7 +18,7 @@ import sqlite3
 import pytest
 
 from cortana.core import db
-from killboard import rankings
+from killboard import cards, rankings
 from killboard.cards import (
     BrandStyle,
     _clip_name,
@@ -32,6 +32,11 @@ from killboard.rankings import DailyRanking, build_daily_ranking, daily_ranking_
 from killboard.store import MIGRATIONS_DIR, KbStore
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+#: The compositor tests need Pillow; CI runs the pure-logic suite without it, so
+#: cards degrade to embed-only there. Skip image tests when PIL isn't importable
+#: (matches tests/test_killboard_cards.py).
+_needs_pil = pytest.mark.skipif(not cards._PIL_OK, reason="Pillow not importable")
 
 
 @pytest.fixture
@@ -172,6 +177,7 @@ def _brand() -> BrandStyle:
     return BrandStyle(name="Dead Gaming", accent=(225, 18, 18), logo=None)
 
 
+@_needs_pil
 def test_compose_ranking_card_returns_png() -> None:
     rk = DailyRanking(
         total_kill_fame=210762,
@@ -183,6 +189,7 @@ def test_compose_ranking_card_returns_png() -> None:
     assert png is not None and png[:8] == _PNG_MAGIC
 
 
+@_needs_pil
 def test_compose_ranking_card_empty_boards_still_renders() -> None:
     png = _compose_ranking_card(
         DailyRanking(0, 0, [], []), "Today", "Daily Ranking", None, _brand()
@@ -190,6 +197,7 @@ def test_compose_ranking_card_empty_boards_still_renders() -> None:
     assert png is not None and png[:8] == _PNG_MAGIC
 
 
+@_needs_pil
 def test_compose_card_with_brand_and_loot_value() -> None:
     fields = {
         "relation": "KILL",
@@ -205,12 +213,14 @@ def test_compose_card_with_brand_and_loot_value() -> None:
     assert png is not None and png[:8] == _PNG_MAGIC
 
 
+@_needs_pil
 def test_compose_card_without_brand_or_value_still_renders() -> None:
     fields = {"relation": "DEATH", "killer_name": "A", "victim_name": "B", "total_fame": 0}
     png = _compose_card(fields, [], [], {}, [])
     assert png is not None and png[:8] == _PNG_MAGIC
 
 
+@_needs_pil
 def test_compositors_render_without_system_dejavu(monkeypatch: pytest.MonkeyPatch) -> None:
     """Both compositors must render on a box with NO system DejaVu font (a minimal
     CI runner): _load_font falls back to Pillow's bundled scalable default, which
