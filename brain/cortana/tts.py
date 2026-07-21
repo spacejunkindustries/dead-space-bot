@@ -48,6 +48,7 @@ __all__ = [
     "area_learned",
     "area_limit",
     "build_wav",
+    "capabilities",
     "chase_hint",
     "chase_no_incident",
     "chase_updated",
@@ -408,6 +409,21 @@ def help_hint() -> str:
     /help front page to the intel channel alongside this (the real manual is
     /help — a spoken catalogue would blow the §12.2 3-second cap)."""
     return "Command list posted to Discord."
+
+
+def capabilities() -> str:
+    """The spoken CAPABILITIES overview (GDD §6.1) — CORTANA's answer to "what
+    can you do". A fixed canned string (constraint 6: no LLM), shared verbatim
+    with the ``/capabilities`` slash twin (constraint 10). Deliberately longer
+    than a §12.2 command reply, so the dialog engine speaks it with the fun
+    path's ``fun.max_speak_s`` cap; kept tight enough to land in ~18 s.
+    Info-carrying, so it never varies by personality."""
+    return (
+        "I'm CORTANA. Say 'hey cortana' to wake me, then report hostiles, "
+        "under attack, or need help with a system, and I'll alert the fleet. "
+        "I can also tell facts, roast a friend, or answer outside questions if "
+        "you say override. Say help for the full command list."
+    )
 
 
 _SEVERITY_SPOKEN: dict[Severity, str] = {

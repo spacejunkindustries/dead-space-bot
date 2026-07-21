@@ -106,7 +106,8 @@ STT_VOCAB_BIAS = (
     "scrambled, pointed, webbed, jammed, under attack, need backup, help me, "
     "send help, gate camp, code red, code orange, clear, status, timer, "
     "form up, cancel, register, ping me, who am I, update chase, report, "
-    "command override, tell me a fact, trivia, insult, roast, over."
+    "command override, tell me a fact, trivia, insult, roast, "
+    "what can you do, capabilities, over."
 )
 
 # Radio sign-off at the tail of an utterance ("...three battleships, over").
@@ -235,6 +236,21 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
     (Intent.TIMER, re.compile(r"\btimer\b", re.I)),
     (Intent.FORMUP, re.compile(r"\bform(?:\s|-)?up\b", re.I)),
     (Intent.QUERY, re.compile(r"\bstatus\b", re.I)),
+    # Spoken capabilities overview (GDD §6.1): "what can you do" and friends
+    # make CORTANA speak a fixed summary of her features (constraint 6). Sits
+    # ABOVE HELP so the question forms win, but does NOT claim the bare word
+    # "help" — that stays the HELP intent (posts the full manual). Below every
+    # report/manage intent so a real callout is never demoted to a tour.
+    (
+        Intent.CAPABILITIES,
+        re.compile(
+            r"\bwhat\s+(?:can|do)\s+you\s+do\b"
+            r"|\bwhat\s+are\s+your\s+commands?\b"
+            r"|\blist\s+your\s+commands?\b"
+            r"|\bcapabilit(?:y|ies)\b",
+            re.I,
+        ),
+    ),
     # HELP sits below ASSIST_REQUEST so "need help" is always a distress call;
     # a bare "help" (nothing else claimed it) is a request for the manual.
     (Intent.HELP, re.compile(r"\bhelp\b", re.I)),
@@ -388,6 +404,7 @@ _SYSTEMLESS_INTENTS = frozenset(
     (
         Intent.QUERY,
         Intent.HELP,
+        Intent.CAPABILITIES,
         Intent.CANCEL,
         Intent.UNREGISTER,
         Intent.WHOAMI,
