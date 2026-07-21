@@ -178,6 +178,12 @@ On first launch against a fresh database, `last_event_id` is 0, so the poller pa
 
 Full event JSON is retained per row (`raw_json`) alongside the extracted columns. This costs a little disk and buys two things: kill cards can be re-rendered later without re-fetching, and if a future feature needs a field not currently extracted, the data is already there. At a few kilobytes per event and a realistic event rate, a year of history is well under the size of a single game screenshot's worth of concern.
 
+### 5.5 Deaths are gathered per-member (the feed is kill-only)
+
+`/events?guildId=` returns **only events where the guild landed the final blow** — guild *deaths* never appear there. Left alone, Death Fame stays 0 and the death feed is silent. So deaths are swept **per-member**: on a slower cadence (every Nth poll tick) the poller walks the cached member roster and pulls each pilot's `/players/{id}/deaths`, skips anything already stored (a cheap `has_event` dedup), and ingests the rest — which then classify as DEATH (victim `GuildId` == the tracked guild) and flow into Death Fame and the death feed through the normal path. The sweep rides the *same* poller task (serialised sqlite writes), is bounded to a slice of the roster per pass (round-robin) so a big guild or a slow endpoint can't make one pass run for minutes, fetches fail-fast (no inline retries — it re-runs anyway) and quiet, and is gated by `killboard.poller.track_deaths`.
+
+**Anti-backfill-spam gate.** A pilot's death history spans weeks, and the feed posts *any* unposted death it finds — so ingesting that history verbatim would flood the channel with old death cards. A death older than `killboard.poller.deaths_post_window_minutes` is therefore **seeded as already-posted** at the feed's single posting chokepoint: kept for the Death-Fame aggregates, never turned into a stale card. Only genuinely-recent deaths produce a post.
+
 ---
 
 ## 6. Classifying guild involvement
@@ -229,6 +235,15 @@ Configurable routing keeps the feed readable:
 - The `posted` table records every event already sent, keyed by EventId, so a restart mid-poll never double-posts.
 - Deaths and kills are posted oldest-first within a batch so the channel reads chronologically.
 - If the bot was offline and backfill ingests a large burst, feed posting is rate-limited (a short delay between messages) and capped per catch-up cycle, with a single "posted N older events" summary rather than flooding the channel.
+- A permanent Discord error on a target channel — a `403` (bot lacks Send Messages), a `404`, or a `4xx`-rejected embed — is treated as **structural** (the event is marked posted and skipped), never as a transient failure. Only `429`/`5xx` defer for retry. Otherwise one mis-permissioned channel would re-attempt the same oldest event every drain and wedge the whole feed behind it.
+
+### 7.4 The public "juicy" feed (server-wide highlights) — optional
+
+The main feed is guild-scoped. The **public-juicy feed** is the opposite: a separate supervised loop that watches Albion's **whole-server** recent kill feed (`/events` with no `guildId`) and posts the notable ones to `feed.juicy_channel` — the highlights other corps' killbots show, where killer and victim need have nothing to do with the tracked guild. It is **off by default** (`killboard.public_juicy.enabled`) and, when on, **owns** the juicy channel (the guild feed stops mirroring the corp's own kills there, so a corp kill — which also appears in the global feed — is never double-posted).
+
+- **Qualification is fame-first, loot-second, as an OR.** A kill clears the bar if its fame ≥ `feed.juicy_min_fame` (free, straight off the event) OR its market loot value ≥ `feed.juicy_min_loot` (priced only when fame missed and the market layer is on). OR, not AND — the classic juicy gank is *low* fame / *high* loot, so an AND would filter out exactly the target kills.
+- **It is a sampled highlight reel, not an exact-once log.** The global window rolls over in seconds, so the loop scans the top `scan_pages` every `interval_seconds` and dedups with a bounded in-memory ring (a durable table would only grow without ever preventing a real double-post).
+- **Two volume/politeness guards.** `max_posts_per_scan` caps how many post (ranked by value — the biggest first), and `max_priced_per_scan` caps how many AODP lookups a scan makes (fame is free; only sub-fame events are priced, with bounded concurrency), so the shared, rate-limited market API is never hit with the whole firehose sequentially.
 
 ---
 
@@ -488,7 +503,7 @@ The design also stands alone as a dedicated bot if preferred — same code, its 
 
 The gameinfo API is unsupported and shared by the whole community's tools. The bot is a good citizen:
 
-- **One guild, gentle interval.** A single `/events` call every 45 seconds is a negligible load, versus scraping broad global feeds.
+- **One guild, gentle interval.** The core loop is a single `/events` call every ~45 seconds — negligible load. The optional public-juicy feed (§7.4) *does* read the server-wide feed, but only a few shallow pages per scan on a slower cadence, with a per-scan loot-pricing budget and bounded concurrency so it stays a polite, non-bursty client of the shared gameinfo and AODP APIs.
 - **Icons cached locally.** Each item icon is fetched from the render service once, then served from disk forever.
 - **Backoff on failure.** The bot slows down when the API struggles rather than hammering it.
 - **A descriptive User-Agent** identifying the bot, so operators can be contacted if needed.

@@ -126,6 +126,7 @@ config/               cortana.yaml, gazetteer.yaml, routing.yaml (examples)
 deploy/               systemd units + staged converge-and-verify install.sh (GDD §17.5)
 assets/wake/          community "hey cortahnah" ONNX wake models (installer deploys them)
 docs/GDD.md           ← the voice spec
+docs/DEPLOYMENT.md    ← GROUND TRUTH for the live install (host = 4-vCPU, config posture, ops)
 docs/dead-bot-architecture.md  ← the module-platform architecture
 docs/KILLBOARD_GDD.md ← the Albion killboard spec
 docs/WAKE_WORDS.md    wake-word options + what is deployed now
@@ -153,7 +154,9 @@ pytest
 python -m cortana --config ../config/cortana.dev.yaml
 ```
 
-CI runs all of the above on every PR. **CI also builds the release binary** — the droplet is 2 vCPU and will thrash compiling Songbird with LTO, so it downloads the artifact instead of building.
+CI runs all of the above on every PR. **CI also builds the release binary** — a small host will thrash compiling Songbird with LTO, so it downloads the artifact instead of building.
+
+> **The live host is a 4-vCPU CPU-optimized VPS — NOT the 2-vCPU droplet this doc uses as its worked example.** When a tradeoff says "on a 2-vCPU box do X / on a ≥4-vCPU box do Y," take the **≥4-vCPU** branch (e.g. `capture.streaming: true`, `stt.cpu_threads: 2`). The authoritative record of the running install — host, deploy process, current config posture (mentions currently OFF by choice; killboard + public-juicy live), and the ops to-do — is **`docs/DEPLOYMENT.md`. Read it before advising on config or hardware.**
 
 ---
 
