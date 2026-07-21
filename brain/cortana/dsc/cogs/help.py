@@ -304,7 +304,10 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "• `/ask question` — the assistant channel; by voice it's "
                 '*"command override, …"* (e.g. *"command override, what\'s the '
                 'weather in Chicago?"*). Separate from intel — CORTANA never uses '
-                "it to interpret reports.",
+                "it to interpret reports.\n"
+                "• `/chat message` — freestyle back-and-forth when the fleet is "
+                "idle (opt-in); by voice she just talks back, no wake word between "
+                "turns. Speech-only — never posts a card, never pings.",
             ),
         ),
     ),

@@ -191,6 +191,13 @@ SECTIONS: Final[tuple[Section, ...]] = (
         optional=True,
     ),
     Section(
+        "conversation",
+        "OPTIONAL freestyle conversation mode (GDD §6.8); absent = off. Its own "
+        "backend lane (default on-box local); never on the command path, never "
+        "posts a card, never pings.",
+        optional=True,
+    ),
+    Section(
         "killboard",
         "OPTIONAL Albion Online killboard add-on (killboard GDD); absent/off by "
         "default. A separate game module — its own SQLite file, own poll loop.",
@@ -1047,6 +1054,158 @@ KEYS: Final[tuple[Key, ...]] = (
         default=8.0,
         minimum=0,
         exclusive_minimum=True,
+    ),
+    # conversation (optional section) — freestyle conversation mode (GDD §6.8)
+    Key(
+        "conversation.enabled",
+        "bool",
+        Reload.SIGHUP,
+        "Master switch for freestyle conversation mode (GDD §6.8): wake-free "
+        "back-and-forth chit-chat / banter / maths when the fleet is idle. "
+        "OFF by default. Never on the command path (grammar + the §6.7 "
+        "understanding brain preempt it), never posts a card, never pings. "
+        "Cold-start claims residue only when stt.relay_mode is off (relay and "
+        "chat are the two mutually-exclusive residue owners); a live "
+        "conversation continues regardless. A half-set config just stays dark.",
+        default=False,
+    ),
+    Key(
+        "conversation.backend",
+        "str",
+        Reload.SIGHUP,
+        "Who chats back: 'local' = an on-box OpenAI-compatible server at "
+        "conversation.local_url (free, high-throughput — the default); "
+        "'anthropic' = the cloud Claude API (a Claude id in conversation.model, "
+        "costs per turn). Reuses the §6.6 ChatBackend abstraction.",
+        default="local",
+        choices=("anthropic", "local"),
+    ),
+    Key(
+        "conversation.local_url",
+        "str",
+        Reload.SIGHUP,
+        "OpenAI-compatible chat-completions endpoint for backend='local' "
+        "(e.g. http://127.0.0.1:11434/v1/chat/completions from Ollama running "
+        "qwen2.5:7b). Empty = dark (degrades gracefully).",
+        default="",
+    ),
+    Key(
+        "conversation.model",
+        "str",
+        Reload.HOT,
+        "Local model name, or a Claude model id for backend='anthropic'.",
+        default="qwen2.5:7b",
+    ),
+    Key(
+        "conversation.api_key_file",
+        "str",
+        Reload.SIGHUP,
+        "Dev fallback ONLY (0600); production reads "
+        "$CREDENTIALS_DIRECTORY/anthropic via LoadCredential= (constraint 12). "
+        "Ignored for backend='local'.",
+        default="/etc/cortana/anthropic",
+    ),
+    Key(
+        "conversation.max_tokens",
+        "int",
+        Reload.HOT,
+        "Hard cap per spoken reply — chit-chat is short.",
+        default=200,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "conversation.turn_taking_seconds",
+        "float",
+        Reload.HOT,
+        "Wake-free window kept open after each reply for the pilot's next turn. "
+        "Re-armed WITHOUT draining the dialog failure-retry budget — the "
+        "conversation is bounded by max_turns + session_ttl_seconds instead.",
+        default=8.0,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "conversation.max_history_turns",
+        "int",
+        Reload.HOT,
+        "Prior user+assistant exchanges replayed to the model as context (0 = stateless).",
+        default=6,
+        minimum=0,
+    ),
+    Key(
+        "conversation.max_turns",
+        "int",
+        Reload.HOT,
+        "Hard per-session turn cap; each spoken reply spends one, and only a "
+        "fresh wake refills it (the loop-safety bound).",
+        default=8,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "conversation.session_ttl_seconds",
+        "int",
+        Reload.HOT,
+        "Idle lifetime of a conversation thread; after this a stale thread is "
+        "dropped so it never bleeds into the next chat.",
+        default=180,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "conversation.user_cooldown_s",
+        "float",
+        Reload.HOT,
+        "Min gap between one pilot's turns — light anti-spam that keeps the "
+        "back-and-forth fluid. A too-soon turn is dropped without spending the "
+        "turn budget.",
+        default=2.0,
+        minimum=0,
+    ),
+    Key(
+        "conversation.quiet_during_ops",
+        "bool",
+        Reload.HOT,
+        "Go silent while an incident is active/recent so banter never crowds "
+        "live comms (GDD §6.8).",
+        default=True,
+    ),
+    Key(
+        "conversation.quiet_window_min",
+        "int",
+        Reload.HOT,
+        "How long after the last active incident 'ops in progress' holds "
+        "(minutes) for quiet_during_ops.",
+        default=10,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "conversation.math_tool",
+        "bool",
+        Reload.HOT,
+        "Answer arithmetic with a deterministic on-box evaluator (chat_math) so "
+        "numbers are exact, never hallucinated — the same posture as §6.7.",
+        default=True,
+    ),
+    Key(
+        "conversation.timeout_s",
+        "float",
+        Reload.HOT,
+        "Wall-clock cap on producing one reply (a local 7B model on 4 vCPU is slow).",
+        default=20.0,
+        minimum=0,
+        exclusive_minimum=True,
+    ),
+    Key(
+        "conversation.overflow_channel",
+        "int",
+        Reload.HOT,
+        "Channel for a reply too long to speak, posted with "
+        "AllowedMentions.none() (constraint 11). 0 = drop it.",
+        default=0,
+        minimum=0,
     ),
     # killboard (optional section) — the Albion Online add-on (killboard GDD)
     Key(

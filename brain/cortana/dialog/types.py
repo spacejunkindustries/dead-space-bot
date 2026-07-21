@@ -30,6 +30,7 @@ __all__ = [
     "PendingKind",
     "Relay",
     "Report",
+    "RunChat",
     "RunOverride",
     "RunStt",
     "Speak",
@@ -55,6 +56,9 @@ class DialogState(Enum):
     #: A wake-free window is armed after a MEDIUM-tier "say again to confirm"
     #: (GDD §8.3): an affirmative or an exact repeat completes the command.
     AWAIT_CONFIRM = "await_confirm"
+    #: A wake-free turn-taking window is armed after a conversation reply
+    #: (GDD §6.8): the pilot's next chit-chat turn continues the thread.
+    AWAIT_CONVERSATION = "await_conversation"
 
 
 #: The AWAIT_* states — a wake-free window is armed in exactly these.
@@ -65,6 +69,7 @@ AWAIT_STATES = frozenset(
         DialogState.AWAIT_OVERRIDE_QUESTION,
         DialogState.AWAIT_REPEAT,
         DialogState.AWAIT_CONFIRM,
+        DialogState.AWAIT_CONVERSATION,
     }
 )
 
@@ -78,6 +83,7 @@ class PendingKind(Enum):
     OVERRIDE = "override"
     REPEAT = "repeat"
     CONFIRM = "confirm"
+    CONVERSATION = "conversation"
 
 
 class Ev(Enum):
@@ -92,6 +98,7 @@ class Ev(Enum):
     ENGINE_REJECTED_LOW = "engine_rejected_low"  # report bounced at LOW tier
     ENGINE_ASKED = "engine_asked"  # MEDIUM tier: "say again to confirm"
     DEADLINE = "deadline"  # the armed window / AWAIT state timed out
+    CONVERSE_ARM = "converse_arm"  # arm the next conversation turn (GDD §6.8)
     RESET = "reset"  # user left / Ears reconnected
 
 
@@ -156,6 +163,11 @@ class Classified:
     #: say-again retry (the open-mic retry loop, live complaint). Recognised
     #: commands are never gated by this (a distress call always posts).
     garbage: bool = False
+    #: Conversation mode is enabled, a backend is live, and ops are quiet
+    #: (GDD §6.8). When True the residue branch may route non-command speech to
+    #: chat; when False (the default / off) the residue path is byte-for-byte
+    #: the old relay/NOT_UNDERSTOOD behaviour.
+    conversation_available: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +312,18 @@ class RunOverride:
 
 
 @dataclass(frozen=True, slots=True)
+class RunChat:
+    """Route one non-command utterance to conversation mode (GDD §6.8).
+
+    Carries ONLY the transcript text — no incident, no severity, no mention
+    surface. Its executor's only sinks are the Speaker (TTS) and an optional
+    ``AllowedMentions.none()`` overflow post: the chat layer physically cannot
+    escalate (constraints 9 + 11)."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class ConfirmPending:
     """Complete a pending §8.3 confirm: apply the stored candidate through
     the same engine path the card's confirm/pick buttons use."""
@@ -323,6 +347,7 @@ Action = Union[  # noqa: UP007 - a named union reads better in match sites
     LearnArea,
     Relay,
     RunOverride,
+    RunChat,
     ConfirmPending,
     NoteRejected,
 ]

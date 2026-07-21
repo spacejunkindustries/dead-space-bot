@@ -48,8 +48,10 @@ from cortana.dialog.types import (
     Line,
     NoteRejected,
     PendingConfirm,
+    PendingKind,
     Relay,
     Report,
+    RunChat,
     RunOverride,
     RunStt,
     Speak,
@@ -71,6 +73,7 @@ if TYPE_CHECKING:
     import sqlite3
 
     from cortana.config import ConfigHolder, NluConfig
+    from cortana.conversation import ConversationManager
     from cortana.core.discipline import Discipline
     from cortana.core.fun import FunEngine
     from cortana.core.incidents import IncidentEngine
@@ -172,6 +175,7 @@ class DialogEngine:
         send_channel: SendChannel,
         shutdown: asyncio.Event,
         fun: FunEngine | None = None,
+        conversation: ConversationManager | None = None,
     ) -> None:
         self._holder = holder
         self._capture = capture
@@ -187,6 +191,10 @@ class DialogEngine:
         self._send_channel = send_channel
         self._shutdown = shutdown
         self._fun = fun
+        # Conversation mode (GDD §6.8). None = feature not wired (the residue
+        # branch stays byte-for-byte the old path). The manager holds NO
+        # incident/routing/mention handle — the hard wall (constraints 9 + 11).
+        self._conversation = conversation
 
         self._sessions: dict[int, DialogSession] = {}
         self._feed_errors = 0
@@ -236,6 +244,8 @@ class DialogEngine:
         self._last_audio_at.pop(user_id, None)
         self._partial_inflight.discard(user_id)
         self._partial_at_frames.pop(user_id, None)
+        if self._conversation is not None:
+            self._conversation.reset_user(user_id)
         if self._capture is not None:
             self._capture.drop_user(user_id)
 
@@ -351,7 +361,7 @@ class DialogEngine:
             text=result.text,
             avg_logprob=round(result.avg_logprob, 3),
         )
-        classified = self._classify(result.text, result.avg_logprob)
+        classified = self._classify(result.text, result.avg_logprob, s.guild_id)
         # The understanding brain (GDD §6.7): if the fixed grammar found no
         # command, let the on-box model read the transcript and try. Only the
         # callouts the grammar misses pay the round-trip; the place it returns
@@ -378,6 +388,12 @@ class DialogEngine:
         authorised; constraint 6 waiver)."""
         cfg = self._holder.current.nlu
         if not self._llm_understand_applies(cfg, classified):
+            return classified
+        # Skip the understanding brain while a conversation is live (GDD §6.8):
+        # the grammar still preempts genuine callouts, and interpreting every
+        # chit-chat turn would speak a "stand by" cue and pay a model round-trip
+        # on speech meant for the chat lane, not the command path.
+        if s.pending is PendingKind.CONVERSATION:
             return classified
         # The on-box interpret is a multi-second round-trip; without a cue the
         # pilot hears dead air and thinks she froze. Speak "stand by" FIRST so
@@ -431,7 +447,7 @@ class DialogEngine:
         except Exception:  # noqa: BLE001 — the review log is best-effort
             log.debug("transcript_log_post_failed", channel_id=channel_id)
 
-    def _classify(self, text: str, avg_logprob: float) -> Classified:
+    def _classify(self, text: str, avg_logprob: float, guild_id: int) -> Classified:
         """All grammar/config lookups for one transcript, in one place —
         the machine receives facts, never functions."""
         cfg = self._holder.current
@@ -452,6 +468,23 @@ class DialogEngine:
             correction_text=grammar.correction_reply(text),
             dismissed=grammar.dismissal(text),
             garbage=avg_logprob < cfg.dialog.retry_min_logprob,
+            conversation_available=self._conversation_available(cfg, guild_id),
+        )
+
+    def _conversation_available(self, cfg: Any, guild_id: int) -> bool:
+        """Whether conversation mode may claim this transcript's residue (§6.8).
+
+        Enabled + a live backend + ops quiet. Off / half-set / ops-live all
+        collapse to False, keeping the residue branch byte-for-byte the old
+        relay/NOT_UNDERSTOOD path (the off-by-default guarantee)."""
+        if self._conversation is None or not cfg.conversation.enabled:
+            return False
+        from cortana.conversation import conversation_available
+
+        return conversation_available(
+            cfg.conversation,
+            backend_live=self._conversation.backend_live(),
+            ops_quiet=self._conversation.ops_quiet(guild_id),
         )
 
     # ── machine application ──────────────────────────────────────────────────
@@ -508,6 +541,8 @@ class DialogEngine:
             await self._relay(s, action)
         elif isinstance(action, RunOverride):
             await self._override(s, action.query)
+        elif isinstance(action, RunChat):
+            await self._converse(s, action.text)
         elif isinstance(action, ConfirmPending):
             await self._confirm(s, action.confirm)
         elif isinstance(action, NoteRejected):
@@ -537,7 +572,14 @@ class DialogEngine:
         if self._capture is not None:
             self._capture.arm_window(s.user_id, s.guild_id, gen)
         now = self._now()
-        self._deadlines[s.user_id] = (now + dcfg.window_ms / 1000, gen)
+        # A conversation turn-taking window (GDD §6.8) uses its own, usually
+        # longer, wall-clock lifetime so a pilot has time to think of a reply;
+        # every other window keeps dialog.window_ms.
+        if s.state is DialogState.AWAIT_CONVERSATION:
+            window_s = self._holder.current.conversation.turn_taking_seconds
+        else:
+            window_s = dcfg.window_ms / 1000
+        self._deadlines[s.user_id] = (now + window_s, gen)
         # The prompt spoken just before this counts into the pilot's reaction
         # time — extend the endpoint grace to cover it.
         self._grace_until[s.user_id] = now + dcfg.ack_grace_ms / 1000
@@ -977,6 +1019,46 @@ class DialogEngine:
             target = cfg.chat.answer_channel or cfg.discord.channels.intel_live
             await self._send_channel(target, f"💬 **Override** · {reply}")
             await self._speak_or_post(s, tts_mod.override_posted())
+
+    async def _converse(self, s: DialogSession, text: str) -> None:
+        """One conversation-mode turn (GDD §6.8): reply → speak → re-arm.
+
+        THE HARD WALL (constraints 9 + 11): this never constructs an Incident,
+        never imports routing, and never calls decide_mentions. Its only sinks
+        are the Speaker (TTS — no mention surface) and, for an over-long reply,
+        an optional overflow-channel post the composition root forces to
+        ``AllowedMentions.none()``. A backend failure/timeout/cooldown drops
+        silently so comms stay clean, and the turn-taking window is re-armed
+        only while the ConversationManager still has budget."""
+        if self._conversation is None:
+            return
+        cfg = self._holder.current
+        try:
+            reply = await asyncio.wait_for(
+                self._conversation.reply(s.user_id, s.guild_id, text),
+                timeout=cfg.conversation.timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 — comms stay clean; never surface
+            log.warning("conversation_failed", user_id=s.user_id, error=str(exc))
+            return
+        if not reply:
+            # No budget / cooldown / backend down: say nothing, arm nothing.
+            return
+        log.info("conversation_reply", user_id=s.user_id)
+        spoken = await self._speaker.say(s.guild_id, reply, PRIORITY_NORMAL, user_id=s.user_id)
+        if not spoken:
+            # Over the §12.2 spoken cap: drop, or post to the overflow channel
+            # FORCED mention-free (constraint 11 — the chat layer can never ping).
+            overflow = cfg.conversation.overflow_channel
+            if overflow:
+                await self._send_channel(overflow, f"💬 {reply}")
+            else:
+                log.info("conversation_reply_unspoken_dropped", user_id=s.user_id)
+        # Re-arm the next turn ONLY while the manager still has budget
+        # (turns_left > 0 AND not expired). This gate is what makes the
+        # wake-free re-arm unable to self-sustain (loop-safety).
+        if self._conversation.active(s.user_id):
+            await self._apply(self._session(s.user_id, s.guild_id), DialogEvent(Ev.CONVERSE_ARM))
 
     # ── spoken output ────────────────────────────────────────────────────────
 

@@ -240,6 +240,12 @@ class AuraBot(commands.Bot):
         # The §6.6 out-of-band assistant; None = override channel disabled.
         self.chat: Any | None = None
         self.chat_status: str = "disabled"  # "ready" | "no_key" | "disabled" (§6.6)
+        # Conversation mode (GDD §6.8): the ConversationManager shared by the
+        # voice residue branch and the /chat slash twin (constraint 10). None
+        # until the composition root wires it. It holds no incident/mention
+        # handle — the hard wall.
+        self.conversation: Any | None = None
+        self.conversation_status: str = "disabled"  # "ready" | "no_url" | "no_key" | "disabled"
         #: The operator alarm surface (GDD §11.3) — set by the composition root.
         self.alarms: AlarmBus | None = None
         #: The one reload transaction (SIGHUP == /reload) — set by __main__.

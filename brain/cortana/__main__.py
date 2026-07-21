@@ -43,6 +43,7 @@ from cortana.audio.vad import VadGate
 from cortana.audio.wake import OpenWakeWordDetector
 from cortana.chat import ChatBackend, ChatClient, LocalChatClient, read_api_key
 from cortana.config import ConfigError, ConfigHolder
+from cortana.conversation import ConversationManager
 from cortana.core import db
 from cortana.core.discipline import Discipline
 from cortana.core.fun import FunEngine
@@ -160,6 +161,13 @@ class App:
         self.gateway: VoiceGateway | None = None
         self.reminders: ReminderService | None = None
         self.chat: ChatBackend | None = None
+        # Conversation mode (GDD §6.8) — its OWN backend lane (default on-box
+        # local), separate from the chat override channel. The manager holds no
+        # incident/routing/mention handle (the hard wall).
+        self.conversation: ConversationManager | None = None
+        self.conversation_backend: ChatBackend | None = None
+        self._conversation_status = "disabled"
+        self._conversation_key: str | None = None
         self.fun: FunEngine | None = None
         # The module kernel (dead/): built at the tail of setup(). Additive —
         # with no add-on enabled it changes no runtime behaviour.
@@ -235,6 +243,7 @@ class App:
         await self.speaker.warm()  # prime Piper's model into cache off the hot path
 
         self._refresh_chat()
+        self._refresh_conversation()
 
         self.transcriber = await asyncio.to_thread(make_transcriber, cfg.stt)
         # Load the Whisper weights now, off the request path: the first real
@@ -318,6 +327,20 @@ class App:
         )
         self.reminders = ReminderService(self.conn, self.bot)
 
+        # Conversation mode (GDD §6.8): ONE manager shared by the voice residue
+        # branch and the /chat slash twin (constraint 10), built with NO
+        # incident/routing/mention handle — only a backend provider and a
+        # READ-ONLY incident-time getter for the auto-quiet predicate.
+        self.conversation = ConversationManager(
+            self.holder,
+            conversation_provider=lambda: (
+                self.conversation_backend,
+                self._conversation_status,
+            ),
+            last_incident_at=self._incident_time,
+        )
+        self.bot.conversation = self.conversation  # /chat slash twin (constraint 10)
+
         # The voice dialog engine (GDD §5.4) — drives the same IncidentEngine
         # the slash cogs call (constraint 10).
         self.dialog = DialogEngine(
@@ -335,6 +358,7 @@ class App:
             send_channel=self._send_channel,
             shutdown=self._shutdown,
             fun=self.fun,
+            conversation=self.conversation,
         )
         # Authoritative dialog cleanup, redundant with the IPC "left" event —
         # survives Ears outages (GDD §5.4).
@@ -554,6 +578,7 @@ class App:
         # Unconditional: catches a rotated on-disk API key even when no
         # chat.* KEY changed (appliers only fire on key changes).
         self._refresh_chat()
+        self._refresh_conversation()
         # Fan the config swap out to add-on modules so their HOT keys hot-apply
         # in the same transaction. Isolated per module (a throw is contained).
         if self.modules is not None and result.swapped:
@@ -645,6 +670,70 @@ class App:
             self.bot.chat = self.chat
             self.bot.chat_status = self._chat_status
 
+    def _refresh_conversation(self) -> None:
+        """(Re)build the §6.8 conversation backend from the current config.
+
+        Mirrors :meth:`_refresh_chat` but on the SEPARATE ``conversation`` lane
+        and its own status string, so a corp can run conversation local while the
+        override channel stays cloud. A half-set config (enabled, no local_url /
+        no key) degrades to dark, exactly like the override channel — no
+        cross-check. The ConversationManager reads ``self.conversation_backend``
+        through its provider lambda, so swapping it here applies live on reload."""
+        cfg = self.holder.current
+        previous = self.conversation_backend
+        if not cfg.conversation.enabled:
+            self.conversation_backend = None
+            self._conversation_key = None
+            self._conversation_status = "disabled"
+        elif cfg.conversation.backend == "local":
+            if not cfg.conversation.local_url:
+                self.conversation_backend = None
+                self._conversation_status = "no_url"
+            else:
+                if not isinstance(self.conversation_backend, LocalChatClient):
+                    self.conversation_backend = LocalChatClient(
+                        self.holder, config_section="conversation"
+                    )
+                self._conversation_key = None
+                self._conversation_status = "ready"
+        else:
+            key = read_api_key(cfg.conversation.api_key_file)
+            if key:
+                if (
+                    not isinstance(self.conversation_backend, ChatClient)
+                    or self._conversation_key != key
+                ):
+                    self.conversation_backend = ChatClient(
+                        self.holder, key, config_section="conversation"
+                    )
+                    self._conversation_key = key
+                self._conversation_status = "ready"
+            else:
+                self.conversation_backend = None
+                self._conversation_key = None
+                self._conversation_status = "no_key"
+        # Release the replaced client's connection pool (backend switch, disable,
+        # key rotation) — same off-band close path the override channel uses.
+        if previous is not None and previous is not self.conversation_backend:
+            self._schedule_chat_close(previous)
+        log.info(
+            "conversation_channel_status",
+            status=self._conversation_status,
+            backend=cfg.conversation.backend,
+            model=cfg.conversation.model,
+        )
+        if self.bot is not None:
+            self.bot.conversation_status = self._conversation_status
+
+    def _incident_time(self, guild_id: int) -> datetime | None:
+        """Read-only accessor: the guild's most-recent ACTIVE incident time,
+        for conversation mode's auto-quiet predicate (GDD §6.8). Delegates to
+        the incident engine's ``most_recent_active_at`` — no mutation, no
+        routing, no mention decision ever flows through here."""
+        if self.engine is None:
+            return None
+        return self.engine.most_recent_active_at(guild_id)
+
     def _schedule_chat_close(self, client: ChatBackend) -> None:
         """Close a replaced chat client off-band, retaining the task so it isn't
         GC'd mid-flight. Degrades to a no-op with no running loop (setup runs on
@@ -693,6 +782,9 @@ class App:
             # Release the chat client's connection pool on graceful shutdown too.
             with contextlib.suppress(Exception):
                 await self.chat.close()
+        if self.conversation_backend is not None:
+            with contextlib.suppress(Exception):
+                await self.conversation_backend.close()
         if self.bot is not None and not self.bot.is_closed():
             with contextlib.suppress(Exception):
                 await self.bot.close()

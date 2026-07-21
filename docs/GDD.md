@@ -199,6 +199,8 @@ Every module in the finished system.
 | `audio/stt.py` | `Transcriber` protocol; faster-whisper (default) and whisper.cpp HTTP backends; gazetteer prompt biasing; bounded serialized decode queue + `stt.watchdog_s` hang watchdog |
 | `nlu/grammar.py` | Intent extraction, group-alias extraction, detail capture |
 | `nlu/llm_nlu.py` | The understanding brain (§6.7): on-box LLM reads a transcript the grammar missed → structured command JSON → `ParsedCommand` |
+| `conversation.py` | Conversation mode (§6.8): per-pilot chat sessions + the turn/TTL/cooldown budget + the ops-quiet/availability predicates. Built with NO incident/routing/mention handle (the hard wall); shared by the voice residue branch and the `/chat` twin |
+| `chat_math.py` | Deterministic on-box arithmetic for §6.8 (tokenizer → shunting-yard → `Decimal`, no `eval`/`exec`) so numbers are exact, never model-hallucinated |
 | `nlu/gazetteer.py` | System load, region pruning, adjacency graph, jump-distance BFS with memo |
 | `nlu/phonetics.py` | Double Metaphone + Levenshtein scoring, alias-table lookup, context priors, confidence tiers |
 | `core/incidents.py` | Incident lifecycle, dedupe folding, staleness sweep, message rendering |
@@ -479,6 +481,22 @@ And it stays cheap where it matters: **grammar-first.** The model is called *onl
 
 **She says "stand by" before she thinks.** The on-box interpret is a multi-second round-trip, and a pilot who hears nothing assumes she froze — the exact "randomly slow" feeling, since only grammar-*misses* pay it. So the instant the utterance is handed to the model, CORTANA speaks an ephemeral cue (*"Stand by." / "One moment."*, personality-flavoured) — best-effort ACK-class, dropped if she can't speak, and it never delays the interpret. The wait then reads as *working*, not *broken*. The decision to consult the model lives in one pure predicate (`_llm_understand_applies`) so "is she about to think?" has a single home shared by the cue and the call.
 
+### 6.8 Conversation mode — freestyle back-and-forth (opt-in)
+
+Sibling of §6.6 (override) and §6.7 (understanding brain): **OFF by default**, on-box-capable, and **never on the command path**. When `conversation.enabled` is set and the fleet is idle, speech that is *not* a fleet command — the grammar **and** the §6.7 understanding brain both missed, so `c.parsed is None` — goes to a chat model and CORTANA talks back, with **wake-free turn-taking**: after each reply a short window (`conversation.turn_taking_seconds`) stays open for the pilot's next turn, no wake word needed.
+
+**Grammar-first is untouched; a command always preempts chat (constraint 6).** Every utterance is parsed for a command first. The conversation residue branch sits *below* the grammar-command dispatch, the LOW-retry rebind, the bare-code opener, and the override/confirm/dismissal steps in the dialog machine, so a real callout spoken mid-conversation hits the command path, tears the conversation down (`s.idle()`), and routes through the **unchanged** deterministic flow (confirm-first → incident engine → `decide_mentions()`). A sighting spoken mid-chat still posts exactly one informational card, no ping — the existing path, byte-for-byte.
+
+**Speech-only — the hard wall (constraints 9 + 11).** The chat layer physically cannot escalate. `ConversationManager` and its executor are built with **no** `IncidentEngine`, no routing, no `decide_mentions` handle; the `RunChat` action carries only text. Its only sinks are the Speaker (TTS) and — for a reply too long to speak — an optional `conversation.overflow_channel` post forced to `AllowedMentions.none()`. It **never posts a card** (constraint 9) and **never pings** (constraint 11). A signature test pins the constructor so the wall cannot be quietly widened.
+
+**Bounded, loop-safe sessions.** Each speaker gets a rolling per-pilot session — `conversation.max_history_turns` exchanges of context — bounded by `conversation.max_turns` (a hard per-session turn cap) plus `conversation.session_ttl_seconds` (idle lifetime). The turn-taking window re-arms after each reply **without draining the dialog failure-retry budget** (a chit-chat thread would otherwise be throttled to ~2 turns), but the re-arm is emitted **only while the manager still has budget** — turns left and not expired — so it cannot self-sustain. Silence closes the window through the wheel's normal DEADLINE, a fresh wake supersedes it, and only a fresh wake refills the turn budget (the same loop-safety guarantee the whole dialog module exists to provide).
+
+**Cold-start precedence.** Relay and chat are the two mutually-exclusive owners of fresh-wake residue: a cold-start conversation claims a non-command utterance **only when `stt.relay_mode: off`**. Once a conversation is live it continues regardless of relay mode. A corp wanting voice chit-chat sets `stt.relay_mode: off` + `conversation.enabled: true`.
+
+**Numbers are exact, never hallucinated.** Arithmetic ("what is 437 times 12") is answered by a deterministic on-box evaluator (`chat_math`, no `eval`/`exec`) before the model is ever consulted — the same "the model never gets the dangerous power" posture as §6.7.
+
+**Its own backend lane.** `conversation.backend` (`local` | `anthropic`) reuses the §6.6 `ChatBackend` abstraction but reads the separate `conversation.*` config, so a corp can run conversation on a free on-box model (the live box runs local `qwen2.5:7b`) while the override channel stays cloud. `quiet_during_ops` silences banter while an incident is active/recent (`quiet_window_min`). A half-set config (enabled, no `local_url`/no key) degrades to dark, exactly like `chat:`. Slash twin: **`/chat`**, sharing one per-pilot history with the voice path (constraint 10).
+
 ---
 
 ## 7. Slash command reference
@@ -504,6 +522,7 @@ Full parity. Every voice command routes to the same engine.
 | `/route from to` | Full shortest jump path between two systems |
 | `/history system hours` | Recent incidents in a system (default 24h, max 72h) |
 | `/remindme duration message` | Personal reminder, DMed when due (max 10 pending, 7 days out) |
+| `/chat message` | Freestyle conversation with CORTANA — twin of voice conversation mode (§6.8), sharing one per-pilot history; speech-only, never posts a card, never pings |
 | `/poll create question options…` | Quick vote with buttons, live counts edited in place |
 | `/poll close id` | Close a poll (author or admin) |
 | `/subscribe` | Self-service role picker |
@@ -1387,6 +1406,23 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `nlu.url` | str | `''` | hot | OpenAI-compatible chat-completions endpoint of the on-box model (e.g. http://127.0.0.1:11434/v1/chat/completions from Ollama). Empty = off. |
 | `nlu.model` | str | `''` | hot | Model name the local server expects (e.g. llama3.2:3b). |
 | `nlu.timeout_s` | float | `8.0` | hot | Wall-clock cap on one interpretation; the grammar already answered the clear callouts fast, so this only paces the messy ones. |
+| **`conversation:`** | | | | *OPTIONAL freestyle conversation mode (GDD §6.8); absent = off. Its own backend lane (default on-box local); never on the command path, never posts a card, never pings.* |
+| `conversation.enabled` | bool | `False` | sighup | Master switch for freestyle conversation mode (GDD §6.8): wake-free back-and-forth chit-chat / banter / maths when the fleet is idle. OFF by default. Never on the command path (grammar + the §6.7 understanding brain preempt it), never posts a card, never pings. Cold-start claims residue only when stt.relay_mode is off (relay and chat are the two mutually-exclusive residue owners); a live conversation continues regardless. A half-set config just stays dark. |
+| `conversation.backend` | str | `'local'` | sighup | Who chats back: 'local' = an on-box OpenAI-compatible server at conversation.local_url (free, high-throughput — the default); 'anthropic' = the cloud Claude API (a Claude id in conversation.model, costs per turn). Reuses the §6.6 ChatBackend abstraction. One of: `anthropic`, `local`. |
+| `conversation.local_url` | str | `''` | sighup | OpenAI-compatible chat-completions endpoint for backend='local' (e.g. http://127.0.0.1:11434/v1/chat/completions from Ollama running qwen2.5:7b). Empty = dark (degrades gracefully). |
+| `conversation.model` | str | `'qwen2.5:7b'` | hot | Local model name, or a Claude model id for backend='anthropic'. |
+| `conversation.api_key_file` | str | `'/etc/cortana/anthropic'` | sighup | Dev fallback ONLY (0600); production reads $CREDENTIALS_DIRECTORY/anthropic via LoadCredential= (constraint 12). Ignored for backend='local'. |
+| `conversation.max_tokens` | int | `200` | hot | Hard cap per spoken reply — chit-chat is short. |
+| `conversation.turn_taking_seconds` | float | `8.0` | hot | Wake-free window kept open after each reply for the pilot's next turn. Re-armed WITHOUT draining the dialog failure-retry budget — the conversation is bounded by max_turns + session_ttl_seconds instead. |
+| `conversation.max_history_turns` | int | `6` | hot | Prior user+assistant exchanges replayed to the model as context (0 = stateless). |
+| `conversation.max_turns` | int | `8` | hot | Hard per-session turn cap; each spoken reply spends one, and only a fresh wake refills it (the loop-safety bound). |
+| `conversation.session_ttl_seconds` | int | `180` | hot | Idle lifetime of a conversation thread; after this a stale thread is dropped so it never bleeds into the next chat. |
+| `conversation.user_cooldown_s` | float | `2.0` | hot | Min gap between one pilot's turns — light anti-spam that keeps the back-and-forth fluid. A too-soon turn is dropped without spending the turn budget. |
+| `conversation.quiet_during_ops` | bool | `True` | hot | Go silent while an incident is active/recent so banter never crowds live comms (GDD §6.8). |
+| `conversation.quiet_window_min` | int | `10` | hot | How long after the last active incident 'ops in progress' holds (minutes) for quiet_during_ops. |
+| `conversation.math_tool` | bool | `True` | hot | Answer arithmetic with a deterministic on-box evaluator (chat_math) so numbers are exact, never hallucinated — the same posture as §6.7. |
+| `conversation.timeout_s` | float | `20.0` | hot | Wall-clock cap on producing one reply (a local 7B model on 4 vCPU is slow). |
+| `conversation.overflow_channel` | int | `0` | hot | Channel for a reply too long to speak, posted with AllowedMentions.none() (constraint 11). 0 = drop it. |
 | **`killboard:`** | | | | *OPTIONAL Albion Online killboard add-on (killboard GDD); absent/off by default. A separate game module — its own SQLite file, own poll loop.* |
 | `killboard.enabled` | bool | `False` | restart | Master switch for the Albion killboard module. Also needs a guild and a feed channel; the module stays dark until all are set. |
 | `killboard.region` | str | `'west'` | restart | Which Albion server the guild lives on — selects the API host (killboard GDD §2.2). Hitting the wrong region returns empty data. One of: `west`, `europe`, `east`. |
