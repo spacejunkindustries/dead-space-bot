@@ -67,6 +67,11 @@ class Intent(StrEnum):
     ASSIST_REQUEST = "ASSIST_REQUEST"
     GATE_CAMP = "GATE_CAMP"
     RESOLVE = "RESOLVE"
+    # Fleet-wide stand-down (GDD §9.1): "stand down", "clear all", "all clear",
+    # "cancel last incident" — resolve active incident cards in place. Never
+    # stored in ``incidents.type`` (like CANCEL/QUERY it is a management verb,
+    # not a report); the incident engine routes it before any report intent.
+    STAND_DOWN = "STAND_DOWN"
     CHASE_UPDATE = "CHASE_UPDATE"
     TIMER = "TIMER"
     FORMUP = "FORMUP"
@@ -108,6 +113,7 @@ INTENT_SEVERITY: Mapping[Intent, Severity] = MappingProxyType(
         Intent.ASSIST_REQUEST: Severity.HIGH,
         Intent.GATE_CAMP: Severity.MEDIUM,
         Intent.RESOLVE: Severity.NONE,
+        Intent.STAND_DOWN: Severity.NONE,
         Intent.CHASE_UPDATE: Severity.NONE,
         Intent.TIMER: Severity.NONE,
         Intent.FORMUP: Severity.NONE,
