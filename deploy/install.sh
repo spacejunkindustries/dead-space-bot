@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# CORTANA droplet deploy — Ubuntu 24.04 LTS (GDD §17).
+# CORTANA deploy — Ubuntu 24.04 LTS or Debian 13 (trixie) (GDD §17).
+# On a host without an apt python3.12 (e.g. Debian 13, whose python3 is 3.13),
+# put a python3.12 on PATH first (source build or pyenv); the apt step below
+# then skips the python packages the distro doesn't have.
 #
 # Staged converge-and-verify. Run as root from a checkout:
 #
@@ -621,9 +624,18 @@ fi
 APT_PKGS=(
     build-essential autoconf automake libtool m4 cmake pkg-config
     libopus-dev
-    python3.12 python3.12-venv
     sqlite3 rsync curl
 )
+# python3.12 + venv are apt-provided on Ubuntu 24.04, but not every supported
+# host packages them — Debian 13 (trixie), for one, ships python3 = 3.13 and has
+# no python3.12 apt package. There the operator supplies python3.12 on PATH (a
+# source build or pyenv); a source-built 3.12 bundles venv + ensurepip, so no apt
+# package is needed. Require the apt packages ONLY when a python3.12 that can
+# actually create a venv isn't already present — otherwise apt-get would abort
+# the whole deploy trying to install a package the distro doesn't have.
+if ! python3.12 -c 'import venv, ensurepip' >/dev/null 2>&1; then
+    APT_PKGS+=(python3.12 python3.12-venv)
+fi
 missing=()
 for p in "${APT_PKGS[@]}"; do
     dpkg -s "${p}" >/dev/null 2>&1 || missing+=("${p}")
