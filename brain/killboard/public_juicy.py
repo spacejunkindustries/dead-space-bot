@@ -69,8 +69,11 @@ _PRICE_CONCURRENCY: int = 6
 class _Candidate:
     """One qualifying global kill, scored for the per-scan top-N ranking.
 
-    ``score`` is the loot value when priced, else the fame — so the cap keeps the
-    juiciest (biggest) kills and drops the long tail of merely-qualifying ones.
+    ``score`` is the fame for a fame-hit (free, no pricing) and the priced loot
+    for a sub-fame qualifier (whose loot IS the reason it qualifies), so the cap
+    keeps the juiciest kills and drops the long tail. ``loot_value`` is the priced
+    loot when known — always for sub-fame, and for a fame-hit only if it survived
+    the cap and the leftover budget decorated it (else ``None``, display-only).
     """
 
     score: int
@@ -141,14 +144,19 @@ class PublicJuicyFeed:
 
         Every geared-player kill on a whole server prices in the millions, so a
         raw threshold on the firehose lets dozens through per scan. Two guards
-        keep it sane: a per-scan LOOT-PRICING BUDGET (``max_priced_per_scan``,
-        priced with bounded concurrency) so the flaky AODP API is never hit with
-        ~100 sequential lookups every cycle, and the POST CAP (``max_posts_per_scan``)
-        that ranks qualifiers by value and posts only the top ``N`` — the juiciest
-        handful, never the whole window.
+        keep it sane: a per-scan PRICING BUDGET (``max_priced_per_scan``, priced
+        with bounded concurrency) that caps the TOTAL number of AODP lookups a
+        scan may make — both the sub-fame qualification prices AND the fame-hit
+        card decoration — so the flaky AODP API is never hit with ~100 lookups
+        every cycle, and the POST CAP (``max_posts_per_scan``) that ranks
+        qualifiers and posts only the top ``N`` — the juiciest handful.
 
-        FAME is free (straight off the event) so it is evaluated first with no
-        network; only sub-fame events consume the loot-pricing budget.
+        FAME is free (straight off the event), so fame-hits are ranked on their
+        fame with no network at all; their loot is priced only for the ``<=cap``
+        SURVIVORS, AFTER ranking, so an AODP call is never spent on a fame-hit the
+        cap will drop. Sub-fame events must be priced to qualify (their score IS
+        their loot) and consume the budget first; fame-hit decoration gets only
+        whatever budget is left over.
         """
         kb = self._cfg_provider().killboard
         pj = kb.public_juicy
@@ -185,9 +193,8 @@ class PublicJuicyFeed:
                     to_price.append((row, raw))
                 # else: sub-fame with no loot gate → can't qualify; dropped.
 
-        # ── Phase 2: price with BOUNDED CONCURRENCY under a per-scan budget.
-        priced_dropped = max(0, len(to_price) - price_budget)
-        to_price = to_price[:price_budget]
+        # ── Phase 2: RANK first, then price under a per-scan budget that bounds
+        # ALL AODP calls (sub-fame qualification + fame-hit decoration together).
         sem = asyncio.Semaphore(_PRICE_CONCURRENCY)
 
         async def _priced(raw: dict[str, Any]) -> int | None:
@@ -195,35 +202,46 @@ class PublicJuicyFeed:
                 return await self._loot_value(raw)
 
         candidates: list[_Candidate] = []
-        # Fame hits always qualify; price them (bounded, few) only to show loot.
-        fame_loot = (
-            await asyncio.gather(*[_priced(raw) for _row, raw in fame_hits])
-            if market_on
-            else [None] * len(fame_hits)
-        )
-        for (row, raw), loot in zip(fame_hits, fame_loot, strict=True):
-            candidates.append(
-                _Candidate(
-                    score=loot if loot is not None else row.total_fame,
-                    raw=raw,
-                    row=row,
-                    loot_value=loot,
-                )
-            )
-        # Sub-fame events qualify only if their priced loot clears the bar.
-        sub_loot = await asyncio.gather(*[_priced(raw) for _row, raw in to_price])
-        for (row, raw), loot in zip(to_price, sub_loot, strict=True):
+        # Sub-fame events MUST be priced to qualify (their score IS loot), so they
+        # consume the budget FIRST — exactly as before. Anything past the budget
+        # is dropped unpriced.
+        sub_slice = to_price[:price_budget] if market_on else []
+        priced_dropped = len(to_price) - len(sub_slice)
+        priced_used = len(sub_slice)
+        sub_loot = await asyncio.gather(*[_priced(raw) for _row, raw in sub_slice])
+        for (row, raw), loot in zip(sub_slice, sub_loot, strict=True):
             if loot is not None and loot >= min_loot:
                 candidates.append(_Candidate(score=loot, raw=raw, row=row, loot_value=loot))
+        # Fame-hits always qualify and are scored by their FREE fame — no pricing,
+        # so the ranking below happens before any fame-hit costs an AODP call.
+        for row, raw in fame_hits:
+            candidates.append(_Candidate(score=row.total_fame, raw=raw, row=row, loot_value=None))
 
         if not candidates:
             if priced_dropped:
                 self._log.info("kb_public_juicy.scan", priced_dropped=priced_dropped)
             return
-        # Post the biggest first; the cap drops the rest of this window's tail.
+        # Rank, then keep only the top-N; the cap drops the rest of this window.
         candidates.sort(key=lambda c: c.score, reverse=True)
+        survivors = candidates[:cap]
+
+        # Decorate ONLY the surviving fame-hits with loot, bounded by the budget
+        # the sub-fame step left over. This is AFTER ranking, so a fame-hit the cap
+        # dropped never costs a lookup; the price is purely decorative and the
+        # score stays UNCHANGED (ranking already happened).
+        if market_on:
+            remaining = max(0, price_budget - priced_used)
+            deco_idx = [i for i, c in enumerate(survivors) if c.loot_value is None][:remaining]
+            deco_loot = await asyncio.gather(*[_priced(survivors[i].raw) for i in deco_idx])
+            priced_used += len(deco_idx)
+            for i, loot in zip(deco_idx, deco_loot, strict=True):
+                if loot is not None:
+                    c = survivors[i]
+                    survivors[i] = _Candidate(score=c.score, raw=c.raw, row=c.row, loot_value=loot)
+
+        # Post the biggest first; the cap already dropped this window's tail.
         posted = 0
-        for cand in candidates[:cap]:
+        for cand in survivors:
             if self._shutting_down():
                 break
             if await self._post(cand, channel_id):

@@ -167,7 +167,14 @@ class App:
         self.modules: ModuleManager | None = None
         self._chat_status = "disabled"
         self._chat_key: str | None = None
-        self._reload_task: asyncio.Task[None] | None = None
+        # ONE in-flight reload: SIGHUP and /reload both join this task, so at most
+        # one _reload_transaction ever runs and concurrent callers share its
+        # receipt (see _ensure_reload_task). Holds the ReloadResult.
+        self._reload_task: asyncio.Task[ReloadResult] | None = None
+        # Keep-alive set for chat clients being closed off-band when _refresh_chat
+        # replaces one (key rotation, backend switch, disable): a fire-and-forget
+        # close whose task we must retain until it finishes or it may be GC'd.
+        self._chat_close_tasks: set[asyncio.Task[None]] = set()
         # Config this PROCESS was built from: restart-pending detection diffs
         # against this, not the last swap — otherwise a second no-op reload
         # would resolve the alarm while the edit is still not live (review
@@ -297,8 +304,10 @@ class App:
         self.bot.chat = self.chat  # /ask slash twin (GDD §6.6, constraint 10)
         self.bot.chat_status = self._chat_status
         self.bot.alarms = self.alarms
-        # /reload is the slash twin of SIGHUP — the SAME transaction.
-        self.bot.request_reload = self._reload_transaction
+        # /reload is the slash twin of SIGHUP — the SAME transaction, routed
+        # through the single-flight guard so a concurrent SIGHUP + /reload (or two
+        # /reload taps) run one transaction and share its receipt.
+        self.bot.request_reload = self.request_reload
         # /restart trips the same graceful shutdown as SIGTERM; exit 0 is
         # restartable (only 78/69 park the unit), so systemd's
         # Restart=always brings the process straight back.
@@ -466,17 +475,28 @@ class App:
         and systemd ``Restart=always`` brings the process back in seconds."""
         self._request_shutdown("restart_via_slash")
 
+    def _ensure_reload_task(self) -> asyncio.Task[ReloadResult]:
+        """The single-flight guard: return the in-flight reload task, creating it
+        if none is running. There is NO ``await`` between the ``done()`` check and
+        the assignment, so on the single-threaded event loop SIGHUP and /reload can
+        never start two racing transactions — the second caller joins the first."""
+        task = self._reload_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._reload_transaction(), name="config-reload")
+            self._reload_task = task
+        return task
+
     def _on_sighup(self) -> None:
         # The transaction is async (engine reloads, health post); the signal
-        # handler only schedules it. One at a time — a second SIGHUP during a
-        # reload is dropped rather than interleaved.
-        if self._reload_task is not None and not self._reload_task.done():
-            log.warning("config_reload_already_running")
-            return
-        self._reload_task = asyncio.create_task(self._reload())
+        # handler only schedules it, fire-and-forget. self._reload_task holds the
+        # reference, and a second SIGHUP mid-reload coalesces into the running one.
+        self._ensure_reload_task()
 
-    async def _reload(self) -> None:
-        await self._reload_transaction()
+    async def request_reload(self) -> ReloadResult:
+        """The /reload slash twin (constraint 10): join the single in-flight reload
+        and return its receipt. Concurrent callers share one transaction and one
+        ReloadResult."""
+        return await self._ensure_reload_task()
 
     async def _reload_transaction(self) -> ReloadResult:
         """The one reload transaction (GDD §16): validate everything, swap
@@ -581,6 +601,9 @@ class App:
         tell an operator *why* the channel is down ("disabled" vs "no key").
         """
         cfg = self.holder.current
+        # The client we may be about to replace — snapshotted before any branch
+        # reassigns self.chat, so we can close its connection pool if it changes.
+        previous = self.chat
         if not cfg.chat.enabled:
             self.chat = None
             self._chat_key = None
@@ -607,6 +630,11 @@ class App:
                 self.chat = None
                 self._chat_key = None
                 self._chat_status = "no_key"
+        # Release the replaced client's connection pool (key rotation, backend
+        # switch, disable). Without this the old AsyncAnthropic httpx pool leaks
+        # every reload that changes the client.
+        if previous is not None and previous is not self.chat:
+            self._schedule_chat_close(previous)
         log.info(
             "override_channel_status",
             status=self._chat_status,
@@ -616,6 +644,17 @@ class App:
         if self.bot is not None:
             self.bot.chat = self.chat
             self.bot.chat_status = self._chat_status
+
+    def _schedule_chat_close(self, client: ChatBackend) -> None:
+        """Close a replaced chat client off-band, retaining the task so it isn't
+        GC'd mid-flight. Degrades to a no-op with no running loop (setup runs on
+        the loop, so in practice there always is one)."""
+        try:
+            task = asyncio.create_task(client.close())
+        except RuntimeError:
+            return  # no running loop — nothing to release yet
+        self._chat_close_tasks.add(task)
+        task.add_done_callback(self._chat_close_tasks.discard)
 
     async def _graceful_shutdown(self) -> None:
         log.info("shutting_down")
@@ -650,6 +689,10 @@ class App:
             await self.ipc.stop()
         if self.speaker is not None:
             await self.speaker.close()
+        if self.chat is not None:
+            # Release the chat client's connection pool on graceful shutdown too.
+            with contextlib.suppress(Exception):
+                await self.chat.close()
         if self.bot is not None and not self.bot.is_closed():
             with contextlib.suppress(Exception):
                 await self.bot.close()

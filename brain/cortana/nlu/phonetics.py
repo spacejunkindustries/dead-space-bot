@@ -26,8 +26,11 @@ in isolation (CLAUDE.md conventions).
 
 from __future__ import annotations
 
+import heapq
 import re
 import sqlite3
+from collections import Counter
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -41,7 +44,9 @@ if TYPE_CHECKING:  # pragma: no cover — import cycle guard only
     from cortana.nlu.gazetteer import Gazetteer
 
 __all__ = [
+    "PoolIndex",
     "base_score",
+    "build_pool_index",
     "double_metaphone",
     "levenshtein",
     "normalize",
@@ -449,6 +454,184 @@ def base_score(window: str, name: str, cfg: MatchingConfig) -> float:
     return score
 
 
+# ── blocking index (GDD §8.2) ────────────────────────────────────────────────
+# A load-time index over one system pool that turns the O(windows·N) all-pairs
+# scan into "score only the entries that could possibly win, prove the rest
+# cannot". It is a STRICT performance layer (constraint 7/8): it never changes
+# how an entry scores, only whether the expensive edit-distance scorer runs on
+# it. Accuracy-neutrality is a THEOREM, not an empirical hope — see
+# ``_score_pool_indexed``: a cheap length-ratio UPPER BOUND on ``base_score``
+# proves that no skipped entry could have entered brute force's rerank pool
+# before any entry is skipped, and anything not provably safe runs the full
+# scan. The equivalence test (test_resolver_index) pins this empirically too.
+
+
+#: A collapsed string plus its length and character multiset — the shape both
+#: the window prep and the per-entry index carry so the upper bound is a few
+#: dict intersections with no re-derivation.
+_Bag = tuple[int, "Counter[str]"]
+
+
+def _bag(text: str) -> _Bag:
+    return (len(text), Counter(text))
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryIndex:
+    """Per-system precompute reused by the scorer and the upper-bound screen.
+
+    Everything here mirrors what :func:`base_score` derives per call, so the
+    hot path reuses it instead of recomputing: the collapsed name and each
+    metaphone code as a length+multiset :data:`_Bag` (``name``/``primary``/
+    ``alt``), the spoken short form's bags (``abbrev_*``, empty when the name
+    has no hyphenated short form), and ``prefix_eligible`` — whether the name
+    is a candidate for unique-prefix promotion (§8.2).
+    """
+
+    collapsed: str
+    name_bag: _Bag
+    primary_bag: _Bag
+    alt_bag: _Bag
+    has_abbrev: bool
+    abbrev_bag: _Bag
+    abbrev_primary_bag: _Bag
+    abbrev_alt_bag: _Bag
+    prefix_eligible: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PoolIndex:
+    """Blocking index over one system pool (``systems`` or ``all_systems``).
+
+    Built once per :meth:`Gazetteer.load` and swapped in atomically with the
+    rest of the snapshot. Holds one :class:`_EntryIndex` per system id; the
+    scorer keys off it so nothing in the hot loop recomputes a collapse or a
+    metaphone. Purely derived data — no audio, no db (constraints 5/6).
+    """
+
+    entries: dict[int, _EntryIndex]
+
+
+def build_pool_index(systems: tuple[SystemEntry, ...]) -> PoolIndex:
+    """Precompute the per-entry index for one pool (blocking layer, §8.2)."""
+    empty = _bag("")
+    out: dict[int, _EntryIndex] = {}
+    for entry in systems:
+        collapsed = _collapse(entry.name)
+        primary, alt = double_metaphone(collapsed)
+        abbrev = eve_abbrev(entry.name)
+        if abbrev is not None:
+            abbrev_collapsed = _collapse(abbrev)
+            ap, aa = double_metaphone(abbrev_collapsed)
+            abbrev_bag = _bag(abbrev_collapsed)
+            abbrev_primary_bag = _bag(ap)
+            abbrev_alt_bag = _bag(aa)
+            has_abbrev = True
+        else:
+            abbrev_bag = abbrev_primary_bag = abbrev_alt_bag = empty
+            has_abbrev = False
+        # Exactly the eligibility gate _promote_unique_prefixes applies to the
+        # single hit: only names with a one-char pre-hyphen head (no eve_abbrev)
+        # ever promote by prefix.
+        prefix_eligible = "-" in entry.name and eve_abbrev(entry.name) is None
+        out[entry.id] = _EntryIndex(
+            collapsed=collapsed,
+            name_bag=_bag(collapsed),
+            primary_bag=_bag(primary),
+            alt_bag=_bag(alt),
+            has_abbrev=has_abbrev,
+            abbrev_bag=abbrev_bag,
+            abbrev_primary_bag=abbrev_primary_bag,
+            abbrev_alt_bag=abbrev_alt_bag,
+            prefix_eligible=prefix_eligible,
+        )
+    return PoolIndex(entries=out)
+
+
+def _sim_upper(x: _Bag, y: _Bag) -> float:
+    """A valid, tight UPPER BOUND on :func:`similarity`: ``sim(x, y) ≤ this``.
+
+    ``levenshtein(x, y) ≥ max(|x|,|y|) − LCS(x, y)`` and the longest common
+    subsequence is bounded by the character multiset intersection, so
+    ``similarity = 1 − lev/max ≤ intersection/max``. Matches
+    :func:`similarity`'s empty-string behaviour (0.0 when either side empty)
+    and is far cheaper than the real edit distance — a few dict lookups.
+    """
+    lx, cx = x
+    ly, cy = y
+    if lx == 0 or ly == 0:
+        return 0.0
+    # Multiset-intersection size = Σ min(count_x, count_y); iterate the smaller.
+    if len(cx) > len(cy):
+        cx, cy = cy, cx
+    inter = 0
+    for ch, n in cx.items():
+        m = cy.get(ch)
+        if m is not None:
+            inter += n if n < m else m
+    return inter / (lx if lx > ly else ly)
+
+
+def _entry_upper_bound(
+    window_bag: _Bag,
+    primary_bag: _Bag,
+    alt_bag: _Bag,
+    idx: _EntryIndex,
+    phonetic_weight: float,
+    text_weight: float,
+) -> float:
+    """A cheap, VALID upper bound on ``base_score(window, name, cfg)``.
+
+    Uses only lengths and character multisets — no edit distance — so it is far
+    cheaper than the real scorer. Every term is bounded above (``_sim_upper`` ≥
+    ``similarity``, and the abbreviation gate is ignored, which only enlarges
+    the bound), so the true ``base_score`` can never exceed this. That is the
+    whole neutrality guarantee: an entry whose bound is below the rerank-pool
+    floor provably cannot win, so skipping it changes nothing.
+    """
+    phon = max(
+        _sim_upper(primary_bag, idx.primary_bag),
+        _sim_upper(primary_bag, idx.alt_bag),
+        _sim_upper(alt_bag, idx.primary_bag),
+        _sim_upper(alt_bag, idx.alt_bag),
+    )
+    bound = phonetic_weight * phon + text_weight * _sim_upper(window_bag, idx.name_bag)
+    if idx.has_abbrev:
+        aphon = max(
+            _sim_upper(primary_bag, idx.abbrev_primary_bag),
+            _sim_upper(primary_bag, idx.abbrev_alt_bag),
+            _sim_upper(alt_bag, idx.abbrev_primary_bag),
+            _sim_upper(alt_bag, idx.abbrev_alt_bag),
+        )
+        abound = phonetic_weight * aphon + text_weight * _sim_upper(window_bag, idx.abbrev_bag)
+        if abound > bound:
+            bound = abound
+    return bound
+
+
+def _prefix_promotions(windows: list[str], index: PoolIndex) -> dict[int, float]:
+    """Unique-prefix promotions over the FULL pool (the neutrality fix, §8.2).
+
+    Mirrors :func:`_promote_unique_prefixes` exactly, but evaluated against the
+    whole pool via the index rather than a candidate subset: a prefix shared by
+    several names is ambiguous and must not promote even if only one of them is
+    a candidate. Returns id → promotion score for each promoted system.
+    """
+    out: dict[int, float] = {}
+    items = index.entries
+    for window in windows:
+        w = _collapse(window)
+        if len(w) < _PREFIX_MIN_LEN:
+            continue
+        hits = [sid for sid, ix in items.items() if ix.collapsed.startswith(w)]
+        if len(hits) != 1:
+            continue
+        sid = hits[0]
+        if items[sid].prefix_eligible:
+            out[sid] = _PREFIX_PROMOTE_SCORE
+    return out
+
+
 def _promote_unique_prefixes(
     windows: list[str],
     best_base: dict[int, float],
@@ -614,8 +797,11 @@ def resolve(
     windows = _windows(tokens)
 
     # Tier 1: the scoped active set, WITH context priors (home bias, proximity,
-    # recency) — small pool, home-region accuracy (GDD §8.2/§8.4).
-    scoped = _score_pool(windows, gazetteer.systems, priors, cfg, gazetteer)
+    # recency) — small pool, home-region accuracy (GDD §8.2/§8.4). The blocking
+    # index (when the gazetteer built one) optimises WITHIN this tier; it never
+    # changes which pool is scored, so include_all/nomadic semantics are intact.
+    scoped_index = getattr(gazetteer, "systems_index", None)
+    scoped = _score_pool(windows, gazetteer.systems, priors, cfg, gazetteer, scoped_index)
 
     # Tier 2 (GDD §8.1): if the scoped set produced no confident match, re-score
     # against the ENTIRE seeded k-space map so a report of ANY real system still
@@ -629,7 +815,8 @@ def resolve(
         and scoped.tier is Tier.LOW
         and len(gazetteer.all_systems) > len(gazetteer.systems)
     ):
-        full = _score_pool(windows, gazetteer.all_systems, priors, cfg, gazetteer)
+        full_index = getattr(gazetteer, "all_systems_index", None)
+        full = _score_pool(windows, gazetteer.all_systems, priors, cfg, gazetteer, full_index)
         if full.tier is not Tier.LOW:
             log.info("full_map_fallback_hit", raw=text.strip().lower(), tier=str(full.tier))
             return full
@@ -658,14 +845,41 @@ def _area_or_low(
     return low if low is not None else Resolution(tier=Tier.LOW, candidates=())
 
 
-def _score_pool(
+def _rank_pool(
+    best_base: dict[int, float],
+    names: dict[int, str],
+    priors: PriorContext,
+    cfg: MatchingConfig,
+    gazetteer: Gazetteer,
+) -> Resolution:
+    """Rerank the top-``_RERANK_POOL`` base scores by the priors, cut to tiers.
+
+    Shared by the brute-force and indexed scorers so both produce a Resolution
+    the exact same way (GDD §8.2/§8.4). ``best_base``/``names`` must be built in
+    the pool's iteration order so the stable sort tie-breaks identically.
+    """
+    pool = sorted(best_base.items(), key=lambda kv: kv[1], reverse=True)[:_RERANK_POOL]
+    rescored = [
+        MatchCandidate(
+            system_id=system_id,
+            name=names[system_id],
+            score=min(1.0, base * _prior_multiplier(system_id, priors, cfg.priors, gazetteer)),
+        )
+        for system_id, base in pool
+    ]
+    rescored.sort(key=lambda c: c.score, reverse=True)
+    top = rescored[:TOP_N]
+    return Resolution(tier=tier_for(top, cfg.tiers), candidates=tuple(top))
+
+
+def _score_pool_bruteforce(
     windows: list[str],
     systems: tuple[SystemEntry, ...],
     priors: PriorContext,
     cfg: MatchingConfig,
     gazetteer: Gazetteer,
 ) -> Resolution:
-    """Score the sliding windows against one system pool and rank (GDD §8.2)."""
+    """Score EVERY entry (the reference path the index is proven equal to)."""
     if not systems:
         return Resolution(tier=Tier.LOW, candidates=())
     best_base: dict[int, float] = {}
@@ -680,16 +894,106 @@ def _score_pool(
         names[entry.id] = entry.name
 
     _promote_unique_prefixes(windows, best_base, names)
+    return _rank_pool(best_base, names, priors, cfg, gazetteer)
 
-    pool = sorted(best_base.items(), key=lambda kv: kv[1], reverse=True)[:_RERANK_POOL]
-    rescored = [
-        MatchCandidate(
-            system_id=system_id,
-            name=names[system_id],
-            score=min(1.0, base * _prior_multiplier(system_id, priors, cfg.priors, gazetteer)),
-        )
-        for system_id, base in pool
-    ]
-    rescored.sort(key=lambda c: c.score, reverse=True)
-    top = rescored[:TOP_N]
-    return Resolution(tier=tier_for(top, cfg.tiers), candidates=tuple(top))
+
+def _score_pool_indexed(
+    windows: list[str],
+    systems: tuple[SystemEntry, ...],
+    priors: PriorContext,
+    cfg: MatchingConfig,
+    gazetteer: Gazetteer,
+    index: PoolIndex,
+) -> Resolution:
+    """Score only the entries that could win; PROVE the rest cannot (§8.2).
+
+    The scoring itself is byte-for-byte :func:`base_score` — the index only
+    orders entries by a cheap upper bound and stops once the bound drops below
+    the current rerank-pool floor. Because the bound is a true upper bound on
+    ``base_score``, every unscored entry is *provably* below the pool floor, so
+    the resulting rerank pool is identical to the brute-force pool. Unique-
+    prefix promotions are computed over the full pool and force-scored, so a
+    low-phonetic but promoted name is never skipped.
+    """
+    if not systems:
+        return Resolution(tier=Tier.LOW, candidates=())
+
+    pw, tw = cfg.phonetic_weight, cfg.text_weight
+    window_prep: list[tuple[_Bag, _Bag, _Bag]] = []
+    for w in windows:
+        cw = _collapse(w)
+        p, a = double_metaphone(cw)
+        window_prep.append((_bag(cw), _bag(p), _bag(a)))
+    promotions = _prefix_promotions(windows, index)
+
+    # Cheap upper bound per entry (no edit distance). Promotions raise the
+    # bound so a promoted entry always sorts early enough to be scored.
+    upper: dict[int, float] = {}
+    for entry in systems:
+        idx = index.entries[entry.id]
+        bound = 0.0
+        for window_bag, primary_bag, alt_bag in window_prep:
+            u = _entry_upper_bound(window_bag, primary_bag, alt_bag, idx, pw, tw)
+            if u > bound:
+                bound = u
+        promoted = promotions.get(entry.id)
+        if promoted is not None and promoted > bound:
+            bound = promoted
+        upper[entry.id] = bound
+
+    # Score in descending-bound order; keep a running rerank-pool floor (the
+    # _RERANK_POOL-th best real base so far) in a size-bounded min-heap.
+    order = sorted(systems, key=lambda e: upper[e.id], reverse=True)
+    min_scored = max(cfg.index.min_candidates, _RERANK_POOL)
+    scored: dict[int, float] = {}
+    names: dict[int, str] = {}
+    top_heap: list[float] = []
+    floor = -1.0
+    for entry in order:
+        # Stop only once the pool is established AND the bound is STRICTLY below
+        # the current floor: then this entry and every later (lower-bound) one
+        # is provably below the pool floor, so brute force would drop them too.
+        if len(scored) >= min_scored and upper[entry.id] < floor:
+            break
+        best = 0.0
+        for window in windows:
+            s = base_score(window, entry.name, cfg)
+            if s > best:
+                best = s
+        promoted = promotions.get(entry.id)
+        if promoted is not None and promoted > best:
+            best = promoted
+        scored[entry.id] = best
+        names[entry.id] = entry.name
+        if len(top_heap) < _RERANK_POOL:
+            heapq.heappush(top_heap, best)
+        elif best > top_heap[0]:
+            heapq.heapreplace(top_heap, best)
+        if len(top_heap) == _RERANK_POOL:
+            floor = top_heap[0]
+
+    # Rebuild best_base in POOL ITERATION ORDER so the stable sort tie-breaks
+    # exactly as brute force does (only entries above the floor are scored, so
+    # this order is identical to brute's among every entry that can place).
+    best_base = {e.id: scored[e.id] for e in systems if e.id in scored}
+    names = {e.id: names[e.id] for e in systems if e.id in scored}
+    return _rank_pool(best_base, names, priors, cfg, gazetteer)
+
+
+def _score_pool(
+    windows: list[str],
+    systems: tuple[SystemEntry, ...],
+    priors: PriorContext,
+    cfg: MatchingConfig,
+    gazetteer: Gazetteer,
+    index: PoolIndex | None = None,
+) -> Resolution:
+    """Score the sliding windows against one system pool and rank (GDD §8.2).
+
+    With a :class:`PoolIndex` and the index enabled, dispatch to the provably-
+    neutral indexed scorer; otherwise (or in tests with no index) run the full
+    brute-force scan. Both paths return an identical :class:`Resolution`.
+    """
+    if index is not None and cfg.index.enabled:
+        return _score_pool_indexed(windows, systems, priors, cfg, gazetteer, index)
+    return _score_pool_bruteforce(windows, systems, priors, cfg, gazetteer)

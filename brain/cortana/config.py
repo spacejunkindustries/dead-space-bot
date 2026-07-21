@@ -303,6 +303,27 @@ class PriorsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class IndexConfig:
+    """Blocking-index tuning for the phonetic matcher (GDD §8.2).
+
+    The index is a STRICT performance layer: it only decides which gazetteer
+    entries the O(windows·N) scorer runs edit-distance on, never HOW they are
+    scored (constraint 7). It is provably accuracy-neutral — a cheap
+    length-ratio upper bound proves that no skipped entry could have entered
+    brute force's rerank pool before any entry is skipped, so a disabled or
+    degenerate index falls back to the identical full scan.
+    """
+
+    #: Master switch. false = always run the full brute-force scan (the old
+    #: behaviour, kept as the reference path the equivalence test pins to).
+    enabled: bool = True
+    #: Never skip the full scan until at least this many entries have been
+    #: fully scored (K_MIN). Keeps the rerank pool well-established before the
+    #: upper-bound stop can fire; must be ≥ the internal rerank pool size.
+    min_candidates: int = 12
+
+
+@dataclass(frozen=True, slots=True)
 class MatchingConfig:
     phonetic_weight: float
     text_weight: float
@@ -313,6 +334,9 @@ class MatchingConfig:
     #: The reliability fix for a small scope / roaming corp; scoped accuracy is
     #: untouched (the fallback only runs when the scoped set already failed).
     full_map_fallback: bool = True
+    #: Blocking-index tuning (GDD §8.2). Defaulted so configs and tests that
+    #: predate the index get the enabled index transparently.
+    index: IndexConfig = field(default_factory=IndexConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -954,6 +978,10 @@ def _assemble_matching(v: dict[str, Any]) -> MatchingConfig:
         phonetic_weight=v["matching.phonetic_weight"],
         text_weight=v["matching.text_weight"],
         full_map_fallback=v["matching.full_map_fallback"],
+        index=IndexConfig(
+            enabled=v["matching.index.enabled"],
+            min_candidates=v["matching.index.min_candidates"],
+        ),
         tiers=TiersConfig(
             high_min=v["matching.tiers.high_min"],
             high_margin=v["matching.tiers.high_margin"],

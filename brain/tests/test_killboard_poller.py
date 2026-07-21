@@ -362,6 +362,83 @@ async def test_persist_failure_keeps_mark_below_the_failed_event(store: KbStore)
     assert sorted(row.event_id for row in store.recent(50)) == [51, 53]
 
 
+class _CapturingStore:
+    """Records the exact args handed to ``upsert_event`` / ``upsert_participants``
+    so a test can assert the persisted bytes are computed correctly off-loop."""
+
+    def __init__(self) -> None:
+        self.raw_json: str | None = None
+        self.parts: Any = None
+
+    def upsert_event(self, row: EventRow, raw_json: str, now: str | None = None) -> None:
+        self.raw_json = raw_json
+
+    def upsert_participants(self, event_id: int, parts: Any) -> None:
+        self.parts = parts
+
+
+def test_persist_serializes_on_the_worker_and_matches_the_old_bytes() -> None:
+    """``_persist`` now receives the raw dict and does the ``json.dumps`` +
+    ``participants_of`` itself (on the to_thread worker, off the event loop). The
+    stored bytes must be byte-for-byte what the loop-side pre-computation produced:
+    same json.dumps args and same participants_of output."""
+    import json
+
+    from killboard.model import participants_of
+
+    raw = {
+        "EventId": 7,
+        "TimeStamp": "2026-07-20T12:00:00Z",
+        "Killer": {"Id": "K", "Name": "Killer", "GuildId": GUILD_ID},
+        "Victim": {"Id": "V7", "Name": "Victim", "GuildId": "OTHER"},
+        "TotalVictimKillFame": 100,
+        # A ZvZ-sized Participants array — the CPU cost this moves off the loop.
+        "Participants": [
+            {"Id": f"P{i}", "Name": f"Pilot{i}", "DamageDone": i, "SupportHealingDone": 0}
+            for i in range(200)
+        ],
+    }
+    row = _row_for(raw)
+    cap = _CapturingStore()
+    poller = _make_poller(cap, FakeApi([]), asyncio.Queue(), _cfg())  # type: ignore[arg-type]
+
+    poller._persist(row, raw)
+
+    assert cap.raw_json == json.dumps(raw, separators=(",", ":"), ensure_ascii=False, default=str)
+    assert cap.parts == participants_of(raw)
+
+
+def _row_for(raw: dict[str, Any]) -> EventRow:
+    from killboard.model import parse_event
+
+    row = parse_event(raw, GUILD_ID)
+    assert row is not None
+    return row
+
+
+@pytest.mark.asyncio
+async def test_persist_offloads_the_raw_dict_not_a_serialized_string(store: KbStore) -> None:
+    """``_store_event`` must hand the raw dict to the worker (no json.dumps on the
+    loop): the value passed to ``to_thread`` for ``_persist`` is the dict itself."""
+    seen: list[Any] = []
+
+    async def _record_to_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append((fn, args))
+        return fn(*args, **kwargs)
+
+    api = FakeApi([])
+    cfg = _cfg()
+    poller = Poller(store, api, lambda: cfg, asyncio.Queue(), _record_to_thread)  # type: ignore[arg-type]
+    raw = _raw(11)
+
+    await poller._store_event(raw, GUILD_ID)
+
+    persist_calls = [args for fn, args in seen if getattr(fn, "__name__", "") == "_persist"]
+    assert persist_calls, "_persist was not invoked via to_thread"
+    _row, passed_raw = persist_calls[0]
+    assert passed_raw is raw  # the dict is passed through untouched, not pre-serialized
+
+
 @pytest.mark.asyncio
 async def test_spike_larger_than_backfill_bound_is_not_partially_dropped(store: KbStore) -> None:
     """A live spike (hwm>0) must page to the server offset ceiling, NOT stop at

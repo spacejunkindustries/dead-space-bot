@@ -143,6 +143,93 @@ async def test_ears_never_connected_raises_ears_down() -> None:
     assert reporter.ears_down is False
 
 
+def _clocked_reporter(bus: FakeAlarmBus, clock: dict[str, float]) -> HealthReporter:
+    """A reporter with an injected clock and a large heartbeat timeout, so the
+    voice-latch tests can advance time without tripping the EARS_DOWN detector."""
+
+    async def post(content: str, embed: dict[str, Any] | None) -> None:
+        return None
+
+    holder = SimpleNamespace(
+        current=SimpleNamespace(
+            health=SimpleNamespace(report_interval_min=60, voice_silence_alarm_s=60)
+        )
+    )
+    reporter = HealthReporter(
+        holder,  # type: ignore[arg-type]
+        post,
+        clock=lambda: clock["now"],
+        heartbeat_timeout_s=10_000.0,
+    )
+    reporter.set_alarm_bus(bus)  # type: ignore[arg-type]
+    return reporter
+
+
+async def _raise_voice_absent(
+    reporter: HealthReporter, bus: FakeAlarmBus, clock: dict[str, float]
+) -> None:
+    """Drive the reporter into the latched VOICE_ABSENT state: two humans, Ears
+    connected, and no audio for the whole alarm window."""
+    reporter.set_humans_present(2)
+    reporter.note_heartbeat({"connected": True})
+    clock["now"] = 61.0  # past voice_silence_alarm_s (60) with no note_audio
+    await reporter.check()
+    assert reporter.voice_offline is True
+    assert reporter.degraded is True
+    assert (AlarmCode.VOICE_ABSENT, None) in bus.raised
+
+
+async def test_voice_offline_latch_clears_when_audience_leaves() -> None:
+    """Once the channel empties below two humans, the very next tick lifts the
+    VOICE_ABSENT latch and its alarm — the alarm is only meaningful while there
+    are pilots to receive — even though no audio ever flowed again."""
+    bus = FakeAlarmBus()
+    clock = {"now": 0.0}
+    reporter = _clocked_reporter(bus, clock)
+    await _raise_voice_absent(reporter, bus, clock)
+
+    reporter.set_humans_present(0)  # audience precondition now false
+    clock["now"] = 62.0
+    await reporter.check()  # no note_audio()
+
+    assert reporter.voice_offline is False
+    assert reporter.degraded is False
+    assert (AlarmCode.VOICE_ABSENT, None) in bus.cleared
+
+
+async def test_voice_offline_latch_clears_when_ears_disconnects() -> None:
+    """The other arm of the precondition: Ears reporting disconnected also drops
+    the audience, so the latch lifts on the next tick without fresh audio."""
+    bus = FakeAlarmBus()
+    clock = {"now": 0.0}
+    reporter = _clocked_reporter(bus, clock)
+    await _raise_voice_absent(reporter, bus, clock)
+
+    reporter.note_heartbeat({"connected": False})  # Ears disconnected
+    clock["now"] = 62.0
+    await reporter.check()  # no note_audio()
+
+    assert reporter.voice_offline is False
+    assert (AlarmCode.VOICE_ABSENT, None) in bus.cleared
+
+
+async def test_voice_offline_latch_clears_when_audio_flows_again() -> None:
+    """The original recovery path still works: pilots stay in channel and audio
+    starts flowing again, so the latch clears via the audio-recovered branch."""
+    bus = FakeAlarmBus()
+    clock = {"now": 0.0}
+    reporter = _clocked_reporter(bus, clock)
+    await _raise_voice_absent(reporter, bus, clock)
+
+    reporter.note_heartbeat({"connected": True})  # audience stays (2 humans)
+    reporter.note_audio()  # audio flows again at t=61
+    clock["now"] = 62.0
+    await reporter.check()
+
+    assert reporter.voice_offline is False
+    assert (AlarmCode.VOICE_ABSENT, None) in bus.cleared
+
+
 def test_report_embed_carries_wake_counters_and_latch_state() -> None:
     reporter = make_reporter([])
     reporter.set_wake_probe(lambda: dict(WAKE_COUNTERS), lambda: True)
