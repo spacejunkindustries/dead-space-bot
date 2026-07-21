@@ -307,6 +307,41 @@ nlu:                                   # LLM understanding brain (GDD §6.7) —
   model: ""                            # model name the server expects, e.g. llama3.2:3b
   timeout_s: 8                         # cap on one interpretation
 
+conversation:                          # freestyle conversation mode (GDD §6.8) — OPTIONAL, OFF by default.
+                                       # Wake-free chit-chat / banter / maths when the fleet is idle.
+                                       # NEVER on the command path (grammar + the §6.7 understanding
+                                       # brain preempt it), never posts a card, never pings. Absent
+                                       # section = all defaults (off). Its OWN backend lane (defaults
+                                       # to on-box local), separate from chat: above.
+  enabled: false                       # master switch (sighup).
+  backend: local                       # local = on-box OpenAI-compatible server (free); anthropic =
+                                       # cloud Claude (a Claude id in model, costs per turn). (sighup)
+  local_url: ""                        # backend=local endpoint, e.g. (sighup)
+                                       # http://127.0.0.1:11434/v1/chat/completions  (Ollama qwen2.5:7b).
+                                       # Empty = dark (degrades gracefully).
+  model: qwen2.5:7b                    # local model name, or a Claude id for backend=anthropic. (hot)
+  api_key_file: /etc/cortana/anthropic    # dev fallback ONLY (0600); prod reads LoadCredential=
+                                       # (constraint 12). Ignored for backend=local. (sighup)
+  max_tokens: 200                      # hard cap per spoken reply — chit-chat is short. (hot)
+  turn_taking_seconds: 8.0             # wake-free window kept open after each reply for the pilot's
+                                       # next turn — re-armed WITHOUT draining the dialog retry budget. (hot)
+  max_history_turns: 6                 # prior exchanges replayed as context (0 = stateless). (hot)
+  max_turns: 8                         # hard per-session turn cap; only a fresh wake refills it (loop bound). (hot)
+  session_ttl_seconds: 180             # idle lifetime; after this a stale thread is dropped. (hot)
+  user_cooldown_s: 2.0                 # min gap between a pilot's turns (light anti-spam). (hot)
+  quiet_during_ops: true               # go silent while an incident is active/recent so banter never
+                                       # crowds live comms. (hot)
+  quiet_window_min: 10                 # how long after the last active incident "ops in progress" holds. (hot)
+  math_tool: true                      # answer arithmetic with a deterministic on-box evaluator
+                                       # (never hallucinated). (hot)
+  timeout_s: 20.0                      # wall-clock cap on producing one reply (a local 7B on 4 vCPU is slow). (hot)
+  overflow_channel: 000000000000000000 # channel for a reply too long to speak, posted
+                                       # AllowedMentions.none(). 0 = drop.
+  # NOTE: cold-start conversation only claims residue when stt.relay_mode: off
+  # (relay and chat are the two mutually-exclusive residue owners). A LIVE
+  # conversation continues regardless of relay_mode. No cross-check: a half-set
+  # config (enabled, no local_url/no key) just stays dark, like chat: above.
+
 killboard:                             # Albion Online killboard add-on — OPTIONAL, OFF by default.
                                        # A separate game module: its own SQLite file, its own poll
                                        # loop, its own /killboard commands. It never touches voice.

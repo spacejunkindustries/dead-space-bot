@@ -35,6 +35,7 @@ from cortana.dialog.types import (
     PendingKind,
     Relay,
     Report,
+    RunChat,
     RunOverride,
     RunStt,
     Speak,
@@ -50,6 +51,7 @@ _AWAIT_FOR: dict[PendingKind, DialogState] = {
     PendingKind.OVERRIDE: DialogState.AWAIT_OVERRIDE_QUESTION,
     PendingKind.REPEAT: DialogState.AWAIT_REPEAT,
     PendingKind.CONFIRM: DialogState.AWAIT_CONFIRM,
+    PendingKind.CONVERSATION: DialogState.AWAIT_CONVERSATION,
     PendingKind.NONE: DialogState.AWAIT_REPEAT,
 }
 
@@ -141,6 +143,12 @@ def transition(s: DialogSession, ev: DialogEvent, max_retries: int) -> Transitio
             return res
         return TransitionResult(s)
 
+    if ev.kind is Ev.CONVERSE_ARM:
+        # After a conversation reply (GDD §6.8): arm the pilot's next turn.
+        # From IDLE only (the report/relay just returned s.idle()); a stale arm
+        # against a superseded dialog is a no-op.
+        return _open_conversation_window(s)
+
     if ev.kind is Ev.CLASSIFIED:
         if s.state is DialogState.THINKING and ev.gen == s.gen and ev.classified is not None:
             return _classified(s, ev.classified)
@@ -219,6 +227,29 @@ def _classified(s: DialogSession, c: Classified) -> TransitionResult:
     if c.bare_code is not None:
         sub = dataclasses.replace(s, ctx_severity=c.bare_code)
         return _open_subdialog(sub, PendingKind.SEVERITY, Speak(Line.CODE_ACK, c.bare_code))
+
+    # 6a. Conversation mode residue (GDD §6.8). This sits strictly BELOW the
+    #     grammar-command dispatch (4), the LOW-retry rebind (5), and the
+    #     bare-code opener (6) — and below the override/confirm/dismissal steps
+    #     above — so commands, dismissals, overrides, confirms, LOW-retry, and
+    #     bare-code ALL preempt chat by construction (constraint 6). It fires
+    #     ONLY for non-command speech, and ONLY when conversation is available
+    #     AND either a conversation is already live (pending CONVERSATION) or
+    #     cold-start is permitted (relay off — relay and chat are the two
+    #     mutually-exclusive residue owners). When conversation_available is
+    #     False (off / half-set / ops live) this is byte-for-byte the old path.
+    if c.conversation_available and (
+        s.pending is PendingKind.CONVERSATION or c.relay_mode == "off"
+    ):
+        if c.garbage:
+            # Chatter-quality noise in a chat window closes silently — no model
+            # call, no re-prompt into an open mic (the retry-loop complaint).
+            return TransitionResult(s.idle(), (NoteRejected("chat_garbage"),))
+        if not c.confident:
+            # A low-confidence decode must not burn a model round-trip; offer
+            # one say-again through the same budgeted door as every window.
+            return _fail(s, Line.SAY_AGAIN, keep_ctx=True)
+        return TransitionResult(s.idle(), (RunChat(c.text),))
 
     # 7. Freeform relay (GDD §8.6). An inherited severity makes the relay
     #    severity-carrying but does NOT frame it: the continuation must still
@@ -387,3 +418,26 @@ def _open_subdialog(s: DialogSession, kind: PendingKind, prompt: Speak) -> Trans
         pending=kind,
     )
     return TransitionResult(nxt, (prompt, ArmWindow(nxt.gen)))
+
+
+def _open_conversation_window(s: DialogSession) -> TransitionResult:
+    """Arm the next conversation turn (GDD §6.8) WITHOUT draining the failure
+    retry budget.
+
+    Deliberately NOT a subdialog: chaining chit-chat turns must not spend the
+    ``max_retries`` budget (that would throttle a conversation to ~2 turns).
+    The conversation is bounded instead by the ConversationManager's max_turns +
+    session TTL, and CONVERSE_ARM is emitted by the engine ONLY while that
+    budget holds (``manager.active``) — so this re-arm cannot self-sustain. From
+    IDLE only (the report/relay executor returned ``s.idle()`` before the arm);
+    a stale arm against a superseded dialog is ignored. No prompt: the spoken
+    reply was the cue."""
+    if s.state is not DialogState.IDLE:
+        return TransitionResult(s)
+    nxt = dataclasses.replace(
+        s,
+        state=DialogState.AWAIT_CONVERSATION,
+        gen=s.gen + 1,
+        pending=PendingKind.CONVERSATION,
+    )
+    return TransitionResult(nxt, (ArmWindow(nxt.gen),))

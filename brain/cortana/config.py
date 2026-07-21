@@ -183,6 +183,52 @@ class ChatConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ConversationConfig:
+    """Freestyle conversation mode (GDD §6.8). Optional section; OFF by default.
+
+    A distinct lane from the ``chat`` override channel: it defaults to the
+    on-box ``local`` backend (free, high-throughput back-and-forth) while
+    ``chat`` keeps its own cloud backend. Reuses the :class:`~cortana.chat.
+    ChatBackend` abstraction. Never on the command path (constraint 6), never
+    posts a card (constraint 9), never pings (constraint 11). A half-set config
+    (enabled but no ``local_url`` / no key) degrades gracefully to dark, exactly
+    like ``chat``."""
+
+    enabled: bool = False
+    #: "local" (on-box OpenAI-compatible server, free) | "anthropic" (cloud).
+    backend: str = "local"
+    #: OpenAI-compatible chat-completions endpoint for backend="local". Empty = dark.
+    local_url: str = ""
+    #: Model name (local server's name, or a Claude id for backend="anthropic").
+    model: str = "qwen2.5:7b"
+    #: Dev fallback ONLY (0600). Production reads $CREDENTIALS_DIRECTORY/anthropic
+    #: via LoadCredential= (constraint 12). Ignored for backend="local".
+    api_key_file: str = "/etc/cortana/anthropic"
+    #: Hard cap per spoken reply — chit-chat is short.
+    max_tokens: int = 200
+    #: Wake-free window kept open after each reply for the pilot's next turn.
+    turn_taking_seconds: float = 8.0
+    #: Prior user+assistant exchanges replayed as context (0 = stateless).
+    max_history_turns: int = 6
+    #: Hard per-session turn cap; refilled only by a fresh wake (loop bound).
+    max_turns: int = 8
+    #: Idle lifetime of a session; after this a stale thread is dropped.
+    session_ttl_seconds: int = 180
+    #: Min gap between a pilot's turns (light anti-spam).
+    user_cooldown_s: float = 2.0
+    #: Go silent while an incident is active/recent so banter never crowds comms.
+    quiet_during_ops: bool = True
+    #: How long after the last active incident "ops in progress" holds (minutes).
+    quiet_window_min: int = 10
+    #: Answer arithmetic with the deterministic on-box evaluator (never hallucinated).
+    math_tool: bool = True
+    #: Wall-clock cap on producing one reply (qwen2.5:7b on 4 vCPU is slow).
+    timeout_s: float = 20.0
+    #: Channel for a reply too long to speak, posted AllowedMentions.none(). 0 = drop.
+    overflow_channel: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class CaptureConfig:
     preroll_ms: int
     endpoint_silence_ms: int
@@ -682,6 +728,7 @@ class AuraConfig:
     health: HealthConfig
     database: DatabaseConfig
     chat: ChatConfig = field(default_factory=ChatConfig)
+    conversation: ConversationConfig = field(default_factory=ConversationConfig)
     routing: RoutingFileConfig = field(default_factory=RoutingFileConfig)
     dialog: DialogConfig = field(default_factory=DialogConfig)
     fun: FunConfig = field(default_factory=FunConfig)
@@ -1044,6 +1091,27 @@ def _assemble_chat(v: dict[str, Any]) -> ChatConfig:
     )
 
 
+def _assemble_conversation(v: dict[str, Any]) -> ConversationConfig:
+    return ConversationConfig(
+        enabled=v["conversation.enabled"],
+        backend=v["conversation.backend"],
+        local_url=v["conversation.local_url"],
+        model=v["conversation.model"],
+        api_key_file=v["conversation.api_key_file"],
+        max_tokens=v["conversation.max_tokens"],
+        turn_taking_seconds=v["conversation.turn_taking_seconds"],
+        max_history_turns=v["conversation.max_history_turns"],
+        max_turns=v["conversation.max_turns"],
+        session_ttl_seconds=v["conversation.session_ttl_seconds"],
+        user_cooldown_s=v["conversation.user_cooldown_s"],
+        quiet_during_ops=v["conversation.quiet_during_ops"],
+        quiet_window_min=v["conversation.quiet_window_min"],
+        math_tool=v["conversation.math_tool"],
+        timeout_s=v["conversation.timeout_s"],
+        overflow_channel=v["conversation.overflow_channel"],
+    )
+
+
 def _assemble_gazetteer(v: dict[str, Any]) -> GazetteerConfig:
     return GazetteerConfig(
         file=v["gazetteer.file"],
@@ -1173,6 +1241,7 @@ def _assemble(values: dict[str, Any]) -> AuraConfig:
         ),
         database=DatabaseConfig(path=values["database.path"]),
         chat=_assemble_chat(values),
+        conversation=_assemble_conversation(values),
         routing=RoutingFileConfig(file=values["routing.file"]),
         dialog=_assemble_dialog(values),
         fun=_assemble_fun(values),

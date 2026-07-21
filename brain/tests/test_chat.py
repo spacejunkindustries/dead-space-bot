@@ -288,3 +288,92 @@ async def test_local_chat_client_close_returns_none() -> None:
     without error."""
     client = LocalChatClient(_local_holder())
     assert await client.close() is None
+
+
+# ── converse(): the conversation lane (GDD §6.8) ─────────────────────────────
+
+from cortana.config import ConversationConfig  # noqa: E402
+
+
+class _DualHolder:
+    """Exposes BOTH sections so a client can be pointed at either lane."""
+
+    def __init__(self, chat: ChatConfig, conversation: ConversationConfig) -> None:
+        self.current = SimpleNamespace(chat=chat, conversation=conversation)
+
+
+def _conv_client(responses: list[Any], **cfg: Any) -> tuple[ChatClient, _FakeMessages]:
+    conv = ConversationConfig(enabled=True, backend="anthropic", model="claude-haiku-4-5", **cfg)
+    holder = _DualHolder(ChatConfig(enabled=True), conv)
+    client = ChatClient(holder, api_key="sk-test", config_section="conversation")  # type: ignore[arg-type]
+    fake = _FakeMessages(responses)
+    client._client = SimpleNamespace(messages=fake)
+    return client, fake
+
+
+async def test_converse_reads_conversation_section_and_has_no_cooldown() -> None:
+    client, fake = _conv_client(
+        [_response("Hello, pilot."), _response("Still here.")], max_tokens=150
+    )
+    history = [{"role": "user", "content": "hi"}]
+    assert await client.converse(1, history) == "Hello, pilot."
+    # A second immediate call goes straight through — NO ask()-style cooldown.
+    assert await client.converse(1, history) == "Still here."
+    # max_tokens comes from the conversation section (150), not chat's 300.
+    assert fake.calls[0]["max_tokens"] == 150
+    # No web search on the conversation lane, and it carries the history verbatim.
+    assert "tools" not in fake.calls[0]
+    assert fake.calls[0]["messages"] == history
+    assert "CORTANA" in fake.calls[0]["system"]
+
+
+async def test_converse_refusal_and_empty_raise() -> None:
+    client, _ = _conv_client([_response("", stop_reason="refusal")])
+    with pytest.raises(ChatError):
+        await client.converse(1, [{"role": "user", "content": "q"}])
+    client2, _ = _conv_client([_response("   ")])
+    with pytest.raises(ChatError):
+        await client2.converse(1, [{"role": "user", "content": "q"}])
+
+
+async def test_local_converse_sends_persona_plus_history(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: Any, timeout: float | None = None) -> _FakeResponse:
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return _FakeResponse(_openai_reply("Chatting away."))
+
+    monkeypatch.setattr("cortana.chat.urllib.request.urlopen", fake_urlopen)
+    conv = ConversationConfig(
+        enabled=True,
+        backend="local",
+        local_url="http://127.0.0.1:11434/v1/chat/completions",
+        model="qwen2.5:7b",
+        max_tokens=150,
+        timeout_s=20.0,
+    )
+    holder = _DualHolder(ChatConfig(), conv)
+    client = LocalChatClient(holder, config_section="conversation")  # type: ignore[arg-type]
+    history = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+    ]
+    # Two rapid calls both succeed — no cooldown on the conversation lane.
+    assert await client.converse(1, history) == "Chatting away."
+    assert await client.converse(1, history) == "Chatting away."
+    body = captured["body"]
+    assert body["model"] == "qwen2.5:7b"
+    assert body["max_tokens"] == 150
+    assert body["messages"][0]["role"] == "system"  # the persona is prepended
+    assert body["messages"][1:] == history
+    assert captured["timeout"] == 20.0
+
+
+async def test_local_converse_unconfigured_url_is_chat_error() -> None:
+    conv = ConversationConfig(enabled=True, backend="local", local_url="")
+    holder = _DualHolder(ChatConfig(), conv)
+    client = LocalChatClient(holder, config_section="conversation")  # type: ignore[arg-type]
+    with pytest.raises(ChatError):
+        await client.converse(1, [{"role": "user", "content": "hi"}])

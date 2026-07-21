@@ -682,6 +682,26 @@ class IncidentEngine:
             log.info("pending_candidates_restored", count=restored)
         return restored
 
+    def most_recent_active_at(self, guild_id: int) -> datetime | None:
+        """The newest ``updated_at`` among this guild's ACTIVE incidents, or None.
+
+        READ-ONLY: a single indexed ``MAX`` query, no mutation, no routing, no
+        decide_mentions. It feeds conversation mode's auto-quiet predicate
+        (GDD §6.8) so banter goes silent while ops are live — the chat layer
+        only OBSERVES an incident here, never touches one (constraint 9 holds
+        structurally). Sync + cheap: safe to call from the classify path."""
+        value = db.query_value(
+            self._conn,
+            "SELECT MAX(updated_at) FROM incidents WHERE guild_id = ? AND status = 'ACTIVE'",
+            (guild_id,),
+        )
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:  # pragma: no cover — stored timestamps are ISO
+            return None
+
     # ── the single deliverer (render under the lock, deliver outside it) ─────
 
     async def _deliver(self, work: _Delivery) -> tuple[int, int] | None:

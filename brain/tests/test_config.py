@@ -405,6 +405,61 @@ def test_chat_section_non_mapping_raises(config_dict, write_config) -> None:
         load_config(write_config(config_dict))
 
 
+def test_conversation_section_missing_means_off(config_dict, write_config) -> None:
+    cfg = load_config(write_config(config_dict))  # no conversation: at all
+    assert cfg.conversation.enabled is False
+    assert cfg.conversation.backend == "local"
+    assert cfg.conversation.model == "qwen2.5:7b"
+
+
+def test_conversation_backend_choices(config_dict, write_config) -> None:
+    config_dict["conversation"] = {"backend": "bogus"}
+    with pytest.raises(ConfigError, match=r"conversation.backend"):
+        load_config(write_config(config_dict))
+    for good in ("anthropic", "local"):
+        config_dict["conversation"] = {"backend": good}
+        assert load_config(write_config(config_dict)).conversation.backend == good
+
+
+def test_conversation_range_checks(config_dict, write_config) -> None:
+    # turn_taking_seconds / session_ttl_seconds / max_turns / timeout_s reject 0.
+    for key in ("turn_taking_seconds", "session_ttl_seconds", "max_turns", "timeout_s"):
+        config_dict["conversation"] = {key: 0}
+        with pytest.raises(ConfigError, match=rf"conversation.{key}"):
+            load_config(write_config(config_dict))
+    # max_history_turns / user_cooldown_s / overflow_channel accept 0.
+    config_dict["conversation"] = {
+        "max_history_turns": 0,
+        "user_cooldown_s": 0,
+        "overflow_channel": 0,
+    }
+    cfg = load_config(write_config(config_dict))
+    assert cfg.conversation.max_history_turns == 0
+    assert cfg.conversation.user_cooldown_s == 0
+    assert cfg.conversation.overflow_channel == 0
+
+
+def test_conversation_diff_configs_reload_classes(config_dict, write_config) -> None:
+    old = load_config(write_config(config_dict))
+    config_dict["conversation"] = {
+        "enabled": True,
+        "backend": "anthropic",
+        "local_url": "http://x",
+        "api_key_file": "/tmp/k",
+        "max_turns": 3,  # hot
+    }
+    new = load_config(write_config(config_dict))
+    buckets = diff_configs(old, new)
+    for sighup in (
+        "conversation.enabled",
+        "conversation.backend",
+        "conversation.local_url",
+        "conversation.api_key_file",
+    ):
+        assert sighup in buckets[Reload.SIGHUP], sighup
+    assert "conversation.max_turns" in buckets[Reload.HOT]
+
+
 def test_routing_section_defaults_and_resolution(config_dict, write_config, tmp_path) -> None:
     cfg = load_config(write_config(config_dict))
     assert cfg.routing.file == ""

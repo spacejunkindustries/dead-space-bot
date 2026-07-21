@@ -514,6 +514,53 @@ class UtilityCog(commands.Cog):
             return
         await interaction.followup.send(f"💬 {reply}")
 
+    # ── /chat — slash twin of conversation mode (GDD §6.8, constraint 10) ─────
+
+    @app_commands.command(name="chat", description="Chat with CORTANA (freestyle conversation)")
+    @app_commands.describe(message="What do you want to say to her?")
+    async def chat(self, interaction: discord.Interaction, message: str) -> None:
+        # Shares the SAME ConversationManager as the voice residue branch, so a
+        # pilot's voice + slash turns ride one per-user rolling history. Reply is
+        # ALWAYS AllowedMentions.none() — the chat layer can never ping
+        # (constraint 11) — and never posts a card (constraint 9).
+        manager = self.bot.conversation
+        status = getattr(self.bot, "conversation_status", "disabled")
+        if manager is None or status != "ready":
+            if status == "no_key":
+                msg = (
+                    "Conversation mode is enabled but no API key is loaded — check "
+                    "`/etc/cortana/anthropic` and the service credential, then "
+                    "`systemctl reload cortana-brain`."
+                )
+            elif status == "no_url":
+                msg = (
+                    "Conversation mode is set to the local backend but "
+                    "`conversation.local_url` is empty — point it at your on-box "
+                    "model server, then `systemctl reload cortana-brain`."
+                )
+            else:
+                msg = "Conversation mode is not enabled on this server."
+            await interaction.response.send_message(msg, ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        timeout_s = self.bot.holder.current.conversation.timeout_s
+        # guild_id is None in a DM — history is keyed by user_id, so 0 is fine.
+        guild_id = interaction.guild_id or 0
+        try:
+            reply = await asyncio.wait_for(
+                manager.reply(interaction.user.id, guild_id, message), timeout=timeout_s
+            )
+        except Exception:  # noqa: BLE001 — a backend hiccup must not raise on comms
+            reply = None
+        none = discord.AllowedMentions.none()
+        if not reply:
+            await interaction.followup.send(
+                "CORTANA has nothing to add right now — try again in a moment.",
+                allowed_mentions=none,
+            )
+            return
+        await interaction.followup.send(f"💬 {reply}", allowed_mentions=none)
+
     # ── /route ───────────────────────────────────────────────────────────────
 
     @app_commands.command(name="route", description="Full jump route between two systems")

@@ -71,13 +71,22 @@ class ChatCooldownError(ChatError):
 
 
 class ChatBackend(Protocol):
-    """The override lane's one method (GDD §6.6). Both the cloud
-    (:class:`ChatClient`) and on-box (:class:`LocalChatClient`) backends satisfy
-    it, so the dialog engine and the ``/ask`` twin never care which is live."""
+    """The override lane's one method (GDD §6.6) plus the conversation lane's
+    (§6.8). Both the cloud (:class:`ChatClient`) and on-box
+    (:class:`LocalChatClient`) backends satisfy it, so the dialog engine, the
+    ``/ask`` twin, the ConversationManager, and the ``/chat`` twin never care
+    which is live."""
 
     async def ask(self, user_id: int, query: str) -> str:
         """One question in, one short spoken-ready answer out. Raises
         :class:`ChatCooldownError` on throttle, :class:`ChatError` otherwise."""
+        ...
+
+    async def converse(self, user_id: int, messages: list[dict[str, str]]) -> str:
+        """Multi-turn conversation (GDD §6.8): the rolling ``{role, content}``
+        history in, one short spoken-ready reply out. NO web search, NO
+        client-level cooldown (the ConversationManager owns the turn/TTL/cooldown
+        budget). Raises :class:`ChatError` on failure."""
         ...
 
     async def close(self) -> None:
@@ -135,15 +144,23 @@ class ChatClient:
     override questions. No conversation memory — each question stands alone
     (memory would grow token spend every turn; the corp asked for cheap)."""
 
-    def __init__(self, holder: ConfigHolder, api_key: str) -> None:
+    def __init__(self, holder: ConfigHolder, api_key: str, config_section: str = "chat") -> None:
         self._holder = holder
         self._api_key = api_key
+        # Which config lane this client reads. The default "chat" keeps the
+        # override channel byte-for-byte; a conversation-purposed instance
+        # (config_section="conversation") reads conversation.* (GDD §6.8).
+        self._section = config_section
         self._client: Any = None
         self._lock = asyncio.Lock()
         # Shared per-pilot throttle — voice path and /ask slash twin ride the
         # same clock (constraint 10 parity), so the cooldown can't be dodged
         # by switching input surface.
         self._last_ask: dict[int, float] = {}
+
+    def _cfg(self) -> Any:
+        """The config section this client reads (``chat`` or ``conversation``)."""
+        return getattr(self._holder.current, self._section)
 
     def _sdk(self) -> Any:
         if self._client is None:
@@ -160,7 +177,7 @@ class ChatClient:
         asked again too soon, :class:`ChatError` on any other failure —
         callers speak/post a fixed line instead of surfacing errors.
         """
-        cfg = self._holder.current.chat
+        cfg = self._cfg()
         now = time.monotonic()
         last = self._last_ask.get(user_id)
         if last is not None and now - last < cfg.user_cooldown_s:
@@ -209,6 +226,38 @@ class ChatClient:
         )
         return text
 
+    async def converse(self, user_id: int, messages: list[dict[str, str]]) -> str:
+        """Multi-turn conversation reply (GDD §6.8). The rolling history in, one
+        short spoken-ready reply out. No web search, no cooldown — the
+        ConversationManager owns the budget. Serialized like :meth:`ask`."""
+        cfg = self._cfg()
+        kwargs: dict[str, Any] = {
+            "model": cfg.model,
+            "max_tokens": cfg.max_tokens,
+            "system": _SYSTEM_CONVERSATION,
+        }
+        async with self._lock:
+            try:
+                response = await self._sdk().messages.create(messages=messages, **kwargs)
+            except Exception as exc:  # SDK errors: auth, rate limit, network
+                raise ChatError(str(exc)) from exc
+        if response.stop_reason == "refusal":
+            raise ChatError("model declined the request")
+        text = " ".join(
+            block.text.strip()
+            for block in response.content
+            if getattr(block, "type", "") == "text" and block.text.strip()
+        ).strip()
+        if not text:
+            raise ChatError("empty reply")
+        log.info(
+            "conversation_answered",
+            model=cfg.model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+        return text
+
     async def close(self) -> None:
         """Close the AsyncAnthropic httpx pool. Idempotent — a snapshot-then-clear
         of ``self._client`` means a second call (or a close before ``_sdk`` ever
@@ -235,6 +284,24 @@ _SYSTEM_LOCAL = (
 )
 
 
+#: Conversation-mode persona (GDD §6.8). The fleet is idle and a pilot is just
+#: chatting — banter, chit-chat, small talk, the odd bit of maths are all
+#: welcome, in CORTANA's voice. The ONE hard rule survives verbatim from the
+#: override personas: never invent in-game fleet intel (constraint 6 — that is
+#: the incident engine's alone). Short spoken sentences, no markdown: the reply
+#: is read aloud over comms.
+_SYSTEM_CONVERSATION = (
+    "You are CORTANA, the ship's AI of the DEAD corporation's fleet in EVE "
+    "Echoes — calm, capable, lightly wry, loyal to the crew. The fleet is idle "
+    "and a pilot is chatting with you over voice comms: banter, small talk, "
+    "jokes, the occasional question or bit of maths are all fair game. Keep the "
+    "back-and-forth going in one to three short spoken sentences — no markdown, "
+    "no lists, no URLs, nothing you wouldn't say out loud. Never invent in-game "
+    "fleet intel (hostiles, system status, timers): that intel comes only from "
+    "CORTANA's own incident reports, so if asked for it, say so and move on."
+)
+
+
 class LocalChatClient:
     """On-box override backend — an OpenAI-compatible chat-completions server
     (llama.cpp's ``server``, Ollama, …) at ``chat.local_url``.
@@ -250,13 +317,19 @@ class LocalChatClient:
     otherwise async), mirroring the whisper.cpp backend — no extra dependency,
     nothing on the event-loop thread."""
 
-    def __init__(self, holder: ConfigHolder) -> None:
+    def __init__(self, holder: ConfigHolder, config_section: str = "chat") -> None:
         self._holder = holder
+        # Which config lane this client reads — "chat" (override, default) or
+        # "conversation" (§6.8). Keeps the override backend byte-for-byte.
+        self._section = config_section
         self._lock = asyncio.Lock()
         self._last_ask: dict[int, float] = {}
 
+    def _cfg(self) -> Any:
+        return getattr(self._holder.current, self._section)
+
     async def ask(self, user_id: int, query: str) -> str:
-        cfg = self._holder.current.chat
+        cfg = self._cfg()
         now = time.monotonic()
         last = self._last_ask.get(user_id)
         if last is not None and now - last < cfg.user_cooldown_s:
@@ -280,6 +353,23 @@ class LocalChatClient:
         log.info("override_answered_local", model=cfg.model)
         return text
 
+    async def converse(self, user_id: int, messages: list[dict[str, str]]) -> str:
+        """Multi-turn conversation reply on the on-box model (GDD §6.8). No
+        cooldown — the ConversationManager owns the budget. The system persona +
+        the rolling history are sent as one OpenAI-style message list."""
+        cfg = self._cfg()
+        if not cfg.local_url:
+            raise ChatError("conversation.local_url is not configured")
+        full = [{"role": "system", "content": _SYSTEM_CONVERSATION}, *messages]
+        async with self._lock:
+            text = await asyncio.to_thread(
+                _local_chat, cfg.local_url, cfg.model, full, cfg.max_tokens, 0.7, cfg.timeout_s
+            )
+        if not text:
+            raise ChatError("empty reply")
+        log.info("conversation_answered_local", model=cfg.model)
+        return text
+
     async def close(self) -> None:
         """No persistent client to release (urllib opens a fresh connection per
         request via ``to_thread``); present only to satisfy the protocol."""
@@ -287,7 +377,27 @@ class LocalChatClient:
 
 
 def _local_completion(url: str, model: str, query: str, max_tokens: int, timeout_s: float) -> str:
-    """POST one OpenAI-style chat completion and return the reply text.
+    """POST one single-shot OpenAI-style completion (the override lane's :meth:`ask`).
+
+    A one-line wrapper over :func:`_local_chat`: the persona + the single
+    question as the message list."""
+    messages = [
+        {"role": "system", "content": _SYSTEM_LOCAL},
+        {"role": "user", "content": query},
+    ]
+    return _local_chat(url, model, messages, max_tokens, 0.6, timeout_s)
+
+
+def _local_chat(
+    url: str,
+    model: str,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float,
+    timeout_s: float,
+) -> str:
+    """POST one OpenAI-style chat completion for a full message list and return
+    the reply text.
 
     Sync + stdlib-only (runs in a worker thread). Every transport/shape error
     surfaces as the :class:`ChatError` the caller contract promises — the pilot
@@ -295,12 +405,9 @@ def _local_completion(url: str, model: str, query: str, max_tokens: int, timeout
     body = json.dumps(
         {
             "model": model,
-            "messages": [
-                {"role": "system", "content": _SYSTEM_LOCAL},
-                {"role": "user", "content": query},
-            ],
+            "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.6,
+            "temperature": temperature,
             "stream": False,
         }
     ).encode("utf-8")
