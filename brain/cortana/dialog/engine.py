@@ -698,6 +698,13 @@ class DialogEngine:
         if parsed.intent in (Intent.FACT, Intent.INSULT):
             await self._fun_reply(s, parsed)
             return
+        # Capabilities overview (GDD §6.1): voice-in → voice-out, exactly like
+        # the fun path — a fixed spoken summary, never a card, never a channel
+        # post, never a mention. The /capabilities slash twin speaks the same
+        # text (constraint 10).
+        if parsed.intent is Intent.CAPABILITIES:
+            await self._capabilities_reply(s)
+            return
         if action.inherited is not None and parsed.severity is None:
             # A severity spoken in the opener ("code orange" → "go ahead" →
             # the report) attaches to the report; an inline code wins.
@@ -910,6 +917,25 @@ class DialogEngine:
         )
         if not spoken:
             log.info("fun_line_unspoken_dropped", user_id=s.user_id)
+
+    async def _capabilities_reply(self, s: DialogSession) -> None:
+        """Speak the fixed capabilities overview (GDD §6.1). Voice in, voice
+        out — no card, no channel post, no mention. The summary runs longer
+        than a §12.2 command reply, so it borrows the fun path's larger
+        ``fun.max_speak_s`` cap; an unspoken line (muted, over cap, synth
+        error) is logged and dropped, never posted."""
+        cfg = self._holder.current
+        line = tts_mod.capabilities()
+        log.info("capabilities_served", user_id=s.user_id)
+        spoken = await self._speaker.say(
+            s.guild_id,
+            line,
+            PRIORITY_NORMAL,
+            user_id=s.user_id,
+            max_s=cfg.fun.max_speak_s,
+        )
+        if not spoken:
+            log.info("capabilities_line_unspoken_dropped", user_id=s.user_id)
 
     async def _confirm(self, s: DialogSession, confirm: PendingConfirm) -> None:
         """Complete a pending §8.3 confirm — the voice twin of the card's

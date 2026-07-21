@@ -83,6 +83,12 @@ class Intent(StrEnum):
     # incident engine is ever involved.
     FACT = "FACT"
     INSULT = "INSULT"
+    # Spoken capabilities summary (GDD §6.1). "What can you do" → CORTANA
+    # speaks a fixed canned overview of her features (constraint 6: no LLM —
+    # a static string). Voice-only, like FACT/INSULT: the dialog engine
+    # intercepts it before the incident engine; never stored in
+    # ``incidents.type``. The /capabilities slash twin sends the same text.
+    CAPABILITIES = "CAPABILITIES"
 
 
 class Severity(StrEnum):
@@ -115,6 +121,7 @@ INTENT_SEVERITY: Mapping[Intent, Severity] = MappingProxyType(
         Intent.PING_ME_CLEAR: Severity.NONE,
         Intent.FACT: Severity.NONE,
         Intent.INSULT: Severity.NONE,
+        Intent.CAPABILITIES: Severity.NONE,
     }
 )
 

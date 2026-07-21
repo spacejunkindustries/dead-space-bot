@@ -82,6 +82,36 @@ def test_cancel() -> None:
     assert cmd.intent is Intent.CANCEL
 
 
+# ── CAPABILITIES: spoken "what can you do" overview (GDD §6.1) ────────────────
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "what can you do",
+        "what do you do",
+        "what can you do for me",
+        "what are your commands",
+        "list your commands",
+        "capabilities",
+        "what are your capabilities",
+    ],
+)
+def test_capabilities_phrases_parse(phrase: str) -> None:
+    cmd = parse(f"Aura Command, {phrase}")
+    assert cmd is not None, phrase
+    assert cmd.intent is Intent.CAPABILITIES, phrase
+    assert cmd.system_text is None  # systemless — never resolved
+
+
+def test_bare_help_still_maps_to_help_not_capabilities() -> None:
+    """CAPABILITIES sits above HELP but must NOT claim the bare word "help" —
+    that stays the HELP intent (posts the full manual)."""
+    cmd = parse("Aura Command, help")
+    assert cmd is not None
+    assert cmd.intent is Intent.HELP
+
+
 # ── severity precedence (GDD §6.1) ───────────────────────────────────────────
 
 

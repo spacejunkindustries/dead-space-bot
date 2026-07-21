@@ -31,6 +31,7 @@ import structlog
 from discord import app_commands
 from discord.ext import commands
 
+from cortana import tts
 from cortana.dsc.cogs.admin import _is_admin
 from cortana.types import Intent, ParsedCommand
 
@@ -106,6 +107,8 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "• *“this is <callsign>”* — set your callsign\n"
                 "• *“command override <question>”* — ask the assistant "
                 "(needs the override channel enabled)\n"
+                "• *“what can you do”* / `/capabilities` — CORTANA speaks a "
+                "quick summary of her features (for new pilots)\n"
                 "• *“help”* — speaks a hint and posts this guide",
             ),
             (
@@ -619,5 +622,16 @@ class HelpCog(commands.Cog):
         await interaction.response.send_message(
             embed=discord.Embed.from_dict(main_embed()),
             view=HelpMenuView(visible_topics(include_admin=_is_admin(interaction))),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="capabilities", description="A quick summary of what CORTANA can do")
+    async def capabilities(self, interaction: discord.Interaction) -> None:
+        """Slash twin of the voice CAPABILITIES intent (constraint 10): sends the
+        SAME fixed summary CORTANA speaks (``tts.capabilities()``), mention-free
+        (constraint 11). Points new players at ``/help`` for the full manual."""
+        await interaction.response.send_message(
+            f"🛰️ {tts.capabilities()}\n\nRun `/help` for the full command list.",
+            allowed_mentions=discord.AllowedMentions.none(),
             ephemeral=True,
         )

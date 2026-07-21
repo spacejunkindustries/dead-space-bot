@@ -167,6 +167,28 @@ def test_help_utterance_catalogue() -> None:
     assert tts.help_hint() == "Command list posted to Discord."
 
 
+# ── CAPABILITIES intent: spoken overview + slash twin (constraint 10) ─────────
+
+
+def test_grammar_parses_capabilities() -> None:
+    cmd = grammar.parse("Aura Command, what can you do")
+    assert cmd is not None
+    assert cmd.intent is Intent.CAPABILITIES
+
+
+def test_capabilities_line_is_accurate_and_speakable() -> None:
+    line = tts.capabilities()
+    lower = line.lower()
+    # Names the wake phrase and the real, load-bearing features — no invented ones.
+    assert "hey cortana" in lower
+    assert "hostiles" in lower
+    assert "under attack" in lower
+    assert "override" in lower
+    assert "help" in lower  # points at the full manual
+    # Tight enough to speak inside the fun path's cap (~150 wpm → well under 20 s).
+    assert len(line.split()) <= 60
+
+
 # ── the /help slash twin (thin-adapter wiring, test_subs_cog pattern) ────────
 
 
@@ -256,3 +278,18 @@ async def test_slash_help_is_guild_only() -> None:
     assert engine.reports == []
     ((content, _),) = interaction.response.messages
     assert content == "Guild only."
+
+
+async def test_slash_capabilities_sends_the_same_summary_mention_free() -> None:
+    """/capabilities is the slash twin of the voice CAPABILITIES intent: it
+    sends the exact ``tts.capabilities()`` text, mention-free (constraint 11)."""
+    cog = HelpCog(SimpleNamespace(engine=_Engine()))  # type: ignore[arg-type]
+    interaction = make_interaction()
+
+    await HelpCog.capabilities.callback(cog, interaction)
+
+    ((content, kwargs),) = interaction.response.messages
+    assert tts.capabilities() in content
+    assert kwargs["ephemeral"] is True
+    am = kwargs["allowed_mentions"]
+    assert am.everyone is False and am.users is False and am.roles is False
