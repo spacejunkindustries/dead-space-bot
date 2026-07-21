@@ -1484,8 +1484,8 @@ Real-time audio is latency-sensitive, and **shared vCPU means CPU steal, which m
 |---|---|---|
 | Basic (shared) 1 vCPU / 1 GB | ~$6 | Rejected — steal time wrecks the audio thread |
 | Premium AMD 2 vCPU / 4 GB | ~$24–28 | Workable; still shared vCPU |
-| **CPU-Optimized 2 vCPU / 4 GB** | **~$42** | **Specified.** Dedicated cores, NVMe. Whisper `small` int8 needs the headroom. |
-| CPU-Optimized 4 vCPU / 8 GB | ~$84 | For Whisper `medium`, or serving multiple corps |
+| CPU-Optimized 2 vCPU / 4 GB | ~$42 | The minimum for a dedicated-core install (`stt.cpu_threads: 1`, `capture.streaming: false`). |
+| **CPU-Optimized 4 vCPU / 8 GB** | **~$84** | **Deployed** (see `DEPLOYMENT.md`). Dedicated cores + headroom for streaming STT (`capture.streaming: true`, `stt.cpu_threads: 2`) and the on-box understanding brain. |
 
 DigitalOcean moved to **per-second billing (60s minimum) on January 1, 2026**. List prices move a few times a year — confirm against the live pricing page before provisioning.
 
