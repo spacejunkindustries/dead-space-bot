@@ -17,6 +17,7 @@ question. The API key rides systemd ``LoadCredential=`` (constraint 12) with
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.client
 import json
 import os
@@ -77,6 +78,12 @@ class ChatBackend(Protocol):
     async def ask(self, user_id: int, query: str) -> str:
         """One question in, one short spoken-ready answer out. Raises
         :class:`ChatCooldownError` on throttle, :class:`ChatError` otherwise."""
+        ...
+
+    async def close(self) -> None:
+        """Release any held connection pool, so a client replaced on reload
+        (:meth:`App._refresh_chat`) or dropped at shutdown does not leak its
+        sockets. Idempotent."""
         ...
 
 
@@ -202,6 +209,16 @@ class ChatClient:
         )
         return text
 
+    async def close(self) -> None:
+        """Close the AsyncAnthropic httpx pool. Idempotent — a snapshot-then-clear
+        of ``self._client`` means a second call (or a close before ``_sdk`` ever
+        built one) is a harmless no-op."""
+        client = self._client
+        self._client = None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
 
 #: On-box persona. Same voice as the cloud one, minus the web-search clause a
 #: local model has no tool for. Short spoken lines, and the one hard rule holds
@@ -262,6 +279,11 @@ class LocalChatClient:
         self._last_ask[user_id] = time.monotonic()
         log.info("override_answered_local", model=cfg.model)
         return text
+
+    async def close(self) -> None:
+        """No persistent client to release (urllib opens a fresh connection per
+        request via ``to_thread``); present only to satisfy the protocol."""
+        return None
 
 
 def _local_completion(url: str, model: str, query: str, max_tokens: int, timeout_s: float) -> str:

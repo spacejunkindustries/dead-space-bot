@@ -388,6 +388,18 @@ class HealthReporter:
                 "check cortana-ears and the Discord voice connection; this "
                 "clears itself when audio flows again",
             )
+        elif self._voice_offline and not audience:
+            # The precondition dropped out from under the latch — the channel
+            # emptied below two humans, or Ears disconnected / went down. The
+            # VOICE_ABSENT alarm is only meaningful while there are pilots to
+            # receive, so lift it (a real Ears outage is covered by EARS_DOWN).
+            self._voice_offline = False
+            log.info(
+                "voice_receive_latch_cleared_no_audience",
+                humans_present=self._humans_present,
+                ears_connected=self._ears_reports_connected,
+            )
+            await self._clear(AlarmCode.VOICE_ABSENT)
         elif self._voice_offline and last is not None and (now - last) < alarm_s:
             self._voice_offline = False
             log.info("voice_receive_recovered")

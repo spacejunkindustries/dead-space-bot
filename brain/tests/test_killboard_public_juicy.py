@@ -205,7 +205,11 @@ async def test_pricing_budget_caps_market_lookups_per_scan(monkeypatch: pytest.M
 
 
 async def test_fame_only_when_pricing_budget_zero(monkeypatch: pytest.MonkeyPatch) -> None:
-    """max_priced_per_scan=0 makes the public feed fame-only — zero AODP calls."""
+    """max_priced_per_scan=0 makes the public feed fame-only — zero AODP calls.
+
+    The budget caps TOTAL pricing (sub-fame qualification + fame-hit decoration),
+    so a budget of 0 prices nothing at all: the fame-hit still posts, just without
+    a decorative loot value."""
     calls = {"n": 0}
 
     async def _counting(*_a: Any, **_k: Any) -> dict[str, Any]:
@@ -219,8 +223,63 @@ async def test_fame_only_when_pricing_budget_zero(monkeypatch: pytest.MonkeyPatc
 
     await feed._scan_once()
 
-    assert calls["n"] == 1  # only the fame-hit is priced (for display); no sub-fame pricing
-    assert len(channel.sent) == 1  # just the 3M-fame kill
+    assert calls["n"] == 0  # budget 0 → not a single AODP call, not even for display
+    assert len(channel.sent) == 1  # the 3M-fame kill still posts (loot just undecorated)
+
+
+async def test_famehit_pricing_is_bounded_by_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The regression guard: fame-hit card decoration is bounded by the pricing
+    budget. Ten fame-hits, market on, budget 3 → at most 3 AODP calls (today's
+    unbounded fan-out would price all 10). All 5 still post, decorated or not."""
+    calls = {"n": 0}
+
+    async def _counting(*_a: Any, **_k: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        return {"total": 20_000_000}
+
+    monkeypatch.setattr("killboard.public_juicy.estimate_value", _counting)
+    api = _Api([_raw_kill(i, fame=3_000_000 + i) for i in range(1, 11)])  # 10 fame-hits
+    channel = _OkChannel()
+    feed = _feed(
+        _Bot({JUICY_CHANNEL: channel}),
+        api,
+        _cfg(market=True, max_priced=3, max_posts=5),
+        _Market(0),
+    )
+
+    await feed._scan_once()
+
+    assert calls["n"] <= 3  # decoration bounded by the budget, not len(fame_hits)
+    assert len(channel.sent) == 5  # the top-5 by fame still post
+
+
+async def test_total_pricing_never_exceeds_budget_across_fame_and_subfame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whatever the fame/sub-fame split, total AODP calls per scan stay <= budget:
+    sub-fame qualification consumes it first, fame-hit decoration gets the rest."""
+    calls = {"n": 0}
+
+    async def _counting(*_a: Any, **_k: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        return {"total": 20_000_000}  # clears the loot bar
+
+    monkeypatch.setattr("killboard.public_juicy.estimate_value", _counting)
+    # 5 fame-hits + 5 sub-fame kills, market on, budget 4.
+    events = [_raw_kill(i, fame=3_000_000 + i) for i in range(1, 6)]
+    events += [_raw_kill(i, fame=100) for i in range(6, 11)]
+    channel = _OkChannel()
+    api = _Api(events)
+    feed = _feed(
+        _Bot({JUICY_CHANNEL: channel}),
+        api,
+        _cfg(market=True, max_priced=4, max_posts=8),
+        _Market(0),
+    )
+
+    await feed._scan_once()
+
+    assert calls["n"] <= 4  # sub-fame + fame-hit pricing combined never exceed the budget
 
 
 async def test_dedup_across_scans() -> None:

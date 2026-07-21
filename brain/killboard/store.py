@@ -53,6 +53,11 @@ _LEADERBOARD_ORDER: dict[str, str] = {
 }
 
 
+#: Chunk size for ``event_id IN (...)`` batches — comfortably under SQLite's
+#: default 999 bound-parameter ceiling (GDD §5).
+_IN_CHUNK: int = 500
+
+
 def _utc_now() -> str:
     """Current instant as an ISO-8601 UTC string (matches stored timestamps)."""
     return datetime.now(UTC).isoformat()
@@ -113,6 +118,33 @@ class KbStore:
             self._conn, "SELECT 1 FROM events WHERE event_id = ? LIMIT 1", (event_id,)
         )
         return val is not None
+
+    def has_events_many(self, event_ids: list[int]) -> set[int]:
+        """Which of ``event_ids`` are already stored, as a set (GDD §5).
+
+        The batched form of :meth:`has_event`: the deaths sweep re-fetches the
+        same recent deaths per member every pass, so a per-death ``has_event``
+        costs one ``to_thread`` hop + shared connection-lock acquisition each —
+        up to ``members × per-member`` SELECTs contending with the live feed.
+        This collapses that to a single ``SELECT event_id ... WHERE event_id IN
+        (...)`` per chunk. The IN list is chunked to stay well under SQLite's
+        bound-parameter ceiling (999); a sweep passes at most a few hundred ids,
+        so this is one query in practice. Idempotent and read-only, mirroring the
+        :meth:`mark_posted` / :meth:`mark_posted_many` precedent.
+        """
+        found: set[int] = set()
+        if not event_ids:
+            return found
+        for i in range(0, len(event_ids), _IN_CHUNK):
+            chunk = event_ids[i : i + _IN_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = db.query(
+                self._conn,
+                f"SELECT event_id FROM events WHERE event_id IN ({placeholders})",  # noqa: S608 — placeholders only
+                chunk,
+            )
+            found.update(int(r["event_id"]) for r in rows)
+        return found
 
     # ── ingestion: event / participant upserts ───────────────────────────────
 

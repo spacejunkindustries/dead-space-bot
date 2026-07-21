@@ -1330,6 +1330,8 @@ A freshly started Ears process reaches the socket before its own Discord gateway
 | `matching.phonetic_weight` | float | **required** | hot | Weight of metaphone similarity (constraint 7). Must sum to 1.0 with text_weight (cross-checked). |
 | `matching.text_weight` | float | **required** | hot | Weight of raw-text Levenshtein similarity. |
 | `matching.full_map_fallback` | bool | `True` | hot | When a report doesn't confidently match the scoped active set, re-resolve against the ENTIRE seeded k-space map (GDD §8.1) so any real system still resolves — the reliability fix for a small scope or a roaming corp. The scoped set keeps home-region accuracy; the full-map pass runs without home/proximity priors and a MEDIUM hit asks to confirm. false = scoped set only (the old behaviour). |
+| `matching.index.enabled` | bool | `True` | hot | Blocking index for the phonetic matcher (GDD §8.2). A STRICT performance layer: it only selects which gazetteer entries pay the edit-distance scorer, never how they score (constraint 7), and is provably accuracy-neutral (a cheap length-ratio upper bound proves no skipped entry could beat the rerank pool). false = always full scan. |
+| `matching.index.min_candidates` | int | `12` | hot | Fully score at least this many entries (K_MIN) before the upper-bound stop may skip the rest. Higher = more scan, never less accuracy. |
 | `matching.tiers.high_min` | float | **required** | hot | top1 >= this (and margin) → post immediately. |
 | `matching.tiers.high_margin` | float | **required** | hot | top1 - top2 must also clear this for HIGH tier. |
 | `matching.tiers.medium_min` | float | **required** | hot | top1 >= this → post flagged uncertain, with buttons. Must be <= high_min (cross-checked). |

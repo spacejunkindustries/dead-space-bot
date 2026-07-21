@@ -35,7 +35,7 @@ import yaml
 
 from cortana.config import ConfigHolder
 from cortana.core import db
-from cortana.nlu.phonetics import double_metaphone
+from cortana.nlu.phonetics import PoolIndex, build_pool_index, double_metaphone
 from cortana.types import SystemEntry
 
 __all__ = ["Gazetteer", "GazetteerError"]
@@ -159,6 +159,11 @@ class Gazetteer:
         self._all_systems: tuple[SystemEntry, ...] = ()
         self._all_by_id: dict[int, SystemEntry] = {}
         self._all_by_name: dict[str, SystemEntry] = {}
+        #: Blocking indexes (GDD §8.2), one per resolution pool. A strict,
+        #: accuracy-neutral performance layer for the phonetic matcher; rebuilt
+        #: only on load()/reload and swapped in with the rest of the snapshot.
+        self._systems_index: PoolIndex | None = None
+        self._all_systems_index: PoolIndex | None = None
         self._home_system_id: int | None = None
         self._prompt_bias: str = ""
         #: FC-authored custom names (GDD §8.5), normalised phrase -> system_id.
@@ -283,6 +288,12 @@ class Gazetteer:
         self._all_systems = tuple(sorted(all_by_id.values(), key=lambda e: e.name.lower()))
         self._all_by_id = all_by_id
         self._all_by_name = all_by_name
+        # Blocking indexes over each pool (GDD §8.2). Built here so they inherit
+        # the same atomic-snapshot swap; when the scope covers everything
+        # (nomadic include_all, systems == all_systems) the two are equivalent
+        # and the win lands on the 5000-entry pool every command pays for today.
+        self._systems_index = build_pool_index(systems)
+        self._all_systems_index = build_pool_index(self._all_systems)
         self._home_system_id = home.id if home is not None else None
         self._systems = systems
         # FC custom names → system_ids (GDD §8.5). Resolved against the FULL
@@ -348,6 +359,18 @@ class Gazetteer:
         §8.1). Falls back to the active set only if the full set is empty
         (defensive; ``load()`` always populates it)."""
         return self._all_systems or self._systems
+
+    @property
+    def systems_index(self) -> PoolIndex | None:
+        """Blocking index over the scoped active set (GDD §8.2), or None until
+        the first :meth:`load`. The phonetic matcher uses it as a strict,
+        accuracy-neutral performance layer."""
+        return self._systems_index
+
+    @property
+    def all_systems_index(self) -> PoolIndex | None:
+        """Blocking index over the full seeded map — the second-tier pool."""
+        return self._all_systems_index
 
     @property
     def home_system_id(self) -> int | None:

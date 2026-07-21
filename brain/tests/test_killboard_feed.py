@@ -450,3 +450,97 @@ def test_route_channels_yields_juicy_to_public_feed_when_enabled() -> None:
     routed = route_channels(row, fc, public_juicy_on=True)
     assert 999 not in routed
     assert KILLS_CHANNEL in routed
+
+
+# ── count_unposted gate: the 30s fallback no longer scans in steady state ──────
+
+
+def _counting_count_unposted(store: KbStore, calls: dict[str, int]) -> None:
+    """Wrap ``store.count_unposted`` with a call counter (delegates to the real)."""
+    real = store.count_unposted
+
+    def counting() -> int:
+        calls["n"] += 1
+        return real()
+
+    store.count_unposted = counting  # type: ignore[method-assign]
+
+
+async def test_clean_drain_skips_rescan(store: KbStore) -> None:
+    """Once a drain proves the backlog empty, the next fallback drain becomes a
+    flag check + return — it does NOT run the authoritative count_unposted scan
+    again. This is the whole point: the 30s fallback stops scanning in steady
+    state."""
+    store.upsert_event(_kill_row(1), "{}")
+    feed = _feed(_Bot({KILLS_CHANNEL: _OkChannel()}), store)
+
+    calls = {"n": 0}
+    _counting_count_unposted(store, calls)
+
+    await feed._drain()  # posts the one event, backlog now clean → flag False
+    assert feed._maybe_unposted is False
+    scanned_once = calls["n"]
+    assert scanned_once >= 1
+
+    await feed._drain()  # gated: flag False, inside the backstop → no scan
+    assert calls["n"] == scanned_once  # count_unposted was NOT called again
+
+
+async def test_queue_signal_rearms_drain(store: KbStore) -> None:
+    """A genuine poller queue signal re-arms the gate so a confirmed-clean feed
+    wakes and scans again for the new events instead of waiting for the backstop."""
+    import asyncio
+
+    queue: asyncio.Queue[list[EventRow]] = asyncio.Queue()
+    cfg = SimpleNamespace(killboard=KillboardConfig(feed=KbFeedConfig(kills_channel=KILLS_CHANNEL)))
+    feed = Feed(
+        _Bot({KILLS_CHANNEL: _OkChannel()}),
+        store,
+        _Cards(),
+        lambda: cfg,  # type: ignore[arg-type]
+        _inline_to_thread,
+        queue=queue,
+    )
+
+    await feed._drain()  # empty store → clean, flag False
+    assert feed._maybe_unposted is False
+
+    queue.put_nowait([_kill_row(9)])
+    await feed._wait_next()  # queue non-empty → returns at once, re-arms the flag
+    assert feed._maybe_unposted is True
+
+
+async def test_deferred_leaves_rearmed(store: KbStore) -> None:
+    """A deferred drain (transient Discord failure) leaves the flag re-armed so a
+    later drain re-scans and re-attempts, even with no new poller signal — the
+    §7.3 retry survives the gate."""
+    store.upsert_event(_kill_row(11), "{}")
+    feed = _feed(_Bot({KILLS_CHANNEL: _FailChannel()}), store)
+
+    await feed._drain()  # DEFERRED → flag stays True (backlog not proven empty)
+    assert feed._maybe_unposted is True
+
+    calls = {"n": 0}
+    _counting_count_unposted(store, calls)
+
+    await feed._drain()  # not gated → re-scans and re-attempts
+    assert calls["n"] == 1
+    assert store.count_unposted() == 1  # still unposted, retried not dropped
+
+
+async def test_idle_backstop_forces_rescan(store: KbStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even with the backlog proven clean (flag False), the idle backstop forces
+    one authoritative count_unposted scan every _IDLE_RESCAN_S so a lost queue
+    wake-up self-heals rather than stalling the feed."""
+    from killboard import feed as feed_mod
+
+    feed = _feed(_Bot({KILLS_CHANNEL: _OkChannel()}), store)
+    await feed._drain()  # empty store → clean, flag False
+    assert feed._maybe_unposted is False
+
+    calls = {"n": 0}
+    _counting_count_unposted(store, calls)
+    monkeypatch.setattr(feed_mod, "_IDLE_RESCAN_S", 0.0)  # backstop always elapsed
+
+    await feed._drain()  # despite the clean flag, the backstop forces a scan
+    assert calls["n"] == 1

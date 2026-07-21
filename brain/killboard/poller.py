@@ -335,21 +335,26 @@ class Poller:
         if row is None:
             return _StoreOutcome.IRRELEVANT
         try:
-            raw_json = json.dumps(raw, separators=(",", ":"), ensure_ascii=False, default=str)
-            parts = participants_of(raw)
-            await self._to_thread(self._persist, row, raw_json, parts)
+            await self._to_thread(self._persist, row, raw)
         except Exception as exc:  # noqa: BLE001 — transient persist failure: retry next tick
             self._log.warning("kb_poller.persist_error", error=str(exc), event_id=row.event_id)
             return _StoreOutcome.FAILED
         return row
 
-    def _persist(self, row: EventRow, raw_json: str, parts: list[Any]) -> None:
+    def _persist(self, row: EventRow, raw: dict[str, Any]) -> None:
         """Synchronous upsert of one event plus its participants (runs off-loop).
 
         Bundled into a single ``to_thread`` hop so the event and its damage rows
         land together. Both writes are idempotent (keyed on ``event_id`` and
         ``(event_id, player_id)``), so a re-seen event is a harmless overwrite.
+
+        The per-event CPU serialization (``json.dumps`` of the raw payload and
+        ``participants_of``) also runs here, on the worker thread — a ZvZ event
+        carries a huge Participants array, and at up to ~1000 events/tick doing
+        that work on the event loop would steal loop time from voice.
         """
+        raw_json = json.dumps(raw, separators=(",", ":"), ensure_ascii=False, default=str)
+        parts = participants_of(raw)
         self._store.upsert_event(row, raw_json)
         self._store.upsert_participants(row.event_id, parts)
 
@@ -382,8 +387,8 @@ class Poller:
         The ``/events?guildId`` endpoint only returns kills the guild landed, so
         deaths never appear there — Death Fame and the death feed stay empty. This
         sweep walks the roster, fetches each member's recent ``/players/{id}/deaths``,
-        skips the ones already stored (cheap ``has_event`` dedup), and stores the
-        rest.
+        skips the ones already stored (one batched ``has_events_many`` dedup per
+        sweep, not a per-death SELECT), and stores the rest.
 
         Ingested deaths flow to the feed via its normal unposted drain and into the
         Death-Fame aggregates. The feed itself applies the anti-backfill recency
@@ -408,7 +413,12 @@ class Poller:
             return
         members = self._roster_slice(roster)
 
-        new_rows: list[EventRow] = []
+        # Collect this sweep's candidate deaths keyed by event_id, then filter the
+        # already-stored ones with a SINGLE batched has_events_many — instead of a
+        # per-death has_event hop (members × per-member = up to 500 SELECTs, each a
+        # to_thread + shared connection-lock acquisition contending with the live
+        # feed). setdefault dedups the rare id shared across members.
+        candidates: dict[int, dict[str, Any]] = {}
         for member in members:
             if self._shutting_down():
                 break
@@ -417,12 +427,20 @@ class Poller:
                 continue
             for raw in await self._api.player_deaths(player_id, limit=_DEATHS_PER_MEMBER):
                 event_id = _raw_event_id(raw)
-                if event_id is not None and await self._to_thread(self._store.has_event, event_id):
+                if event_id is None:
+                    continue
+                candidates.setdefault(event_id, raw)
+            await asyncio.sleep(_MEMBER_THROTTLE_S)
+
+        new_rows: list[EventRow] = []
+        if candidates:
+            already = await self._to_thread(self._store.has_events_many, list(candidates))
+            for event_id, raw in candidates.items():
+                if event_id in already:
                     continue  # already ingested a previous sweep — skip re-store/re-emit
                 outcome = await self._store_event(raw, guild_id)
                 if isinstance(outcome, EventRow):
                     new_rows.append(outcome)
-            await asyncio.sleep(_MEMBER_THROTTLE_S)
 
         if new_rows:
             new_rows.sort(key=lambda r: r.event_id)

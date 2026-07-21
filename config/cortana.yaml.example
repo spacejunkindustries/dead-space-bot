@@ -184,6 +184,15 @@ matching:
                                        # Scoped accuracy is untouched (the fallback only runs
                                        # when the scoped set already failed). false = old
                                        # scoped-only behaviour.
+  index:                               # OPTIONAL blocking index — GDD §8.2. A STRICT,
+                                       # accuracy-neutral performance layer: it only selects
+                                       # which gazetteer entries pay the edit-distance scorer,
+                                       # never how they score (constraint 7). A cheap length-
+                                       # ratio upper bound proves no skipped entry could enter
+                                       # the rerank pool, so results are identical to a full scan.
+    enabled: true                      # false = always full-scan (the reference path)
+    min_candidates: 12                 # fully score at least this many before the upper-bound
+                                       # stop may skip the rest (K_MIN; higher = more scan)
   tiers:                               # confidence tiers — GDD §8.3
     high_min: 0.80                     # top1 >= this ...
     high_margin: 0.12                  # ... and top1 - top2 >= this → post immediately

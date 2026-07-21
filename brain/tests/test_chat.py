@@ -251,3 +251,40 @@ async def test_local_backend_unconfigured_url_is_chat_error() -> None:
     client = LocalChatClient(_local_holder(local_url=""))
     with pytest.raises(ChatError):
         await client.ask(1, "hello")
+
+
+# ── close(): release the connection pool on replace/shutdown ──────────────────
+
+
+async def test_chat_client_close_releases_pool_and_is_idempotent() -> None:
+    """ChatClient.close() aclose()s the AsyncAnthropic pool once and is idempotent:
+    a second close (or a close before the SDK was ever built) does nothing more."""
+    calls = {"n": 0}
+
+    class _FakeSdk:
+        async def aclose(self) -> None:
+            calls["n"] += 1
+
+    client, _ = make_client([])
+    client._client = _FakeSdk()  # type: ignore[assignment]
+
+    await client.close()
+    assert calls["n"] == 1
+    assert client._client is None  # cleared, so a re-close is a no-op
+
+    await client.close()  # idempotent — does not aclose again
+    assert calls["n"] == 1
+
+
+async def test_chat_client_close_no_client_is_noop() -> None:
+    """A close before _sdk() ever built the pool must not raise."""
+    client, _ = make_client([])
+    client._client = None
+    await client.close()  # no client to release — clean no-op
+
+
+async def test_local_chat_client_close_returns_none() -> None:
+    """LocalChatClient has no persistent client; close() satisfies the protocol
+    without error."""
+    client = LocalChatClient(_local_holder())
+    assert await client.close() is None

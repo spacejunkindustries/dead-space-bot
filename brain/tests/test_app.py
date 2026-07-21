@@ -1160,6 +1160,93 @@ async def test_refresh_chat_follows_config_and_key_state(
     assert app._chat_status == "disabled"
 
 
+# ── reload single-flight + chat close-on-replace ─────────────────────────────
+
+
+async def test_reload_is_single_flight() -> None:
+    """Two concurrent /reload callers share ONE transaction and receive the SAME
+    receipt — the single-flight guard coalesces them (no racing transactions)."""
+    app, _ = make_app(roles=[PILOT_ROLE])
+    calls = {"n": 0}
+    gate = asyncio.Event()
+    sentinel = object()
+
+    async def _fake_txn() -> object:
+        calls["n"] += 1
+        await gate.wait()
+        return sentinel
+
+    app._reload_transaction = _fake_txn  # type: ignore[method-assign]
+
+    t1 = asyncio.ensure_future(app.request_reload())
+    t2 = asyncio.ensure_future(app.request_reload())
+    await asyncio.sleep(0)  # let both reach _ensure_reload_task before releasing
+    gate.set()
+    r1, r2 = await asyncio.gather(t1, t2)
+
+    assert calls["n"] == 1  # exactly one transaction ran
+    assert r1 is r2 is sentinel  # both callers got the same receipt object
+
+
+async def test_sighup_and_slash_coalesce() -> None:
+    """A SIGHUP already in flight and a /reload arriving mid-transaction join the
+    same run; request_reload returns the running task's result."""
+    app, _ = make_app(roles=[PILOT_ROLE])
+    calls = {"n": 0}
+    gate = asyncio.Event()
+    sentinel = object()
+
+    async def _fake_txn() -> object:
+        calls["n"] += 1
+        await gate.wait()
+        return sentinel
+
+    app._reload_transaction = _fake_txn  # type: ignore[method-assign]
+
+    app._on_sighup()  # fire-and-forget: sets self._reload_task
+    receipt_task = asyncio.ensure_future(app.request_reload())
+    await asyncio.sleep(0)  # let the slash caller join the running task
+    gate.set()
+    receipt = await receipt_task
+
+    assert calls["n"] == 1
+    assert receipt is sentinel
+
+
+async def test_refresh_chat_closes_replaced_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replacing the chat client (here: a rotated key) closes the OLD client's
+    connection pool exactly once; a no-op reload that keeps the same object does
+    not schedule a close."""
+
+    class _FakeChat:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def ask(self, user_id: int, query: str) -> str:
+            return ""
+
+        async def close(self) -> None:
+            self.closed += 1
+
+    app, _ = make_app(roles=[PILOT_ROLE])
+    old = _FakeChat()
+    app.chat = old  # type: ignore[assignment]
+    app._chat_key = "old-key"
+    app.holder = StubHolder(make_config(chat_enabled=True))  # type: ignore[assignment]
+    monkeypatch.setattr(app_main, "read_api_key", lambda path: "new-key")
+
+    app._refresh_chat()  # builds a fresh ChatClient, schedules old.close()
+    assert app.chat is not old
+    await asyncio.gather(*app._chat_close_tasks)
+    assert old.closed == 1
+
+    # A no-op reload retains the same object (key unchanged) → no close scheduled.
+    same = app.chat
+    app._refresh_chat()
+    assert app.chat is same
+    assert app._chat_close_tasks == set()
+
+
 async def test_stale_arm_window_action_is_dropped() -> None:
     # Regression (confirmed review finding): ArmWindow executes after the
     # spoken prompt resolves; if the pilot re-woke in that gap the session

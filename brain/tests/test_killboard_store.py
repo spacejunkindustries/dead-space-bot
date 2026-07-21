@@ -245,6 +245,37 @@ def test_mark_posted_many_batches(store: KbStore) -> None:
     store.mark_posted_many([])  # empty is a no-op
 
 
+def test_has_events_many_returns_only_stored_ids(store: KbStore) -> None:
+    """has_events_many is the batched has_event: it returns exactly the subset of
+    the asked ids already in the store, and an empty ask is a no-op — the deaths
+    sweep's per-pass dedup in one SELECT instead of one per death."""
+    for eid in (10, 20, 30):
+        store.upsert_event(_event(eid), raw_json="{}")
+
+    # Mix of stored (10, 30) and unseen (15, 40) ids.
+    assert store.has_events_many([15, 10, 40, 30]) == {10, 30}
+    assert store.has_events_many([]) == set()
+    assert store.has_events_many([999]) == set()
+    # Agrees with the scalar has_event for every asked id.
+    for eid in (10, 15, 20, 40):
+        assert (eid in store.has_events_many([eid])) == store.has_event(eid)
+
+
+def test_has_events_many_chunks_beyond_the_in_limit(store: KbStore) -> None:
+    """A batch larger than the IN-chunk size is split across multiple SELECTs yet
+    still returns the complete stored set — proving the chunking loop reassembles
+    correctly and stays under SQLite's bound-parameter ceiling."""
+    import killboard.store as kb_store
+
+    stored = list(range(1, 1201, 2))  # 600 odd ids, spanning >1 chunk of 500
+    for eid in stored:
+        store.upsert_event(_event(eid), raw_json="{}")
+
+    asked = list(range(1, 1201))  # 1200 ids: every odd one is stored, evens are not
+    assert store.has_events_many(asked) == set(stored)
+    assert len(asked) > kb_store._IN_CHUNK  # the split actually happened
+
+
 def test_poll_state_serves_cache_matching_the_db(store: KbStore) -> None:
     """poll_state() serves an in-memory mirror (so health() never reads sqlite on
     the event loop). The mirror must match a fresh DB read after every write."""

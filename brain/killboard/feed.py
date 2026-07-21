@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import enum
 import io
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -74,6 +75,13 @@ _FALLBACK_POLL_S = 30.0
 #: work; catch-up collapse is sized against the TOTAL unposted count (not this
 #: window), so a backlog larger than this still collapses correctly.
 _DRAIN_WINDOW = 1000
+
+#: Idle backstop cadence for the authoritative ``count_unposted`` scan. The 30s
+#: fallback drain is normally gated to a flag check once the backlog is proven
+#: empty; even so, force one full scan this often so a lost queue wake-up (the
+#: race :meth:`_wait_next` already tolerates) self-heals rather than stalling the
+#: feed. Internal cadence, not a config knob (mirrors :data:`_FALLBACK_POLL_S`).
+_IDLE_RESCAN_S = 300.0
 
 
 class _PostResult(enum.Enum):
@@ -142,6 +150,13 @@ class Feed:
         self._posted_total = 0
         self._collapsed_total = 0
         self._last_post_at: str | None = None
+        # Gate for the authoritative count_unposted scan. Dirty (True) until a
+        # scan proves the backlog empty; True on startup so the first drain
+        # resumes any downtime backlog. _last_count_at is the monotonic time of
+        # the last scan (0.0 forces the first drain to scan). Touched only within
+        # this single feed coroutine (run→_drain / run→_wait_next), so no lock.
+        self._maybe_unposted = True
+        self._last_count_at = 0.0
 
     # ── supervised entry point ───────────────────────────────────────────────
 
@@ -189,12 +204,24 @@ class Feed:
         """
         if self._shutting_down():
             return
+        # Gate the whole scan: in steady state (backlog proven empty, flag False)
+        # the 30s fallback tick becomes a flag check + return, so count_unposted
+        # only runs on a genuine new-event burst (queue signal re-arms the flag)
+        # or once per idle backstop interval. This is the ONLY place the scan is
+        # reached — no scan happens on a gated fallback tick.
+        now = time.monotonic()
+        if not self._maybe_unposted and (now - self._last_count_at) < _IDLE_RESCAN_S:
+            return
+        self._maybe_unposted = True  # assume dirty until this scan proves it clean
+        self._last_count_at = now
+
         fc = self._cfg_provider().killboard.feed
         cap = max(1, fc.catchup_max_posts)
         delay = max(0.0, fc.post_delay_ms / 1000.0)
 
         total = await self._to_thread(self._store.count_unposted)
         if total == 0:
+            self._maybe_unposted = False  # backlog empty — gate the next fallbacks
             return
 
         # Catch-up collapse over the whole backlog (§7.3), oldest-first.
@@ -216,6 +243,7 @@ class Feed:
         while not self._shutting_down():
             pending = await self._to_thread(self._store.unposted_events, cap)
             if not pending:
+                self._maybe_unposted = False  # drained clean — gate the next fallbacks
                 return
             progressed = False
             for i, row in enumerate(pending):
@@ -520,9 +548,11 @@ class Feed:
         if self._shutting_down():
             return
 
+        queue_fut: asyncio.Future[Any] | None = None
         waiters: list[asyncio.Future[Any]] = []
         if self._queue is not None:
-            waiters.append(asyncio.ensure_future(self._queue.get()))
+            queue_fut = asyncio.ensure_future(self._queue.get())
+            waiters.append(queue_fut)
         if self._shutdown is not None:
             waiters.append(asyncio.ensure_future(self._shutdown.wait()))
 
@@ -539,10 +569,24 @@ class Feed:
                 if not waiter.done():
                     waiter.cancel()
 
+        # A genuine queue signal (kills loop OR deaths sweep — both go through
+        # _emit→queue, and the deaths sweep does NOT advance the poll high-water
+        # mark, so gating on hwm alone would starve deaths) re-arms the drain gate
+        # so a confirmed-clean feed wakes promptly for new events instead of
+        # waiting for the idle backstop. Contents are discarded (the store stays
+        # source of truth); only the wake-up FACT is used.
+        signalled = False
+        if queue_fut is not None and queue_fut.done() and not queue_fut.cancelled():
+            with contextlib.suppress(Exception):
+                queue_fut.result()  # consume so the future isn't left un-retrieved
+            signalled = True
         if self._queue is not None:
             with contextlib.suppress(asyncio.QueueEmpty):
                 while True:
                     self._queue.get_nowait()
+                    signalled = True
+        if signalled:
+            self._maybe_unposted = True
 
 
 # ── pure routing + embed helpers (no I/O — unit-testable) ─────────────────────

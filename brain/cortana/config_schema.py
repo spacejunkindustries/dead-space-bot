@@ -159,6 +159,12 @@ SECTIONS: Final[tuple[Section, ...]] = (
     Section("matching", "Phonetic system-name matcher weights (constraint 7)."),
     Section("matching.tiers", "Confidence tiers — GDD §8.3."),
     Section("matching.priors", "Context reweighting — GDD §8.4."),
+    Section(
+        "matching.index",
+        "OPTIONAL blocking-index tuning (GDD §8.2); a strict, accuracy-neutral "
+        "performance layer over the scorer.",
+        optional=True,
+    ),
     Section("incidents", "Dedupe / staleness / cancel windows."),
     Section("discipline", "Mention cooldowns and the flood breaker."),
     Section("discipline.circuit_breaker", "Corp-wide mention flood control."),
@@ -625,6 +631,26 @@ KEYS: Final[tuple[Key, ...]] = (
         "full-map pass runs without home/proximity priors and a MEDIUM hit "
         "asks to confirm. false = scoped set only (the old behaviour).",
         default=True,
+    ),
+    Key(
+        "matching.index.enabled",
+        "bool",
+        Reload.HOT,
+        "Blocking index for the phonetic matcher (GDD §8.2). A STRICT "
+        "performance layer: it only selects which gazetteer entries pay the "
+        "edit-distance scorer, never how they score (constraint 7), and is "
+        "provably accuracy-neutral (a cheap length-ratio upper bound proves no "
+        "skipped entry could beat the rerank pool). false = always full scan.",
+        default=True,
+    ),
+    Key(
+        "matching.index.min_candidates",
+        "int",
+        Reload.HOT,
+        "Fully score at least this many entries (K_MIN) before the upper-bound "
+        "stop may skip the rest. Higher = more scan, never less accuracy.",
+        default=12,
+        minimum=8,
     ),
     Key(
         "matching.tiers.high_min",
