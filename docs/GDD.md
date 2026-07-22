@@ -329,7 +329,7 @@ Everything conversational — say-again retries, the "code *colour*" opener, the
 
 **Two absolute exits, learned in heavy comms chatter (live complaint — the say-again loop had no spoken way out and kept recapturing conversation):**
 
-- **Dismissal.** A standalone *"end transmission"* / *"disregard"* / *"never mind"* / *"belay that"* / *"stand down"* / *"stop"* closes the dialog from ANY point — mid-capture, any retry window, even a pending confirm-first report (an explicit abort fails closed) — answered with *"Standing down."* so the pilot hears the door shut. Standalone only: *"stop pinging me"* stays a command. *"cancel"* is deliberately NOT a dismissal — it keeps its meaning (retract the last incident).
+- **Dismissal.** A standalone *"end transmission"* / *"disregard"* / *"never mind"* / *"belay that"* / *"stop"* closes the dialog from ANY point — mid-capture, any retry window, even a pending confirm-first report (an explicit abort fails closed) — answered with *"Standing down."* so the pilot hears the door shut. Standalone only: *"stop pinging me"* stays a command. *"cancel"* is deliberately NOT a dismissal — it keeps its meaning (retract the last incident); nor are *"stand down"* / *"all clear"*, which are the `STAND_DOWN` command (resolve active incident cards, §9.1), not a dialog exit.
 - **The garbage gate.** A transcript below `dialog.retry_min_logprob` (default −1.3) that matched nothing is chatter/noise: the dialog closes **silently** instead of prompting *"say again"* into an open mic that will only recapture more conversation. Recognised commands are never gated by this — a quiet mic's distress call still posts.
 
 **Rule 1 — one door.** The machine's `fail()` / `open_subdialog()` helpers are the *only* code paths that can arm a wake-free capture window. Every failure class — STT error, unmatched speech, low-confidence transcript, override noise, LOW-tier rejection — flows through the same door and draws on one per-dialog **retry budget** (`dialog.max_retries`, default 2, shared with deliberate subdialog openers). Only a fresh wake refills the budget; exhaustion always terminates *audibly* ("Standing down. Wake me to retry."). A self-sustaining reopen loop is structurally impossible, not merely guarded against.
@@ -383,6 +383,7 @@ The grammar is **fixed and rigid**. No LLM sits in this loop — it would be slo
 | "need help \<system\>" / "help me \<system\>" / "send help\|backup\|reinforcements\|the fleet \<system\>" / "request(ing) [heavy] assistance\|backup\|reinforcements\|support \<system\>" | `ASSIST_REQUEST` | **high** | role mention + `@here` |
 | "gate camp \<system\>" | `GATE_CAMP` | medium | role mention |
 | "clear \<system\>" | `RESOLVE` | none | edits card, no mention |
+| "stand down" / "all clear" / "clear all [statuses]" / "clear the board" / "cancel\|clear the last incident" | `STAND_DOWN` | none | resolves active incident cards in place, no mention (slash twin `/standdown`; "last" → most recent only, otherwise all) |
 | "timer \<system\> \<duration\>" | `TIMER` | none | schedules a future ping |
 | "form up \<system\> \<duration\>" | `FORMUP` | none | posts op with RSVP |
 | "status" | `QUERY` | none | spoken reply only |
@@ -498,6 +499,8 @@ Sibling of §6.6 (override) and §6.7 (understanding brain): **OFF by default**,
 
 **Its own backend lane.** `conversation.backend` (`local` | `anthropic`) reuses the §6.6 `ChatBackend` abstraction but reads the separate `conversation.*` config, so a corp can run conversation on a free on-box model (the live box runs local `qwen2.5:7b`) while the override channel stays cloud. `quiet_during_ops` silences banter while an incident is active/recent (`quiet_window_min`). A half-set config (enabled, no `local_url`/no key) degrades to dark, exactly like `chat:`. Slash twin: **`/chat`**, sharing one per-pilot history with the voice path (constraint 10).
 
+**The chatter guard.** Conversation mode changes what an *uncertain* report means. When banter is flowing, a wake followed by chit-chat routinely trips a loose report keyword — a bare colour word like *"red"* claims `HOSTILE_SPOTTED` — and a phonetic scrap resolves weakly to a real system, which used to post a junk *"unconfirmed"* CODE ORANGE card (live defect). So while conversation is **available** (enabled, backend up, ops not in progress) a mention-report whose location did **not** confidently match a real system — below HIGH tier (§8.3) and not a known area — is dropped as chatter instead of opening / confirming / learning a card. A confident callout (*"hostiles in Jita"*, a spelled nullsec name — both resolve HIGH) is never touched, nor is a confirmed / forced / rebound report, nor any corp with conversation off (the default → byte-for-byte the old path). The `quiet_during_ops` predicate makes this self-adjusting: during real ops conversation goes unavailable, so the guard relaxes exactly when callouts, not banter, dominate. Enforced in `DialogEngine._report` (never in `machine.py`), below `decide_mentions()` — it only *drops*, it never mints a mention.
+
 ---
 
 ## 7. Slash command reference
@@ -512,6 +515,7 @@ Full parity. Every voice command routes to the same engine.
 | `/camp system detail [code] [audience]` | Report a gate camp |
 | `/relay message [code] [audience]` | Freeform intel relay, posted verbatim — twin of the voice relay (§8.6); never `@here` |
 | `/clear system` | Resolve an incident |
+| `/standdown [scope]` | Stand down: resolve active incident cards — twin of the voice "stand down" / "clear all" / "cancel last incident"; `scope=all` (default) clears every active card, `scope=last` only the most recent; never mentions |
 | `/status` | Active incidents summary |
 | `/help [topic]` | Interactive help: main page + topic pages (reporting, responding, subscriptions, identity, ops, privacy, admin) via a select menu; twin of voice "help" |
 | `/cancel` | Retract your own last report (30s window) |

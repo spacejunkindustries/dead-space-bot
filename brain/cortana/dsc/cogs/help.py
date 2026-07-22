@@ -125,9 +125,10 @@ HELP_TOPICS: dict[str, HelpTopic] = {
                 "again. When she's not sure of the system she asks *“Heard X — "
                 "confirm?”*: say **yes** to post, **no** to re-say the system — "
                 "or say nothing and it posts anyway (a distress call is never "
-                "dropped). Say *“end transmission”*, *“disregard”*, *“never "
-                "mind”* or *“stand down”* at any point to close her out "
-                "immediately.",
+                "dropped). Say *“end transmission”*, *“disregard”* or *“never "
+                "mind”* at any point to close her out immediately; *“stand "
+                "down”* / *“all clear”* instead resolves the active incident "
+                "cards (twin: `/standdown`).",
             ),
         ),
     ),

@@ -232,6 +232,29 @@ _INTENT_PATTERNS: tuple[tuple[Intent, re.Pattern[str]], ...] = (
         ),
     ),
     (Intent.GATE_CAMP, re.compile(r"\bgate\s*camp(?:ed|ers)?\b", re.I)),
+    # Fleet-wide stand-down (GDD §9.1). Sits ABOVE RESOLVE ("clear <system>")
+    # and CANCEL ("cancel") so the board-wipe phrasings — "stand down", "clear
+    # all [statuses]", "all clear", "clear the board", "cancel/clear the last
+    # incident" — resolve active cards instead of being swallowed by the bare
+    # "clear"/"cancel" patterns and then rejected for having no system (live
+    # complaint: "clear all statuses" did nothing). Below every report/distress
+    # intent so a real callout is never demoted to a stand-down. A LEADING
+    # "last …" carries scope in ``detail`` ("last" = the most recent incident;
+    # otherwise "all"). Deliberately specific: a bare "clear" or "cancel" still
+    # means RESOLVE / CANCEL.
+    (
+        Intent.STAND_DOWN,
+        re.compile(
+            r"\bstand\s+down\b"
+            r"|\bstanding\s+down\b"
+            r"|\ball\s+clear\b"
+            r"|\bclear\s+all\b"
+            r"|\bclear\s+(?:all\s+)?(?:status(?:es)?|incidents?|everything|cards?)\b"
+            r"|\bclear\s+the\s+board\b"
+            r"|\b(?:cancel|clear)\s+(?:the\s+)?last(?:\s+incident)?\b",
+            re.I,
+        ),
+    ),
     (Intent.RESOLVE, re.compile(r"\bclear(?:ed)?\b", re.I)),
     (Intent.TIMER, re.compile(r"\btimer\b", re.I)),
     (Intent.FORMUP, re.compile(r"\bform(?:\s|-)?up\b", re.I)),
@@ -406,6 +429,7 @@ _SYSTEMLESS_INTENTS = frozenset(
         Intent.HELP,
         Intent.CAPABILITIES,
         Intent.CANCEL,
+        Intent.STAND_DOWN,
         Intent.UNREGISTER,
         Intent.WHOAMI,
         Intent.PING_ME_CLEAR,
@@ -809,13 +833,15 @@ _DO_IT_RE = re.compile(r"\bdo\s+it\b", re.I)
 def dismissal(transcript: str) -> bool:
     """True for a *standalone* dismissal — the pilot closing the dialog.
 
-    "End transmission", "disregard", "never mind", "belay that", "stand
-    down", a bare "stop" — spoken during a capture, a retry window, or as a
-    fresh wake command, any of these ends the dialog immediately with
-    "Standing down." (live complaint: in heavy chatter the say-again loop
-    had no spoken exit). Standalone-ness is required — "stop pinging me" is
-    a command, not a dismissal. "cancel" is deliberately absent: it is the
-    CANCEL intent (retract the last incident) and must keep that meaning.
+    "End transmission", "disregard", "never mind", "belay that", a bare
+    "stop" — spoken during a capture, a retry window, or as a fresh wake
+    command, any of these ends the dialog immediately with "Standing down."
+    (live complaint: in heavy chatter the say-again loop had no spoken exit).
+    Standalone-ness is required — "stop pinging me" is a command, not a
+    dismissal. "cancel" is deliberately absent: it is the CANCEL intent
+    (retract the last incident) and must keep that meaning; so are "stand
+    down"/"all clear", which are the STAND_DOWN command (resolve active
+    incident cards, GDD §9.1), not a dialog exit.
     """
     if not transcript or not transcript.strip():
         return False
@@ -841,8 +867,10 @@ _DISMISS_PHRASES = frozenset(
         "nevermind",
         "disregard",
         "belay",
-        "stand down",
-        "standing down",
+        # "stand down" / "standing down" are NOT here: they are the STAND_DOWN
+        # command (resolve active incident cards, GDD §9.1), not a dialog exit.
+        # "disregard" / "never mind" / "end transmission" remain the spoken way
+        # out of a say-again loop.
         "stop",
         "stop listening",
         "shut up",
@@ -1050,6 +1078,21 @@ def parse(transcript: str) -> ParsedCommand | None:
             group_alias = alias
             remainder = pattern.sub(" ", remainder)
             break
+
+    if intent is Intent.STAND_DOWN:
+        # Scope rides in ``detail`` (GDD §9.1): "cancel/clear the last incident"
+        # resolves only the most recent card; every other phrasing clears them
+        # all. Carried as a plain word so both paths (voice + /standdown twin)
+        # and the command_log read the same (constraint 10).
+        scope = "last" if "last" in match.group(0).lower() else "all"
+        return ParsedCommand(
+            intent=intent,
+            system_text=None,
+            group_alias=group_alias,
+            detail=scope,
+            raw=transcript,
+            severity=severity,
+        )
 
     if intent in _SYSTEMLESS_INTENTS:
         return ParsedCommand(

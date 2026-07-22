@@ -373,6 +373,41 @@ class IntelCog(commands.Cog):
             outcome_text(outcome.outcome, outcome.utterance), ephemeral=True
         )
 
+    @app_commands.command(
+        name="standdown",
+        description="Stand down: resolve active incident cards — twin of the voice 'stand down'",
+    )
+    @app_commands.describe(
+        scope="all = clear every active card (default); last = only the most recent"
+    )
+    async def standdown(
+        self,
+        interaction: discord.Interaction,
+        scope: Literal["all", "last"] = "all",
+    ) -> None:
+        # Slash twin of the voice "stand down" / "clear all" / "cancel last
+        # incident" (constraint 10): the same engine.report → stand_down path,
+        # so both surfaces resolve cards identically and write one command_log
+        # row. RESOLVE-class verb — never mentions, so it stays open to everyone
+        # (like /clear and /cancel).
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        parsed = ParsedCommand(
+            intent=Intent.STAND_DOWN,
+            system_text=None,
+            group_alias=None,
+            detail=scope,
+            raw=f"/standdown {scope}",
+        )
+        outcome = await self.bot.engine.report(
+            interaction.guild_id, interaction.user.id, parsed, None
+        )
+        await interaction.followup.send(
+            outcome_text(outcome.outcome, outcome.utterance), ephemeral=True
+        )
+
     @app_commands.command(name="status", description="Active incidents summary")
     async def status(self, interaction: discord.Interaction) -> None:
         if interaction.guild_id is None:

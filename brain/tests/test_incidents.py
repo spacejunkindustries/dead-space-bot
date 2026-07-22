@@ -2077,6 +2077,75 @@ async def test_clear_all_resolves_every_active_card(make_env: Callable[..., Env]
     assert again == []  # idempotent: nothing active remains
 
 
+# ── stand-down: voice "stand down" / "clear all" / "cancel last" (§9.1) ───────
+
+
+def _status(conn: sqlite3.Connection, incident_id: int) -> str:
+    return db.query_value(conn, "SELECT status FROM incidents WHERE id = ?", (incident_id,))
+
+
+async def test_stand_down_all_resolves_every_active_card(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    a = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    env.clock.advance(5)
+    b = await env.engine.report(GUILD, 43, cmd(Intent.GATE_CAMP), high(2, "Kisogo"))
+    assert a.incident_id and b.incident_id
+
+    posts_before = len(env.poster.posts)
+    out = await env.engine.stand_down(GUILD, 99, "all")
+    assert out.outcome is Outcome.POSTED
+    assert _status(env.conn, a.incident_id) == "RESOLVED"
+    assert _status(env.conn, b.incident_id) == "RESOLVED"
+    # Cards edited in place to their resolved render — never a second live card
+    # per incident (constraint 9), and the resolve edit carries no mention
+    # (edit() has no mention channel — mention-free by construction, constraint 11).
+    assert len(env.poster.edits) == 2
+    assert len(env.poster.posts) == posts_before  # no new card posted, only edits
+
+    again = await env.engine.stand_down(GUILD, 99, "all")
+    assert again.outcome is Outcome.REJECTED  # idempotent: nothing left to clear
+
+
+async def test_stand_down_last_resolves_only_most_recent(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    a = await env.engine.report(GUILD, 42, cmd(Intent.UNDER_ATTACK), high(1, "Otanuomi"))
+    env.clock.advance(5)
+    b = await env.engine.report(GUILD, 43, cmd(Intent.GATE_CAMP), high(2, "Kisogo"))
+    assert a.incident_id and b.incident_id
+
+    out = await env.engine.stand_down(GUILD, 99, "last")
+    assert out.outcome is Outcome.POSTED
+    assert out.incident_id == b.incident_id
+    # Only the most recent card resolved; the earlier one stays ACTIVE.
+    assert _status(env.conn, b.incident_id) == "RESOLVED"
+    assert _status(env.conn, a.incident_id) == "ACTIVE"
+
+
+async def test_stand_down_via_report_entry_point(make_env: Callable[..., Env]) -> None:
+    """The voice path drives stand-down through the ONE engine entry point
+    (constraint 10): a STAND_DOWN ParsedCommand with scope in ``detail``."""
+    env = make_env()
+    a = await env.engine.report(GUILD, 42, cmd(Intent.HOSTILE_SPOTTED), high(1, "Otanuomi"))
+    assert a.incident_id
+
+    out = await env.engine.report(GUILD, 99, cmd(Intent.STAND_DOWN, detail="all"), None)
+    assert out.outcome is Outcome.POSTED
+    assert _status(env.conn, a.incident_id) == "RESOLVED"
+    # One command_log row was written for the stand-down.
+    logged = db.query_value(
+        env.conn,
+        "SELECT COUNT(*) FROM command_log WHERE parsed_intent = 'STAND_DOWN'",
+    )
+    assert logged == 1
+
+
+async def test_stand_down_nothing_active_is_rejected(make_env: Callable[..., Env]) -> None:
+    env = make_env()
+    out = await env.engine.stand_down(GUILD, 99, "all")
+    assert out.outcome is Outcome.REJECTED
+    assert not env.poster.edits and not env.poster.posts
+
+
 # ── incident durability: render-then-deliver + lost-message recovery (§9.1) ──
 
 

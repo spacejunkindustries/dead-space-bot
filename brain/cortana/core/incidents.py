@@ -819,6 +819,11 @@ class IncidentEngine:
             await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
             return outcome
 
+        if intent is Intent.STAND_DOWN:
+            outcome = await self.stand_down(guild_id, reporter_id, parsed.detail)
+            await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
+            return outcome
+
         if intent is Intent.QUERY:
             outcome = await self._query_status(guild_id)
             await self._log_command(reporter_id, parsed, None, None, outcome.outcome)
@@ -1556,6 +1561,78 @@ class IncidentEngine:
         # Discord I/O outside the lock (render-then-deliver).
         await self._deliver_all(works)
         return IncidentOutcome(Outcome.POSTED, f"{system_name} clear.", card, resolved[-1].id)
+
+    async def stand_down(
+        self, guild_id: int, user_id: int, scope: str | None = None
+    ) -> IncidentOutcome:
+        """Voice "stand down" / "clear all" / "all clear" / "cancel last
+        incident" and the ``/standdown`` twin (constraint 10): resolve active
+        incident cards in place (GDD §9.1).
+
+        ``scope == "last"`` resolves only the most recent ACTIVE incident (the
+        "cancel/clear the last incident" phrasing); anything else clears every
+        ACTIVE incident in the guild. Each card is edited to its RESOLVED state
+        — never a second post, never a mention (a resolve carries none;
+        constraint 11) — and a lost card re-posts resolved so a stand-down the
+        corp cannot see never silently fails. Unlike the admin ``clear_all``
+        board-wipe, this is the pilot-facing verb: it speaks a confirmation and
+        recovers lost cards, so the fleet hears (and sees) that the board is
+        clear."""
+        only_last = (scope or "").strip().lower() == "last"
+        async with self._lock:
+            now = self._clock()
+
+            def _resolve() -> list[Incident]:
+                rows = db.query(
+                    self._conn,
+                    "SELECT id FROM incidents WHERE guild_id = ? AND status = 'ACTIVE'"
+                    " ORDER BY updated_at DESC" + (" LIMIT 1" if only_last else ""),
+                    (guild_id,),
+                )
+                resolved: list[Incident] = []
+                for row in rows:
+                    db.execute(
+                        self._conn,
+                        "UPDATE incidents SET status = 'RESOLVED', updated_at = ?,"
+                        " pending_candidates = NULL WHERE id = ?",
+                        (_iso(now), row["id"]),
+                    )
+                    incident = _load_incident(self._conn, row["id"])
+                    if incident is not None:
+                        resolved.append(incident)
+                return resolved
+
+            resolved = await asyncio.to_thread(_resolve)
+            if not resolved:
+                return IncidentOutcome(
+                    Outcome.REJECTED, "Nothing active to stand down.", None, None
+                )
+            card: CardRender | None = None
+            works: list[_Delivery] = []
+            for incident in resolved:
+                self._pending_candidates.pop(incident.id, None)
+                system_name = self._system_name(
+                    incident.system_id, incident.raw_system_text or _UNKNOWN_LOCATION
+                )
+                card = self._render(incident, system_name)
+                works.append(self._edit_work(incident, card, repost_if_lost=True))
+            log.info(
+                "incidents_stood_down",
+                guild_id=guild_id,
+                count=len(resolved),
+                scope="last" if only_last else "all",
+                user_id=user_id,
+            )
+        # Discord I/O outside the lock (render-then-deliver).
+        await self._deliver_all(works)
+        count = len(resolved)
+        if only_last:
+            utterance = "Last incident cleared. Standing down."
+        elif count == 1:
+            utterance = "One incident cleared. Standing down."
+        else:
+            utterance = f"{_number_word(count)} incidents cleared. Standing down."
+        return IncidentOutcome(Outcome.POSTED, utterance, card, resolved[-1].id)
 
     async def cancel(self, guild_id: int, user_id: int) -> IncidentOutcome:
         """Kill this user's last incident, inside ``incidents.cancel_window_s``."""

@@ -1247,7 +1247,6 @@ def test_woust_is_a_roast() -> None:
         "nevermind, over",
         "okay disregard that",
         "belay that",
-        "stand down",
         "stop",
         "shut up",
         "forget it",
@@ -1266,6 +1265,9 @@ def test_dismissal_phrases(heard: str) -> None:
         "stop pinging me",  # a command, not a dismissal
         "forget me",  # UNREGISTER
         "cancel",  # CANCEL keeps its meaning (retract last incident)
+        "stand down",  # STAND_DOWN command now (resolve active cards), not a dialog exit
+        "standing down",  # ditto
+        "all clear",  # STAND_DOWN command
         "hostiles Otanuomi, end transmission",  # sign-off use, not a dismissal
         "under attack, stand by",
     ],
@@ -1274,3 +1276,57 @@ def test_dismissal_negatives(heard: str) -> None:
     from cortana.nlu.grammar import dismissal
 
     assert dismissal(heard) is False
+
+
+# ── stand-down (GDD §9.1): resolve active incident cards by voice ────────────
+
+
+@pytest.mark.parametrize(
+    ("heard", "scope"),
+    [
+        ("clear all statuses", "all"),
+        ("please clear all statuses", "all"),
+        ("clear all", "all"),
+        ("stand down", "all"),
+        ("hey cortana, stand down", "all"),
+        ("standing down", "all"),
+        ("all clear", "all"),
+        ("clear the board", "all"),
+        ("clear everything", "all"),
+        ("clear all incidents", "all"),
+        ("cancel last incident", "last"),
+        ("cancel the last incident", "last"),
+        ("clear the last incident", "last"),
+    ],
+)
+def test_stand_down_phrases(heard: str, scope: str) -> None:
+    from cortana.nlu.grammar import parse
+    from cortana.types import Intent
+
+    parsed = parse(heard)
+    assert parsed is not None
+    assert parsed.intent is Intent.STAND_DOWN
+    assert parsed.system_text is None
+    assert parsed.detail == scope  # scope rides in detail (constraint 10 parity)
+
+
+@pytest.mark.parametrize(
+    ("heard", "intent"),
+    [
+        # A bare "clear"/"cancel" with a system keeps its RESOLVE/CANCEL meaning;
+        # only the board-wipe phrasings become STAND_DOWN.
+        ("clear Kisogo", "RESOLVE"),
+        ("clear Otanuomi", "RESOLVE"),
+        ("cancel", "CANCEL"),
+        ("cancel that", "CANCEL"),
+        # A real distress/sighting call is never demoted to a stand-down.
+        ("under attack in Otanuomi, all hands", "UNDER_ATTACK"),
+        ("hostiles in Jita", "HOSTILE_SPOTTED"),
+    ],
+)
+def test_stand_down_does_not_shadow_reports(heard: str, intent: str) -> None:
+    from cortana.nlu.grammar import parse
+
+    parsed = parse(heard)
+    assert parsed is not None
+    assert parsed.intent.value == intent

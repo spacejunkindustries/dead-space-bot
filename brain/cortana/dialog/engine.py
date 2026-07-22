@@ -742,6 +742,42 @@ class DialogEngine:
                 resolution.best.score if resolution.best else 0.0, resolution.tier
             )
 
+        # Chatter guard (GDD §6.8 + §8.3): while conversation mode is live —
+        # enabled, backend up, ops quiet — a wake followed by ordinary chit-chat
+        # routinely trips a loose report keyword (a bare colour word like "red")
+        # AND a phonetic scrap that resolves weakly ("you got to" → a nullsec
+        # ID), which used to post a junk "unconfirmed" CODE ORANGE card. When
+        # conversation is available, a mention-report whose location did NOT
+        # confidently match a real system (below HIGH tier, and not a known
+        # area) is far more likely banter than a callout, so it is dropped as
+        # chatter instead of opening / confirming / learning a card. A confident
+        # callout ("hostiles in Jita", a spelled nullsec name — both resolve
+        # HIGH) is never touched; neither is a confirmed / forced / rebound
+        # report; and with conversation off (the default) this is byte-for-byte
+        # the old path. During real ops the quiet-during-ops predicate makes
+        # conversation unavailable, so the guard relaxes exactly when callouts,
+        # not banter, dominate.
+        if (
+            not action.confirmed
+            and action.forced_resolution is None
+            and action.rebound_from is None
+            and parsed.intent in MENTION_INTENTS
+            and parsed.system_text
+            and (
+                resolution is None
+                or (resolution.tier is not Tier.HIGH and resolution.area_name is None)
+            )
+            and self._conversation_available(cfg, s.guild_id)
+        ):
+            self._health.record_rejected()
+            log.info(
+                "report_chatter_dropped",
+                user_id=s.user_id,
+                heard=parsed.system_text,
+                tier=str(resolution.tier) if resolution is not None else "none",
+            )
+            return
+
         # Learn-a-word (GDD §8.5a): a mention-report naming a place that
         # resolved to NO system (LOW, and not already a known area/alias) is
         # offered up to be remembered — "Did you say <word>?" — instead of
